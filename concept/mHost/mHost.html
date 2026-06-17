@@ -374,6 +374,45 @@
   letter-spacing: .02em;
 }
 
+/* ── Prototype Slide ── */
+.proto-slide {
+  --bg-texture: none;
+  background: var(--bg);
+  padding: 48px 64px 40px;
+  justify-content: flex-start;
+  align-items: stretch;
+  overflow: hidden;
+}
+.proto-frame {
+  flex: 1;
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  border: 1px solid var(--border-strong);
+  box-shadow: var(--shadow-lg);
+  background: #fff;
+  position: relative;
+  min-height: 0;
+}
+.proto-frame iframe {
+  width: 100%;
+  height: 100%;
+  display: block;
+  border: none;
+  min-height: 520px;
+}
+.proto-hint {
+  margin-top: .75rem;
+  font-size: .72rem;
+  color: var(--text-3);
+  text-align: center;
+  letter-spacing: .01em;
+}
+.proto-hint span {
+  font-weight: 700;
+  color: var(--text-2);
+  font-family: var(--font-mono);
+}
+
 /* ── Animations ── */
 @keyframes pulse {
   0%, 100% { box-shadow: 0 0 0 0 rgba(59,108,255,.4); }
@@ -412,6 +451,7 @@
       <li><span class="toc-num">03</span><span class="toc-label">核心功能一览</span></li>
       <li><span class="toc-num">04</span><span class="toc-label">技术优势与差异化</span></li>
       <li><span class="toc-num">05</span><span class="toc-label">发展路线图</span></li>
+      <li><span class="toc-num">06</span><span class="toc-label">产品原型演示</span></li>
     </ol>
     <div class="notes">简要说明每个章节的核心内容，让评委快速了解整体结构。</div>
   </section>
@@ -737,7 +777,25 @@
   </section>
 
   <!-- ═══════════════════════════════════════════════════ -->
-  <!-- 11. Thanks -->
+  <!-- 11. Prototype — 内嵌原型 -->
+  <!-- ═══════════════════════════════════════════════════ -->
+  <section class="slide proto-slide" data-title="产品原型">
+    <p class="kicker">PRODUCT</p>
+    <h2 class="h2 anim-fade-up" data-anim="fade-up" style="margin-bottom:1.25rem">产品原型预览</h2>
+    <div class="proto-frame anim-fade-up" data-anim="fade-up">
+      <iframe src="prototype.html" frameborder="0" scrolling="auto" allowfullscreen="false"></iframe>
+    </div>
+    <div class="proto-hint anim-fade-up" data-anim="fade-up">
+      <span>← →</span> 切换幻灯片 &nbsp;·&nbsp;
+      <span>1-5</span> 切换 Profile &nbsp;·&nbsp;
+      <span>⌘S</span> 保存 &nbsp;·&nbsp;
+      原型文件位于 <code>prototype.html</code>
+    </div>
+    <div class="notes">通过 iframe 直接嵌入 prototype.html，评委可在此页直接体验产品交互。prototype.html 保留为开发参考文件。</div>
+  </section>
+
+  <!-- ═══════════════════════════════════════════════════ -->
+  <!-- 12. Thanks -->
   <!-- ═══════════════════════════════════════════════════ -->
   <section class="slide deco-soft-gradient center tc" data-title="谢谢">
     <h1 class="h1 anim-blur-in" data-anim="blur-in" style="font-size:96px;letter-spacing:-.03em">mHost</h1>
