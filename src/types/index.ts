@@ -1,0 +1,57 @@
+export interface Profile {
+  id: string;
+  name: string;
+  description: string | null;
+  enabled: boolean;
+  protected: boolean;
+  tags: string[];
+  rules: HostRule[];
+  created_at: string; // ISO 8601
+  updated_at: string;
+}
+
+export interface HostRule {
+  id: string;
+  ip: string;
+  domains: string[];
+  enabled: boolean;
+  comment: string | null;
+  source: RuleSource;
+}
+
+export type RuleSource =
+  | { type: "Manual" }
+  | { type: "Remote"; source_id: string; source_name: string }
+  | { type: "AdBlock"; source_id: string; source_name: string };
+
+export interface ApplyPlan {
+  rules: ResolvedRule[];
+  conflicts: RuleConflict[];
+  diff: HostsDiff;
+  backup_required: boolean;
+}
+
+export interface ResolvedRule {
+  ip: string;
+  domain: string;
+  source_profile_id: string;
+  source_profile_name: string;
+}
+
+export interface RuleConflict {
+  domain: string;
+  rules: ResolvedRule[];
+}
+
+export interface HostsDiff {
+  added: string[];
+  removed: string[];
+  unchanged: string[];
+}
+
+export type AppError =
+  | { type: "Parse"; message: string }
+  | { type: "Apply"; message: string }
+  | { type: "Storage"; message: string }
+  | { type: "Io"; message: string }
+  | { type: "InvalidInput"; message: string };

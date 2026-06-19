@@ -1,0 +1,15 @@
+[package]
+name = "mhost-apply"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mhost-core = { path = "../mhost-core" }
+mhost-hosts = { path = "../mhost-hosts" }
+uuid = { version = "1.8", features = ["v4"] }
+chrono = { workspace = true }
+dirs = "5.0"
+
+[dev-dependencies]
+tempfile = "3.10"
+mhost-storage = { path = "../mhost-storage" }
