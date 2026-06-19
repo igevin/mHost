@@ -6,7 +6,9 @@
 use chrono::Utc;
 use mhost_core::{ApplyError, ApplyPlan, MhostError};
 use mhost_hosts::Parser;
+use std::any::Any;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Managed block markers
@@ -14,6 +16,57 @@ use std::path::{Path, PathBuf};
 const MANAGED_START: &str = "# ---- mHost start ----";
 #[allow(dead_code)]
 const MANAGED_END: &str = "# ---- mHost end ----";
+
+/// Maximum number of backup files to retain.
+const MAX_BACKUPS: usize = 10;
+
+/// Trait for moving a file to another path, potentially with elevated privileges.
+pub trait ElevatedMover: Send + Sync {
+    /// Move `from` to `to`.
+    fn elevated_move(&self, from: &Path, to: &Path) -> Result<(), MhostError>;
+}
+
+/// Production mover using osascript to request administrator privileges.
+pub struct OsascriptMover;
+
+impl ElevatedMover for OsascriptMover {
+    fn elevated_move(&self, from: &Path, to: &Path) -> Result<(), MhostError> {
+        let from_escaped = escape_applescript_path(&from.to_string_lossy());
+        let to_escaped = escape_applescript_path(&to.to_string_lossy());
+        let script = format!(
+            "do shell script \"mv {} {}\" with administrator privileges",
+            from_escaped, to_escaped
+        );
+        let output = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(&script)
+            .output()?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(ApplyError::PermissionDenied(stderr.to_string()).into());
+        }
+
+        Ok(())
+    }
+}
+
+/// Test mover using regular `fs::rename`.
+pub struct TestMover;
+
+impl ElevatedMover for TestMover {
+    fn elevated_move(&self, from: &Path, to: &Path) -> Result<(), MhostError> {
+        fs::rename(from, to).map_err(|e| e.into())
+    }
+}
+
+/// Escape a path for safe use inside an AppleScript string literal.
+///
+/// AppleScript string literals use `\` as the escape character, so
+/// backslashes and double quotes must be escaped.
+fn escape_applescript_path(path: &str) -> String {
+    path.replace('\\', "\\\\").replace('"', "\\\"")
+}
 
 /// Writes hosts changes to the system hosts file.
 ///
@@ -28,6 +81,7 @@ const MANAGED_END: &str = "# ---- mHost end ----";
 pub struct HostsWriter {
     hosts_path: PathBuf,
     backup_dir: PathBuf,
+    mover: Box<dyn ElevatedMover>,
 }
 
 impl HostsWriter {
@@ -39,6 +93,7 @@ impl HostsWriter {
         Self {
             hosts_path: PathBuf::from("/etc/hosts"),
             backup_dir: storage_root().join("backups"),
+            mover: Box::new(OsascriptMover),
         }
     }
 
@@ -47,6 +102,21 @@ impl HostsWriter {
         Self {
             hosts_path: hosts_path.into(),
             backup_dir: backup_dir.into(),
+            mover: Box::new(TestMover),
+        }
+    }
+
+    /// Create a new `HostsWriter` with a custom mover (for advanced testing).
+    #[allow(dead_code)]
+    pub fn with_mover(
+        hosts_path: impl Into<PathBuf>,
+        backup_dir: impl Into<PathBuf>,
+        mover: Box<dyn ElevatedMover>,
+    ) -> Self {
+        Self {
+            hosts_path: hosts_path.into(),
+            backup_dir: backup_dir.into(),
+            mover,
         }
     }
 
@@ -124,15 +194,18 @@ impl HostsWriter {
 
     /// Rollback to the most recent backup.
     ///
-    /// Finds the latest backup file (sorted by filename, which includes a
-    /// timestamp) and restores it to the hosts path.
-    /// After rollback, verifies the file content matches the backup.
+    /// Finds the latest backup file (by filesystem modification time) and
+    /// restores it to the hosts path. After rollback, verifies the file
+    /// content matches the backup.
+    ///
+    /// Also enforces a maximum number of backups (retains the most recent).
     pub fn rollback(&self) -> Result<(), MhostError> {
         let mut backups: Vec<_> = fs::read_dir(&self.backup_dir)?
             .filter_map(|e| e.ok())
             .filter(|e| {
-                e.file_name().to_string_lossy().starts_with("hosts-")
-                    && e.file_name().to_string_lossy().ends_with(".bak")
+                let file_name = e.file_name();
+                let name = file_name.to_string_lossy();
+                name.starts_with("hosts-") && name.ends_with(".bak")
             })
             .collect();
 
@@ -140,8 +213,19 @@ impl HostsWriter {
             return Err(ApplyError::BackupFailed("no backup found".to_string()).into());
         }
 
-        // Sort by filename descending to get the latest backup
-        backups.sort_by_key(|b| std::cmp::Reverse(b.file_name()));
+        // Sort by modification time descending to get the latest backup
+        backups.sort_by(|a, b| {
+            let time_a = a
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            let time_b = b
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            time_b.cmp(&time_a)
+        });
+
         let latest = &backups[0];
         let latest_path = latest.path();
 
@@ -219,12 +303,55 @@ impl HostsWriter {
     // -----------------------------------------------------------------------
 
     /// Create a timestamped backup of the given content.
+    ///
+    /// After creating the backup, enforces the maximum backup limit by
+    /// removing the oldest backups if the count exceeds `MAX_BACKUPS`.
     fn create_backup(&self, content: &str) -> Result<PathBuf, MhostError> {
         fs::create_dir_all(&self.backup_dir)?;
         let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
         let path = self.backup_dir.join(format!("hosts-{}.bak", timestamp));
         fs::write(&path, content)?;
+
+        // Enforce backup limit
+        self.prune_old_backups()?;
+
         Ok(path)
+    }
+
+    /// Remove oldest backups if the total count exceeds `MAX_BACKUPS`.
+    fn prune_old_backups(&self) -> Result<(), MhostError> {
+        let mut backups: Vec<_> = fs::read_dir(&self.backup_dir)?
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let file_name = e.file_name();
+                let name = file_name.to_string_lossy();
+                name.starts_with("hosts-") && name.ends_with(".bak")
+            })
+            .collect();
+
+        if backups.len() <= MAX_BACKUPS {
+            return Ok(());
+        }
+
+        // Sort by modification time ascending (oldest first)
+        backups.sort_by(|a, b| {
+            let time_a = a
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            let time_b = b
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            time_a.cmp(&time_b)
+        });
+
+        let to_remove = backups.len() - MAX_BACKUPS;
+        for entry in backups.iter().take(to_remove) {
+            let _ = fs::remove_file(entry.path());
+        }
+
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -232,50 +359,25 @@ impl HostsWriter {
     // -----------------------------------------------------------------------
 
     /// Write content atomically via a temp file.
+    ///
+    /// Uses `tempfile::NamedTempFile` to generate a unique temporary file
+    /// in the same directory as the target, then moves it into place.
+    /// The temp file is automatically cleaned up on failure.
     fn atomic_write(&self, content: &str) -> Result<(), MhostError> {
-        let temp = self.hosts_path.with_extension("tmp");
-        fs::write(&temp, content)?;
-        self.elevated_move(&temp, &self.hosts_path)?;
-        Ok(())
-    }
+        let parent = self
+            .hosts_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let mut temp_file = tempfile::NamedTempFile::new_in(parent)?;
+        std::io::Write::write_all(&mut temp_file, content.as_bytes())?;
+        temp_file.flush()?;
 
-    /// Escape a path for safe use inside an AppleScript string literal.
-    ///
-    /// AppleScript string literals use `\` as the escape character, so
-    /// backslashes and double quotes must be escaped.
-    fn escape_applescript_path(path: &str) -> String {
-        path.replace('\\', "\\\\").replace('"', "\\\"")
-    }
+        let temp_path = temp_file.into_temp_path();
+        self.mover.elevated_move(&temp_path, &self.hosts_path)?;
 
-    /// Move `from` to `to` with elevated privileges (macOS).
-    ///
-    /// Uses `osascript` to prompt the user for administrator privileges.
-    /// In test environments this falls back to a regular `fs::rename` when
-    /// the temp file and target are in the same directory (mock setup).
-    fn elevated_move(&self, from: &Path, to: &Path) -> Result<(), MhostError> {
-        // In tests (same directory, not /etc/hosts) we can do a regular rename
-        if self.hosts_path != Path::new("/etc/hosts") {
-            return fs::rename(from, to).map_err(|e| e.into());
-        }
-
-        let from_escaped = Self::escape_applescript_path(&from.to_string_lossy());
-        let to_escaped = Self::escape_applescript_path(&to.to_string_lossy());
-        let script = format!(
-            "do shell script \"mv {} {}\" with administrator privileges",
-            from_escaped, to_escaped
-        );
-        let output = std::process::Command::new("osascript")
-            .arg("-e")
-            .arg(&script)
-            .output()?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // Clean up temp file on failure
-            let _ = fs::remove_file(from);
-            return Err(ApplyError::PermissionDenied(stderr.to_string()).into());
-        }
-
+        // On success, the temp file has been moved to hosts_path;
+        // no explicit cleanup needed.
         Ok(())
     }
 
@@ -285,8 +387,8 @@ impl HostsWriter {
 
     /// Flush the system DNS cache (macOS).
     fn flush_dns_cache(&self) -> Result<(), MhostError> {
-        // Skip DNS flush in test environments
-        if self.hosts_path != Path::new("/etc/hosts") {
+        // Only flush DNS in production (when using OsascriptMover)
+        if self.mover.as_ref().type_id() != std::any::TypeId::of::<OsascriptMover>() {
             return Ok(());
         }
 
@@ -546,14 +648,18 @@ mod tests {
     }
 
     #[test]
-    fn test_multiple_backups_sorted_correctly() {
+    fn test_multiple_backups_sorted_by_mtime() {
         let temp_dir = TempDir::new().unwrap();
         let backup_dir = temp_dir.path().join("backups");
         fs::create_dir_all(&backup_dir).unwrap();
 
-        // Create two backups with different timestamps
-        fs::write(backup_dir.join("hosts-20240101_120000.bak"), "old").unwrap();
-        fs::write(backup_dir.join("hosts-20240102_120000.bak"), "new").unwrap();
+        // Create two backups with different timestamps (simulate older/newer)
+        let old_path = backup_dir.join("hosts-20240101_120000.bak");
+        let new_path = backup_dir.join("hosts-20240102_120000.bak");
+        fs::write(&old_path, "old").unwrap();
+        // Ensure there's a detectable time difference
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        fs::write(&new_path, "new").unwrap();
 
         let hosts_path = temp_dir.path().join("hosts");
         fs::write(&hosts_path, "current").unwrap();
@@ -688,20 +794,51 @@ mod tests {
     #[test]
     fn test_escape_applescript_path() {
         assert_eq!(
-            HostsWriter::escape_applescript_path("/path/to/file"),
+            escape_applescript_path("/path/to/file"),
             "/path/to/file"
         );
         assert_eq!(
-            HostsWriter::escape_applescript_path("/path/with\"quote"),
+            escape_applescript_path("/path/with\"quote"),
             "/path/with\\\"quote"
         );
         assert_eq!(
-            HostsWriter::escape_applescript_path("/path/with\\backslash"),
+            escape_applescript_path("/path/with\\backslash"),
             "/path/with\\\\backslash"
         );
         assert_eq!(
-            HostsWriter::escape_applescript_path("/path/with\\\"both"),
+            escape_applescript_path("/path/with\\\"both"),
             "/path/with\\\\\\\"both"
+        );
+    }
+
+    #[test]
+    fn test_backup_limit_prunes_oldest() {
+        let temp_dir = TempDir::new().unwrap();
+        let backup_dir = temp_dir.path().join("backups");
+        fs::create_dir_all(&backup_dir).unwrap();
+
+        // Create 12 backups (exceeds MAX_BACKUPS = 10)
+        for i in 0..12 {
+            let path = backup_dir.join(format!("hosts-202401{:02}_120000.bak", i + 1));
+            fs::write(&path, format!("backup-{}", i)).unwrap();
+            // Small sleep to ensure distinct modification times
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let hosts_path = temp_dir.path().join("hosts");
+        fs::write(&hosts_path, "current").unwrap();
+
+        let writer = HostsWriter::with_paths(&hosts_path, &backup_dir);
+        let plan = plan_with_rules(vec![resolved_rule("127.0.0.1", "example.com", "p1")]);
+        writer.apply(&plan).unwrap();
+
+        // After apply, should have at most MAX_BACKUPS backups
+        let backups: Vec<_> = fs::read_dir(&backup_dir).unwrap().collect();
+        assert!(
+            backups.len() <= MAX_BACKUPS,
+            "expected at most {} backups, got {}",
+            MAX_BACKUPS,
+            backups.len()
         );
     }
 }

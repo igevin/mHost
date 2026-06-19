@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { atom, getDefaultStore } from "jotai";
+import { getDefaultStore } from "jotai";
 import {
   profilesAtom,
   selectedProfileIdAtom,
@@ -68,7 +68,7 @@ describe("Profile store atoms", () => {
   });
 
   it("can set error", () => {
-    const testError = { type: "Storage", message: "test error" };
+    const testError = "Storage: test error";
     store.set(errorAtom, testError);
     expect(store.get(errorAtom)).toEqual(testError);
   });

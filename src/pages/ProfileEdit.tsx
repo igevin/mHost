@@ -18,6 +18,7 @@ function ProfileEdit() {
   const isLoading = useAtomValue(isLoadingAtom);
   const error = useAtomValue(errorAtom);
   const setSelectedId = useSetAtom(selectedProfileIdAtom);
+  const setError = useSetAtom(errorAtom);
 
   const fetchProfile = useSetAtom(fetchProfileAtom);
   const updateProfile = useSetAtom(updateProfileAtom);
@@ -31,19 +32,19 @@ function ProfileEdit() {
     if (id) {
       setSelectedId(id);
       if (!profile) {
-        fetchProfile(id).catch(() => {
-          // backend may not be ready
+        fetchProfile(id).catch((err: unknown) => {
+          setError(err instanceof Error ? err.message : String(err));
         });
       }
     }
-  }, [id, setSelectedId, fetchProfile, profile]);
+  }, [id, setSelectedId, fetchProfile, profile, setError]);
 
   useEffect(() => {
     if (profile) {
       setDraft({ ...profile });
       setHasChanges(false);
     }
-  }, [profile?.id]);
+  }, [profile]);
 
   const handleChange = useCallback(
     (field: keyof Profile, value: unknown) => {
@@ -62,10 +63,10 @@ function ProfileEdit() {
     try {
       await updateProfile(draft);
       setHasChanges(false);
-    } catch {
-      // error captured in store
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : String(err));
     }
-  }, [draft, updateProfile]);
+  }, [draft, updateProfile, setError]);
 
   const handleTagsChange = useCallback((value: string) => {
     const tags = value
@@ -77,7 +78,7 @@ function ProfileEdit() {
 
   if (!profile || !draft) {
     return (
-      <div className="page">
+      <div className="mhost-page">
         <div className="empty-state">
           <p>Profile not found.</p>
           <button className="btn btn-primary" onClick={() => navigate("/profiles")}>
@@ -89,13 +90,13 @@ function ProfileEdit() {
   }
 
   return (
-    <div className="page">
-      <header className="page-header">
+    <div className="mhost-page">
+      <header className="mhost-page-header">
         <div>
-          <h1 className="page-title">Edit Profile</h1>
-          <p className="page-subtitle">{profile.name}</p>
+          <h1 className="mhost-page-title">Edit Profile</h1>
+          <p className="mhost-page-subtitle">{profile.name}</p>
         </div>
-        <div className="page-actions">
+        <div className="mhost-page-actions">
           <button
             className="btn btn-primary"
             onClick={handleSave}

@@ -12,7 +12,7 @@ function Layout() {
   ];
 
   return (
-    <div className="layout">
+    <div className="mhost-layout">
       <aside className="sidebar">
         <div className="sidebar-header">
           <div className="logo">
@@ -55,7 +55,7 @@ function Layout() {
         </div>
       </aside>
 
-      <main className="main">
+      <main className="mhost-main">
         <Outlet />
       </main>
     </div>

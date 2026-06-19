@@ -56,8 +56,8 @@ fn extract_existing_lines(current_hosts: &str) -> Vec<String> {
     let content_to_parse = match managed_range {
         Some((start, end)) => {
             let lines: Vec<&str> = current_hosts.lines().collect();
-            // Extract lines strictly between start and end markers
-            if start < end.saturating_sub(1) {
+            // Validate indices: start+1 must be < end and within bounds
+            if start + 1 < end && end <= lines.len() {
                 lines[start + 1..end].join("\n")
             } else {
                 String::new()

@@ -18,8 +18,8 @@ pub enum MhostError {
     #[error("storage error: {0}")]
     Storage(#[from] StorageError),
 
-    #[error("io error: {0}")]
-    Io(String),
+    #[error("io error ({kind}): {message}")]
+    Io { kind: String, message: String },
 
     #[error("invalid input: {0}")]
     InvalidInput(String),
@@ -27,7 +27,16 @@ pub enum MhostError {
 
 impl From<std::io::Error> for MhostError {
     fn from(err: std::io::Error) -> Self {
-        MhostError::Io(err.to_string())
+        MhostError::Io {
+            kind: err.kind().to_string(),
+            message: err.to_string(),
+        }
+    }
+}
+
+impl From<ApplyError> for std::io::Error {
+    fn from(err: ApplyError) -> Self {
+        std::io::Error::new(std::io::ErrorKind::Other, err.to_string())
     }
 }
 
@@ -155,6 +164,14 @@ mod tests {
                 "io error",
             ),
             (
+                "io_with_kind",
+                MhostError::Io {
+                    kind: "NotFound".to_string(),
+                    message: "file gone".to_string(),
+                },
+                "io error",
+            ),
+            (
                 "storage_version_mismatch",
                 MhostError::Storage(StorageError::VersionMismatch {
                     expected: 1,
@@ -209,8 +226,10 @@ mod tests {
     fn test_io_error_from_impl() {
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file gone");
         let mhost_err: MhostError = io_err.into();
-        assert!(mhost_err.to_string().contains("file gone"));
-        // Verify it serializes correctly (Io wraps a String)
+        let msg = mhost_err.to_string();
+        assert!(msg.contains("file gone"), "message should contain 'file gone'");
+        assert!(msg.contains("entity not found"), "message should contain ErrorKind 'entity not found'");
+        // Verify it serializes correctly
         let json = serde_json::to_string(&mhost_err).unwrap();
         let restored: MhostError = serde_json::from_str(&json).unwrap();
         assert_eq!(mhost_err.to_string(), restored.to_string());

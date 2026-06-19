@@ -7,9 +7,17 @@ use state::AppState;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let app_state = match AppState::new() {
+        Ok(state) => state,
+        Err(e) => {
+            eprintln!("[mHost] Failed to initialize AppState: {}", e);
+            std::process::exit(1);
+        }
+    };
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .manage(AppState::new())
+        .manage(app_state)
         .invoke_handler(tauri::generate_handler![
             list_profiles,
             get_profile,

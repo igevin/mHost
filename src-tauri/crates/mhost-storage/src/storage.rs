@@ -20,8 +20,10 @@ pub trait Storage {
     fn save_profile(&self, profile: &Profile) -> Result<(), StorageError>;
     /// 删除 Profile。
     fn delete_profile(&self, id: &ProfileId) -> Result<(), StorageError>;
-    /// 列出所有 Profile。
+    /// 列出所有 Profile（损坏的文件会被静默跳过）。
     fn list_profiles(&self) -> Result<Vec<Profile>, StorageError>;
+    /// 列出所有 Profile，同时返回解析过程中遇到的错误。
+    fn list_profiles_with_errors(&self) -> Result<(Vec<Profile>, Vec<StorageError>), StorageError>;
     /// 加载 Manifest。
     fn load_manifest(&self) -> Result<Manifest, StorageError>;
     /// 保存 Manifest。
@@ -124,18 +126,24 @@ impl Storage for FileStorage {
     }
 
     fn list_profiles(&self) -> Result<Vec<Profile>, StorageError> {
+        let (profiles, _errors) = self.list_profiles_with_errors()?;
+        Ok(profiles)
+    }
+
+    fn list_profiles_with_errors(&self) -> Result<(Vec<Profile>, Vec<StorageError>), StorageError> {
         let dir = self.profiles_dir();
         if !dir.exists() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
         let mut profiles = Vec::new();
+        let mut errors = Vec::new();
         for entry in fs::read_dir(&dir)
             .map_err(|e| StorageError::Io(format!("读取 profiles 目录失败: {}", e)))?
         {
             let entry = match entry {
                 Ok(e) => e,
                 Err(e) => {
-                    eprintln!("警告: 遍历目录项失败: {}", e);
+                    errors.push(StorageError::Io(format!("遍历目录项失败: {}", e)));
                     continue;
                 }
             };
@@ -144,21 +152,29 @@ impl Storage for FileStorage {
                 let content = match fs::read_to_string(&path) {
                     Ok(c) => c,
                     Err(e) => {
-                        eprintln!("警告: 读取 Profile 文件失败 [{}]: {}", path.display(), e);
+                        errors.push(StorageError::Io(format!(
+                            "读取 Profile 文件失败 [{}]: {}",
+                            path.display(),
+                            e
+                        )));
                         continue;
                     }
                 };
                 let profile: Profile = match serde_json::from_str(&content) {
                     Ok(p) => p,
                     Err(e) => {
-                        eprintln!("警告: 解析 Profile JSON 失败 [{}]: {}", path.display(), e);
+                        errors.push(StorageError::ManifestCorrupted(format!(
+                            "解析 Profile JSON 失败 [{}]: {}",
+                            path.display(),
+                            e
+                        )));
                         continue;
                     }
                 };
                 profiles.push(profile);
             }
         }
-        Ok(profiles)
+        Ok((profiles, errors))
     }
 
     fn load_manifest(&self) -> Result<Manifest, StorageError> {

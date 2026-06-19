@@ -12,9 +12,9 @@ function Settings() {
   }, []);
 
   return (
-    <div className="page">
-      <header className="page-header">
-        <h1 className="page-title">Settings</h1>
+    <div className="mhost-page">
+      <header className="mhost-page-header">
+        <h1 className="mhost-page-title">Settings</h1>
       </header>
 
       <div className="settings-grid">

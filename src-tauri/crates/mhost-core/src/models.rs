@@ -17,6 +17,16 @@ impl fmt::Display for ProfileId {
     }
 }
 
+impl std::str::FromStr for ProfileId {
+    type Err = crate::MhostError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let uuid = Uuid::parse_str(s)
+            .map_err(|e| crate::MhostError::InvalidInput(format!("invalid profile id: {}", e)))?;
+        Ok(ProfileId(uuid))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RuleId(pub Uuid);
 
@@ -97,6 +107,16 @@ impl HostRule {
 }
 
 // ---------------------------------------------------------------------------
+// ExternalSource
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExternalSource {
+    pub source_id: SourceId,
+    pub source_name: String,
+}
+
+// ---------------------------------------------------------------------------
 // RuleSource
 // ---------------------------------------------------------------------------
 
@@ -104,14 +124,8 @@ impl HostRule {
 #[serde(tag = "type")]
 pub enum RuleSource {
     Manual,
-    Remote {
-        source_id: SourceId,
-        source_name: String,
-    },
-    AdBlock {
-        source_id: SourceId,
-        source_name: String,
-    },
+    Remote(ExternalSource),
+    AdBlock(ExternalSource),
 }
 
 // ---------------------------------------------------------------------------
@@ -269,10 +283,10 @@ mod tests {
 
     #[test]
     fn test_rule_source_remote_serde() {
-        let source = RuleSource::Remote {
+        let source = RuleSource::Remote(ExternalSource {
             source_id: SourceId(Uuid::new_v4()),
             source_name: "My Remote".to_string(),
-        };
+        });
         let json = serde_json::to_string(&source).unwrap();
         assert!(json.contains("\"type\":\"Remote\""));
         assert!(json.contains("\"source_name\":\"My Remote\""));
@@ -282,10 +296,10 @@ mod tests {
 
     #[test]
     fn test_rule_source_adblock_serde() {
-        let source = RuleSource::AdBlock {
+        let source = RuleSource::AdBlock(ExternalSource {
             source_id: SourceId(Uuid::new_v4()),
             source_name: "AdGuard".to_string(),
-        };
+        });
         let json = serde_json::to_string(&source).unwrap();
         assert!(json.contains("\"type\":\"AdBlock\""));
         assert!(json.contains("\"source_name\":\"AdGuard\""));

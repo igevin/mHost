@@ -1,5 +1,6 @@
 //! Manifest management
 
+use chrono::{DateTime, Utc};
 use mhost_core::StorageError;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -15,8 +16,8 @@ pub struct Manifest {
     pub version: u32,
     /// 应用版本号
     pub app_version: String,
-    /// 最后更新时间戳（ISO 8601 格式）
-    pub updated_at: String,
+    /// 最后更新时间戳（UTC）
+    pub updated_at: DateTime<Utc>,
 }
 
 impl Manifest {
@@ -25,7 +26,7 @@ impl Manifest {
         Self {
             version: 1,
             app_version: app_version.into(),
-            updated_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: Utc::now(),
         }
     }
 }
@@ -70,7 +71,7 @@ mod tests {
                 Manifest {
                     version: 1,
                     app_version: "1.0.0".to_string(),
-                    updated_at: "2024-01-01T00:00:00+00:00".to_string(),
+                    updated_at: "2024-01-01T00:00:00+00:00".parse().unwrap(),
                 },
             ),
         ];
@@ -96,9 +97,9 @@ mod tests {
     #[test]
     fn test_manifest_updated_at_is_set() {
         let manifest = Manifest::new("0.1.0");
-        assert!(!manifest.updated_at.is_empty());
+        let rfc3339 = manifest.updated_at.to_rfc3339();
         // 验证是有效的 RFC 3339 时间戳
-        assert!(manifest.updated_at.contains('T'));
-        assert!(manifest.updated_at.contains('+') || manifest.updated_at.contains('Z'));
+        assert!(rfc3339.contains('T'));
+        assert!(rfc3339.contains('+') || rfc3339.contains('Z'));
     }
 }

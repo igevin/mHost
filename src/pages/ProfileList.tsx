@@ -18,6 +18,7 @@ function ProfileList() {
   const isLoading = useAtomValue(isLoadingAtom);
   const error = useAtomValue(errorAtom);
   const setSelectedId = useSetAtom(selectedProfileIdAtom);
+  const setError = useSetAtom(errorAtom);
 
   const fetchProfiles = useSetAtom(fetchProfilesAtom);
   const createProfile = useSetAtom(createProfileAtom);
@@ -29,10 +30,10 @@ function ProfileList() {
 
   useEffect(() => {
     // Load profiles on mount; gracefully handle missing backend
-    fetchProfiles().catch(() => {
-      // no-op: backend may not be ready in early development
+    fetchProfiles().catch((err: unknown) => {
+      setError(err instanceof Error ? err.message : String(err));
     });
-  }, [fetchProfiles]);
+  }, [fetchProfiles, setError]);
 
   const handleCreate = useCallback(async () => {
     const name = newName.trim();
@@ -43,32 +44,32 @@ function ProfileList() {
       setShowCreate(false);
       setSelectedId(profile.id);
       navigate(`/profiles/${profile.id}`);
-    } catch {
-      // error already captured in store
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : String(err));
     }
-  }, [newName, createProfile, setSelectedId, navigate]);
+  }, [newName, createProfile, setSelectedId, navigate, setError]);
 
   const handleDelete = useCallback(
     async (id: string) => {
       if (!confirm("Delete this profile?")) return;
       try {
         await deleteProfile(id);
-      } catch {
-        // error already captured in store
+      } catch (err: unknown) {
+        setError(err instanceof Error ? err.message : String(err));
       }
     },
-    [deleteProfile],
+    [deleteProfile, setError],
   );
 
   const handleToggle = useCallback(
     async (id: string) => {
       try {
         await toggleEnabled(id);
-      } catch {
-        // error already captured in store
+      } catch (err: unknown) {
+        setError(err instanceof Error ? err.message : String(err));
       }
     },
-    [toggleEnabled],
+    [toggleEnabled, setError],
   );
 
   const handleEdit = useCallback(
@@ -80,9 +81,9 @@ function ProfileList() {
   );
 
   return (
-    <div className="page">
-      <header className="page-header">
-        <h1 className="page-title">Profiles</h1>
+    <div className="mhost-page">
+      <header className="mhost-page-header">
+        <h1 className="mhost-page-title">Profiles</h1>
         <button
           className="btn btn-primary"
           onClick={() => setShowCreate(true)}
