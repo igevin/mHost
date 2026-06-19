@@ -1,0 +1,2504 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>mHost - 轻量 Hosts 管理工具</title>
+<style>
+/* ========== CSS Variables & Theme ========== */
+:root {
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Inter', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  --font-mono: 'JetBrains Mono', 'SF Mono', 'Fira Code', 'Cascadia Code', Consolas, 'Courier New', monospace;
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 20px;
+  --shadow-sm: 0 1px 3px rgba(0,0,0,0.06);
+  --shadow-md: 0 4px 12px rgba(0,0,0,0.08);
+  --shadow-lg: 0 8px 30px rgba(0,0,0,0.12);
+  --shadow-xl: 0 16px 50px rgba(0,0,0,0.16);
+  --transition-fast: 0.15s ease;
+  --transition-normal: 0.25s ease;
+  --transition-slow: 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+  --accent: #3b6cff;
+  --accent-hover: #2a5ce6;
+  --accent-light: rgba(59,108,255,0.1);
+  --accent-lighter: rgba(59,108,255,0.05);
+  --green: #22c55e;
+  --green-light: rgba(34,197,94,0.1);
+  --red: #ef4444;
+  --red-light: rgba(239,68,68,0.1);
+  --yellow: #f59e0b;
+  --yellow-light: rgba(245,158,11,0.1);
+  --orange: #f97316;
+  --purple: #8b5cf6;
+  --sidebar-width: 260px;
+  --titlebar-height: 38px;
+  --statusbar-height: 28px;
+}
+
+[data-theme="light"] {
+  --bg-primary: #ffffff;
+  --bg-secondary: #f8f9fb;
+  --bg-tertiary: #f1f3f5;
+  --bg-sidebar: rgba(248,249,251,0.82);
+  --bg-card: #ffffff;
+  --bg-hover: rgba(59,108,255,0.06);
+  --bg-active: rgba(59,108,255,0.1);
+  --bg-input: #f1f3f5;
+  --bg-modal-overlay: rgba(0,0,0,0.35);
+  --text-primary: #1a1a2e;
+  --text-secondary: #5c6370;
+  --text-tertiary: #98a2b3;
+  --text-inverse: #ffffff;
+  --border-primary: #e2e8f0;
+  --border-secondary: #f1f3f5;
+  --border-focus: var(--accent);
+  --code-bg: #f6f8fa;
+  --diff-add-bg: #dcfce7;
+  --diff-add-text: #166534;
+  --diff-del-bg: #fee2e2;
+  --diff-del-text: #991b1b;
+  --diff-mod-bg: #fef9c3;
+  --diff-mod-text: #854d0e;
+  --scrollbar-thumb: #c1c9d4;
+  --scrollbar-track: transparent;
+}
+
+[data-theme="dark"] {
+  --bg-primary: #1a1a2e;
+  --bg-secondary: #16213e;
+  --bg-tertiary: #0f3460;
+  --bg-sidebar: rgba(22,33,62,0.85);
+  --bg-card: #1e2a4a;
+  --bg-hover: rgba(59,108,255,0.12);
+  --bg-active: rgba(59,108,255,0.18);
+  --bg-input: #16213e;
+  --bg-modal-overlay: rgba(0,0,0,0.6);
+  --text-primary: #e2e8f0;
+  --text-secondary: #94a3b8;
+  --text-tertiary: #64748b;
+  --text-inverse: #ffffff;
+  --border-primary: #2d3a5c;
+  --border-secondary: #1e2a4a;
+  --border-focus: var(--accent);
+  --code-bg: #0f172a;
+  --diff-add-bg: rgba(34,197,94,0.15);
+  --diff-add-text: #4ade80;
+  --diff-del-bg: rgba(239,68,68,0.15);
+  --diff-del-text: #f87171;
+  --diff-mod-bg: rgba(245,158,11,0.15);
+  --diff-mod-text: #fbbf24;
+  --scrollbar-thumb: #3b4a6b;
+  --scrollbar-track: transparent;
+}
+
+/* ========== Reset & Base ========== */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { font-size: 14px; -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
+body {
+  font-family: var(--font-sans);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  overflow: hidden;
+  height: 100vh;
+  width: 100vw;
+  transition: background var(--transition-normal), color var(--transition-normal);
+}
+
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: var(--scrollbar-track); }
+::-webkit-scrollbar-thumb { background: var(--scrollbar-thumb); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-tertiary); }
+
+/* ========== Layout ========== */
+.app-container {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  width: 100vw;
+}
+
+/* ========== Title Bar ========== */
+.titlebar {
+  height: var(--titlebar-height);
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border-primary);
+  display: flex;
+  align-items: center;
+  padding: 0 12px;
+  -webkit-app-region: drag;
+  user-select: none;
+  flex-shrink: 0;
+  z-index: 100;
+}
+.traffic-lights {
+  display: flex;
+  gap: 8px;
+  -webkit-app-region: no-drag;
+}
+.traffic-light {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  cursor: pointer;
+  transition: opacity var(--transition-fast);
+  border: none;
+  padding: 0;
+}
+.traffic-light:hover { opacity: 0.8; }
+.traffic-light.close { background: #ff5f57; }
+.traffic-light.minimize { background: #ffbd2e; }
+.traffic-light.maximize { background: #28c840; }
+.titlebar-title {
+  flex: 1;
+  text-align: center;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+.titlebar-actions {
+  display: flex;
+  gap: 4px;
+  -webkit-app-region: no-drag;
+}
+
+/* ========== Main Content Area ========== */
+.main-area {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+}
+
+/* ========== Sidebar ========== */
+.sidebar {
+  width: var(--sidebar-width);
+  background: var(--bg-sidebar);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border-right: 1px solid var(--border-primary);
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  transition: background var(--transition-normal);
+  overflow: hidden;
+}
+
+.sidebar-header {
+  padding: 16px 16px 8px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.sidebar-logo {
+  width: 28px;
+  height: 28px;
+  background: var(--accent);
+  border-radius: var(--radius-sm);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: white;
+  font-weight: 700;
+  font-size: 14px;
+}
+.sidebar-brand {
+  font-weight: 700;
+  font-size: 16px;
+  color: var(--text-primary);
+}
+
+.sidebar-section {
+  padding: 8px 10px 4px;
+}
+.sidebar-section-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 4px 8px 6px;
+}
+
+.sidebar-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 500;
+  position: relative;
+  user-select: none;
+}
+.sidebar-item:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+.sidebar-item.active {
+  background: var(--bg-active);
+  color: var(--accent);
+}
+.sidebar-item.active::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 3px;
+  height: 18px;
+  background: var(--accent);
+  border-radius: 0 3px 3px 0;
+}
+.sidebar-item svg {
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+  opacity: 0.7;
+}
+.sidebar-item.active svg { opacity: 1; }
+.sidebar-item .badge {
+  margin-left: auto;
+  font-size: 11px;
+  font-weight: 600;
+  background: var(--bg-tertiary);
+  color: var(--text-tertiary);
+  padding: 1px 7px;
+  border-radius: 10px;
+  min-width: 20px;
+  text-align: center;
+}
+.sidebar-item.active .badge {
+  background: var(--accent-light);
+  color: var(--accent);
+}
+
+.profile-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.sidebar-add-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  margin: 4px 10px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  color: var(--text-tertiary);
+  font-size: 13px;
+  border: 1px dashed var(--border-primary);
+  transition: all var(--transition-fast);
+  background: transparent;
+  width: calc(100% - 20px);
+}
+.sidebar-add-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-lighter);
+}
+
+.sidebar-spacer { flex: 1; }
+
+/* ========== Content ========== */
+.content {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--bg-primary);
+}
+
+.page { display: none; flex-direction: column; height: 100%; overflow: hidden; }
+.page.active { display: flex; }
+
+/* ========== Page Header ========== */
+.page-header {
+  padding: 20px 28px 16px;
+  border-bottom: 1px solid var(--border-secondary);
+  flex-shrink: 0;
+}
+.page-header-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.page-header h1 {
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+.page-header .subtitle {
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin-left: 4px;
+}
+.page-header-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+/* ========== Status Badge ========== */
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 10px;
+  border-radius: 20px;
+  font-size: 12px;
+  font-weight: 600;
+}
+.status-badge.active {
+  background: var(--green-light);
+  color: var(--green);
+}
+.status-badge.inactive {
+  background: var(--bg-tertiary);
+  color: var(--text-tertiary);
+}
+.status-badge .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+/* ========== Buttons ========== */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 16px;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  border: none;
+  transition: all var(--transition-fast);
+  font-family: var(--font-sans);
+  white-space: nowrap;
+}
+.btn svg { width: 16px; height: 16px; }
+.btn-primary {
+  background: var(--accent);
+  color: white;
+}
+.btn-primary:hover { background: var(--accent-hover); transform: translateY(-1px); box-shadow: var(--shadow-md); }
+.btn-secondary {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+.btn-secondary:hover { background: var(--bg-hover); }
+.btn-ghost {
+  background: transparent;
+  color: var(--text-secondary);
+}
+.btn-ghost:hover { background: var(--bg-hover); color: var(--text-primary); }
+.btn-danger {
+  background: var(--red-light);
+  color: var(--red);
+}
+.btn-danger:hover { background: var(--red); color: white; }
+.btn-sm { padding: 4px 10px; font-size: 12px; }
+.btn-icon {
+  padding: 6px;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  color: var(--text-tertiary);
+  transition: all var(--transition-fast);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.btn-icon:hover { background: var(--bg-hover); color: var(--text-primary); }
+.btn-icon svg { width: 16px; height: 16px; }
+
+/* ========== Toggle Switch ========== */
+.toggle {
+  position: relative;
+  width: 40px;
+  height: 22px;
+  flex-shrink: 0;
+}
+.toggle input { display: none; }
+.toggle-slider {
+  position: absolute;
+  inset: 0;
+  background: var(--bg-tertiary);
+  border-radius: 11px;
+  cursor: pointer;
+  transition: all var(--transition-normal);
+  border: 2px solid var(--border-primary);
+}
+.toggle-slider::after {
+  content: '';
+  position: absolute;
+  left: 2px;
+  top: 2px;
+  width: 14px;
+  height: 14px;
+  background: white;
+  border-radius: 50%;
+  transition: all var(--transition-normal);
+  box-shadow: 0 1px 3px rgba(0,0,0,0.15);
+}
+.toggle input:checked + .toggle-slider {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.toggle input:checked + .toggle-slider::after {
+  transform: translateX(18px);
+}
+
+/* ========== Cards ========== */
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-md);
+  padding: 20px;
+  transition: all var(--transition-normal);
+}
+.card:hover { box-shadow: var(--shadow-sm); }
+
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 16px;
+  padding: 20px 28px;
+}
+.stat-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-md);
+  padding: 18px 20px;
+  transition: all var(--transition-normal);
+}
+.stat-card:hover { box-shadow: var(--shadow-sm); transform: translateY(-1px); }
+.stat-card .stat-label {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-tertiary);
+  margin-bottom: 6px;
+}
+.stat-card .stat-value {
+  font-size: 28px;
+  font-weight: 700;
+  color: var(--text-primary);
+  line-height: 1.2;
+}
+.stat-card .stat-change {
+  font-size: 12px;
+  color: var(--green);
+  margin-top: 4px;
+}
+
+/* ========== Table ========== */
+.table-container {
+  flex: 1;
+  overflow: auto;
+  padding: 0 28px 20px;
+}
+.table-wrapper {
+  background: var(--bg-card);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+thead {
+  background: var(--bg-secondary);
+  position: sticky;
+  top: 0;
+  z-index: 5;
+}
+th {
+  padding: 10px 16px;
+  text-align: left;
+  font-weight: 600;
+  color: var(--text-secondary);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  border-bottom: 1px solid var(--border-primary);
+  white-space: nowrap;
+}
+td {
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border-secondary);
+  color: var(--text-primary);
+  vertical-align: middle;
+}
+tr:last-child td { border-bottom: none; }
+tr:hover td { background: var(--bg-hover); }
+tr.disabled td { opacity: 0.45; }
+tr.disabled td:first-child { opacity: 1; }
+.ip-cell {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--accent);
+  background: var(--accent-lighter);
+  padding: 2px 8px;
+  border-radius: 4px;
+  display: inline-block;
+}
+.domain-cell { font-weight: 500; }
+.note-cell { color: var(--text-secondary); font-size: 12px; }
+.actions-cell {
+  display: flex;
+  gap: 2px;
+  opacity: 0;
+  transition: opacity var(--transition-fast);
+}
+tr:hover .actions-cell { opacity: 1; }
+
+/* ========== Text Editor View ========== */
+.editor-container {
+  flex: 1;
+  overflow: auto;
+  padding: 0 28px 20px;
+}
+.editor-wrapper {
+  background: var(--code-bg);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  height: 100%;
+  display: flex;
+}
+.line-numbers {
+  padding: 16px 12px 16px 16px;
+  text-align: right;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text-tertiary);
+  user-select: none;
+  border-right: 1px solid var(--border-primary);
+  min-width: 48px;
+  background: var(--bg-secondary);
+  white-space: pre;
+  overflow: hidden;
+}
+.editor-content {
+  flex: 1;
+  padding: 16px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text-primary);
+  white-space: pre;
+  overflow: auto;
+  outline: none;
+  tab-size: 4;
+}
+.editor-content .comment { color: var(--text-tertiary); font-style: italic; }
+.editor-content .ip { color: var(--accent); font-weight: 600; }
+.editor-content .domain { color: var(--green); }
+
+/* ========== View Toggle ========== */
+.view-toggle {
+  display: inline-flex;
+  background: var(--bg-tertiary);
+  border-radius: var(--radius-sm);
+  padding: 2px;
+  gap: 2px;
+}
+.view-toggle-btn {
+  padding: 5px 14px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  transition: all var(--transition-fast);
+  font-family: var(--font-sans);
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.view-toggle-btn svg { width: 14px; height: 14px; }
+.view-toggle-btn.active {
+  background: var(--bg-card);
+  color: var(--text-primary);
+  box-shadow: var(--shadow-sm);
+}
+
+/* ========== Quick Add Bar ========== */
+.quick-add-bar {
+  padding: 16px 28px;
+  border-top: 1px solid var(--border-secondary);
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-shrink: 0;
+  background: var(--bg-secondary);
+}
+.quick-add-bar input {
+  flex: 1;
+  padding: 8px 12px;
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  font-size: 13px;
+  font-family: var(--font-sans);
+  outline: none;
+  transition: border-color var(--transition-fast);
+}
+.quick-add-bar input:focus { border-color: var(--accent); }
+.quick-add-bar input::placeholder { color: var(--text-tertiary); }
+.quick-add-bar input.ip-input { font-family: var(--font-mono); max-width: 180px; }
+.quick-add-bar input.domain-input { max-width: 260px; }
+.quick-add-bar input.note-input { max-width: 200px; }
+
+/* ========== Modal ========== */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: var(--bg-modal-overlay);
+  backdrop-filter: blur(4px);
+  display: none;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  animation: fadeIn 0.2s ease;
+}
+.modal-overlay.active { display: flex; }
+.modal {
+  background: var(--bg-card);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-xl);
+  width: 90%;
+  max-width: 800px;
+  max-height: 85vh;
+  display: flex;
+  flex-direction: column;
+  animation: slideUp 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  border: 1px solid var(--border-primary);
+}
+.modal-header {
+  padding: 20px 24px 16px;
+  border-bottom: 1px solid var(--border-secondary);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.modal-header h2 { font-size: 17px; font-weight: 700; }
+.modal-close {
+  margin-left: auto;
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-sm);
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  color: var(--text-tertiary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all var(--transition-fast);
+}
+.modal-close:hover { background: var(--bg-hover); color: var(--text-primary); }
+.modal-body {
+  padding: 20px 24px;
+  overflow-y: auto;
+  flex: 1;
+}
+.modal-footer {
+  padding: 16px 24px;
+  border-top: 1px solid var(--border-secondary);
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+/* ========== Diff View ========== */
+.diff-container {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+.diff-panel {
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+.diff-panel-header {
+  padding: 10px 16px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border-primary);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.diff-panel-header .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+.diff-content {
+  padding: 12px 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.8;
+}
+.diff-line {
+  padding: 1px 16px;
+  display: flex;
+  gap: 12px;
+}
+.diff-line .line-no {
+  color: var(--text-tertiary);
+  min-width: 24px;
+  text-align: right;
+  user-select: none;
+}
+.diff-line .line-content { flex: 1; }
+.diff-line.add { background: var(--diff-add-bg); }
+.diff-line.add .line-content { color: var(--diff-add-text); }
+.diff-line.del { background: var(--diff-del-bg); }
+.diff-line.del .line-content { color: var(--diff-del-text); }
+.diff-line.mod { background: var(--diff-mod-bg); }
+.diff-line.mod .line-content { color: var(--diff-mod-text); }
+.diff-line .prefix {
+  min-width: 14px;
+  font-weight: 700;
+}
+.diff-line.add .prefix { color: var(--green); }
+.diff-line.del .prefix { color: var(--red); }
+.diff-line.mod .prefix { color: var(--yellow); }
+
+.diff-warning {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 16px;
+  background: var(--yellow-light);
+  border: 1px solid rgba(245,158,11,0.3);
+  border-radius: var(--radius-sm);
+  margin-bottom: 16px;
+  font-size: 13px;
+  color: var(--yellow);
+}
+.diff-warning svg { width: 18px; height: 18px; flex-shrink: 0; margin-top: 1px; }
+
+.diff-backup-note {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px;
+  background: var(--accent-lighter);
+  border: 1px solid rgba(59,108,255,0.15);
+  border-radius: var(--radius-sm);
+  margin-bottom: 16px;
+  font-size: 13px;
+  color: var(--accent);
+}
+.diff-backup-note svg { width: 16px; height: 16px; flex-shrink: 0; }
+
+/* ========== Toast ========== */
+.toast-container {
+  position: fixed;
+  bottom: 48px;
+  right: 24px;
+  z-index: 2000;
+  display: flex;
+  flex-direction: column-reverse;
+  gap: 8px;
+}
+.toast {
+  padding: 12px 20px;
+  border-radius: var(--radius-md);
+  background: var(--bg-card);
+  border: 1px solid var(--border-primary);
+  box-shadow: var(--shadow-lg);
+  font-size: 13px;
+  font-weight: 500;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  animation: toastIn 0.35s cubic-bezier(0.4, 0, 0.2, 1);
+  min-width: 280px;
+  color: var(--text-primary);
+}
+.toast.success .toast-icon { color: var(--green); }
+.toast.error .toast-icon { color: var(--red); }
+.toast.warning .toast-icon { color: var(--yellow); }
+.toast.info .toast-icon { color: var(--accent); }
+.toast-icon svg { width: 18px; height: 18px; }
+.toast.removing { animation: toastOut 0.3s ease forwards; }
+
+/* ========== Status Bar ========== */
+.statusbar {
+  height: var(--statusbar-height);
+  background: var(--bg-secondary);
+  border-top: 1px solid var(--border-primary);
+  display: flex;
+  align-items: center;
+  padding: 0 16px;
+  font-size: 11px;
+  color: var(--text-tertiary);
+  gap: 16px;
+  flex-shrink: 0;
+  z-index: 100;
+}
+.statusbar-item {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.statusbar-item svg { width: 12px; height: 12px; }
+.statusbar-spacer { flex: 1; }
+.statusbar-item .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+}
+.statusbar-item .dot.green { background: var(--green); }
+.statusbar-item .dot.yellow { background: var(--yellow); }
+
+/* ========== Remote Rules Cards ========== */
+.source-cards {
+  padding: 20px 28px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow-y: auto;
+  flex: 1;
+}
+.source-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-md);
+  padding: 18px 20px;
+  transition: all var(--transition-fast);
+}
+.source-card:hover { box-shadow: var(--shadow-sm); }
+.source-card-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.source-card-header .source-icon {
+  width: 36px;
+  height: 36px;
+  border-radius: var(--radius-sm);
+  background: var(--accent-light);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--accent);
+}
+.source-card-header .source-icon svg { width: 18px; height: 18px; }
+.source-card-header .source-name { font-weight: 600; font-size: 14px; }
+.source-card-header .source-type {
+  font-size: 11px;
+  padding: 2px 8px;
+  background: var(--bg-tertiary);
+  border-radius: 10px;
+  color: var(--text-tertiary);
+  font-weight: 600;
+}
+.source-card-header .source-actions { margin-left: auto; display: flex; gap: 4px; }
+.source-card-meta {
+  display: flex;
+  gap: 20px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.source-card-meta span {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.source-card-meta svg { width: 13px; height: 13px; }
+.source-card-url {
+  margin-top: 8px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-tertiary);
+  background: var(--bg-secondary);
+  padding: 6px 10px;
+  border-radius: 6px;
+  word-break: break-all;
+}
+
+/* ========== Backup Timeline ========== */
+.backup-timeline {
+  padding: 20px 28px;
+  overflow-y: auto;
+  flex: 1;
+}
+.timeline-item {
+  display: flex;
+  gap: 16px;
+  padding: 14px 0;
+  border-bottom: 1px solid var(--border-secondary);
+  align-items: flex-start;
+}
+.timeline-item:last-child { border-bottom: none; }
+.timeline-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--accent);
+  margin-top: 5px;
+  flex-shrink: 0;
+  position: relative;
+}
+.timeline-dot::before {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 10px;
+  transform: translateX(-50%);
+  width: 2px;
+  height: calc(100% + 18px);
+  background: var(--border-primary);
+}
+.timeline-item:last-child .timeline-dot::before { display: none; }
+.timeline-content { flex: 1; }
+.timeline-title {
+  font-weight: 600;
+  font-size: 14px;
+  margin-bottom: 4px;
+}
+.timeline-meta {
+  font-size: 12px;
+  color: var(--text-secondary);
+  display: flex;
+  gap: 16px;
+}
+.timeline-actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+/* ========== Settings ========== */
+.settings-container {
+  padding: 20px 28px;
+  overflow-y: auto;
+  flex: 1;
+}
+.settings-group {
+  margin-bottom: 28px;
+}
+.settings-group-title {
+  font-size: 15px;
+  font-weight: 700;
+  margin-bottom: 14px;
+  color: var(--text-primary);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.settings-group-title svg { width: 18px; height: 18px; color: var(--accent); }
+.setting-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  background: var(--bg-card);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-sm);
+  margin-bottom: 8px;
+  transition: all var(--transition-fast);
+}
+.setting-row:hover { border-color: var(--accent); }
+.setting-row:first-of-type { border-radius: var(--radius-md) var(--radius-md) var(--radius-sm) var(--radius-sm); }
+.setting-row:last-of-type { border-radius: var(--radius-sm) var(--radius-sm) var(--radius-md) var(--radius-md); margin-bottom: 0; }
+.setting-row:only-of-type { border-radius: var(--radius-md); }
+.setting-info { flex: 1; }
+.setting-label { font-size: 13px; font-weight: 600; }
+.setting-desc { font-size: 12px; color: var(--text-secondary); margin-top: 2px; }
+
+/* Theme selector */
+.theme-selector {
+  display: flex;
+  gap: 8px;
+}
+.theme-option {
+  padding: 6px 14px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-primary);
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all var(--transition-fast);
+  font-family: var(--font-sans);
+}
+.theme-option:hover { border-color: var(--accent); color: var(--accent); }
+.theme-option.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: white;
+}
+
+/* Select */
+.custom-select {
+  padding: 6px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-primary);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  font-size: 12px;
+  font-family: var(--font-sans);
+  outline: none;
+  cursor: pointer;
+}
+
+/* ========== Ad Block Page ========== */
+.adblock-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 20px 28px 16px;
+  border-bottom: 1px solid var(--border-secondary);
+}
+.adblock-header h1 { font-size: 20px; font-weight: 700; }
+.adblock-toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.search-bar {
+  padding: 16px 28px;
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+.search-input-wrapper {
+  flex: 1;
+  position: relative;
+}
+.search-input-wrapper svg {
+  position: absolute;
+  left: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 16px;
+  height: 16px;
+  color: var(--text-tertiary);
+}
+.search-input-wrapper input {
+  width: 100%;
+  padding: 9px 12px 9px 36px;
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  font-size: 13px;
+  font-family: var(--font-sans);
+  outline: none;
+  transition: border-color var(--transition-fast);
+}
+.search-input-wrapper input:focus { border-color: var(--accent); }
+.search-input-wrapper input::placeholder { color: var(--text-tertiary); }
+
+/* ========== Profile Modal ========== */
+.profile-modal .modal { max-width: 560px; }
+.form-group {
+  margin-bottom: 18px;
+}
+.form-label {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 6px;
+  color: var(--text-primary);
+}
+.form-input {
+  width: 100%;
+  padding: 9px 12px;
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  font-size: 13px;
+  font-family: var(--font-sans);
+  outline: none;
+  transition: border-color var(--transition-fast);
+}
+.form-input:focus { border-color: var(--accent); }
+.form-input::placeholder { color: var(--text-tertiary); }
+.form-textarea {
+  width: 100%;
+  padding: 9px 12px;
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  font-size: 13px;
+  font-family: var(--font-mono);
+  outline: none;
+  transition: border-color var(--transition-fast);
+  resize: vertical;
+  min-height: 100px;
+}
+.form-textarea:focus { border-color: var(--accent); }
+.form-textarea::placeholder { color: var(--text-tertiary); }
+
+.color-picker {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.color-option {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  cursor: pointer;
+  border: 3px solid transparent;
+  transition: all var(--transition-fast);
+}
+.color-option:hover { transform: scale(1.15); }
+.color-option.active { border-color: var(--text-primary); box-shadow: 0 0 0 2px var(--bg-card); }
+
+/* ========== About Section ========== */
+.about-card {
+  text-align: center;
+  padding: 32px;
+}
+.about-logo {
+  width: 64px;
+  height: 64px;
+  background: var(--accent);
+  border-radius: var(--radius-lg);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: white;
+  font-weight: 800;
+  font-size: 28px;
+  margin: 0 auto 16px;
+}
+.about-name {
+  font-size: 22px;
+  font-weight: 700;
+  margin-bottom: 4px;
+}
+.about-version {
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin-bottom: 20px;
+}
+.about-info {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  text-align: left;
+}
+.about-info-item {
+  padding: 10px 14px;
+  background: var(--bg-secondary);
+  border-radius: var(--radius-sm);
+}
+.about-info-item .label {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+.about-info-item .value {
+  font-size: 13px;
+  font-weight: 600;
+  margin-top: 2px;
+}
+
+/* ========== Animations ========== */
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes slideUp {
+  from { opacity: 0; transform: translateY(20px) scale(0.98); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+@keyframes toastIn {
+  from { opacity: 0; transform: translateX(40px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+@keyframes toastOut {
+  from { opacity: 1; transform: translateX(0); }
+  to { opacity: 0; transform: translateX(40px); }
+}
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+/* ========== Keyboard Shortcut Hints ========== */
+.shortcut {
+  font-size: 11px;
+  padding: 1px 6px;
+  background: var(--bg-tertiary);
+  border-radius: 4px;
+  color: var(--text-tertiary);
+  font-family: var(--font-mono);
+  margin-left: 8px;
+}
+
+/* ========== Responsive ========== */
+@media (max-width: 900px) {
+  .sidebar { width: 200px; }
+  .diff-container { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+
+<div class="app-container">
+  <!-- ========== Title Bar ========== -->
+  <div class="titlebar">
+    <div class="traffic-lights">
+      <button class="traffic-light close" title="关闭"></button>
+      <button class="traffic-light minimize" title="最小化"></button>
+      <button class="traffic-light maximize" title="最大化"></button>
+    </div>
+    <div class="titlebar-title" id="titlebarTitle">Development - mHost</div>
+    <div class="titlebar-actions">
+      <button class="btn-icon" title="切换主题 (⌘D)" onclick="toggleTheme()">
+        <svg id="themeIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+      </button>
+    </div>
+  </div>
+
+  <div class="main-area">
+    <!-- ========== Sidebar ========== -->
+    <div class="sidebar">
+      <div class="sidebar-header">
+        <div class="sidebar-logo">m</div>
+        <span class="sidebar-brand">mHost</span>
+      </div>
+
+      <!-- Profiles Section -->
+      <div class="sidebar-section">
+        <div class="sidebar-section-title">环境配置</div>
+        <div id="profileList"></div>
+        <button class="sidebar-add-btn" onclick="openProfileModal()">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+          新建 Profile
+        </button>
+      </div>
+
+      <!-- Tools Section -->
+      <div class="sidebar-section">
+        <div class="sidebar-section-title">工具</div>
+        <div class="sidebar-item" data-page="adblock" onclick="switchPage('adblock')">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+          广告屏蔽
+          <span class="badge" id="adblockBadge">10</span>
+        </div>
+        <div class="sidebar-item" data-page="remote" onclick="switchPage('remote')">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.66 0 3-4.03 3-9s-1.34-9-3-9m0 18c-1.66 0-3-4.03-3-9s1.34-9 3-9m-9 9a9 9 0 019-9"/></svg>
+          远程规则
+          <span class="badge">3</span>
+        </div>
+        <div class="sidebar-item" data-page="backup" onclick="switchPage('backup')">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          备份管理
+        </div>
+        <div class="sidebar-item" data-page="settings" onclick="switchPage('settings')">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83 0 2 2 0 010-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>
+          设置
+        </div>
+      </div>
+
+      <div class="sidebar-spacer"></div>
+
+      <!-- Bottom Status -->
+      <div style="padding: 12px 16px; border-top: 1px solid var(--border-secondary); font-size: 11px; color: var(--text-tertiary);">
+        <div style="display:flex; align-items:center; gap:6px; margin-bottom:4px;">
+          <span class="dot green" style="width:6px;height:6px;border-radius:50%;background:var(--green);display:inline-block;"></span>
+          <span id="sidebarStatus">运行中</span>
+        </div>
+        <div id="sidebarRuleCount">共 15 条规则</div>
+      </div>
+    </div>
+
+    <!-- ========== Content Area ========== -->
+    <div class="content">
+
+      <!-- Page 1: Hosts Rules Editor -->
+      <div class="page active" id="page-rules">
+        <div class="page-header">
+          <div class="page-header-row">
+            <h1 id="rulesPageTitle">Development</h1>
+            <span class="status-badge active" id="profileStatusBadge"><span class="dot"></span>已启用</span>
+            <div class="page-header-actions">
+              <div class="view-toggle">
+                <button class="view-toggle-btn active" id="viewTableBtn" onclick="switchView('table')">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
+                  表格
+                </button>
+                <button class="view-toggle-btn" id="viewTextBtn" onclick="switchView('text')">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
+                  文本
+                </button>
+              </div>
+              <button class="btn btn-primary" onclick="openApplyModal()">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
+                应用
+                <span class="shortcut">⌘S</span>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Table View -->
+        <div id="tableView" class="table-container">
+          <div class="table-wrapper">
+            <table>
+              <thead>
+                <tr>
+                  <th style="width:40px"></th>
+                  <th>IP 地址</th>
+                  <th>域名</th>
+                  <th>备注</th>
+                  <th style="width:60px">状态</th>
+                  <th style="width:80px">操作</th>
+                </tr>
+              </thead>
+              <tbody id="rulesTableBody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Text View -->
+        <div id="textView" class="editor-container" style="display:none">
+          <div class="editor-wrapper">
+            <div class="line-numbers" id="lineNumbers"></div>
+            <div class="editor-content" id="editorContent" contenteditable="true" spellcheck="false"></div>
+          </div>
+        </div>
+
+        <!-- Quick Add Bar -->
+        <div class="quick-add-bar">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:16px;height:16px;color:var(--text-tertiary);flex-shrink:0"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+          <input class="ip-input" id="quickAddIp" placeholder="IP 地址" />
+          <input class="domain-input" id="quickAddDomain" placeholder="域名" />
+          <input class="note-input" id="quickAddNote" placeholder="备注（可选）" />
+          <button class="btn btn-primary btn-sm" onclick="quickAddRule()">添加</button>
+          <span class="shortcut" style="margin-left:4px">⌘N</span>
+        </div>
+      </div>
+
+      <!-- Page 3: Ad Block -->
+      <div class="page" id="page-adblock">
+        <div class="adblock-header">
+          <h1>广告屏蔽</h1>
+          <div class="adblock-toggle-row">
+            <span>总开关</span>
+            <label class="toggle">
+              <input type="checkbox" id="adblockToggle" checked onchange="toggleAdblock()">
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+        </div>
+
+        <div class="stats-grid">
+          <div class="stat-card">
+            <div class="stat-label">已屏蔽域名</div>
+            <div class="stat-value">1,247</div>
+            <div class="stat-change">+32 本周新增</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">已拦截请求</div>
+            <div class="stat-value">15,832</div>
+            <div class="stat-change">今日 423 次</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">节省流量</div>
+            <div class="stat-value">2.4 GB</div>
+            <div class="stat-change">本月累计</div>
+          </div>
+        </div>
+
+        <div class="search-bar">
+          <div class="search-input-wrapper">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+            <input placeholder="搜索域名..." id="adblockSearch" oninput="filterAdblockList()">
+          </div>
+          <button class="btn btn-secondary btn-sm" onclick="showToast('已导入规则列表', 'success')">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+            导入规则
+          </button>
+          <button class="btn btn-ghost btn-sm" onclick="showToast('白名单管理功能开发中', 'info')">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="10"/></svg>
+            白名单
+          </button>
+        </div>
+
+        <div class="table-container" style="padding-top:0">
+          <div class="table-wrapper">
+            <table>
+              <thead>
+                <tr>
+                  <th>域名</th>
+                  <th>状态</th>
+                  <th>命中次数</th>
+                  <th>上次命中</th>
+                  <th style="width:60px">操作</th>
+                </tr>
+              </thead>
+              <tbody id="adblockTableBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- Page 4: Remote Rules -->
+      <div class="page" id="page-remote">
+        <div class="page-header">
+          <div class="page-header-row">
+            <h1>远程规则订阅</h1>
+            <div class="page-header-actions">
+              <button class="btn btn-primary" onclick="showToast('添加订阅源功能开发中', 'info')">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                添加订阅源
+              </button>
+            </div>
+          </div>
+        </div>
+        <div class="source-cards" id="remoteSources"></div>
+      </div>
+
+      <!-- Page 5: Backup -->
+      <div class="page" id="page-backup">
+        <div class="page-header">
+          <div class="page-header-row">
+            <h1>备份与恢复</h1>
+            <div class="page-header-actions">
+              <button class="btn btn-secondary" onclick="showToast('已创建手动备份', 'success')">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21H5a2 2 0 01-2-2V5a2 2 0 012-2h11l5 5v11a2 2 0 01-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
+                手动备份
+              </button>
+              <button class="btn btn-ghost" onclick="showToast('回收站功能开发中', 'info')">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
+                回收站
+              </button>
+            </div>
+          </div>
+        </div>
+        <div class="backup-timeline" id="backupTimeline"></div>
+      </div>
+
+      <!-- Page 6: Settings -->
+      <div class="page" id="page-settings">
+        <div class="page-header">
+          <div class="page-header-row">
+            <h1>设置</h1>
+          </div>
+        </div>
+        <div class="settings-container">
+          <!-- Appearance -->
+          <div class="settings-group">
+            <div class="settings-group-title">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+              外观
+            </div>
+            <div class="setting-row">
+              <div class="setting-info">
+                <div class="setting-label">主题模式</div>
+                <div class="setting-desc">选择应用的外观主题</div>
+              </div>
+              <div class="theme-selector">
+                <button class="theme-option" data-theme-val="light" onclick="setTheme('light')">亮色</button>
+                <button class="theme-option" data-theme-val="dark" onclick="setTheme('dark')">暗色</button>
+                <button class="theme-option active" data-theme-val="system" onclick="setTheme('system')">跟随系统</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- General -->
+          <div class="settings-group">
+            <div class="settings-group-title">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+              通用
+            </div>
+            <div class="setting-row">
+              <div class="setting-info">
+                <div class="setting-label">开机自启动</div>
+                <div class="setting-desc">系统启动时自动运行 mHost</div>
+              </div>
+              <label class="toggle"><input type="checkbox" checked><span class="toggle-slider"></span></label>
+            </div>
+            <div class="setting-row">
+              <div class="setting-info">
+                <div class="setting-label">菜单栏图标</div>
+                <div class="setting-desc">在系统菜单栏显示 mHost 图标</div>
+              </div>
+              <label class="toggle"><input type="checkbox" checked><span class="toggle-slider"></span></label>
+            </div>
+            <div class="setting-row">
+              <div class="setting-info">
+                <div class="setting-label">关闭行为</div>
+                <div class="setting-desc">点击关闭按钮时的操作</div>
+              </div>
+              <select class="custom-select">
+                <option>最小化到托盘</option>
+                <option>退出应用</option>
+              </select>
+            </div>
+          </div>
+
+          <!-- Hosts Write -->
+          <div class="settings-group">
+            <div class="settings-group-title">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+              Hosts 写入
+            </div>
+            <div class="setting-row">
+              <div class="setting-info">
+                <div class="setting-label">写入模式</div>
+                <div class="setting-desc">替换模式：完全替换系统 hosts 文件内容。mHost 会在文件头添加管理标记。</div>
+              </div>
+              <select class="custom-select">
+                <option>替换模式</option>
+                <option>追加模式</option>
+              </select>
+            </div>
+            <div class="setting-row">
+              <div class="setting-info">
+                <div class="setting-label">DNS 缓存刷新</div>
+                <div class="setting-desc">应用 hosts 后自动刷新系统 DNS 缓存</div>
+              </div>
+              <label class="toggle"><input type="checkbox" checked><span class="toggle-slider"></span></label>
+            </div>
+          </div>
+
+          <!-- Remote Rules -->
+          <div class="settings-group">
+            <div class="settings-group-title">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.66 0 3-4.03 3-9s-1.34-9-3-9m0 18c-1.66 0-3-4.03-3-9s1.34-9 3-9m-9 9a9 9 0 019-9"/></svg>
+              远程规则
+            </div>
+            <div class="setting-row">
+              <div class="setting-info">
+                <div class="setting-label">默认刷新策略</div>
+                <div class="setting-desc">远程规则源的默认更新方式</div>
+              </div>
+              <select class="custom-select">
+                <option>手动刷新</option>
+                <option>启动时刷新</option>
+                <option>每天定时刷新</option>
+                <option>每周定时刷新</option>
+              </select>
+            </div>
+          </div>
+
+          <!-- About -->
+          <div class="settings-group">
+            <div class="settings-group-title">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+              关于
+            </div>
+            <div class="card about-card">
+              <div class="about-logo">m</div>
+              <div class="about-name">mHost</div>
+              <div class="about-version">v0.1.0-alpha.1</div>
+              <div class="about-info">
+                <div class="about-info-item">
+                  <div class="label">构建日期</div>
+                  <div class="value">2026-06-19</div>
+                </div>
+                <div class="about-info-item">
+                  <div class="label">平台</div>
+                  <div class="value">macOS (Apple Silicon)</div>
+                </div>
+                <div class="about-info-item">
+                  <div class="label">技术栈</div>
+                  <div class="value">Rust + Tauri 2.0</div>
+                </div>
+                <div class="about-info-item">
+                  <div class="label">前端框架</div>
+                  <div class="value">React + TypeScript</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div><!-- /content -->
+  </div><!-- /main-area -->
+
+  <!-- ========== Status Bar ========== -->
+  <div class="statusbar">
+    <div class="statusbar-item">
+      <span class="dot green"></span>
+      <span id="statusProfile">Development</span>
+    </div>
+    <div class="statusbar-item">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+      <span id="statusRuleCount">5 条规则</span>
+    </div>
+    <div class="statusbar-item">
+      <span class="dot green"></span>
+      <span>广告屏蔽: 开</span>
+    </div>
+    <div class="statusbar-spacer"></div>
+    <div class="statusbar-item">
+      <span>v0.1.0-alpha</span>
+    </div>
+    <div class="statusbar-item">
+      <span>Rust + Tauri</span>
+    </div>
+  </div>
+</div>
+
+<!-- ========== Apply Modal (Diff Preview) ========== -->
+<div class="modal-overlay" id="applyModal">
+  <div class="modal">
+    <div class="modal-header">
+      <svg viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2" style="width:22px;height:22px"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+      <h2>应用确认 - Diff 预览</h2>
+      <button class="modal-close" onclick="closeApplyModal()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      <div class="diff-backup-note">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        应用前将自动备份当前 hosts 文件
+      </div>
+
+      <div class="diff-warning">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        <div>
+          <strong>冲突检测：</strong>发现 1 条冲突规则。api.example.com 在当前 hosts 中已存在映射，应用后将被覆盖。
+        </div>
+      </div>
+
+      <div class="diff-container">
+        <div class="diff-panel">
+          <div class="diff-panel-header">
+            <span class="dot" style="background:var(--red)"></span>
+            当前系统 hosts
+          </div>
+          <div class="diff-content" id="diffCurrent"></div>
+        </div>
+        <div class="diff-panel">
+          <div class="diff-panel-header">
+            <span class="dot" style="background:var(--green)"></span>
+            即将应用
+          </div>
+          <div class="diff-content" id="diffNew"></div>
+        </div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeApplyModal()">取消</button>
+      <button class="btn btn-primary" onclick="applyHosts()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
+        确认应用
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- ========== Profile Modal (New/Edit) ========== -->
+<div class="modal-overlay" id="profileModal">
+  <div class="modal profile-modal">
+    <div class="modal-header">
+      <svg viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2" style="width:22px;height:22px"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+      <h2 id="profileModalTitle">新建 Profile</h2>
+      <button class="modal-close" onclick="closeProfileModal()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      <div class="form-group">
+        <label class="form-label">Profile 名称</label>
+        <input class="form-input" id="profileNameInput" placeholder="例如：Production" />
+      </div>
+      <div class="form-group">
+        <label class="form-label">描述</label>
+        <input class="form-input" id="profileDescInput" placeholder="简要描述此环境的用途" />
+      </div>
+      <div class="form-group">
+        <label class="form-label">颜色标识</label>
+        <div class="color-picker" id="colorPicker">
+          <div class="color-option active" style="background:#3b6cff" data-color="#3b6cff"></div>
+          <div class="color-option" style="background:#22c55e" data-color="#22c55e"></div>
+          <div class="color-option" style="background:#f59e0b" data-color="#f59e0b"></div>
+          <div class="color-option" style="background:#ef4444" data-color="#ef4444"></div>
+          <div class="color-option" style="background:#8b5cf6" data-color="#8b5cf6"></div>
+          <div class="color-option" style="background:#ec4899" data-color="#ec4899"></div>
+          <div class="color-option" style="background:#06b6d4" data-color="#06b6d4"></div>
+          <div class="color-option" style="background:#f97316" data-color="#f97316"></div>
+        </div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">标签</label>
+        <input class="form-input" id="profileTagsInput" placeholder="用逗号分隔，例如：生产, 线上" />
+      </div>
+      <div class="form-group">
+        <label class="form-label">初始规则（可选）</label>
+        <textarea class="form-textarea" id="profileRulesInput" placeholder="粘贴 hosts 规则，每行一条，格式：IP 域名 # 备注&#10;例如：&#10;192.168.1.100 api.example.com # API 服务"></textarea>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeProfileModal()">取消</button>
+      <button class="btn btn-primary" onclick="saveProfile()">创建</button>
+    </div>
+  </div>
+</div>
+
+<!-- ========== Toast Container ========== -->
+<div class="toast-container" id="toastContainer"></div>
+
+<script>
+// ========== Data ==========
+const profiles = [
+  {
+    id: 'dev', name: 'Development', color: '#3b6cff', active: true,
+    rules: [
+      { ip: '127.0.0.1', domain: 'localhost', note: '本地开发', enabled: true },
+      { ip: '192.168.1.100', domain: 'api.dev.local', note: '开发 API 服务', enabled: true },
+      { ip: '192.168.1.101', domain: 'db.dev.local', note: '开发数据库', enabled: true },
+      { ip: '192.168.1.102', domain: 'redis.dev.local', note: '开发 Redis', enabled: true },
+      { ip: '10.0.0.1', domain: 'minio.dev.local', note: '对象存储', enabled: false },
+    ]
+  },
+  {
+    id: 'test', name: 'Testing', color: '#f59e0b', active: true,
+    rules: [
+      { ip: '10.10.0.50', domain: 'api.test.local', note: '测试 API', enabled: true },
+      { ip: '10.10.0.51', domain: 'db.test.local', note: '测试数据库', enabled: true },
+      { ip: '10.10.0.52', domain: 'mq.test.local', note: '消息队列', enabled: true },
+    ]
+  },
+  {
+    id: 'staging', name: 'Staging', color: '#8b5cf6', active: true,
+    rules: [
+      { ip: '172.16.0.10', domain: 'api.staging.local', note: '预发布 API', enabled: true },
+      { ip: '172.16.0.11', domain: 'db.staging.local', note: '预发布数据库', enabled: true },
+      { ip: '172.16.0.12', domain: 'cache.staging.local', note: '预发布缓存', enabled: true },
+      { ip: '172.16.0.13', domain: 'cdn.staging.local', note: '预发布 CDN', enabled: false },
+    ]
+  },
+  {
+    id: 'prod', name: 'Production', color: '#ef4444', active: false,
+    rules: [
+      { ip: '203.0.113.10', domain: 'api.example.com', note: '生产 API', enabled: true },
+      { ip: '203.0.113.11', domain: 'www.example.com', note: '生产网站', enabled: true },
+    ]
+  }
+];
+
+const adblockDomains = [
+  { domain: 'ad.doubleclick.net', status: 'blocked', hits: 3842, lastHit: '2 分钟前' },
+  { domain: 'pagead2.googlesyndication.com', status: 'blocked', hits: 2156, lastHit: '5 分钟前' },
+  { domain: 'ads.facebook.com', status: 'blocked', hits: 1893, lastHit: '12 分钟前' },
+  { domain: 'analytics.google.com', status: 'whitelist', hits: 0, lastHit: '-' },
+  { domain: 'pixel.facebook.com', status: 'blocked', hits: 1542, lastHit: '8 分钟前' },
+  { domain: 'tracker.example.com', status: 'blocked', hits: 987, lastHit: '1 小时前' },
+  { domain: 'cdn.adservice.google.com', status: 'blocked', hits: 876, lastHit: '15 分钟前' },
+  { domain: 'static.ads-twitter.com', status: 'blocked', hits: 654, lastHit: '30 分钟前' },
+  { domain: 'ad.serving-sys.com', status: 'blocked', hits: 432, lastHit: '2 小时前' },
+  { domain: 'metrics.example.com', status: 'whitelist', hits: 0, lastHit: '-' },
+];
+
+const remoteSources = [
+  {
+    name: 'StevenBlack Hosts',
+    url: 'https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts',
+    type: 'hosts',
+    lastUpdate: '2026-06-19 08:30',
+    status: 'active',
+    ruleCount: 52487,
+    cacheStatus: '已缓存'
+  },
+  {
+    name: 'AdAway Default Blocklist',
+    url: 'https://adaway.org/hosts.txt',
+    type: 'hosts',
+    lastUpdate: '2026-06-18 14:15',
+    status: 'active',
+    ruleCount: 12453,
+    cacheStatus: '已缓存'
+  },
+  {
+    name: '自定义规则 - 公司内部',
+    url: 'https://internal.company.com/hosts/blocklist.txt',
+    type: 'hosts',
+    lastUpdate: '2026-06-17 09:00',
+    status: 'paused',
+    ruleCount: 328,
+    cacheStatus: '已过期'
+  }
+];
+
+const backups = [
+  { time: '2026-06-19 14:32:18', reason: '应用前自动备份', profile: 'Development', ruleCount: 5 },
+  { time: '2026-06-19 10:15:42', reason: '手动备份', profile: 'Testing', ruleCount: 3 },
+  { time: '2026-06-18 22:08:33', reason: '应用前自动备份', profile: 'Staging', ruleCount: 4 },
+  { time: '2026-06-18 16:45:11', reason: '手动备份', profile: 'Production', ruleCount: 2 },
+  { time: '2026-06-17 09:30:00', reason: '自动备份（每日）', profile: 'Development', ruleCount: 5 },
+];
+
+// ========== State ==========
+let currentProfileId = 'dev';
+let currentPage = 'rules';
+let currentView = 'table';
+let currentTheme = 'light';
+
+// ========== Initialization ==========
+function init() {
+  renderProfileList();
+  renderRulesTable();
+  renderEditorContent();
+  renderAdblockTable();
+  renderRemoteSources();
+  renderBackupTimeline();
+  renderDiffView();
+  updateStatusBar();
+  setupColorPicker();
+}
+
+// ========== Profile List ==========
+function renderProfileList() {
+  const container = document.getElementById('profileList');
+  container.innerHTML = profiles.map(p => `
+    <div class="sidebar-item ${p.id === currentProfileId ? 'active' : ''}" data-profile="${p.id}" onclick="selectProfile('${p.id}')">
+      <span class="profile-dot" style="background:${p.color}"></span>
+      <span style="flex:1">${p.name}</span>
+      <span class="badge">${p.rules.length}</span>
+    </div>
+  `).join('');
+}
+
+function selectProfile(id) {
+  currentProfileId = id;
+  currentPage = 'rules';
+  renderProfileList();
+  renderRulesTable();
+  renderEditorContent();
+  updateStatusBar();
+  updateTitlebar();
+  // Highlight sidebar
+  document.querySelectorAll('.sidebar-item').forEach(el => {
+    el.classList.remove('active');
+    if (el.dataset.profile === id) el.classList.add('active');
+    if (el.dataset.page === 'rules') el.classList.remove('active');
+  });
+  // Show rules page
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.getElementById('page-rules').classList.add('active');
+}
+
+// ========== Rules Table ==========
+function renderRulesTable() {
+  const profile = profiles.find(p => p.id === currentProfileId);
+  if (!profile) return;
+  const tbody = document.getElementById('rulesTableBody');
+  const title = document.getElementById('rulesPageTitle');
+  title.textContent = profile.name;
+  const badge = document.getElementById('profileStatusBadge');
+  if (profile.active) {
+    badge.className = 'status-badge active';
+    badge.innerHTML = '<span class="dot"></span>已启用';
+  } else {
+    badge.className = 'status-badge inactive';
+    badge.innerHTML = '<span class="dot"></span>已禁用';
+  }
+
+  tbody.innerHTML = profile.rules.map((r, i) => `
+    <tr class="${r.enabled ? '' : 'disabled'}" data-index="${i}">
+      <td style="text-align:center;color:var(--text-tertiary);font-size:12px">${i + 1}</td>
+      <td><span class="ip-cell">${r.ip}</span></td>
+      <td class="domain-cell">${r.domain}</td>
+      <td class="note-cell">${r.note}</td>
+      <td>
+        <label class="toggle" style="width:36px;height:20px">
+          <input type="checkbox" ${r.enabled ? 'checked' : ''} onchange="toggleRule(${i})">
+          <span class="toggle-slider" style="border-radius:10px"><style>.toggle[style] .toggle-slider::after{width:12px;height:12px;left:2px;top:2px}</style></span>
+        </label>
+      </td>
+      <td>
+        <div class="actions-cell">
+          <button class="btn-icon" title="编辑" onclick="editRule(${i})">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+          </button>
+          <button class="btn-icon" title="删除" onclick="deleteRule(${i})">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
+          </button>
+        </div>
+      </td>
+    </tr>
+  `).join('');
+}
+
+// ========== Editor Content ==========
+function renderEditorContent() {
+  const profile = profiles.find(p => p.id === currentProfileId);
+  if (!profile) return;
+  const editor = document.getElementById('editorContent');
+  const lineNums = document.getElementById('lineNumbers');
+
+  const lines = [
+    '# mHost - ' + profile.name,
+    '# 由 mHost 管理，请勿手动编辑',
+    '# 最后更新: ' + new Date().toLocaleString('zh-CN'),
+    '',
+  ];
+  profile.rules.forEach(r => {
+    if (!r.enabled) {
+      lines.push(`# ${r.ip} ${r.domain} # ${r.note} (已禁用)`);
+    } else {
+      lines.push(`${r.ip} ${r.domain} # ${r.note}`);
+    }
+  });
+
+  const content = lines.join('\n');
+  editor.innerHTML = content.split('\n').map(line => {
+    if (line.startsWith('#')) {
+      return `<span class="comment">${escapeHtml(line)}</span>`;
+    }
+    const parts = line.split(/\s+/);
+    if (parts.length >= 2) {
+      return `<span class="ip">${escapeHtml(parts[0])}</span> <span class="domain">${escapeHtml(parts[1])}</span>${parts.length > 2 ? ' ' + escapeHtml(parts.slice(2).join(' ')) : ''}`;
+    }
+    return escapeHtml(line);
+  }).join('\n');
+
+  lineNums.innerHTML = lines.map((_, i) => i + 1).join('<br>');
+  // Sync scroll between line numbers and editor
+  const editorEl = document.getElementById('editorContent');
+  editorEl.onscroll = () => { lineNums.scrollTop = editorEl.scrollTop; };
+}
+
+function escapeHtml(str) {
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
+}
+
+// ========== View Toggle ==========
+function switchView(view) {
+  currentView = view;
+  document.getElementById('tableView').style.display = view === 'table' ? 'block' : 'none';
+  document.getElementById('textView').style.display = view === 'text' ? 'flex' : 'none';
+  document.getElementById('viewTableBtn').classList.toggle('active', view === 'table');
+  document.getElementById('viewTextBtn').classList.toggle('active', view === 'text');
+}
+
+// ========== Rule Operations ==========
+function toggleRule(index) {
+  const profile = profiles.find(p => p.id === currentProfileId);
+  if (profile) {
+    profile.rules[index].enabled = !profile.rules[index].enabled;
+    renderRulesTable();
+    renderEditorContent();
+    updateStatusBar();
+  }
+}
+
+function editRule(index) {
+  const profile = profiles.find(p => p.id === currentProfileId);
+  if (!profile) return;
+  const rule = profile.rules[index];
+  const newIp = prompt('编辑 IP 地址', rule.ip);
+  if (newIp !== null) {
+    const newDomain = prompt('编辑域名', rule.domain);
+    if (newDomain !== null) {
+      const newNote = prompt('编辑备注', rule.note);
+      if (newNote !== null) {
+        rule.ip = newIp;
+        rule.domain = newDomain;
+        rule.note = newNote;
+        renderRulesTable();
+        renderEditorContent();
+        showToast('规则已更新', 'success');
+      }
+    }
+  }
+}
+
+function deleteRule(index) {
+  const profile = profiles.find(p => p.id === currentProfileId);
+  if (profile) {
+    const rule = profile.rules[index];
+    if (confirm(`确定删除规则 ${rule.domain} 吗？`)) {
+      profile.rules.splice(index, 1);
+      renderRulesTable();
+      renderEditorContent();
+      renderProfileList();
+      updateStatusBar();
+      showToast('规则已删除', 'success');
+    }
+  }
+}
+
+function quickAddRule() {
+  const ip = document.getElementById('quickAddIp').value.trim();
+  const domain = document.getElementById('quickAddDomain').value.trim();
+  const note = document.getElementById('quickAddNote').value.trim();
+
+  if (!ip || !domain) {
+    showToast('请填写 IP 地址和域名', 'warning');
+    return;
+  }
+
+  const profile = profiles.find(p => p.id === currentProfileId);
+  if (profile) {
+    profile.rules.push({ ip, domain, note: note || '', enabled: true });
+    renderRulesTable();
+    renderEditorContent();
+    renderProfileList();
+    updateStatusBar();
+    document.getElementById('quickAddIp').value = '';
+    document.getElementById('quickAddDomain').value = '';
+    document.getElementById('quickAddNote').value = '';
+    showToast(`已添加规则: ${domain}`, 'success');
+  }
+}
+
+// ========== Page Switching ==========
+function switchPage(page) {
+  currentPage = page;
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  const pageEl = document.getElementById('page-' + page);
+  if (pageEl) pageEl.classList.add('active');
+
+  document.querySelectorAll('.sidebar-item').forEach(el => {
+    el.classList.remove('active');
+    if (el.dataset.page === page) el.classList.add('active');
+    if (el.dataset.profile === currentProfileId && page === 'rules') el.classList.add('active');
+  });
+
+  updateTitlebar();
+}
+
+function updateTitlebar() {
+  const title = document.getElementById('titlebarTitle');
+  const pageNames = {
+    rules: profiles.find(p => p.id === currentProfileId)?.name || '规则编辑',
+    adblock: '广告屏蔽',
+    remote: '远程规则',
+    backup: '备份管理',
+    settings: '设置'
+  };
+  title.textContent = (pageNames[currentPage] || 'mHost') + ' - mHost';
+}
+
+function updateStatusBar() {
+  const profile = profiles.find(p => p.id === currentProfileId);
+  document.getElementById('statusProfile').textContent = profile?.name || '';
+  document.getElementById('statusRuleCount').textContent = profile ? profile.rules.length + ' 条规则' : '';
+  const totalRules = profiles.reduce((sum, p) => sum + p.rules.length, 0);
+  document.getElementById('sidebarRuleCount').textContent = '共 ' + totalRules + ' 条规则';
+}
+
+// ========== Apply Modal ==========
+function openApplyModal() {
+  document.getElementById('applyModal').classList.add('active');
+}
+
+function closeApplyModal() {
+  document.getElementById('applyModal').classList.remove('active');
+}
+
+function applyHosts() {
+  closeApplyModal();
+  showToast('Hosts 文件已成功应用！DNS 缓存已刷新。', 'success');
+}
+
+function renderDiffView() {
+  const current = document.getElementById('diffCurrent');
+  const newEl = document.getElementById('diffNew');
+
+  const currentLines = [
+    { no: 1, text: '##', type: '' },
+    { no: 2, text: '# Host Database', type: '' },
+    { no: 3, text: '#', type: '' },
+    { no: 4, text: '127.0.0.1\tlocalhost', type: '' },
+    { no: 5, text: '255.255.255.255\tbroadcasthost', type: '' },
+    { no: 6, text: '::1\t\tlocalhost', type: '' },
+    { no: 7, text: '', type: '' },
+    { no: 8, text: '# mHost - Staging (上次应用)', type: '' },
+    { no: 9, text: '172.16.0.10\tapi.staging.local', type: 'del' },
+    { no: 10, text: '172.16.0.11\tdb.staging.local', type: 'del' },
+    { no: 11, text: '172.16.0.12\tcache.staging.local', type: 'del' },
+    { no: 12, text: '', type: '' },
+  ];
+
+  const newLines = [
+    { no: 1, text: '##', type: '' },
+    { no: 2, text: '# Host Database', type: '' },
+    { no: 3, text: '#', type: '' },
+    { no: 4, text: '127.0.0.1\tlocalhost', type: '' },
+    { no: 5, text: '255.255.255.255\tbroadcasthost', type: '' },
+    { no: 6, text: '::1\t\tlocalhost', type: '' },
+    { no: 7, text: '', type: '' },
+    { no: 8, text: '# mHost - Development', type: 'mod' },
+    { no: 9, text: '192.168.1.100\tapi.dev.local', type: 'add' },
+    { no: 10, text: '192.168.1.101\tdb.dev.local', type: 'add' },
+    { no: 11, text: '192.168.1.102\tredis.dev.local', type: 'add' },
+    { no: 12, text: '127.0.0.1\tlocalhost', type: '' },
+    { no: 13, text: '', type: '' },
+  ];
+
+  current.innerHTML = currentLines.map(l => {
+    const cls = l.type ? ' ' + l.type : '';
+    const prefix = l.type === 'del' ? '-' : l.type === 'add' ? '+' : l.type === 'mod' ? '~' : ' ';
+    return `<div class="diff-line${cls}"><span class="line-no">${l.no}</span><span class="prefix">${prefix}</span><span class="line-content">${escapeHtml(l.text)}</span></div>`;
+  }).join('');
+
+  newEl.innerHTML = newLines.map(l => {
+    const cls = l.type ? ' ' + l.type : '';
+    const prefix = l.type === 'del' ? '-' : l.type === 'add' ? '+' : l.type === 'mod' ? '~' : ' ';
+    return `<div class="diff-line${cls}"><span class="line-no">${l.no}</span><span class="prefix">${prefix}</span><span class="line-content">${escapeHtml(l.text)}</span></div>`;
+  }).join('');
+}
+
+// ========== Profile Modal ==========
+function openProfileModal() {
+  document.getElementById('profileModal').classList.add('active');
+  document.getElementById('profileModalTitle').textContent = '新建 Profile';
+  document.getElementById('profileNameInput').value = '';
+  document.getElementById('profileDescInput').value = '';
+  document.getElementById('profileTagsInput').value = '';
+  document.getElementById('profileRulesInput').value = '';
+  // Reset color picker
+  document.querySelectorAll('.color-option').forEach((el, i) => {
+    el.classList.toggle('active', i === 0);
+  });
+}
+
+function closeProfileModal() {
+  document.getElementById('profileModal').classList.remove('active');
+}
+
+function saveProfile() {
+  const name = document.getElementById('profileNameInput').value.trim();
+  if (!name) {
+    showToast('请输入 Profile 名称', 'warning');
+    return;
+  }
+  const desc = document.getElementById('profileDescInput').value.trim();
+  const activeColor = document.querySelector('.color-option.active');
+  const color = activeColor ? activeColor.dataset.color : '#3b6cff';
+  const rulesText = document.getElementById('profileRulesInput').value.trim();
+
+  const newProfile = {
+    id: name.toLowerCase().replace(/\s+/g, '_') + '_' + Date.now(),
+    name,
+    color,
+    active: true,
+    rules: []
+  };
+
+  if (rulesText) {
+    rulesText.split('\n').forEach(line => {
+      line = line.replace(/#.*$/, '').trim();
+      if (!line) return;
+      const parts = line.split(/\s+/);
+      if (parts.length >= 2) {
+        newProfile.rules.push({ ip: parts[0], domain: parts[1], note: '', enabled: true });
+      }
+    });
+  }
+
+  profiles.push(newProfile);
+  renderProfileList();
+  closeProfileModal();
+  showToast(`Profile "${name}" 已创建`, 'success');
+}
+
+function setupColorPicker() {
+  document.querySelectorAll('.color-option').forEach(el => {
+    el.addEventListener('click', () => {
+      document.querySelectorAll('.color-option').forEach(e => e.classList.remove('active'));
+      el.classList.add('active');
+    });
+  });
+}
+
+// ========== Ad Block ==========
+function renderAdblockTable() {
+  const tbody = document.getElementById('adblockTableBody');
+  tbody.innerHTML = adblockDomains.map(d => `
+    <tr data-domain="${d.domain}">
+      <td style="font-family:var(--font-mono);font-size:12px">${d.domain}</td>
+      <td>
+        <span class="status-badge ${d.status === 'blocked' ? 'inactive' : 'active'}">
+          <span class="dot"></span>
+          ${d.status === 'blocked' ? '屏蔽' : '白名单'}
+        </span>
+      </td>
+      <td style="font-family:var(--font-mono)">${d.hits.toLocaleString()}</td>
+      <td style="color:var(--text-secondary)">${d.lastHit}</td>
+      <td>
+        <div class="actions-cell" style="opacity:1">
+          <button class="btn-icon" title="${d.status === 'blocked' ? '加入白名单' : '移除白名单'}" onclick="toggleAdblockDomain('${d.domain}')">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">${d.status === 'blocked' ? '<path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="10"/>' : '<circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/>'}</svg>
+          </button>
+          <button class="btn-icon" title="删除" onclick="deleteAdblockDomain('${d.domain}')">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
+          </button>
+        </div>
+      </td>
+    </tr>
+  `).join('');
+}
+
+function toggleAdblock() {
+  const on = document.getElementById('adblockToggle').checked;
+  showToast(on ? '广告屏蔽已开启' : '广告屏蔽已关闭', on ? 'success' : 'warning');
+}
+
+function toggleAdblockDomain(domain) {
+  const d = adblockDomains.find(item => item.domain === domain);
+  if (d) {
+    d.status = d.status === 'blocked' ? 'whitelist' : 'blocked';
+    renderAdblockTable();
+    showToast(`${domain} 已${d.status === 'blocked' ? '加入屏蔽列表' : '移入白名单'}`, 'success');
+  }
+}
+
+function deleteAdblockDomain(domain) {
+  const idx = adblockDomains.findIndex(d => d.domain === domain);
+  if (idx >= 0) {
+    adblockDomains.splice(idx, 1);
+    renderAdblockTable();
+    document.getElementById('adblockBadge').textContent = adblockDomains.length;
+    showToast(`已删除 ${domain}`, 'success');
+  }
+}
+
+function filterAdblockList() {
+  const query = document.getElementById('adblockSearch').value.toLowerCase();
+  document.querySelectorAll('#adblockTableBody tr').forEach(tr => {
+    const domain = tr.dataset.domain || '';
+    tr.style.display = domain.toLowerCase().includes(query) ? '' : 'none';
+  });
+}
+
+// ========== Remote Sources ==========
+function renderRemoteSources() {
+  const container = document.getElementById('remoteSources');
+  container.innerHTML = remoteSources.map(s => `
+    <div class="source-card">
+      <div class="source-card-header">
+        <div class="source-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.66 0 3-4.03 3-9s-1.34-9-3-9m0 18c-1.66 0-3-4.03-3-9s1.34-9 3-9m-9 9a9 9 0 019-9"/></svg>
+        </div>
+        <div>
+          <div class="source-name">${s.name}</div>
+        </div>
+        <span class="source-type">${s.type}</span>
+        <div class="source-actions">
+          <button class="btn-icon" title="刷新" onclick="refreshSource('${s.name}')">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/></svg>
+          </button>
+          <button class="btn-icon" title="${s.status === 'active' ? '暂停' : '恢复'}" onclick="toggleSource('${s.name}')">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">${s.status === 'active' ? '<rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/>' : '<polygon points="5 3 19 12 5 21 5 3"/>'}</svg>
+          </button>
+          <button class="btn-icon" title="删除" onclick="deleteSource('${s.name}')">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
+          </button>
+        </div>
+      </div>
+      <div class="source-card-meta">
+        <span>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+          ${s.lastUpdate}
+        </span>
+        <span>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+          ${s.ruleCount.toLocaleString()} 条规则
+        </span>
+        <span>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          ${s.cacheStatus}
+        </span>
+        <span class="status-badge ${s.status === 'active' ? 'active' : 'inactive'}">
+          <span class="dot"></span>
+          ${s.status === 'active' ? '活跃' : '已暂停'}
+        </span>
+      </div>
+      <div class="source-card-url">${s.url}</div>
+    </div>
+  `).join('');
+}
+
+function refreshSource(name) {
+  showToast(`正在刷新 "${name}"...`, 'info');
+  setTimeout(() => showToast(`"${name}" 刷新成功`, 'success'), 1500);
+}
+
+function toggleSource(name) {
+  const s = remoteSources.find(item => item.name === name);
+  if (s) {
+    s.status = s.status === 'active' ? 'paused' : 'active';
+    renderRemoteSources();
+    showToast(`"${name}" 已${s.status === 'active' ? '恢复' : '暂停'}`, 'success');
+  }
+}
+
+function deleteSource(name) {
+  const idx = remoteSources.findIndex(s => s.name === name);
+  if (idx >= 0) {
+    remoteSources.splice(idx, 1);
+    renderRemoteSources();
+    showToast(`已删除订阅源 "${name}"`, 'success');
+  }
+}
+
+// ========== Backup Timeline ==========
+function renderBackupTimeline() {
+  const container = document.getElementById('backupTimeline');
+  container.innerHTML = backups.map(b => `
+    <div class="timeline-item">
+      <div class="timeline-dot" style="background:${b.reason.includes('自动') ? 'var(--accent)' : b.reason.includes('应用前') ? 'var(--green)' : 'var(--yellow)'}"></div>
+      <div class="timeline-content">
+        <div class="timeline-title">${b.reason}</div>
+        <div class="timeline-meta">
+          <span>${b.time}</span>
+          <span>Profile: ${b.profile}</span>
+          <span>${b.ruleCount} 条规则</span>
+        </div>
+      </div>
+      <div class="timeline-actions">
+        <button class="btn btn-ghost btn-sm" onclick="showToast('已恢复到 ${b.time} 的备份', 'success')">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 102.13-9.36L1 10"/></svg>
+          恢复
+        </button>
+        <button class="btn-icon" title="删除备份">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
+        </button>
+      </div>
+    </div>
+  `).join('');
+}
+
+// ========== Theme ==========
+function setTheme(theme) {
+  if (theme === 'system') {
+    const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    currentTheme = prefersDark ? 'dark' : 'light';
+  } else {
+    currentTheme = theme;
+  }
+  document.documentElement.setAttribute('data-theme', currentTheme);
+
+  // Update theme selector buttons
+  document.querySelectorAll('.theme-option').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.themeVal === theme);
+  });
+
+  // Update theme icon
+  const icon = document.getElementById('themeIcon');
+  if (currentTheme === 'dark') {
+    icon.innerHTML = '<path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/>';
+  } else {
+    icon.innerHTML = '<circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>';
+  }
+}
+
+function toggleTheme() {
+  const next = currentTheme === 'light' ? 'dark' : 'light';
+  setTheme(next);
+  // Update selector
+  document.querySelectorAll('.theme-option').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.themeVal === next);
+  });
+}
+
+// ========== Toast ==========
+function showToast(message, type = 'info') {
+  const container = document.getElementById('toastContainer');
+  const toast = document.createElement('div');
+  toast.className = `toast ${type}`;
+
+  const icons = {
+    success: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 11-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>',
+    error: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>',
+    warning: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>',
+    info: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>'
+  };
+
+  toast.innerHTML = `
+    <span class="toast-icon">${icons[type] || icons.info}</span>
+    <span>${message}</span>
+  `;
+
+  container.appendChild(toast);
+
+  setTimeout(() => {
+    toast.classList.add('removing');
+    setTimeout(() => toast.remove(), 300);
+  }, 3000);
+}
+
+// ========== Keyboard Shortcuts ==========
+document.addEventListener('keydown', (e) => {
+  const isCmd = e.metaKey || e.ctrlKey;
+
+  if (isCmd && e.key === 's') {
+    e.preventDefault();
+    openApplyModal();
+  }
+  if (isCmd && e.key === 'n') {
+    e.preventDefault();
+    document.getElementById('quickAddIp').focus();
+  }
+  if (isCmd && e.key === 'd') {
+    e.preventDefault();
+    toggleTheme();
+  }
+  if (e.key === 'Escape') {
+    closeApplyModal();
+    closeProfileModal();
+  }
+  // 1-4 switch profiles
+  if (!isCmd && !e.altKey && !e.shiftKey && document.activeElement.tagName !== 'INPUT' && document.activeElement.tagName !== 'TEXTAREA' && !document.activeElement.isContentEditable) {
+    const num = parseInt(e.key);
+    if (num >= 1 && num <= profiles.length) {
+      selectProfile(profiles[num - 1].id);
+    }
+  }
+});
+
+// Close modals on overlay click
+document.getElementById('applyModal').addEventListener('click', (e) => {
+  if (e.target === e.currentTarget) closeApplyModal();
+});
+document.getElementById('profileModal').addEventListener('click', (e) => {
+  if (e.target === e.currentTarget) closeProfileModal();
+});
+
+// ========== Init ==========
+init();
+</script>
+</body>
+</html>
