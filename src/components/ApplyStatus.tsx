@@ -51,7 +51,7 @@ function ApplyStatus() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [enabledProfile]);
 
   if (loading) {
     return <div className={styles.loading}>Loading status...</div>;
