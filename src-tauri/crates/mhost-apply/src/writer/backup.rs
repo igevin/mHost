@@ -6,7 +6,7 @@
 use chrono::Utc;
 use mhost_core::MhostError;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Maximum number of backup files to retain.
 const MAX_BACKUPS: usize = 10;
@@ -15,7 +15,7 @@ const MAX_BACKUPS: usize = 10;
 ///
 /// After creating the backup, enforces the maximum backup limit by
 /// removing the oldest backups if the count exceeds `MAX_BACKUPS`.
-pub fn create_backup(backup_dir: &PathBuf, content: &str) -> Result<PathBuf, MhostError> {
+pub fn create_backup(backup_dir: &Path, content: &str) -> Result<PathBuf, MhostError> {
     fs::create_dir_all(backup_dir)?;
     let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
     let path = backup_dir.join(format!("hosts-{}.bak", timestamp));
@@ -28,7 +28,7 @@ pub fn create_backup(backup_dir: &PathBuf, content: &str) -> Result<PathBuf, Mho
 }
 
 /// Remove oldest backups if the total count exceeds `MAX_BACKUPS`.
-pub fn prune_old_backups(backup_dir: &PathBuf) -> Result<(), MhostError> {
+pub fn prune_old_backups(backup_dir: &Path) -> Result<(), MhostError> {
     let mut backups: Vec<_> = fs::read_dir(backup_dir)?
         .filter_map(|e| e.ok())
         .filter(|e| {
