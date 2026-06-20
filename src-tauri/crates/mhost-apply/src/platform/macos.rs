@@ -51,10 +51,12 @@ impl PlatformAdapter for MacOsAdapter {
 
 /// Validate that a path contains only allowed characters.
 ///
-/// Allowed: `[a-zA-Z0-9/._-]`
+/// Allowed: `[a-zA-Z0-9/._-\\"]`
+/// Backslash and double quote are allowed because they are handled by
+/// the escaping logic.
 fn validate_path_characters(path: &str) -> Result<(), MhostError> {
     let allowed: std::collections::HashSet<char> =
-        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/._-"
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/._-\\\""
             .chars()
             .collect();
     if let Some(ch) = path.chars().find(|c| !allowed.contains(c)) {

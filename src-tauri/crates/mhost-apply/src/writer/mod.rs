@@ -173,7 +173,7 @@ impl HostsWriter {
 
         // 13. Flush DNS cache (non-blocking: failure is logged but not fatal)
         if let Err(e) = self.platform.flush_dns_cache() {
-            eprintln!("[mHost] Warning: DNS cache flush failed: {}", e);
+            log::warn!("DNS cache flush failed: {}", e);
         }
 
         // 14. Verify write result
@@ -181,7 +181,7 @@ impl HostsWriter {
         if let Err(verify_err) = verification::verify(&written, plan) {
             // Rollback to backup on verification failure
             if let Some(ref backup) = backup_path {
-                eprintln!("[mHost] Verification failed, rolling back...");
+                log::warn!("Verification failed, rolling back...");
                 let backup_content = fs::read_to_string(backup)?;
                 if let Err(rollback_err) = self.atomic_write(&backup_content) {
                     return Err(ApplyError::VerificationFailed(format!(
