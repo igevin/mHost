@@ -58,7 +58,7 @@ export type AppError =
 
 export interface ParseErrorAtLine {
   line_number: number;
-  error: string;
+  error: string | Record<string, string>;
 }
 
 export interface ValidateResult {

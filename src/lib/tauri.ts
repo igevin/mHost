@@ -64,18 +64,12 @@ export async function exportProfile(id: string, format: ExportFormat): Promise<s
   return invoke("export_profile", { id, format });
 }
 
+export async function exportProfileToFile(id: string, format: ExportFormat, path: string): Promise<void> {
+  return invoke("export_profile_to_file", { id, format, path });
+}
+
 export async function duplicateProfile(id: string, newName: string): Promise<Profile> {
   return invoke("duplicate_profile", { id, newName });
-}
-
-// ---- File I/O commands ----
-
-export async function readFileText(path: string): Promise<string> {
-  return invoke("read_file_text", { path });
-}
-
-export async function writeFileText(path: string, content: string): Promise<void> {
-  return invoke("write_file_text", { path, content });
 }
 
 // ---- Hosts block commands ----

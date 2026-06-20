@@ -12,7 +12,7 @@ import {
   toggleProfileEnabledAtom,
 } from "../stores/profiles";
 import type { Profile, ExportFormat } from "../types";
-import { exportProfile, duplicateProfile, writeFileText } from "../lib/tauri";
+import { exportProfileToFile, duplicateProfile } from "../lib/tauri";
 import { save } from "@tauri-apps/plugin-dialog";
 import ProfileCard from "../components/ProfileCard";
 import CreateProfileForm from "../components/CreateProfileForm";
@@ -97,7 +97,6 @@ function ProfileList() {
 
   const handleExport = useCallback(async (profile: Profile, format: ExportFormat) => {
     try {
-      const content = await exportProfile(profile.id, format);
       const path = await save({
         defaultPath: `${profile.name}.${format === "hosts" ? "hosts" : "json"}`,
         filters: format === "hosts"
@@ -105,7 +104,7 @@ function ProfileList() {
           : [{ name: "JSON", extensions: ["json"] }],
       });
       if (path) {
-        await writeFileText(path, content);
+        await exportProfileToFile(profile.id, format, path);
       }
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : String(err));

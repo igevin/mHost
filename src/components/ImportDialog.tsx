@@ -153,7 +153,7 @@ function ImportDialog({ open, onClose, onImported }: ImportDialogProps) {
           <div className={styles.errorList}>
             {errors.map((err) => (
               <div key={err.line_number} className={styles.errorItem}>
-                Line {err.line_number}: {err.error}
+                Line {err.line_number}: {typeof err.error === "string" ? err.error : JSON.stringify(err.error)}
               </div>
             ))}
           </div>
