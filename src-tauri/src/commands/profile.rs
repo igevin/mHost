@@ -1,6 +1,7 @@
 use std::str::FromStr;
 
 use mhost_core::{MhostError, Profile, ProfileId};
+use mhost_storage::storage::Storage;
 use tauri::State;
 
 use crate::state::AppState;
@@ -35,6 +36,23 @@ pub fn delete_profile(id: String, state: State<'_, AppState>) -> Result<(), Mhos
     state.storage.delete_profile(&profile_id).map_err(Into::into)
 }
 
+/// Disable all profiles except the given one.
+///
+/// Phase 0 constraint: only one profile can be enabled at a time.
+pub fn disable_other_profiles(
+    storage: &(dyn Storage + Send + Sync),
+    except_id: &ProfileId,
+) -> Result<(), MhostError> {
+    let all_profiles = storage.list_profiles()?;
+    for mut p in all_profiles {
+        if p.enabled && p.id != *except_id {
+            p.enabled = false;
+            storage.save_profile(&p)?;
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn set_profile_enabled(
     id: String,
@@ -45,13 +63,7 @@ pub fn set_profile_enabled(
 
     // 阶段 0：只允许一个 Profile 启用
     if enabled {
-        let all_profiles = state.storage.list_profiles()?;
-        for mut p in all_profiles {
-            if p.enabled && p.id != profile_id {
-                p.enabled = false;
-                state.storage.save_profile(&p)?;
-            }
-        }
+        disable_other_profiles(state.storage.as_ref(), &profile_id)?;
     }
 
     let mut profile = state.storage.load_profile(&profile_id)?;

@@ -2,7 +2,6 @@
 export {
   profilesAtom,
   selectedProfileIdAtom,
-  applyPlanAtom,
   isApplyingAtom,
   errorAtom,
   isLoadingAtom,

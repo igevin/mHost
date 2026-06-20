@@ -116,6 +116,9 @@ export const toggleProfileEnabledAtom = atom(
 
     const newEnabled = !target.enabled;
 
+    // Save a full snapshot of all profiles for rollback
+    const previousProfiles = [...profiles];
+
     // Optimistic UI update
     if (newEnabled) {
       set(profilesAtom, (prev) =>
@@ -139,10 +142,8 @@ export const toggleProfileEnabledAtom = atom(
       set(profilesAtom, updated);
     } catch (err) {
       set(errorAtom, extractErrorMessage(err));
-      // Revert optimistic update
-      set(profilesAtom, (prev) =>
-        prev.map((p) => (p.id === id ? target : p)),
-      );
+      // Revert optimistic update: restore full profiles snapshot
+      set(profilesAtom, previousProfiles);
       throw err;
     } finally {
       set(isApplyingAtom, false);

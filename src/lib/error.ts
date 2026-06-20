@@ -22,6 +22,14 @@ export function extractErrorMessage(err: unknown): string {
       return obj.message;
     }
 
+    // MhostError::Io serializes as { "Io": { "kind": "...", "message": "..." } }
+    if (typeof obj.Io === "object" && obj.Io !== null) {
+      const ioObj = obj.Io as Record<string, unknown>;
+      if (typeof ioObj.message === "string") {
+        return ioObj.message;
+      }
+    }
+
     // MhostError variants with a single string payload (Parse, Apply, Storage, InvalidInput)
     if (typeof obj.Parse === "string") return obj.Parse;
     if (typeof obj.Apply === "string") return obj.Apply;
