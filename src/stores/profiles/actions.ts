@@ -191,7 +191,7 @@ export const applyHostsActionAtom = atom(null, async (get, set) => {
   }
 });
 
-export const rollbackHostsActionAtom = atom(null, async (get, set) => {
+export const rollbackHostsActionAtom = atom(null, async (get, _set) => {
   try {
     await rollbackHosts();
     await get(fetchProfilesAtom);
