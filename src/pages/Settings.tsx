@@ -28,7 +28,7 @@ function Settings() {
         <div className={`card ${styles.aboutCard}`}>
           <div className={styles.aboutLogo}>m</div>
           <div className={styles.aboutName}>mHost</div>
-          <div className={styles.aboutVersion}>Version 1.0.0</div>
+          <div className={styles.aboutVersion}>Version {__APP_VERSION__}</div>
           <div className={styles.aboutInfo}>
             <div className={styles.aboutInfoItem}>
               <div className={styles.label}>Phase</div>

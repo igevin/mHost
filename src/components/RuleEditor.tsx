@@ -60,11 +60,15 @@ function highlightText(text: string): string {
         remaining = remaining.slice(2);
       }
 
-      // IP address
-      const ipMatch = remaining.match(/^(\d+\.\d+\.\d+\.\d+)/);
-      if (ipMatch) {
-        html += `<span class="${styles.tokenIp}">${escapeHtml(ipMatch[1])}</span>`;
-        remaining = remaining.slice(ipMatch[1].length);
+      // IP address (IPv4 or IPv6)
+      const ipv4Match = remaining.match(/^(\d+\.\d+\.\d+\.\d+)/);
+      const ipv6Match = remaining.match(/^([0-9a-fA-F:]+)/);
+      if (ipv4Match) {
+        html += `<span class="${styles.tokenIp}">${escapeHtml(ipv4Match[1])}</span>`;
+        remaining = remaining.slice(ipv4Match[1].length);
+      } else if (ipv6Match && ipv6Match[1].includes(":")) {
+        html += `<span class="${styles.tokenIp}">${escapeHtml(ipv6Match[1])}</span>`;
+        remaining = remaining.slice(ipv6Match[1].length);
       }
 
       // Remaining: spaces, domains, inline comment
@@ -204,7 +208,7 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEd
 
   return (
     <div className={styles.container}>
-      <div className={styles.editorWrapper}>
+      <div className={`${styles.editorWrapper} ${errors.length > 0 ? styles.editorWrapperHasErrors : ""}`}>
         {/* Highlight Layer */}
         <div
           ref={highlightRef}
@@ -216,7 +220,7 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEd
         {/* Textarea */}
         <textarea
           ref={textareaRef}
-          className={`${styles.textarea} ${errors.length > 0 ? styles.hasErrors : ""}`}
+          className={styles.textarea}
           value={text}
           onChange={handleChange}
           onScroll={handleScroll}

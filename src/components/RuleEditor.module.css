@@ -80,7 +80,7 @@
   cursor: default;
 }
 
-.hasErrors {
+.editorWrapperHasErrors {
   border-color: var(--color-danger) !important;
 }
 
