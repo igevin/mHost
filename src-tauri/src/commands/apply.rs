@@ -2,7 +2,7 @@ use mhost_apply::{ApplyPlan, generate_plan};
 use mhost_apply::writer::HostsWriter;
 use mhost_core::MhostError;
 use mhost_storage::storage::Storage;
-use tauri::State;
+use tauri::{AppHandle, State};
 
 use crate::commands::profile::disable_other_profiles;
 use crate::state::AppState;
@@ -94,8 +94,11 @@ pub fn enable_and_apply(
     id: String,
     enabled: bool,
     state: State<'_, AppState>,
+    app_handle: AppHandle,
 ) -> Result<(), MhostError> {
-    enable_and_apply_logic(&id, enabled, state.storage.as_ref(), &state.writer)
+    enable_and_apply_logic(&id, enabled, state.storage.as_ref(), &state.writer)?;
+    crate::tray::update_tray_menu(&app_handle);
+    Ok(())
 }
 
 #[tauri::command]
