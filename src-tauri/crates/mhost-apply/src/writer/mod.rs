@@ -40,8 +40,8 @@ pub struct OsascriptMover;
 #[allow(deprecated)]
 impl ElevatedMover for OsascriptMover {
     fn elevated_move(&self, from: &Path, to: &Path) -> Result<(), MhostError> {
-        let from_escaped = crate::platform::macos::escape_applescript_path(&from.to_string_lossy());
-        let to_escaped = crate::platform::macos::escape_applescript_path(&to.to_string_lossy());
+        let from_escaped = crate::platform::macos::escape_applescript_path(&from.to_string_lossy())?;
+        let to_escaped = crate::platform::macos::escape_applescript_path(&to.to_string_lossy())?;
         let script = format!(
             "do shell script \"mv {} {}\" with administrator privileges",
             from_escaped, to_escaped
