@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import type { Profile, ParseErrorAtLine } from "../types";
 import { validateHostsText, importProfile } from "../lib/tauri";
+import { extractErrorMessage } from "../lib/error";
 import styles from "./ImportDialog.module.css";
 
 interface ImportDialogProps {
@@ -88,7 +89,7 @@ function ImportDialog({ open, onClose, onImported }: ImportDialogProps) {
       onImported(profile);
       onClose();
     } catch (err) {
-      setImportError(err instanceof Error ? err.message : String(err));
+      setImportError(extractErrorMessage(err));
     } finally {
       setIsImporting(false);
     }

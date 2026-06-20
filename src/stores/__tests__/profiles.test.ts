@@ -3,7 +3,6 @@ import { getDefaultStore } from "jotai";
 import {
   profilesAtom,
   selectedProfileIdAtom,
-  applyPlanAtom,
   isApplyingAtom,
   errorAtom,
 } from "../profiles";
@@ -19,11 +18,6 @@ describe("Profile store atoms", () => {
   it("selectedProfileIdAtom defaults to null", () => {
     const id = store.get(selectedProfileIdAtom);
     expect(id).toBeNull();
-  });
-
-  it("applyPlanAtom defaults to null", () => {
-    const plan = store.get(applyPlanAtom);
-    expect(plan).toBeNull();
   });
 
   it("isApplyingAtom defaults to false", () => {

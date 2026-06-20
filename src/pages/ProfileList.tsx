@@ -11,6 +11,7 @@ import {
   deleteProfileAtom,
   toggleProfileEnabledAtom,
 } from "../stores/profiles";
+import { extractErrorMessage } from "../lib/error";
 import type { Profile, ExportFormat } from "../types";
 import { exportProfileToFile, duplicateProfile } from "../lib/tauri";
 import { save } from "@tauri-apps/plugin-dialog";
@@ -41,7 +42,7 @@ function ProfileList() {
   useEffect(() => {
     // Load profiles on mount; gracefully handle missing backend
     fetchProfiles().catch((err: unknown) => {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(extractErrorMessage(err));
     });
   }, [fetchProfiles, setError]);
 
@@ -52,7 +53,7 @@ function ProfileList() {
       setSelectedId(profile.id);
       navigate(`/profiles/${profile.id}`);
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(extractErrorMessage(err));
     }
   }, [createProfile, setSelectedId, navigate, setError]);
 
@@ -62,7 +63,7 @@ function ProfileList() {
       try {
         await deleteProfile(id);
       } catch (err: unknown) {
-        setError(err instanceof Error ? err.message : String(err));
+        setError(extractErrorMessage(err));
       }
     },
     [deleteProfile, setError],
@@ -73,7 +74,7 @@ function ProfileList() {
       try {
         await toggleEnabled(id);
       } catch (err: unknown) {
-        setError(err instanceof Error ? err.message : String(err));
+        setError(extractErrorMessage(err));
       }
     },
     [toggleEnabled, setError],
@@ -107,7 +108,7 @@ function ProfileList() {
         await exportProfileToFile(profile.id, format, path);
       }
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(extractErrorMessage(err));
     }
     setExportTarget(null);
   }, [setError]);
@@ -121,7 +122,7 @@ function ProfileList() {
       setSelectedId(profile.id);
       navigate(`/profiles/${profile.id}`);
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(extractErrorMessage(err));
     }
   }, [duplicateTarget, duplicateName, setSelectedId, navigate, setError]);
 

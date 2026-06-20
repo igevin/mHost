@@ -2,7 +2,6 @@
 export {
   profilesAtom,
   selectedProfileIdAtom,
-  applyPlanAtom,
   isApplyingAtom,
   errorAtom,
   isLoadingAtom,
@@ -18,7 +17,5 @@ export {
   updateProfileAtom,
   deleteProfileAtom,
   toggleProfileEnabledAtom,
-  generateApplyPlanActionAtom,
-  applyHostsActionAtom,
   rollbackHostsActionAtom,
 } from "./actions";

@@ -30,6 +30,15 @@ export async function setProfileEnabled(
   return invoke("set_profile_enabled", { id, enabled });
 }
 
+// ---- Enable & Apply (single atomic command) ----
+
+export async function enableAndApply(
+  id: string,
+  enabled: boolean,
+): Promise<void> {
+  return invoke("enable_and_apply", { id, enabled });
+}
+
 // ---- Apply commands ----
 
 export async function generateApplyPlan(): Promise<ApplyPlan> {

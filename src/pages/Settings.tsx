@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
 import { useSetAtom } from "jotai";
 import { readSystemHosts } from "../lib/tauri";
+import { extractErrorMessage } from "../lib/error";
 import { rollbackHostsActionAtom } from "../stores/profiles";
 import RollbackButton from "../components/RollbackButton";
 import styles from "./Settings.module.css";
@@ -13,7 +14,7 @@ function Settings() {
   useEffect(() => {
     readSystemHosts()
       .then((content) => setHostsContent(content))
-      .catch((err) => setHostsError(err instanceof Error ? err.message : String(err)));
+      .catch((err) => setHostsError(extractErrorMessage(err)));
   }, []);
 
   return (

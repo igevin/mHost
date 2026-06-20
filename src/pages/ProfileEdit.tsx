@@ -9,6 +9,7 @@ import {
   fetchProfileAtom,
   updateProfileAtom,
 } from "../stores/profiles";
+import { extractErrorMessage } from "../lib/error";
 import type { HostRule, Profile } from "../types";
 import BasicInfoForm from "../components/BasicInfoForm";
 import RuleEditor from "../components/RuleEditor";
@@ -37,7 +38,7 @@ function ProfileEdit() {
       setSelectedId(id);
       if (!profile) {
         fetchProfile(id).catch((err: unknown) => {
-          setError(err instanceof Error ? err.message : String(err));
+          setError(extractErrorMessage(err));
         });
       }
     }
@@ -89,7 +90,7 @@ function ProfileEdit() {
       await updateProfile(draft);
       setHasChanges(false);
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(extractErrorMessage(err));
     }
   }, [draft, ruleErrors, updateProfile, setError]);
 

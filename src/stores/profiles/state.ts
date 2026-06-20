@@ -1,11 +1,10 @@
 import { atom } from "jotai";
-import type { Profile, ApplyPlan } from "../../types";
+import type { Profile } from "../../types";
 
 // ---- Base atoms ----
 
 export const profilesAtom = atom<Profile[]>([]);
 export const selectedProfileIdAtom = atom<string | null>(null);
-export const applyPlanAtom = atom<ApplyPlan | null>(null);
 export const isApplyingAtom = atom(false);
 export const errorAtom = atom<string | null>(null);
 export const isLoadingAtom = atom(false);

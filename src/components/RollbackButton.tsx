@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { extractErrorMessage } from "../lib/error";
 import styles from "./RollbackButton.module.css";
 
 interface RollbackButtonProps {
@@ -22,9 +23,7 @@ function RollbackButton({ onRollback }: RollbackButtonProps) {
       await onRollback();
       setShowConfirm(false);
     } catch (err) {
-      setError(
-        err instanceof Error ? err.message : String(err),
-      );
+      setError(extractErrorMessage(err));
     } finally {
       setIsRollingBack(false);
     }

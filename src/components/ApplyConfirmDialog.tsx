@@ -1,8 +1,6 @@
-import { useAtomValue, useSetAtom } from "jotai";
+import { useAtomValue } from "jotai";
 import {
-  applyPlanAtom,
   isApplyingAtom,
-  applyHostsActionAtom,
 } from "../stores/profiles";
 import styles from "./ApplyConfirmDialog.module.css";
 
@@ -21,21 +19,9 @@ function ApplyConfirmDialog({
   applyError,
   onRollback,
 }: ApplyConfirmDialogProps) {
-  const applyPlan = useAtomValue(applyPlanAtom);
   const isApplying = useAtomValue(isApplyingAtom);
-  const applyHosts = useSetAtom(applyHostsActionAtom);
 
   if (!open) return null;
-
-  const hasConflicts = applyPlan !== null && applyPlan.conflicts.length > 0;
-
-  const handleConfirm = async () => {
-    try {
-      await applyHosts();
-    } catch {
-      // Error is handled by the store
-    }
-  };
 
   return (
     <div className={styles.overlay} role="dialog" aria-modal="true">
@@ -71,76 +57,6 @@ function ApplyConfirmDialog({
               </button>
             )}
           </div>
-        )}
-
-        {/* Diff preview (show when not applying and no result yet) */}
-        {!isApplying && !applyResult && applyPlan && (
-          <>
-            {/* Conflicts */}
-            {hasConflicts && (
-              <div className={styles.conflictSection}>
-                {applyPlan.conflicts.map((conflict) => (
-                  <div key={conflict.domain} className={styles.conflictItem}>
-                    Conflict on{" "}
-                    <span className={styles.conflictDomain}>
-                      {conflict.domain}
-                    </span>
-                    : {conflict.rules.length} profiles claim this domain
-                  </div>
-                ))}
-              </div>
-            )}
-
-            {/* Diff */}
-            <div className={styles.diffPreview}>
-              {applyPlan.diff.added.length === 0 &&
-              applyPlan.diff.removed.length === 0 &&
-              applyPlan.diff.unchanged.length === 0 ? (
-                <div className={styles.diffEmpty}>No changes to preview.</div>
-              ) : (
-                <>
-                  {applyPlan.diff.removed.map((line, i) => (
-                    <div
-                      key={`removed-${i}`}
-                      className={`${styles.diffLine} ${styles.diffRemoved}`}
-                    >
-                      {line}
-                    </div>
-                  ))}
-                  {applyPlan.diff.unchanged.map((line, i) => (
-                    <div
-                      key={`unchanged-${i}`}
-                      className={`${styles.diffLine} ${styles.diffUnchanged}`}
-                    >
-                      {line}
-                    </div>
-                  ))}
-                  {applyPlan.diff.added.map((line, i) => (
-                    <div
-                      key={`added-${i}`}
-                      className={`${styles.diffLine} ${styles.diffAdded}`}
-                    >
-                      {line}
-                    </div>
-                  ))}
-                </>
-              )}
-            </div>
-
-            {/* Actions */}
-            <div className={styles.dialogActions}>
-              <button className="btn btn-ghost" onClick={onClose}>
-                Cancel
-              </button>
-              <button
-                className="btn btn-primary"
-                onClick={handleConfirm}
-                disabled={hasConflicts}
-              >
-                Confirm
-              </button>
-            </div>
-          </>
         )}
 
         {/* Close button for success/error states */}
