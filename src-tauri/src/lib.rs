@@ -1,9 +1,12 @@
 pub mod commands;
 pub mod platform;
 pub mod state;
+pub mod tray;
+pub mod tray_logic;
 
 use commands::{apply::*, profile::*, profile_io::*, validate::*};
 use state::AppState;
+use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -15,7 +18,7 @@ pub fn run() {
         }
     };
 
-    tauri::Builder::default()
+    if let Err(e) = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(app_state)
         .invoke_handler(tauri::generate_handler![
@@ -39,6 +42,29 @@ pub fn run() {
             export_profile_to_file,
             import_profile_from_file,
         ])
+        .setup(|app| {
+            if let Err(e) = crate::tray::build_tray(&app.handle()) {
+                eprintln!("[mHost] Failed to build tray: {}", e);
+            }
+
+            // Intercept window close to hide instead of exit
+            if let Some(window) = app.get_webview_window("main") {
+                let handle = app.handle().clone();
+                window.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        if let Some(window) = handle.get_webview_window("main") {
+                            let _ = window.hide();
+                        }
+                    }
+                });
+            }
+
+            Ok(())
+        })
         .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+    {
+        eprintln!("[mHost] Tauri application error: {}", e);
+        std::process::exit(1);
+    }
 }

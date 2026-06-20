@@ -2,7 +2,7 @@ use std::str::FromStr;
 
 use mhost_core::{MhostError, Profile, ProfileId};
 use mhost_storage::storage::Storage;
-use tauri::State;
+use tauri::{AppHandle, State};
 
 use crate::state::AppState;
 
@@ -18,22 +18,38 @@ pub fn get_profile(id: String, state: State<'_, AppState>) -> Result<Profile, Mh
 }
 
 #[tauri::command]
-pub fn create_profile(name: String, state: State<'_, AppState>) -> Result<Profile, MhostError> {
+pub fn create_profile(
+    name: String,
+    state: State<'_, AppState>,
+    app_handle: AppHandle,
+) -> Result<Profile, MhostError> {
     let profile = Profile::new(name);
     state.storage.save_profile(&profile)?;
+    crate::tray::update_tray_menu(&app_handle);
     Ok(profile)
 }
 
 #[tauri::command]
-pub fn update_profile(profile: Profile, state: State<'_, AppState>) -> Result<Profile, MhostError> {
+pub fn update_profile(
+    profile: Profile,
+    state: State<'_, AppState>,
+    app_handle: AppHandle,
+) -> Result<Profile, MhostError> {
     state.storage.save_profile(&profile)?;
+    crate::tray::update_tray_menu(&app_handle);
     Ok(profile)
 }
 
 #[tauri::command]
-pub fn delete_profile(id: String, state: State<'_, AppState>) -> Result<(), MhostError> {
+pub fn delete_profile(
+    id: String,
+    state: State<'_, AppState>,
+    app_handle: AppHandle,
+) -> Result<(), MhostError> {
     let profile_id = ProfileId::from_str(&id)?;
-    state.storage.delete_profile(&profile_id).map_err(Into::into)
+    state.storage.delete_profile(&profile_id)?;
+    crate::tray::update_tray_menu(&app_handle);
+    Ok(())
 }
 
 /// Disable all profiles except the given one.
@@ -58,6 +74,7 @@ pub fn set_profile_enabled(
     id: String,
     enabled: bool,
     state: State<'_, AppState>,
+    app_handle: AppHandle,
 ) -> Result<Profile, MhostError> {
     let profile_id = ProfileId::from_str(&id)?;
 
@@ -70,5 +87,6 @@ pub fn set_profile_enabled(
     profile.enabled = enabled;
     profile.updated_at = chrono::Utc::now();
     state.storage.save_profile(&profile)?;
+    crate::tray::update_tray_menu(&app_handle);
     Ok(profile)
 }
