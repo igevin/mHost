@@ -36,8 +36,8 @@ export async function generateApplyPlan(): Promise<ApplyPlan> {
   return invoke("generate_apply_plan");
 }
 
-export async function applyHosts(): Promise<void> {
-  return invoke("apply_hosts");
+export async function applyHosts(plan: ApplyPlan): Promise<void> {
+  return invoke("apply_hosts", { plan });
 }
 
 export async function rollbackHosts(): Promise<void> {

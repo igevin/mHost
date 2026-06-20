@@ -185,11 +185,17 @@ export const generateApplyPlanActionAtom = atom(
   },
 );
 
-export const applyHostsActionAtom = atom(null, async (_get, set) => {
+export const applyHostsActionAtom = atom(null, async (get, set) => {
+  const plan = get(applyPlanAtom);
+  if (!plan) {
+    set(errorAtom, "No apply plan available. Please generate a plan first.");
+    return;
+  }
+
   set(isApplyingAtom, true);
   set(errorAtom, null);
   try {
-    await applyHosts();
+    await applyHosts(plan);
   } catch (err) {
     set(errorAtom, err instanceof Error ? err.message : String(err));
     throw err;

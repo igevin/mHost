@@ -7,8 +7,16 @@ use crate::state::AppState;
 #[tauri::command]
 pub fn generate_apply_plan(state: State<'_, AppState>) -> Result<ApplyPlan, MhostError> {
     let profiles = state.storage.list_profiles()?;
-    let current_hosts = std::fs::read_to_string("/etc/hosts")
-        .unwrap_or_default();
+    let current_hosts = match std::fs::read_to_string("/etc/hosts") {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(MhostError::Io {
+                kind: e.kind().to_string(),
+                message: e.to_string(),
+            });
+        }
+    };
     generate_plan(&profiles, &current_hosts).map_err(Into::into)
 }
 
