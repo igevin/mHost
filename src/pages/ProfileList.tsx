@@ -211,13 +211,13 @@ function ProfileList() {
             <div className={styles.dialogActions}>
               <button
                 className="btn btn-primary"
-                onClick={() => handleExport(exportTarget.id, "hosts")}
+                onClick={() => handleExport(exportTarget, "hosts")}
               >
                 hosts format
               </button>
               <button
                 className="btn btn-ghost"
-                onClick={() => handleExport(exportTarget.id, "json")}
+                onClick={() => handleExport(exportTarget, "json")}
               >
                 JSON format
               </button>

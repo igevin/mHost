@@ -191,10 +191,11 @@ export const applyHostsActionAtom = atom(null, async (get, set) => {
   }
 });
 
-export const rollbackHostsActionAtom = atom(null, async (get, _set) => {
+export const rollbackHostsActionAtom = atom(null, async (_get, set) => {
   try {
     await rollbackHosts();
-    await get(fetchProfilesAtom);
+    const profiles = await listProfiles();
+    set(profilesAtom, profiles);
   } catch (e) {
     console.error("Rollback failed:", e);
     throw e;
