@@ -36,13 +36,18 @@ describe("RuleEditor", () => {
     vi.useRealTimers();
   });
 
-  it("renders rules as hosts text", () => {
+  it("renders rules as hosts text with syntax highlighting layer", () => {
     const onChange = vi.fn();
     render(<RuleEditor rules={sampleRules} onChange={onChange} />);
 
-    const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
-    expect(textarea.value).toContain("127.0.0.1 localhost # local");
-    expect(textarea.value).toContain("192.168.1.1 example.com www.example.com");
+    const textarea = screen.getByRole("textbox");
+    expect(textarea).toHaveValue("127.0.0.1 localhost # local\n192.168.1.1 example.com www.example.com");
+
+    // Highlight layer should contain colored spans
+    const highlightLayer = document.querySelector("[aria-hidden='true']");
+    expect(highlightLayer).toBeInTheDocument();
+    expect(highlightLayer).toHaveTextContent("127.0.0.1");
+    expect(highlightLayer).toHaveTextContent("localhost");
   });
 
   it("shows validation errors inline", async () => {
@@ -55,15 +60,12 @@ describe("RuleEditor", () => {
     render(<RuleEditor rules={sampleRules} onChange={onChange} />);
     const textarea = screen.getByRole("textbox");
 
-    // Use fireEvent to avoid userEvent + fakeTimers conflict
     fireEvent.change(textarea, { target: { value: "127.0.0.1 localhost\ninvalid-line" } });
 
-    // Advance debounce timer
     act(() => {
       vi.advanceTimersByTime(350);
     });
 
-    // Flush async promise resolution
     await act(async () => {
       await vi.runAllTimersAsync();
     });
@@ -148,7 +150,7 @@ describe("RuleEditor", () => {
     const onChange = vi.fn();
     render(<RuleEditor rules={sampleRules} onChange={onChange} readOnly />);
 
-    const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
-    expect(textarea.readOnly).toBe(true);
+    const textarea = screen.getByRole("textbox");
+    expect(textarea).toHaveAttribute("readonly");
   });
 });

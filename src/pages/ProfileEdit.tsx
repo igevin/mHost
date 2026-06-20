@@ -108,7 +108,7 @@ function ProfileEdit() {
   }
 
   return (
-    <div className="mhost-page">
+    <div className={`mhost-page ${styles.editPage}`}>
       <header className="mhost-page-header">
         <div>
           <h1 className="mhost-page-title">Edit Profile</h1>

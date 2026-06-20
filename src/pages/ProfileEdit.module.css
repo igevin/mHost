@@ -1,9 +1,35 @@
+/* ---- Edit Page (fills main content area) ---- */
+
+.editPage {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  max-width: none;
+}
+
 /* ---- Edit Grid ---- */
 
 .editGrid {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 16px;
+  flex: 1;
+  min-height: 0; /* Critical: allows grid to shrink below content size */
+  align-items: stretch;
+}
+
+/* Each card column becomes a flex column so inner content can fill */
+.editGrid > .card,
+.editGrid > [class*="card"] {
+  display: flex;
+  flex-direction: column;
+  min-height: 0; /* Allow card to shrink */
+  overflow: hidden;
+}
+
+.editGrid > .card .card-title,
+.editGrid > [class*="card"] .card-title {
+  flex-shrink: 0;
 }
 
 @media (max-width: 768px) {
@@ -44,6 +70,10 @@
   font-size: 13px;
   font-weight: 600;
   color: var(--color-primary);
+  background: var(--accent-lighter);
+  padding: 2px 8px;
+  border-radius: 4px;
+  display: inline-block;
 }
 
 .ruleStatus {
@@ -57,6 +87,7 @@
 .ruleDomains {
   font-size: 13px;
   color: var(--color-text);
+  font-weight: 500;
 }
 
 .ruleComment {

@@ -12,6 +12,75 @@
   }
 }
 
+/* ---- Settings Group (Prototype aligned) ---- */
+
+.settingsGroup {
+  margin-bottom: 28px;
+}
+
+.settingsGroupTitle {
+  font-size: 15px;
+  font-weight: 700;
+  margin-bottom: 14px;
+  color: var(--color-text);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.settingsGroupTitle svg {
+  width: 18px;
+  height: 18px;
+  color: var(--color-primary);
+}
+
+/* ---- Setting Row ---- */
+
+.settingRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  margin-bottom: 8px;
+  transition: all var(--transition-fast);
+}
+
+.settingRow:hover {
+  border-color: var(--color-primary);
+}
+
+.settingRow:first-of-type {
+  border-radius: var(--radius-md) var(--radius-md) var(--radius-sm) var(--radius-sm);
+}
+
+.settingRow:last-of-type {
+  border-radius: var(--radius-sm) var(--radius-sm) var(--radius-md) var(--radius-md);
+  margin-bottom: 0;
+}
+
+.settingRow:only-of-type {
+  border-radius: var(--radius-md);
+}
+
+.settingInfo {
+  flex: 1;
+}
+
+.settingLabel {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-text);
+}
+
+.settingDesc {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  margin-top: 2px;
+}
+
 /* ---- Info Row ---- */
 
 .infoRow {
@@ -33,6 +102,7 @@
 .infoValue {
   font-size: 13px;
   font-weight: 500;
+  color: var(--color-text);
 }
 
 /* ---- Section Description ---- */
@@ -47,7 +117,7 @@
 /* ---- Hosts Preview ---- */
 
 .hostsPreview {
-  background: var(--color-bg);
+  background: var(--color-readonly-bg);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-sm);
   padding: 12px;
@@ -58,4 +128,65 @@
   white-space: pre-wrap;
   word-break: break-word;
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+/* ---- About Card ---- */
+
+.aboutCard {
+  text-align: center;
+  padding: 32px;
+}
+
+.aboutLogo {
+  width: 64px;
+  height: 64px;
+  background: var(--color-primary);
+  border-radius: var(--radius-lg);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: white;
+  font-weight: 800;
+  font-size: 28px;
+  margin: 0 auto 16px;
+}
+
+.aboutName {
+  font-size: 22px;
+  font-weight: 700;
+  margin-bottom: 4px;
+  color: var(--color-text);
+}
+
+.aboutVersion {
+  font-size: 13px;
+  color: var(--color-text-secondary);
+  margin-bottom: 20px;
+}
+
+.aboutInfo {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  text-align: left;
+}
+
+.aboutInfoItem {
+  padding: 10px 14px;
+  background: var(--color-bg);
+  border-radius: var(--radius-sm);
+}
+
+.aboutInfoItem .label {
+  font-size: 11px;
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+
+.aboutInfoItem .value {
+  font-size: 13px;
+  font-weight: 600;
+  margin-top: 2px;
+  color: var(--color-text);
 }

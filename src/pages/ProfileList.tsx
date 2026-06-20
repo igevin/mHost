@@ -126,6 +126,11 @@ function ProfileList() {
     }
   }, [duplicateTarget, duplicateName, setSelectedId, navigate, setError]);
 
+  // Stats calculation
+  const totalProfiles = profiles.length;
+  const enabledProfiles = profiles.filter((p) => p.enabled).length;
+  const totalRules = profiles.reduce((sum, p) => sum + p.rules.length, 0);
+
   return (
     <div className="mhost-page">
       <header className="mhost-page-header">
@@ -149,6 +154,22 @@ function ProfileList() {
       </header>
 
       {error && <div className="alert alert-error">{error}</div>}
+
+      {/* Stats Dashboard */}
+      <div className={styles.statsGrid}>
+        <div className={styles.statCard}>
+          <div className={styles.statLabel}>Total Profiles</div>
+          <div className={styles.statValue}>{totalProfiles}</div>
+        </div>
+        <div className={styles.statCard}>
+          <div className={styles.statLabel}>Enabled</div>
+          <div className={styles.statValue}>{enabledProfiles}</div>
+        </div>
+        <div className={styles.statCard}>
+          <div className={styles.statLabel}>Total Rules</div>
+          <div className={styles.statValue}>{totalRules}</div>
+        </div>
+      </div>
 
       {showCreate && (
         <CreateProfileForm

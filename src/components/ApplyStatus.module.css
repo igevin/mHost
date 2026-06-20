@@ -84,8 +84,8 @@
   align-items: center;
   gap: 6px;
   padding: 8px 12px;
-  background: #fffbeb;
-  border: 1px solid #fde68a;
+  background: var(--color-warning-bg);
+  border: 1px solid var(--color-warning-border);
   border-radius: var(--radius-sm);
   font-size: 13px;
   color: var(--color-warning);
@@ -99,8 +99,8 @@
   align-items: center;
   gap: 6px;
   padding: 8px 12px;
-  background: #fef2f2;
-  border: 1px solid #fecaca;
+  background: var(--color-error-bg);
+  border: 1px solid var(--color-error-border);
   border-radius: var(--radius-sm);
   font-size: 13px;
   color: var(--color-danger);
