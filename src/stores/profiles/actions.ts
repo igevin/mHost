@@ -6,15 +6,13 @@ import {
   createProfile,
   updateProfile,
   deleteProfile,
-  setProfileEnabled,
-  generateApplyPlan,
-  applyHosts,
+  enableAndApply,
   rollbackHosts,
 } from "../../lib/tauri";
+import { extractErrorMessage } from "../../lib/error";
 import {
   profilesAtom,
   selectedProfileIdAtom,
-  applyPlanAtom,
   isApplyingAtom,
   errorAtom,
   isLoadingAtom,
@@ -29,7 +27,7 @@ export const fetchProfilesAtom = atom(null, async (_get, set) => {
     const profiles = await listProfiles();
     set(profilesAtom, profiles);
   } catch (err) {
-    set(errorAtom, err instanceof Error ? err.message : String(err));
+    set(errorAtom, extractErrorMessage(err));
   } finally {
     set(isLoadingAtom, false);
   }
@@ -50,7 +48,7 @@ export const fetchProfileAtom = atom(null, async (_get, set, id: string) => {
       return [...prev, profile];
     });
   } catch (err) {
-    set(errorAtom, err instanceof Error ? err.message : String(err));
+    set(errorAtom, extractErrorMessage(err));
   } finally {
     set(isLoadingAtom, false);
   }
@@ -64,7 +62,7 @@ export const createProfileAtom = atom(null, async (_get, set, name: string) => {
     set(profilesAtom, (prev) => [...prev, profile]);
     return profile;
   } catch (err) {
-    set(errorAtom, err instanceof Error ? err.message : String(err));
+    set(errorAtom, extractErrorMessage(err));
     throw err;
   } finally {
     set(isLoadingAtom, false);
@@ -83,7 +81,7 @@ export const updateProfileAtom = atom(
       );
       return updated;
     } catch (err) {
-      set(errorAtom, err instanceof Error ? err.message : String(err));
+      set(errorAtom, extractErrorMessage(err));
       throw err;
     } finally {
       set(isLoadingAtom, false);
@@ -101,7 +99,7 @@ export const deleteProfileAtom = atom(
       set(profilesAtom, (prev) => prev.filter((p) => p.id !== id));
       set(selectedProfileIdAtom, (prev) => (prev === id ? null : prev));
     } catch (err) {
-      set(errorAtom, err instanceof Error ? err.message : String(err));
+      set(errorAtom, extractErrorMessage(err));
       throw err;
     } finally {
       set(isLoadingAtom, false);
@@ -118,7 +116,7 @@ export const toggleProfileEnabledAtom = atom(
 
     const newEnabled = !target.enabled;
 
-    // Phase 0: only one profile can be enabled at a time
+    // Optimistic UI update
     if (newEnabled) {
       set(profilesAtom, (prev) =>
         prev.map((p) => (p.id === id ? { ...p, enabled: true } : { ...p, enabled: false })),
@@ -129,67 +127,28 @@ export const toggleProfileEnabledAtom = atom(
       );
     }
 
-    set(isLoadingAtom, true);
+    set(isApplyingAtom, true);
     set(errorAtom, null);
     try {
-      const updated = await setProfileEnabled(id, newEnabled);
-      set(profilesAtom, (prev) =>
-        prev.map((p) => {
-          if (p.id === updated.id) return updated;
-          // Ensure only one enabled after server response
-          if (newEnabled && p.id !== updated.id) return { ...p, enabled: false };
-          return p;
-        }),
-      );
+      // Backend handles: toggle enabled + generate plan + write hosts + flush DNS
+      // All in one atomic operation (triggers macOS auth prompt).
+      await enableAndApply(id, newEnabled);
+
+      // Reload profiles from backend to sync state
+      const updated = await listProfiles();
+      set(profilesAtom, updated);
     } catch (err) {
-      set(errorAtom, err instanceof Error ? err.message : String(err));
+      set(errorAtom, extractErrorMessage(err));
       // Revert optimistic update
       set(profilesAtom, (prev) =>
         prev.map((p) => (p.id === id ? target : p)),
       );
       throw err;
     } finally {
-      set(isLoadingAtom, false);
+      set(isApplyingAtom, false);
     }
   },
 );
-
-export const generateApplyPlanActionAtom = atom(
-  null,
-  async (_get, set) => {
-    set(isLoadingAtom, true);
-    set(errorAtom, null);
-    try {
-      const plan = await generateApplyPlan();
-      set(applyPlanAtom, plan);
-      return plan;
-    } catch (err) {
-      set(errorAtom, err instanceof Error ? err.message : String(err));
-      throw err;
-    } finally {
-      set(isLoadingAtom, false);
-    }
-  },
-);
-
-export const applyHostsActionAtom = atom(null, async (get, set) => {
-  const plan = get(applyPlanAtom);
-  if (!plan) {
-    set(errorAtom, "No apply plan available. Please generate a plan first.");
-    return;
-  }
-
-  set(isApplyingAtom, true);
-  set(errorAtom, null);
-  try {
-    await applyHosts(plan);
-  } catch (err) {
-    set(errorAtom, err instanceof Error ? err.message : String(err));
-    throw err;
-  } finally {
-    set(isApplyingAtom, false);
-  }
-});
 
 export const rollbackHostsActionAtom = atom(null, async (_get, set) => {
   try {

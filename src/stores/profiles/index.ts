@@ -18,7 +18,5 @@ export {
   updateProfileAtom,
   deleteProfileAtom,
   toggleProfileEnabledAtom,
-  generateApplyPlanActionAtom,
-  applyHostsActionAtom,
   rollbackHostsActionAtom,
 } from "./actions";

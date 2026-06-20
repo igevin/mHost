@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import type { HostRule, ParseErrorAtLine } from "../types";
 import { validateHostsText } from "../lib/tauri";
+import { extractErrorMessage } from "../lib/error";
 import styles from "./RuleEditor.module.css";
 
 interface RuleEditorProps {
@@ -90,7 +91,7 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEd
           onChange(result.rules);
         }
       } catch (err) {
-        setErrors([{ line_number: 0, error: "Validation failed: " + String(err) }]);
+        setErrors([{ line_number: 0, error: "Validation failed: " + extractErrorMessage(err) }]);
       } finally {
         setIsValidating(false);
       }

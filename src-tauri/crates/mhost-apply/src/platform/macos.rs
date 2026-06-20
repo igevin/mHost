@@ -20,9 +20,11 @@ impl PlatformAdapter for MacOsAdapter {
     fn elevated_move(&self, from: &Path, to: &Path) -> Result<(), MhostError> {
         let from_escaped = escape_applescript_path(&from.to_string_lossy())?;
         let to_escaped = escape_applescript_path(&to.to_string_lossy())?;
+        // Use cp + rm instead of mv to handle cross-device moves.
+        // Temp files may be created in /tmp while the target is in /etc.
         let script = format!(
-            "do shell script \"mv {} {}\" with administrator privileges",
-            from_escaped, to_escaped
+            "do shell script \"cp {} {} && rm {}\" with administrator privileges",
+            from_escaped, to_escaped, from_escaped
         );
         let output = std::process::Command::new("osascript")
             .arg("-e")

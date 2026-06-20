@@ -266,19 +266,16 @@ impl HostsWriter {
     /// in the same directory as the target, then moves it into place.
     /// The temp file is automatically cleaned up on failure.
     fn atomic_write(&self, content: &str) -> Result<(), MhostError> {
-        let parent = self
-            .hosts_path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        let mut temp_file = tempfile::NamedTempFile::new_in(parent)?;
+        // Create the temp file in the system temp directory (writable by all users).
+        // Using /etc as the parent would fail for non-root users.
+        let mut temp_file = tempfile::NamedTempFile::new()?;
         std::io::Write::write_all(&mut temp_file, content.as_bytes())?;
         temp_file.flush()?;
 
         let temp_path = temp_file.into_temp_path();
         self.platform.elevated_move(&temp_path, &self.hosts_path)?;
 
-        // On success, the temp file has been moved to hosts_path;
+        // On success, the temp file has been copied to hosts_path and removed;
         // no explicit cleanup needed.
         Ok(())
     }
