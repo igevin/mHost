@@ -38,19 +38,10 @@ impl Parser {
 
     /// Format a slice of HostRule back into hosts text.
     /// Multi-domain rules are expanded to one line per domain.
+    ///
+    /// Delegates to [`crate::formatter::format_rules`].
     pub fn format(rules: &[HostRule]) -> String {
-        let mut lines = Vec::new();
-        for rule in rules {
-            for domain in &rule.domains {
-                let line = if let Some(ref comment) = rule.comment {
-                    format!("{} {} # {}", rule.ip, domain, comment)
-                } else {
-                    format!("{} {}", rule.ip, domain)
-                };
-                lines.push(line);
-            }
-        }
-        lines.join("\n") + if lines.is_empty() { "" } else { "\n" }
+        crate::formatter::format_rules(rules)
     }
 
     /// Extract the line range (0-based, inclusive) of the managed block.

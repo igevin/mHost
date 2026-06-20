@@ -5,7 +5,7 @@
 //! file path resolution. A factory function `create_platform_adapter()` returns
 //! the correct implementation based on the target OS.
 
-mod macos;
+pub mod macos;
 
 use std::path::{Path, PathBuf};
 

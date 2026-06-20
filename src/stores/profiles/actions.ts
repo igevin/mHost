@@ -1,5 +1,5 @@
 import { atom } from "jotai";
-import type { Profile, ApplyPlan } from "../types";
+import type { Profile } from "../../types";
 import {
   listProfiles,
   getProfile,
@@ -9,29 +9,16 @@ import {
   setProfileEnabled,
   generateApplyPlan,
   applyHosts,
-} from "../lib/tauri";
-
-// ---- Base atoms ----
-
-export const profilesAtom = atom<Profile[]>([]);
-export const selectedProfileIdAtom = atom<string | null>(null);
-export const applyPlanAtom = atom<ApplyPlan | null>(null);
-export const isApplyingAtom = atom(false);
-export const errorAtom = atom<string | null>(null);
-export const isLoadingAtom = atom(false);
-
-// ---- Derived atoms ----
-
-export const selectedProfileAtom = atom((get) => {
-  const profiles = get(profilesAtom);
-  const id = get(selectedProfileIdAtom);
-  return profiles.find((p) => p.id === id) ?? null;
-});
-
-export const enabledProfileAtom = atom((get) => {
-  const profiles = get(profilesAtom);
-  return profiles.find((p) => p.enabled) ?? null;
-});
+  rollbackHosts,
+} from "../../lib/tauri";
+import {
+  profilesAtom,
+  selectedProfileIdAtom,
+  applyPlanAtom,
+  isApplyingAtom,
+  errorAtom,
+  isLoadingAtom,
+} from "./state";
 
 // ---- Async action atoms ----
 
@@ -201,5 +188,15 @@ export const applyHostsActionAtom = atom(null, async (get, set) => {
     throw err;
   } finally {
     set(isApplyingAtom, false);
+  }
+});
+
+export const rollbackHostsActionAtom = atom(null, async (get, set) => {
+  try {
+    await rollbackHosts();
+    await get(fetchProfilesAtom);
+  } catch (e) {
+    console.error("Rollback failed:", e);
+    throw e;
   }
 });

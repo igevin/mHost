@@ -60,6 +60,7 @@ impl ElevatedMover for OsascriptMover {
 /// Test mover using regular `fs::rename`.
 pub struct TestMover;
 
+#[allow(deprecated)]
 impl ElevatedMover for TestMover {
     fn elevated_move(&self, from: &Path, to: &Path) -> Result<(), MhostError> {
         fs::rename(from, to).map_err(|e| e.into())
@@ -112,6 +113,7 @@ impl HostsWriter {
     /// Retained for backward compatibility. The mover is wrapped into a
     /// `PlatformAdapter` internally.
     #[allow(dead_code)]
+    #[allow(deprecated)]
     #[deprecated(note = "Prefer with_platform() or with_paths() for new code.")]
     pub fn with_mover(
         hosts_path: impl Into<PathBuf>,
@@ -286,8 +288,10 @@ impl Default for HostsWriter {
 
 /// Adapter that wraps a legacy `ElevatedMover` into the new `PlatformAdapter`
 /// trait. Used for backward compatibility with existing tests.
+#[allow(deprecated)]
 struct MoverAdapter(Box<dyn ElevatedMover>);
 
+#[allow(deprecated)]
 impl PlatformAdapter for MoverAdapter {
     fn hosts_path(&self) -> PathBuf {
         PathBuf::from("/etc/hosts")
@@ -359,12 +363,6 @@ mod tests {
 
     #[test]
     fn test_build_content_first_write_appends_block() {
-        let temp_dir = TempDir::new().unwrap();
-        let writer = HostsWriter::with_paths(
-            temp_dir.path().join("hosts"),
-            temp_dir.path().join("backups"),
-        );
-
         let current = "# original content\n";
         let plan = plan_with_rules(vec![resolved_rule("127.0.0.1", "example.com", "p1")]);
         let content = content::build_hosts_content(current, &plan);
@@ -377,12 +375,6 @@ mod tests {
 
     #[test]
     fn test_build_content_update_replaces_block() {
-        let temp_dir = TempDir::new().unwrap();
-        let writer = HostsWriter::with_paths(
-            temp_dir.path().join("hosts"),
-            temp_dir.path().join("backups"),
-        );
-
         let current = "# before\n# ---- mHost start ----\n127.0.0.1 old.com\n# ---- mHost end ----\n# after\n";
         let plan = plan_with_rules(vec![resolved_rule("127.0.0.1", "new.com", "p1")]);
         let content = content::build_hosts_content(current, &plan);
@@ -395,12 +387,6 @@ mod tests {
 
     #[test]
     fn test_build_content_empty_rules_no_block() {
-        let temp_dir = TempDir::new().unwrap();
-        let writer = HostsWriter::with_paths(
-            temp_dir.path().join("hosts"),
-            temp_dir.path().join("backups"),
-        );
-
         let current = "# original\n";
         let plan = plan_with_rules(vec![]);
         let content = content::build_hosts_content(current, &plan);
@@ -590,12 +576,6 @@ mod tests {
 
     #[test]
     fn test_build_content_preserves_trailing_newlines() {
-        let temp_dir = TempDir::new().unwrap();
-        let writer = HostsWriter::with_paths(
-            temp_dir.path().join("hosts"),
-            temp_dir.path().join("backups"),
-        );
-
         // File ends with two blank lines (trailing whitespace)
         let current =
             "# before\n\n# ---- mHost start ----\n127.0.0.1 old.com\n# ---- mHost end ----\n\n";
@@ -615,12 +595,6 @@ mod tests {
 
     #[test]
     fn test_build_content_preserves_trailing_blank_lines_no_block() {
-        let temp_dir = TempDir::new().unwrap();
-        let writer = HostsWriter::with_paths(
-            temp_dir.path().join("hosts"),
-            temp_dir.path().join("backups"),
-        );
-
         let current = "# original\n\n";
         let plan = plan_with_rules(vec![resolved_rule("127.0.0.1", "example.com", "p1")]);
         let content = content::build_hosts_content(current, &plan);
