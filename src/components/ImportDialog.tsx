@@ -77,7 +77,7 @@ function ImportDialog({ open, onClose, onImported }: ImportDialogProps) {
     };
   }, []);
 
-  const canImport = name.trim().length > 0 && errors.length === 0 && ruleCount !== null && ruleCount > 0;
+  const canImport = name.trim().length > 0 && errors.length === 0 && ruleCount !== null;
 
   const handleImport = useCallback(async () => {
     if (!canImport) return;
