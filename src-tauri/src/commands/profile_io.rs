@@ -95,13 +95,19 @@ fn resolve_name_conflict(name: &str, storage: &dyn Storage) -> Result<String, Mh
     }
 
     let mut counter = 2;
-    loop {
+    const MAX_ITERATIONS: usize = 100;
+    while counter <= MAX_ITERATIONS {
         let candidate = format!("{} ({})", name, counter);
         if !existing_names.contains(&candidate.as_str()) {
             return Ok(candidate);
         }
         counter += 1;
     }
+
+    Err(MhostError::InvalidInput(format!(
+        "Could not resolve name conflict for '{}' after {} attempts",
+        name, MAX_ITERATIONS
+    )))
 }
 
 // ---------------------------------------------------------------------------
