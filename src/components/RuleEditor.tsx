@@ -89,8 +89,8 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEd
         if (result.errors.length === 0) {
           onChange(result.rules);
         }
-      } catch (_err) {
-        // Silently ignore validation errors
+      } catch (err) {
+        setErrors([{ line_number: 0, error: "Validation failed: " + String(err) }]);
       } finally {
         setIsValidating(false);
       }
