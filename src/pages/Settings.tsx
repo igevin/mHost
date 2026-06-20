@@ -31,11 +31,7 @@ function Settings() {
           </div>
           <div className={styles.infoRow}>
             <span className={styles.infoLabel}>Version</span>
-            <span className={styles.infoValue}>0.1.0</span>
-          </div>
-          <div className={styles.infoRow}>
-            <span className={styles.infoLabel}>Phase</span>
-            <span className={styles.infoValue}>0 (Skeleton)</span>
+            <span className={styles.infoValue}>1 (MVP Profile Switching)</span>
           </div>
         </div>
 
