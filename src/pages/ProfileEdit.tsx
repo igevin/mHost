@@ -10,6 +10,8 @@ import {
   updateProfileAtom,
 } from "../stores/profiles";
 import type { Profile } from "../types";
+import BasicInfoForm from "../components/BasicInfoForm";
+import RuleList from "../components/RuleList";
 import styles from "./ProfileEdit.module.css";
 
 function ProfileEdit() {
@@ -69,14 +71,6 @@ function ProfileEdit() {
     }
   }, [draft, updateProfile, setError]);
 
-  const handleTagsChange = useCallback((value: string) => {
-    const tags = value
-      .split(",")
-      .map((t) => t.trim())
-      .filter(Boolean);
-    handleChange("tags", tags);
-  }, [handleChange]);
-
   if (!profile || !draft) {
     return (
       <div className="mhost-page">
@@ -117,79 +111,11 @@ function ProfileEdit() {
       {error && <div className="alert alert-error">{error}</div>}
 
       <div className={styles.editGrid}>
-        <div className="card">
-          <h3 className="card-title">Basic Info</h3>
-          <div className="form-group">
-            <label className="form-label">Name</label>
-            <input
-              className="input"
-              value={draft.name}
-              onChange={(e) => handleChange("name", e.target.value)}
-            />
-          </div>
-          <div className="form-group">
-            <label className="form-label">Description</label>
-            <textarea
-              className="input textarea"
-              rows={3}
-              value={draft.description ?? ""}
-              onChange={(e) =>
-                handleChange(
-                  "description",
-                  e.target.value || null,
-                )
-              }
-            />
-          </div>
-          <div className="form-group">
-            <label className="form-label">Tags (comma separated)</label>
-            <input
-              className="input"
-              value={draft.tags.join(", ")}
-              onChange={(e) => handleTagsChange(e.target.value)}
-            />
-          </div>
-          <div className="form-group">
-            <label className="form-label">Status</label>
-            <div className="form-static">
-              {draft.enabled ? "Enabled" : "Disabled"}
-              {draft.protected && " · Protected"}
-            </div>
-          </div>
-        </div>
+        <BasicInfoForm draft={draft} onChange={handleChange} />
 
         <div className="card">
           <h3 className="card-title">Rules ({draft.rules.length})</h3>
-          {draft.rules.length === 0 ? (
-            <div className="empty-state">
-              <p>No rules in this profile.</p>
-              <p className="empty-hint">
-                Rule editing will be available in a later phase.
-              </p>
-            </div>
-          ) : (
-            <div className={styles.ruleList}>
-              {draft.rules.map((rule) => (
-                <div
-                  key={rule.id}
-                  className={`${styles.ruleItem} ${rule.enabled ? "" : styles.ruleItemDisabled}`}
-                >
-                  <div className={styles.ruleHeader}>
-                    <span className={styles.ruleIp}>{rule.ip}</span>
-                    <span className={styles.ruleStatus}>
-                      {rule.enabled ? "On" : "Off"}
-                    </span>
-                  </div>
-                  <div className={styles.ruleDomains}>
-                    {rule.domains.join(", ")}
-                  </div>
-                  {rule.comment && (
-                    <div className={styles.ruleComment}>{rule.comment}</div>
-                  )}
-                </div>
-              ))}
-            </div>
-          )}
+          <RuleList rules={draft.rules} />
         </div>
       </div>
     </div>

@@ -1,12 +1,8 @@
 import { NavLink, Outlet } from "react-router-dom";
-import { useAtomValue } from "jotai";
-import { enabledProfileAtom, isApplyingAtom } from "../stores/profiles";
+import StatusBar from "./StatusBar";
 import styles from "./Layout.module.css";
 
 function Layout() {
-  const enabledProfile = useAtomValue(enabledProfileAtom);
-  const isApplying = useAtomValue(isApplyingAtom);
-
   const navItems = [
     { to: "/profiles", label: "Profiles", icon: "Profiles" },
     { to: "/settings", label: "Settings", icon: "Settings" },
@@ -38,22 +34,7 @@ function Layout() {
           ))}
         </nav>
 
-        <div className={styles.sidebarFooter}>
-          <div className={styles.statusCard}>
-            <div className={styles.statusRow}>
-              <span className={styles.statusLabel}>Active</span>
-              <span
-                className={`${styles.statusDot} ${enabledProfile ? styles.statusDotOn : styles.statusDotOff}`}
-              />
-            </div>
-            <div className={styles.statusProfile}>
-              {enabledProfile ? enabledProfile.name : "None"}
-            </div>
-            {isApplying && (
-              <div className={styles.statusApplying}>Applying...</div>
-            )}
-          </div>
-        </div>
+        <StatusBar />
       </aside>
 
       <main className={styles.mhostMain}>

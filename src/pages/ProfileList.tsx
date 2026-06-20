@@ -11,6 +11,8 @@ import {
   deleteProfileAtom,
   toggleProfileEnabledAtom,
 } from "../stores/profiles";
+import ProfileCard from "../components/ProfileCard";
+import CreateProfileForm from "../components/CreateProfileForm";
 import styles from "./ProfileList.module.css";
 
 function ProfileList() {
@@ -26,7 +28,6 @@ function ProfileList() {
   const deleteProfile = useSetAtom(deleteProfileAtom);
   const toggleEnabled = useSetAtom(toggleProfileEnabledAtom);
 
-  const [newName, setNewName] = useState("");
   const [showCreate, setShowCreate] = useState(false);
 
   useEffect(() => {
@@ -36,19 +37,16 @@ function ProfileList() {
     });
   }, [fetchProfiles, setError]);
 
-  const handleCreate = useCallback(async () => {
-    const name = newName.trim();
-    if (!name) return;
+  const handleCreate = useCallback(async (name: string) => {
     try {
       const profile = await createProfile(name);
-      setNewName("");
       setShowCreate(false);
       setSelectedId(profile.id);
       navigate(`/profiles/${profile.id}`);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : String(err));
     }
-  }, [newName, createProfile, setSelectedId, navigate, setError]);
+  }, [createProfile, setSelectedId, navigate, setError]);
 
   const handleDelete = useCallback(
     async (id: string) => {
@@ -97,37 +95,11 @@ function ProfileList() {
       {error && <div className="alert alert-error">{error}</div>}
 
       {showCreate && (
-        <div className={`card ${styles.createCard}`}>
-          <h3>Create Profile</h3>
-          <div className="form-row">
-            <input
-              className="input"
-              placeholder="Profile name"
-              value={newName}
-              onChange={(e) => setNewName(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") handleCreate();
-              }}
-              autoFocus
-            />
-            <button
-              className="btn btn-primary"
-              onClick={handleCreate}
-              disabled={!newName.trim() || isLoading}
-            >
-              Create
-            </button>
-            <button
-              className="btn btn-ghost"
-              onClick={() => {
-                setShowCreate(false);
-                setNewName("");
-              }}
-            >
-              Cancel
-            </button>
-          </div>
-        </div>
+        <CreateProfileForm
+          isLoading={isLoading}
+          onCreate={handleCreate}
+          onCancel={() => setShowCreate(false)}
+        />
       )}
 
       <div className={styles.profileList}>
@@ -141,67 +113,14 @@ function ProfileList() {
         )}
 
         {profiles.map((profile) => (
-          <div
+          <ProfileCard
             key={profile.id}
-            className={`${styles.profileCard} ${profile.enabled ? styles.profileCardEnabled : ""}`}
-          >
-            <div className={styles.profileCardMain}>
-              <div className={styles.profileCardHeader}>
-                <h3
-                  className={styles.profileName}
-                  onClick={() => handleEdit(profile.id)}
-                >
-                  {profile.name}
-                </h3>
-                <div className={styles.profileTags}>
-                  {profile.tags.map((tag) => (
-                    <span key={tag} className="tag">
-                      {tag}
-                    </span>
-                  ))}
-                </div>
-              </div>
-              {profile.description && (
-                <p className={styles.profileDesc}>{profile.description}</p>
-              )}
-              <div className={styles.profileMeta}>
-                <span>{profile.rules.length} rules</span>
-                <span className={styles.metaSep}>·</span>
-                <span>{profile.enabled ? "Enabled" : "Disabled"}</span>
-                {profile.protected && (
-                  <>
-                    <span className={styles.metaSep}>·</span>
-                    <span className={styles.protectedBadge}>Protected</span>
-                  </>
-                )}
-              </div>
-            </div>
-
-            <div className={styles.profileCardActions}>
-              <label className="toggle">
-                <input
-                  type="checkbox"
-                  checked={profile.enabled}
-                  onChange={() => handleToggle(profile.id)}
-                  disabled={isLoading}
-                />
-                <span className="toggle-slider" />
-              </label>
-              <button
-                className="btn btn-ghost btn-sm"
-                onClick={() => handleEdit(profile.id)}
-              >
-                Edit
-              </button>
-              <button
-                className="btn btn-danger btn-sm"
-                onClick={() => handleDelete(profile.id)}
-                disabled={profile.protected || isLoading}
-              >
-                Delete
-              </button>
-            </div>
-          </div>
+            profile={profile}
+            isLoading={isLoading}
+            onEdit={handleEdit}
+            onToggle={handleToggle}
+            onDelete={handleDelete}
+          />
         ))}
       </div>
     </div>
