@@ -3,36 +3,42 @@
 //! Safely writes hosts file changes to the system hosts file.
 //! Supports backup creation, atomic writes, rollback, and DNS cache flushing.
 
-use chrono::Utc;
+pub mod backup;
+pub mod content;
+pub mod verification;
+
 use mhost_core::{ApplyError, ApplyPlan, MhostError};
 use mhost_hosts::Parser;
-use std::any::Any;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use crate::platform::{create_platform_adapter, PlatformAdapter};
+
 /// Managed block markers
 #[allow(dead_code)]
-const MANAGED_START: &str = "# ---- mHost start ----";
+pub const MANAGED_START: &str = "# ---- mHost start ----";
 #[allow(dead_code)]
-const MANAGED_END: &str = "# ---- mHost end ----";
-
-/// Maximum number of backup files to retain.
-const MAX_BACKUPS: usize = 10;
+pub const MANAGED_END: &str = "# ---- mHost end ----";
 
 /// Trait for moving a file to another path, potentially with elevated privileges.
+#[deprecated(
+    note = "Use PlatformAdapter instead. This trait is retained for backward compatibility."
+)]
 pub trait ElevatedMover: Send + Sync {
     /// Move `from` to `to`.
     fn elevated_move(&self, from: &Path, to: &Path) -> Result<(), MhostError>;
 }
 
 /// Production mover using osascript to request administrator privileges.
+#[deprecated(note = "Use MacOsAdapter via PlatformAdapter instead.")]
 pub struct OsascriptMover;
 
+#[allow(deprecated)]
 impl ElevatedMover for OsascriptMover {
     fn elevated_move(&self, from: &Path, to: &Path) -> Result<(), MhostError> {
-        let from_escaped = escape_applescript_path(&from.to_string_lossy());
-        let to_escaped = escape_applescript_path(&to.to_string_lossy());
+        let from_escaped = crate::platform::macos::escape_applescript_path(&from.to_string_lossy());
+        let to_escaped = crate::platform::macos::escape_applescript_path(&to.to_string_lossy());
         let script = format!(
             "do shell script \"mv {} {}\" with administrator privileges",
             from_escaped, to_escaped
@@ -60,14 +66,6 @@ impl ElevatedMover for TestMover {
     }
 }
 
-/// Escape a path for safe use inside an AppleScript string literal.
-///
-/// AppleScript string literals use `\` as the escape character, so
-/// backslashes and double quotes must be escaped.
-fn escape_applescript_path(path: &str) -> String {
-    path.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
 /// Writes hosts changes to the system hosts file.
 ///
 /// `HostsWriter` handles:
@@ -81,33 +79,40 @@ fn escape_applescript_path(path: &str) -> String {
 pub struct HostsWriter {
     hosts_path: PathBuf,
     backup_dir: PathBuf,
-    mover: Box<dyn ElevatedMover>,
+    platform: Box<dyn PlatformAdapter>,
 }
 
 impl HostsWriter {
     /// Create a new `HostsWriter` for production use.
     ///
-    /// Uses `/etc/hosts` as the system hosts path and the standard
+    /// Uses the platform-specific hosts path and the standard
     /// application data directory for backups.
     pub fn new() -> Self {
+        let platform = create_platform_adapter();
         Self {
-            hosts_path: PathBuf::from("/etc/hosts"),
+            hosts_path: platform.hosts_path(),
             backup_dir: storage_root().join("backups"),
-            mover: Box::new(OsascriptMover),
+            platform,
         }
     }
 
     /// Create a new `HostsWriter` with custom paths (for testing).
+    ///
+    /// Uses `TestMover` internally wrapped as a `PlatformAdapter`.
     pub fn with_paths(hosts_path: impl Into<PathBuf>, backup_dir: impl Into<PathBuf>) -> Self {
         Self {
             hosts_path: hosts_path.into(),
             backup_dir: backup_dir.into(),
-            mover: Box::new(TestMover),
+            platform: Box::new(MoverAdapter(Box::new(TestMover))),
         }
     }
 
     /// Create a new `HostsWriter` with a custom mover (for advanced testing).
+    ///
+    /// Retained for backward compatibility. The mover is wrapped into a
+    /// `PlatformAdapter` internally.
     #[allow(dead_code)]
+    #[deprecated(note = "Prefer with_platform() or with_paths() for new code.")]
     pub fn with_mover(
         hosts_path: impl Into<PathBuf>,
         backup_dir: impl Into<PathBuf>,
@@ -116,7 +121,7 @@ impl HostsWriter {
         Self {
             hosts_path: hosts_path.into(),
             backup_dir: backup_dir.into(),
-            mover,
+            platform: Box::new(MoverAdapter(mover)),
         }
     }
 
@@ -147,23 +152,23 @@ impl HostsWriter {
 
         // 9. Create backup if required
         let backup_path = if plan.backup_required {
-            Some(self.create_backup(&current)?)
+            Some(backup::create_backup(&self.backup_dir, &current)?)
         } else {
             None
         };
 
         // 10-12. Write temp file, verify, replace
-        let new_content = self.build_hosts_content(&current, plan);
+        let new_content = content::build_hosts_content(&current, plan);
         self.atomic_write(&new_content)?;
 
         // 13. Flush DNS cache (non-blocking: failure is logged but not fatal)
-        if let Err(e) = self.flush_dns_cache() {
+        if let Err(e) = self.platform.flush_dns_cache() {
             eprintln!("[mHost] Warning: DNS cache flush failed: {}", e);
         }
 
         // 14. Verify write result
         let written = fs::read_to_string(&self.hosts_path)?;
-        if let Err(verify_err) = self.verify(&written, plan) {
+        if let Err(verify_err) = verification::verify(&written, plan) {
             // Rollback to backup on verification failure
             if let Some(ref backup) = backup_path {
                 eprintln!("[mHost] Verification failed, rolling back...");
@@ -242,119 +247,6 @@ impl HostsWriter {
     }
 
     // -----------------------------------------------------------------------
-    // Content building
-    // -----------------------------------------------------------------------
-
-    /// Build the new hosts content.
-    ///
-    /// - If a managed block exists, remove it and replace with the new block.
-    /// - If no managed block exists, append the new block at the end.
-    /// - All unmanaged content is preserved exactly as-is, including trailing
-    ///   whitespace.
-    fn build_hosts_content(&self, current: &str, plan: &ApplyPlan) -> String {
-        let managed_block = crate::format_as_hosts(&plan.rules);
-
-        if let Some((start, end)) = Parser::extract_managed_block(current) {
-            // Replace existing managed block using byte offsets to preserve
-            // original formatting including trailing whitespace.
-            let line_offsets: Vec<(usize, usize)> = current
-                .lines()
-                .scan(0, |pos, line| {
-                    let line_start = *pos;
-                    // lines() does not include the newline; find it manually
-                    let after_line = line_start + line.len();
-                    let nl_len = if current[after_line..].starts_with("\r\n") {
-                        2
-                    } else if current[after_line..].starts_with('\n') {
-                        1
-                    } else {
-                        0
-                    };
-                    *pos = after_line + nl_len;
-                    Some((line_start, *pos))
-                })
-                .collect();
-
-            let block_start = line_offsets[start].0;
-            let block_end = line_offsets[end].1;
-
-            let mut output = String::new();
-            output.push_str(&current[..block_start]);
-            if !managed_block.is_empty() {
-                output.push_str(&managed_block);
-            }
-            output.push_str(&current[block_end..]);
-            output
-        } else {
-            // No managed block — append at the end
-            let mut output = current.to_string();
-            if !output.ends_with('\n') && !output.is_empty() {
-                output.push('\n');
-            }
-            if !managed_block.is_empty() {
-                output.push_str(&managed_block);
-            }
-            output
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Backup
-    // -----------------------------------------------------------------------
-
-    /// Create a timestamped backup of the given content.
-    ///
-    /// After creating the backup, enforces the maximum backup limit by
-    /// removing the oldest backups if the count exceeds `MAX_BACKUPS`.
-    fn create_backup(&self, content: &str) -> Result<PathBuf, MhostError> {
-        fs::create_dir_all(&self.backup_dir)?;
-        let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
-        let path = self.backup_dir.join(format!("hosts-{}.bak", timestamp));
-        fs::write(&path, content)?;
-
-        // Enforce backup limit
-        self.prune_old_backups()?;
-
-        Ok(path)
-    }
-
-    /// Remove oldest backups if the total count exceeds `MAX_BACKUPS`.
-    fn prune_old_backups(&self) -> Result<(), MhostError> {
-        let mut backups: Vec<_> = fs::read_dir(&self.backup_dir)?
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                let file_name = e.file_name();
-                let name = file_name.to_string_lossy();
-                name.starts_with("hosts-") && name.ends_with(".bak")
-            })
-            .collect();
-
-        if backups.len() <= MAX_BACKUPS {
-            return Ok(());
-        }
-
-        // Sort by modification time ascending (oldest first)
-        backups.sort_by(|a, b| {
-            let time_a = a
-                .metadata()
-                .and_then(|m| m.modified())
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            let time_b = b
-                .metadata()
-                .and_then(|m| m.modified())
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            time_a.cmp(&time_b)
-        });
-
-        let to_remove = backups.len() - MAX_BACKUPS;
-        for entry in backups.iter().take(to_remove) {
-            let _ = fs::remove_file(entry.path());
-        }
-
-        Ok(())
-    }
-
-    // -----------------------------------------------------------------------
     // Atomic write
     // -----------------------------------------------------------------------
 
@@ -374,66 +266,10 @@ impl HostsWriter {
         temp_file.flush()?;
 
         let temp_path = temp_file.into_temp_path();
-        self.mover.elevated_move(&temp_path, &self.hosts_path)?;
+        self.platform.elevated_move(&temp_path, &self.hosts_path)?;
 
         // On success, the temp file has been moved to hosts_path;
         // no explicit cleanup needed.
-        Ok(())
-    }
-
-    // -----------------------------------------------------------------------
-    // DNS cache
-    // -----------------------------------------------------------------------
-
-    /// Flush the system DNS cache (macOS).
-    fn flush_dns_cache(&self) -> Result<(), MhostError> {
-        // Only flush DNS in production (when using OsascriptMover)
-        if self.mover.as_ref().type_id() != std::any::TypeId::of::<OsascriptMover>() {
-            return Ok(());
-        }
-
-        std::process::Command::new("dscacheutil")
-            .args(["-flushcache"])
-            .output()?;
-        Ok(())
-    }
-
-    // -----------------------------------------------------------------------
-    // Verification
-    // -----------------------------------------------------------------------
-
-    /// Verify that the written content matches the expected plan.
-    fn verify(&self, written: &str, plan: &ApplyPlan) -> Result<(), MhostError> {
-        // Basic verification: check that the managed block markers exist
-        // if the plan has rules, and that all expected rules are present.
-        if plan.rules.is_empty() {
-            // If no rules, there should be no managed block
-            if Parser::extract_managed_block(written).is_some() {
-                return Err(ApplyError::VerificationFailed(
-                    "expected no managed block but found one".to_string(),
-                )
-                .into());
-            }
-            return Ok(());
-        }
-
-        let block = Parser::extract_managed_block(written);
-        if block.is_none() {
-            return Err(ApplyError::VerificationFailed("managed block missing".to_string()).into());
-        }
-
-        // Verify each rule appears in the written content
-        for rule in &plan.rules {
-            let expected = format!("{} {}", rule.ip, rule.domain);
-            if !written.contains(&expected) {
-                return Err(ApplyError::VerificationFailed(format!(
-                    "expected rule '{}' not found",
-                    expected
-                ))
-                .into());
-            }
-        }
-
         Ok(())
     }
 }
@@ -441,6 +277,33 @@ impl HostsWriter {
 impl Default for HostsWriter {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MoverAdapter: wraps an ElevatedMover into a PlatformAdapter
+// ---------------------------------------------------------------------------
+
+/// Adapter that wraps a legacy `ElevatedMover` into the new `PlatformAdapter`
+/// trait. Used for backward compatibility with existing tests.
+struct MoverAdapter(Box<dyn ElevatedMover>);
+
+impl PlatformAdapter for MoverAdapter {
+    fn hosts_path(&self) -> PathBuf {
+        PathBuf::from("/etc/hosts")
+    }
+
+    fn elevated_move(&self, from: &Path, to: &Path) -> Result<(), MhostError> {
+        self.0.elevated_move(from, to)
+    }
+
+    fn flush_dns_cache(&self) -> Result<(), MhostError> {
+        // Test movers should not flush DNS
+        Ok(())
+    }
+
+    fn platform_name(&self) -> &'static str {
+        "mover-adapter"
     }
 }
 
@@ -504,7 +367,7 @@ mod tests {
 
         let current = "# original content\n";
         let plan = plan_with_rules(vec![resolved_rule("127.0.0.1", "example.com", "p1")]);
-        let content = writer.build_hosts_content(current, &plan);
+        let content = content::build_hosts_content(current, &plan);
 
         assert!(content.contains("# original content"));
         assert!(content.contains(MANAGED_START));
@@ -522,7 +385,7 @@ mod tests {
 
         let current = "# before\n# ---- mHost start ----\n127.0.0.1 old.com\n# ---- mHost end ----\n# after\n";
         let plan = plan_with_rules(vec![resolved_rule("127.0.0.1", "new.com", "p1")]);
-        let content = writer.build_hosts_content(current, &plan);
+        let content = content::build_hosts_content(current, &plan);
 
         assert!(content.contains("# before"));
         assert!(content.contains("# after"));
@@ -540,7 +403,7 @@ mod tests {
 
         let current = "# original\n";
         let plan = plan_with_rules(vec![]);
-        let content = writer.build_hosts_content(current, &plan);
+        let content = content::build_hosts_content(current, &plan);
 
         assert!(content.contains("# original"));
         assert!(!content.contains(MANAGED_START));
@@ -737,7 +600,7 @@ mod tests {
         let current =
             "# before\n\n# ---- mHost start ----\n127.0.0.1 old.com\n# ---- mHost end ----\n\n";
         let plan = plan_with_rules(vec![resolved_rule("127.0.0.1", "new.com", "p1")]);
-        let content = writer.build_hosts_content(current, &plan);
+        let content = content::build_hosts_content(current, &plan);
 
         // Should preserve the trailing blank lines
         assert!(content.contains("# before"));
@@ -760,7 +623,7 @@ mod tests {
 
         let current = "# original\n\n";
         let plan = plan_with_rules(vec![resolved_rule("127.0.0.1", "example.com", "p1")]);
-        let content = writer.build_hosts_content(current, &plan);
+        let content = content::build_hosts_content(current, &plan);
 
         assert!(content.contains("# original"));
         assert!(content.contains("127.0.0.1 example.com"));
@@ -792,26 +655,6 @@ mod tests {
     }
 
     #[test]
-    fn test_escape_applescript_path() {
-        assert_eq!(
-            escape_applescript_path("/path/to/file"),
-            "/path/to/file"
-        );
-        assert_eq!(
-            escape_applescript_path("/path/with\"quote"),
-            "/path/with\\\"quote"
-        );
-        assert_eq!(
-            escape_applescript_path("/path/with\\backslash"),
-            "/path/with\\\\backslash"
-        );
-        assert_eq!(
-            escape_applescript_path("/path/with\\\"both"),
-            "/path/with\\\\\\\"both"
-        );
-    }
-
-    #[test]
     fn test_backup_limit_prunes_oldest() {
         let temp_dir = TempDir::new().unwrap();
         let backup_dir = temp_dir.path().join("backups");
@@ -835,9 +678,8 @@ mod tests {
         // After apply, should have at most MAX_BACKUPS backups
         let backups: Vec<_> = fs::read_dir(&backup_dir).unwrap().collect();
         assert!(
-            backups.len() <= MAX_BACKUPS,
-            "expected at most {} backups, got {}",
-            MAX_BACKUPS,
+            backups.len() <= 10,
+            "expected at most 10 backups, got {}",
             backups.len()
         );
     }

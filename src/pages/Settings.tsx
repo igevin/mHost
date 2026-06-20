@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import { readSystemHosts } from "../lib/tauri";
+import styles from "./Settings.module.css";
 
 function Settings() {
   const [hostsContent, setHostsContent] = useState<string | null>(null);
@@ -17,36 +18,36 @@ function Settings() {
         <h1 className="mhost-page-title">Settings</h1>
       </header>
 
-      <div className="settings-grid">
+      <div className={styles.settingsGrid}>
         <div className="card">
           <h3 className="card-title">About</h3>
-          <div className="info-row">
-            <span className="info-label">App Name</span>
-            <span className="info-value">mHost</span>
+          <div className={styles.infoRow}>
+            <span className={styles.infoLabel}>App Name</span>
+            <span className={styles.infoValue}>mHost</span>
           </div>
-          <div className="info-row">
-            <span className="info-label">Version</span>
-            <span className="info-value">0.1.0</span>
+          <div className={styles.infoRow}>
+            <span className={styles.infoLabel}>Version</span>
+            <span className={styles.infoValue}>0.1.0</span>
           </div>
-          <div className="info-row">
-            <span className="info-label">Phase</span>
-            <span className="info-value">0 (Skeleton)</span>
+          <div className={styles.infoRow}>
+            <span className={styles.infoLabel}>Phase</span>
+            <span className={styles.infoValue}>0 (Skeleton)</span>
           </div>
         </div>
 
         <div className="card">
           <h3 className="card-title">Storage</h3>
-          <div className="info-row">
-            <span className="info-label">Data Directory</span>
-            <span className="info-value">~/Library/Application Support/mHost</span>
+          <div className={styles.infoRow}>
+            <span className={styles.infoLabel}>Data Directory</span>
+            <span className={styles.infoValue}>~/Library/Application Support/mHost</span>
           </div>
-          <div className="info-row">
-            <span className="info-label">Profiles</span>
-            <span className="info-value">profiles/</span>
+          <div className={styles.infoRow}>
+            <span className={styles.infoLabel}>Profiles</span>
+            <span className={styles.infoValue}>profiles/</span>
           </div>
-          <div className="info-row">
-            <span className="info-label">Backups</span>
-            <span className="info-value">backups/</span>
+          <div className={styles.infoRow}>
+            <span className={styles.infoLabel}>Backups</span>
+            <span className={styles.infoValue}>backups/</span>
           </div>
         </div>
 
@@ -57,7 +58,7 @@ function Settings() {
           ) : hostsContent === null ? (
             <div className="loading">Loading...</div>
           ) : (
-            <pre className="hosts-preview">{hostsContent}</pre>
+            <pre className={styles.hostsPreview}>{hostsContent}</pre>
           )}
         </div>
       </div>

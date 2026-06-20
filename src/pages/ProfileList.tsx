@@ -11,6 +11,7 @@ import {
   deleteProfileAtom,
   toggleProfileEnabledAtom,
 } from "../stores/profiles";
+import styles from "./ProfileList.module.css";
 
 function ProfileList() {
   const navigate = useNavigate();
@@ -96,7 +97,7 @@ function ProfileList() {
       {error && <div className="alert alert-error">{error}</div>}
 
       {showCreate && (
-        <div className="card create-card">
+        <div className={`card ${styles.createCard}`}>
           <h3>Create Profile</h3>
           <div className="form-row">
             <input
@@ -129,7 +130,7 @@ function ProfileList() {
         </div>
       )}
 
-      <div className="profile-list">
+      <div className={styles.profileList}>
         {profiles.length === 0 && !isLoading && (
           <div className="empty-state">
             <p>No profiles yet.</p>
@@ -142,17 +143,17 @@ function ProfileList() {
         {profiles.map((profile) => (
           <div
             key={profile.id}
-            className={`profile-card ${profile.enabled ? "profile-card-enabled" : ""}`}
+            className={`${styles.profileCard} ${profile.enabled ? styles.profileCardEnabled : ""}`}
           >
-            <div className="profile-card-main">
-              <div className="profile-card-header">
+            <div className={styles.profileCardMain}>
+              <div className={styles.profileCardHeader}>
                 <h3
-                  className="profile-name"
+                  className={styles.profileName}
                   onClick={() => handleEdit(profile.id)}
                 >
                   {profile.name}
                 </h3>
-                <div className="profile-tags">
+                <div className={styles.profileTags}>
                   {profile.tags.map((tag) => (
                     <span key={tag} className="tag">
                       {tag}
@@ -161,22 +162,22 @@ function ProfileList() {
                 </div>
               </div>
               {profile.description && (
-                <p className="profile-desc">{profile.description}</p>
+                <p className={styles.profileDesc}>{profile.description}</p>
               )}
-              <div className="profile-meta">
+              <div className={styles.profileMeta}>
                 <span>{profile.rules.length} rules</span>
-                <span className="meta-sep">·</span>
+                <span className={styles.metaSep}>·</span>
                 <span>{profile.enabled ? "Enabled" : "Disabled"}</span>
                 {profile.protected && (
                   <>
-                    <span className="meta-sep">·</span>
-                    <span className="protected-badge">Protected</span>
+                    <span className={styles.metaSep}>·</span>
+                    <span className={styles.protectedBadge}>Protected</span>
                   </>
                 )}
               </div>
             </div>
 
-            <div className="profile-card-actions">
+            <div className={styles.profileCardActions}>
               <label className="toggle">
                 <input
                   type="checkbox"

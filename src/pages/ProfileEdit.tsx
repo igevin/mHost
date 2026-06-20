@@ -10,6 +10,7 @@ import {
   updateProfileAtom,
 } from "../stores/profiles";
 import type { Profile } from "../types";
+import styles from "./ProfileEdit.module.css";
 
 function ProfileEdit() {
   const { id } = useParams<{ id: string }>();
@@ -115,7 +116,7 @@ function ProfileEdit() {
 
       {error && <div className="alert alert-error">{error}</div>}
 
-      <div className="edit-grid">
+      <div className={styles.editGrid}>
         <div className="card">
           <h3 className="card-title">Basic Info</h3>
           <div className="form-group">
@@ -167,23 +168,23 @@ function ProfileEdit() {
               </p>
             </div>
           ) : (
-            <div className="rule-list">
+            <div className={styles.ruleList}>
               {draft.rules.map((rule) => (
                 <div
                   key={rule.id}
-                  className={`rule-item ${rule.enabled ? "" : "rule-item-disabled"}`}
+                  className={`${styles.ruleItem} ${rule.enabled ? "" : styles.ruleItemDisabled}`}
                 >
-                  <div className="rule-header">
-                    <span className="rule-ip">{rule.ip}</span>
-                    <span className="rule-status">
+                  <div className={styles.ruleHeader}>
+                    <span className={styles.ruleIp}>{rule.ip}</span>
+                    <span className={styles.ruleStatus}>
                       {rule.enabled ? "On" : "Off"}
                     </span>
                   </div>
-                  <div className="rule-domains">
+                  <div className={styles.ruleDomains}>
                     {rule.domains.join(", ")}
                   </div>
                   {rule.comment && (
-                    <div className="rule-comment">{rule.comment}</div>
+                    <div className={styles.ruleComment}>{rule.comment}</div>
                   )}
                 </div>
               ))}
