@@ -35,6 +35,8 @@ pub fn run() {
             import_profile,
             export_profile,
             duplicate_profile,
+            export_profile_to_file,
+            import_profile_from_file,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
