@@ -8,6 +8,8 @@ use tauri::State;
 
 use crate::state::AppState;
 
+const MAX_FILE_READ_SIZE: usize = 1_048_576; // 1MB
+
 // ---------------------------------------------------------------------------
 // Core logic (testable without Tauri State)
 // ---------------------------------------------------------------------------
@@ -131,6 +133,50 @@ pub fn duplicate_profile(
     state: State<'_, AppState>,
 ) -> Result<Profile, MhostError> {
     duplicate_profile_logic(&id, new_name, state.storage.as_ref())
+}
+
+/// Export a profile to a file.
+///
+/// Path is from user dialog selection; we reject paths containing ".." for safety.
+#[tauri::command]
+pub fn export_profile_to_file(
+    id: String,
+    format: ExportFormat,
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<(), MhostError> {
+    if path.contains("..") {
+        return Err(MhostError::InvalidInput(
+            "Path cannot contain '..'".to_string(),
+        ));
+    }
+    let content = export_profile_logic(&id, format, state.storage.as_ref())?;
+    std::fs::write(&path, &content).map_err(Into::into)
+}
+
+/// Import a profile from a file.
+///
+/// Reads file content (limited to 1MB) and imports it as a new profile.
+#[tauri::command]
+pub fn import_profile_from_file(
+    name: String,
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<Profile, MhostError> {
+    if path.contains("..") {
+        return Err(MhostError::InvalidInput(
+            "Path cannot contain '..'".to_string(),
+        ));
+    }
+    let metadata = std::fs::metadata(&path)?;
+    if metadata.len() > MAX_FILE_READ_SIZE as u64 {
+        return Err(MhostError::InvalidInput(format!(
+            "File too large (max {} bytes)",
+            MAX_FILE_READ_SIZE
+        )));
+    }
+    let hosts_text = std::fs::read_to_string(&path)?;
+    import_profile_logic(name, &hosts_text, state.storage.as_ref())
 }
 
 // ---------------------------------------------------------------------------
