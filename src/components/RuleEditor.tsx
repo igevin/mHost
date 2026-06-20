@@ -61,10 +61,22 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEd
   const [errors, setErrors] = useState<ParseErrorAtLine[]>([]);
   const [isValidating, setIsValidating] = useState(false);
 
-  // Sync text when rules prop changes externally
+  // Sync text when rules prop changes externally (only on substantive changes)
+  const prevRulesRef = useRef<HostRule[]>([]);
   useEffect(() => {
-    setText(rulesToText(rules));
-    setErrors([]);
+    const prevRules = prevRulesRef.current;
+    const rulesChanged =
+      rules.length !== prevRules.length ||
+      rules.some(
+        (r, i) =>
+          r.ip !== prevRules[i]?.ip ||
+          r.domains.join(",") !== prevRules[i]?.domains.join(","),
+      );
+    if (rulesChanged) {
+      setText(rulesToText(rules));
+      setErrors([]);
+      prevRulesRef.current = rules;
+    }
   }, [rules]);
 
   const handleValidate = useCallback(
