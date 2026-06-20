@@ -2,12 +2,6 @@
   margin-bottom: 16px;
 }
 
-.sectionTitle {
-  font-size: 15px;
-  font-weight: 600;
-  margin: 0 0 14px;
-}
-
 .profileName {
   font-size: 16px;
   font-weight: 600;
@@ -48,10 +42,6 @@
 }
 
 /* ---- Managed Block ---- */
-
-.managedBlockSection {
-  margin-bottom: 16px;
-}
 
 .managedBlockContent {
   background: var(--color-bg);
