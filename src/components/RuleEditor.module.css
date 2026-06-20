@@ -3,26 +3,53 @@
 .container {
   display: flex;
   flex-direction: column;
+  flex: 1;
+  min-height: 0; /* Critical: allows flex child to shrink */
   gap: 8px;
 }
 
-.hasErrors {
-  border-color: var(--color-danger);
+.textarea {
+  flex: 1;
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.6;
+  background: var(--color-surface);
+  color: var(--color-text);
+  outline: none;
+  resize: none;
+  min-height: 0; /* Allow textarea to shrink in flex context */
+  transition: border-color var(--transition-fast);
 }
 
-.hasErrors:focus {
-  border-color: var(--color-danger);
+.textarea:focus {
+  border-color: var(--color-primary);
+}
+
+.textarea[readonly] {
+  background: #f6f8fa;
+  cursor: default;
+  opacity: 0.8;
+}
+
+.hasErrors {
+  border-color: var(--color-danger) !important;
 }
 
 .validating {
   font-size: 12px;
   color: var(--color-text-muted);
+  flex-shrink: 0;
 }
 
 .errorList {
   display: flex;
   flex-direction: column;
   gap: 4px;
+  flex-shrink: 0;
 }
 
 .errorItem {

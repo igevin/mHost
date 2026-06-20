@@ -15,11 +15,12 @@ interface RuleEditorProps {
 function rulesToText(rules: HostRule[]): string {
   return rules
     .map((rule) => {
+      const prefix = rule.enabled ? "" : "# ";
       const line = rule.ip + " " + rule.domains.join(" ");
       if (rule.comment) {
-        return line + " # " + rule.comment;
+        return prefix + line + " # " + rule.comment;
       }
-      return line;
+      return prefix + line;
     })
     .join("\n");
 }
@@ -45,7 +46,6 @@ function useDebouncedCallback<T extends (...args: Parameters<T>) => void>(
     [delay],
   ) as T;
 
-  // Cleanup on unmount
   useEffect(() => {
     return () => {
       if (timerRef.current) {
@@ -62,7 +62,7 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEd
   const [errors, setErrors] = useState<ParseErrorAtLine[]>([]);
   const [isValidating, setIsValidating] = useState(false);
 
-  // Sync text when rules prop changes externally (only on substantive changes)
+  // Sync text when rules prop changes externally
   const prevRulesRef = useRef<HostRule[]>([]);
   useEffect(() => {
     const prevRules = prevRulesRef.current;
@@ -71,7 +71,9 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEd
       rules.some(
         (r, i) =>
           r.ip !== prevRules[i]?.ip ||
-          r.domains.join(",") !== prevRules[i]?.domains.join(","),
+          r.domains.join(",") !== prevRules[i]?.domains.join(",") ||
+          r.enabled !== prevRules[i]?.enabled ||
+          r.comment !== prevRules[i]?.comment,
       );
     if (rulesChanged) {
       setText(rulesToText(rules));
@@ -113,14 +115,14 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEd
   return (
     <div className={styles.container}>
       <textarea
-        className={`hosts-textarea ${errors.length > 0 ? styles.hasErrors : ""}`}
+        className={`${styles.textarea} ${errors.length > 0 ? styles.hasErrors : ""}`}
         value={text}
         onChange={handleChange}
         readOnly={readOnly}
-        rows={Math.max(8, text.split("\n").length + 2)}
         spellCheck={false}
-        placeholder="Enter hosts rules, one per line: IP domain1 domain2 # comment"
+        placeholder="Enter hosts rules, one per line:&#10;127.0.0.1 localhost # local dev&#10;192.168.1.100 api.dev.local # API server"
       />
+
       {isValidating && (
         <div className={styles.validating}>Validating...</div>
       )}
@@ -128,7 +130,7 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEd
         <div className={styles.errorList}>
           {errors.map((err) => (
             <div key={err.line_number} className={styles.errorItem}>
-              Line {err.line_number}: {typeof err.error === 'string' ? err.error : JSON.stringify(err.error)}
+              Line {err.line_number}: {typeof err.error === "string" ? err.error : JSON.stringify(err.error)}
             </div>
           ))}
         </div>

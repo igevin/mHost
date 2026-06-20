@@ -24,18 +24,24 @@ function Settings() {
       </header>
 
       <div className={styles.settingsGrid}>
-        <div className="card">
-          <h3 className="card-title">About</h3>
-          <div className={styles.infoRow}>
-            <span className={styles.infoLabel}>App Name</span>
-            <span className={styles.infoValue}>mHost</span>
-          </div>
-          <div className={styles.infoRow}>
-            <span className={styles.infoLabel}>Version</span>
-            <span className={styles.infoValue}>1 (Phase 1: MVP Profile Switching)</span>
+        {/* About Card */}
+        <div className={`card ${styles.aboutCard}`}>
+          <div className={styles.aboutLogo}>m</div>
+          <div className={styles.aboutName}>mHost</div>
+          <div className={styles.aboutVersion}>Version 1.0.0</div>
+          <div className={styles.aboutInfo}>
+            <div className={styles.aboutInfoItem}>
+              <div className={styles.label}>Phase</div>
+              <div className={styles.value}>MVP Profile Switching</div>
+            </div>
+            <div className={styles.aboutInfoItem}>
+              <div className={styles.label}>Platform</div>
+              <div className={styles.value}>macOS</div>
+            </div>
           </div>
         </div>
 
+        {/* Storage Card */}
         <div className="card">
           <h3 className="card-title">Storage</h3>
           <div className={styles.infoRow}>
@@ -52,6 +58,7 @@ function Settings() {
           </div>
         </div>
 
+        {/* Hosts Management Card */}
         <div className="card">
           <h3 className="card-title">Hosts Management</h3>
           <p className={styles.sectionDesc}>
@@ -60,6 +67,7 @@ function Settings() {
           <RollbackButton onRollback={rollback} />
         </div>
 
+        {/* System Hosts Preview */}
         <div className="card card-full">
           <h3 className="card-title">System Hosts Preview</h3>
           {hostsError ? (
