@@ -25,6 +25,79 @@ function rulesToText(rules: HostRule[]): string {
     .join("\n");
 }
 
+/** Parse text into tokens for syntax highlighting */
+function tokenize(text: string | undefined): { type: string; text: string }[] {
+  const tokens: { type: string; text: string }[] = [];
+  if (!text) return tokens;
+  const lines = text.split("\n");
+
+  lines.forEach((line, lineIdx) => {
+    const trimmed = line.trim();
+
+    if (trimmed === "") {
+      tokens.push({ type: "empty", text: lineIdx === lines.length - 1 ? "" : "\n" });
+      return;
+    }
+
+    // Full line comment
+    if (trimmed.startsWith("#")) {
+      tokens.push({ type: "comment", text: line + (lineIdx === lines.length - 1 ? "" : "\n") });
+      return;
+    }
+
+    let remaining = line;
+
+    // Disabled prefix
+    if (remaining.startsWith("# ")) {
+      tokens.push({ type: "comment", text: "# " });
+      remaining = remaining.slice(2);
+    }
+
+    // IP address
+    const ipMatch = remaining.match(/^(\d+\.\d+\.\d+\.\d+)/);
+    if (ipMatch) {
+      tokens.push({ type: "ip", text: ipMatch[1] });
+      remaining = remaining.slice(ipMatch[1].length);
+    }
+
+    // Remaining: spaces, domains, inline comment
+    const commentIdx = remaining.indexOf(" #");
+    if (commentIdx >= 0) {
+      const beforeComment = remaining.slice(0, commentIdx);
+      const comment = remaining.slice(commentIdx);
+
+      // Tokenize before comment: spaces and domains
+      const parts = beforeComment.split(/(\s+)/);
+      for (const part of parts) {
+        if (part === "") continue;
+        if (/^\s+$/.test(part)) {
+          tokens.push({ type: "space", text: part });
+        } else {
+          tokens.push({ type: "domain", text: part });
+        }
+      }
+
+      tokens.push({ type: "comment", text: comment });
+    } else {
+      const parts = remaining.split(/(\s+)/);
+      for (const part of parts) {
+        if (part === "") continue;
+        if (/^\s+$/.test(part)) {
+          tokens.push({ type: "space", text: part });
+        } else {
+          tokens.push({ type: "domain", text: part });
+        }
+      }
+    }
+
+    if (lineIdx < lines.length - 1) {
+      tokens.push({ type: "newline", text: "\n" });
+    }
+  });
+
+  return tokens;
+}
+
 /** Simple debounce hook */
 function useDebouncedCallback<T extends (...args: Parameters<T>) => void>(
   callback: T,
@@ -61,6 +134,7 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEd
   const [text, setText] = useState(() => rulesToText(rules));
   const [errors, setErrors] = useState<ParseErrorAtLine[]>([]);
   const [isValidating, setIsValidating] = useState(false);
+  const editorRef = useRef<HTMLDivElement>(null);
 
   // Sync text when rules prop changes externally
   const prevRulesRef = useRef<HostRule[]>([]);
@@ -103,25 +177,47 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEd
 
   const debouncedValidate = useDebouncedCallback(handleValidate, 300);
 
-  const handleChange = useCallback(
-    (e: React.ChangeEvent<HTMLTextAreaElement>) => {
-      const value = e.target.value;
+  const handleInput = useCallback(
+    (e: React.FormEvent<HTMLDivElement>) => {
+      const value = e.currentTarget.innerText;
       setText(value);
       debouncedValidate(value);
     },
     [debouncedValidate],
   );
 
+  // Prevent formatting on paste
+  const handlePaste = useCallback((e: React.ClipboardEvent) => {
+    e.preventDefault();
+    const text = e.clipboardData.getData("text/plain");
+    document.execCommand("insertText", false, text);
+  }, []);
+
+  // Generate highlighted content
+  const tokens = tokenize(text);
+
   return (
     <div className={styles.container}>
-      <textarea
-        className={`${styles.textarea} ${errors.length > 0 ? styles.hasErrors : ""}`}
-        value={text}
-        onChange={handleChange}
-        readOnly={readOnly}
+      <div
+        ref={editorRef}
+        role="textbox"
+        aria-multiline="true"
+        className={`${styles.editor} ${errors.length > 0 ? styles.hasErrors : ""} ${readOnly ? styles.readOnly : ""}`}
+        contentEditable={!readOnly}
+        onInput={handleInput}
+        onPaste={handlePaste}
+        suppressContentEditableWarning
         spellCheck={false}
-        placeholder="Enter hosts rules, one per line:&#10;127.0.0.1 localhost # local dev&#10;192.168.1.100 api.dev.local # API server"
-      />
+      >
+        {tokens.map((token, idx) => (
+          <span
+            key={idx}
+            className={styles[`token${token.type.charAt(0).toUpperCase() + token.type.slice(1)}`]}
+          >
+            {token.text}
+          </span>
+        ))}
+      </div>
 
       {isValidating && (
         <div className={styles.validating}>Validating...</div>
