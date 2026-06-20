@@ -2,6 +2,7 @@
 
 use crate::validator;
 use mhost_core::{HostRule, ParseError};
+use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::str::FromStr;
 
@@ -14,6 +15,20 @@ const MANAGED_END: &str = "# ---- mHost end ----";
 pub struct ParseResult {
     pub rules: Vec<HostRule>,
     pub errors: Vec<ParseError>,
+}
+
+/// A parse error annotated with its 1-based line number
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParseErrorAtLine {
+    pub line_number: usize,
+    pub error: ParseError,
+}
+
+/// Validation result suitable for frontend consumption (serializable)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidateResult {
+    pub rules: Vec<HostRule>,
+    pub errors: Vec<ParseErrorAtLine>,
 }
 
 /// Hosts file parser
@@ -36,21 +51,43 @@ impl Parser {
         ParseResult { rules, errors }
     }
 
-    /// Format a slice of HostRule back into hosts text.
-    /// Multi-domain rules are expanded to one line per domain.
-    pub fn format(rules: &[HostRule]) -> String {
-        let mut lines = Vec::new();
-        for rule in rules {
-            for domain in &rule.domains {
-                let line = if let Some(ref comment) = rule.comment {
-                    format!("{} {} # {}", rule.ip, domain, comment)
-                } else {
-                    format!("{} {}", rule.ip, domain)
-                };
-                lines.push(line);
+    /// Parse hosts text into a serializable validation result with line numbers.
+    /// Each error is annotated with its 1-based line number in the input text.
+    pub fn parse_with_lines(text: &str) -> ValidateResult {
+        let parse_result = Self::parse(text);
+
+        // Build a mapping from line content to 1-based line numbers.
+        // A single line may produce at most one error, so we can collect all
+        // line numbers first, then zip with errors.
+        let mut error_line_numbers: Vec<usize> = Vec::new();
+        for (idx, line) in text.lines().enumerate() {
+            if Self::parse_line(line).is_err() {
+                error_line_numbers.push(idx + 1);
             }
         }
-        lines.join("\n") + if lines.is_empty() { "" } else { "\n" }
+
+        let errors: Vec<ParseErrorAtLine> = parse_result
+            .errors
+            .into_iter()
+            .zip(error_line_numbers)
+            .map(|(error, line_number)| ParseErrorAtLine {
+                line_number,
+                error,
+            })
+            .collect();
+
+        ValidateResult {
+            rules: parse_result.rules,
+            errors,
+        }
+    }
+
+    /// Format a slice of HostRule back into hosts text.
+    /// Multi-domain rules are expanded to one line per domain.
+    ///
+    /// Delegates to [`crate::formatter::format_rules`].
+    pub fn format(rules: &[HostRule]) -> String {
+        crate::formatter::format_rules(rules)
     }
 
     /// Extract the line range (0-based, inclusive) of the managed block.
@@ -82,6 +119,19 @@ impl Parser {
             (Some(s), Some(e)) if s <= e => Some((s, e)),
             _ => None,
         }
+    }
+
+    /// Extract the content between managed block markers (exclusive of markers).
+    /// Returns `Some(content)` if a valid managed block exists, `None` otherwise.
+    /// An empty block (start immediately followed by end) returns `Some("")`.
+    pub fn extract_managed_block_content(input: &str) -> Option<String> {
+        let (start, end) = Self::extract_managed_block(input)?;
+        let lines: Vec<&str> = input.lines().collect();
+        if end <= start + 1 {
+            return Some(String::new());
+        }
+        let content_lines = &lines[start + 1..end];
+        Some(content_lines.join("\n"))
     }
 
     // -----------------------------------------------------------------------
@@ -438,5 +488,115 @@ mod tests {
         assert!(!formatted.contains("Manual"));
         assert!(!formatted.contains("Remote"));
         assert!(!formatted.contains("AdBlock"));
+    }
+
+    // -------------------------------------------------------------------
+    // extract_managed_block_content tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_managed_block_content_with_block() {
+        let input = "# some comment\n# ---- mHost start ----\n127.0.0.1 example.com\n# ---- mHost end ----\n# tail";
+        let result = Parser::extract_managed_block_content(input);
+        assert_eq!(result, Some("127.0.0.1 example.com".to_string()));
+    }
+
+    #[test]
+    fn test_extract_managed_block_content_without_block() {
+        let input = "# no block here\n127.0.0.1 example.com";
+        let result = Parser::extract_managed_block_content(input);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_extract_managed_block_content_empty_block() {
+        let input = "# ---- mHost start ----\n# ---- mHost end ----";
+        let result = Parser::extract_managed_block_content(input);
+        assert_eq!(result, Some(String::new()));
+    }
+
+    #[test]
+    fn test_extract_managed_block_content_multi_line() {
+        let input = "# ---- mHost start ----\n127.0.0.1 a.com\n192.168.1.1 b.com\n# ---- mHost end ----";
+        let result = Parser::extract_managed_block_content(input);
+        assert_eq!(result, Some("127.0.0.1 a.com\n192.168.1.1 b.com".to_string()));
+    }
+
+    #[test]
+    fn test_extract_managed_block_content_with_surrounding_content() {
+        let input = "127.0.0.1 pre-existing.com\n# ---- mHost start ----\n::1 managed.local\n# ---- mHost end ----\n192.168.1.1 post-existing.com";
+        let result = Parser::extract_managed_block_content(input);
+        assert_eq!(result, Some("::1 managed.local".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_with_lines tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_with_lines_valid() {
+        let cases = vec![
+            ("single_ipv4", "127.0.0.1 example.com",
+             vec![("127.0.0.1", vec!["example.com"])], 0),
+            ("ipv6", "::1 localhost",
+             vec![("::1", vec!["localhost"])], 0),
+            ("multi_domain", "127.0.0.1 a.com b.com",
+             vec![("127.0.0.1", vec!["a.com", "b.com"])], 0),
+            ("with_comment", "127.0.0.1 x.com # dev",
+             vec![("127.0.0.1", vec!["x.com"])], 0),
+            ("empty_lines", "\n\n127.0.0.1 x.com\n\n",
+             vec![("127.0.0.1", vec!["x.com"])], 0),
+            ("comment_only", "# this is a comment", vec![], 0),
+        ];
+        for (name, input, expected_rules, expected_errors) in cases {
+            let result = Parser::parse_with_lines(input);
+            assert_eq!(result.rules.len(), expected_rules.len(), "case: {}", name);
+            for (i, (expected_ip, expected_domains)) in expected_rules.iter().enumerate() {
+                assert_eq!(result.rules[i].ip, expected_ip.parse::<IpAddr>().unwrap(), "case: {} rule {} ip", name, i);
+                assert_eq!(result.rules[i].domains, *expected_domains, "case: {} rule {} domains", name, i);
+            }
+            assert_eq!(result.errors.len(), expected_errors, "case: {}", name);
+        }
+    }
+
+    #[test]
+    fn test_parse_with_lines_invalid() {
+        let cases = vec![
+            ("bad_ip", "999.999.999.999 x.com", "invalid ip"),
+            ("bad_domain", "127.0.0.1 -bad", "invalid domain"),
+            ("no_ip", "example.com 127.0.0.1", "malformed"),
+        ];
+        for (name, input, expected_msg_contains) in cases {
+            let result = Parser::parse_with_lines(input);
+            assert!(!result.errors.is_empty(), "case: {} should have errors", name);
+            let msg = result.errors[0].error.to_string().to_lowercase();
+            assert!(msg.contains(expected_msg_contains),
+                "case: {} error '{}' should contain '{}'", name, msg, expected_msg_contains);
+        }
+    }
+
+    #[test]
+    fn test_parse_with_lines_error_line_numbers() {
+        let result = Parser::parse_with_lines("127.0.0.1 valid.com\n999.999.999.999 bad.com");
+        assert_eq!(result.errors.len(), 1);
+        assert_eq!(result.errors[0].line_number, 2);
+    }
+
+    #[test]
+    fn test_parse_with_lines_multiple_errors() {
+        let result = Parser::parse_with_lines(
+            "127.0.0.1 ok.com\nbad_line\n127.0.0.1 ok2.com\n999.999.999.999 bad.com"
+        );
+        assert_eq!(result.errors.len(), 2);
+        assert_eq!(result.errors[0].line_number, 2);
+        assert_eq!(result.errors[1].line_number, 4);
+    }
+
+    #[test]
+    fn test_validate_result_serialization() {
+        let result = Parser::parse_with_lines("127.0.0.1 example.com");
+        let json = serde_json::to_string(&result).unwrap();
+        let parsed: ValidateResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.rules.len(), result.rules.len());
     }
 }

@@ -1,0 +1,179 @@
+/* ---- Layout ---- */
+
+.mhostLayout {
+  display: flex;
+  height: 100vh;
+  width: 100vw;
+  overflow: hidden;
+}
+
+.sidebar {
+  width: var(--sidebar-width);
+  background: var(--color-sidebar);
+  color: #c9d1d9;
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+}
+
+.sidebarHeader {
+  padding: 20px 16px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.logo {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.logoIcon {
+  width: 32px;
+  height: 32px;
+  background: var(--color-primary);
+  color: #fff;
+  border-radius: var(--radius-md);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  font-size: 16px;
+}
+
+.logoText {
+  font-size: 18px;
+  font-weight: 600;
+  color: #fff;
+}
+
+.sidebarNav {
+  flex: 1;
+  padding: 12px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.navLink {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+  border-radius: var(--radius-sm);
+  color: #c9d1d9;
+  text-decoration: none;
+  font-size: 14px;
+  transition: background 0.15s;
+}
+
+.navLink:hover {
+  background: var(--color-sidebar-hover);
+  color: #fff;
+}
+
+.navLinkActive {
+  background: var(--color-sidebar-active);
+  color: #fff;
+}
+
+.navIcon {
+  width: 20px;
+  text-align: center;
+  font-weight: 600;
+  opacity: 0.8;
+}
+
+.sidebarFooter {
+  padding: 12px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+/* ---- Status Bar (sidebar footer) ---- */
+
+.statusCard {
+  background: var(--color-sidebar-hover);
+  border-radius: var(--radius-md);
+  padding: 12px;
+}
+
+.statusRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+
+.statusLabel {
+  font-size: 12px;
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+
+.statusDot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--color-text-muted);
+}
+
+.statusDotOn {
+  background: var(--color-success);
+}
+
+.statusDotOff {
+  background: var(--color-text-muted);
+}
+
+.statusProfile {
+  font-size: 13px;
+  color: #fff;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.statusApplying {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--color-warning);
+}
+
+.statusPending {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--color-warning);
+  font-weight: 500;
+}
+
+.statusApplyBtn {
+  margin-top: 8px;
+  width: 100%;
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-primary);
+  background: var(--color-primary);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.statusApplyBtn:hover:not(:disabled) {
+  background: var(--color-primary-hover);
+}
+
+.statusApplyBtn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* ---- Main content area ---- */
+
+.mhostMain {
+  flex: 1;
+  overflow: auto;
+  padding: 24px 28px;
+}

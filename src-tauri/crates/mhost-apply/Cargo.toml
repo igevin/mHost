@@ -10,6 +10,7 @@ uuid = { version = "1.8", features = ["v4"] }
 chrono = { workspace = true }
 dirs = "5.0"
 tempfile = "3.10"
+log = "0.4"
 
 [dev-dependencies]
 mhost-storage = { path = "../mhost-storage" }

@@ -1,9 +1,14 @@
 import { useState, useEffect } from "react";
+import { useSetAtom } from "jotai";
 import { readSystemHosts } from "../lib/tauri";
+import { rollbackHostsActionAtom } from "../stores/profiles";
+import RollbackButton from "../components/RollbackButton";
+import styles from "./Settings.module.css";
 
 function Settings() {
   const [hostsContent, setHostsContent] = useState<string | null>(null);
   const [hostsError, setHostsError] = useState<string | null>(null);
+  const rollback = useSetAtom(rollbackHostsActionAtom);
 
   useEffect(() => {
     readSystemHosts()
@@ -17,37 +22,41 @@ function Settings() {
         <h1 className="mhost-page-title">Settings</h1>
       </header>
 
-      <div className="settings-grid">
+      <div className={styles.settingsGrid}>
         <div className="card">
           <h3 className="card-title">About</h3>
-          <div className="info-row">
-            <span className="info-label">App Name</span>
-            <span className="info-value">mHost</span>
+          <div className={styles.infoRow}>
+            <span className={styles.infoLabel}>App Name</span>
+            <span className={styles.infoValue}>mHost</span>
           </div>
-          <div className="info-row">
-            <span className="info-label">Version</span>
-            <span className="info-value">0.1.0</span>
-          </div>
-          <div className="info-row">
-            <span className="info-label">Phase</span>
-            <span className="info-value">0 (Skeleton)</span>
+          <div className={styles.infoRow}>
+            <span className={styles.infoLabel}>Version</span>
+            <span className={styles.infoValue}>1 (Phase 1: MVP Profile Switching)</span>
           </div>
         </div>
 
         <div className="card">
           <h3 className="card-title">Storage</h3>
-          <div className="info-row">
-            <span className="info-label">Data Directory</span>
-            <span className="info-value">~/Library/Application Support/mHost</span>
+          <div className={styles.infoRow}>
+            <span className={styles.infoLabel}>Data Directory</span>
+            <span className={styles.infoValue}>~/Library/Application Support/mHost</span>
           </div>
-          <div className="info-row">
-            <span className="info-label">Profiles</span>
-            <span className="info-value">profiles/</span>
+          <div className={styles.infoRow}>
+            <span className={styles.infoLabel}>Profiles</span>
+            <span className={styles.infoValue}>profiles/</span>
           </div>
-          <div className="info-row">
-            <span className="info-label">Backups</span>
-            <span className="info-value">backups/</span>
+          <div className={styles.infoRow}>
+            <span className={styles.infoLabel}>Backups</span>
+            <span className={styles.infoValue}>backups/</span>
           </div>
+        </div>
+
+        <div className="card">
+          <h3 className="card-title">Hosts Management</h3>
+          <p className={styles.sectionDesc}>
+            Rollback the system hosts file to the last backed-up version.
+          </p>
+          <RollbackButton onRollback={rollback} />
         </div>
 
         <div className="card card-full">
@@ -57,7 +66,7 @@ function Settings() {
           ) : hostsContent === null ? (
             <div className="loading">Loading...</div>
           ) : (
-            <pre className="hosts-preview">{hostsContent}</pre>
+            <pre className={styles.hostsPreview}>{hostsContent}</pre>
           )}
         </div>
       </div>

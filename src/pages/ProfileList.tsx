@@ -11,6 +11,13 @@ import {
   deleteProfileAtom,
   toggleProfileEnabledAtom,
 } from "../stores/profiles";
+import type { Profile, ExportFormat } from "../types";
+import { exportProfileToFile, duplicateProfile } from "../lib/tauri";
+import { save } from "@tauri-apps/plugin-dialog";
+import ProfileCard from "../components/ProfileCard";
+import CreateProfileForm from "../components/CreateProfileForm";
+import ImportDialog from "../components/ImportDialog";
+import styles from "./ProfileList.module.css";
 
 function ProfileList() {
   const navigate = useNavigate();
@@ -25,8 +32,11 @@ function ProfileList() {
   const deleteProfile = useSetAtom(deleteProfileAtom);
   const toggleEnabled = useSetAtom(toggleProfileEnabledAtom);
 
-  const [newName, setNewName] = useState("");
   const [showCreate, setShowCreate] = useState(false);
+  const [showImport, setShowImport] = useState(false);
+  const [duplicateTarget, setDuplicateTarget] = useState<Profile | null>(null);
+  const [duplicateName, setDuplicateName] = useState("");
+  const [exportTarget, setExportTarget] = useState<Profile | null>(null);
 
   useEffect(() => {
     // Load profiles on mount; gracefully handle missing backend
@@ -35,19 +45,16 @@ function ProfileList() {
     });
   }, [fetchProfiles, setError]);
 
-  const handleCreate = useCallback(async () => {
-    const name = newName.trim();
-    if (!name) return;
+  const handleCreate = useCallback(async (name: string) => {
     try {
       const profile = await createProfile(name);
-      setNewName("");
       setShowCreate(false);
       setSelectedId(profile.id);
       navigate(`/profiles/${profile.id}`);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : String(err));
     }
-  }, [newName, createProfile, setSelectedId, navigate, setError]);
+  }, [createProfile, setSelectedId, navigate, setError]);
 
   const handleDelete = useCallback(
     async (id: string) => {
@@ -80,56 +87,77 @@ function ProfileList() {
     [setSelectedId, navigate],
   );
 
+  const handleImported = useCallback(
+    (profile: Profile) => {
+      setShowImport(false);
+      setSelectedId(profile.id);
+    },
+    [setSelectedId],
+  );
+
+  const handleExport = useCallback(async (profile: Profile, format: ExportFormat) => {
+    try {
+      const path = await save({
+        defaultPath: `${profile.name}.${format === "hosts" ? "hosts" : "json"}`,
+        filters: format === "hosts"
+          ? [{ name: "Hosts", extensions: ["hosts", "txt"] }]
+          : [{ name: "JSON", extensions: ["json"] }],
+      });
+      if (path) {
+        await exportProfileToFile(profile.id, format, path);
+      }
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+    setExportTarget(null);
+  }, [setError]);
+
+  const handleDuplicate = useCallback(async () => {
+    if (!duplicateTarget || !duplicateName.trim()) return;
+    try {
+      const profile = await duplicateProfile(duplicateTarget.id, duplicateName.trim());
+      setDuplicateTarget(null);
+      setDuplicateName("");
+      setSelectedId(profile.id);
+      navigate(`/profiles/${profile.id}`);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }, [duplicateTarget, duplicateName, setSelectedId, navigate, setError]);
+
   return (
     <div className="mhost-page">
       <header className="mhost-page-header">
         <h1 className="mhost-page-title">Profiles</h1>
-        <button
-          className="btn btn-primary"
-          onClick={() => setShowCreate(true)}
-          disabled={isLoading}
-        >
-          + New Profile
-        </button>
+        <div className="mhost-page-actions">
+          <button
+            className="btn btn-ghost"
+            onClick={() => setShowImport(true)}
+            disabled={isLoading}
+          >
+            Import
+          </button>
+          <button
+            className="btn btn-primary"
+            onClick={() => setShowCreate(true)}
+            disabled={isLoading}
+          >
+            + New Profile
+          </button>
+        </div>
       </header>
 
       {error && <div className="alert alert-error">{error}</div>}
 
       {showCreate && (
-        <div className="card create-card">
-          <h3>Create Profile</h3>
-          <div className="form-row">
-            <input
-              className="input"
-              placeholder="Profile name"
-              value={newName}
-              onChange={(e) => setNewName(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") handleCreate();
-              }}
-              autoFocus
-            />
-            <button
-              className="btn btn-primary"
-              onClick={handleCreate}
-              disabled={!newName.trim() || isLoading}
-            >
-              Create
-            </button>
-            <button
-              className="btn btn-ghost"
-              onClick={() => {
-                setShowCreate(false);
-                setNewName("");
-              }}
-            >
-              Cancel
-            </button>
-          </div>
-        </div>
+        <CreateProfileForm
+          isLoading={isLoading}
+          onCreate={handleCreate}
+          onCancel={() => setShowCreate(false)}
+        />
       )}
 
-      <div className="profile-list">
+      <div className={styles.profileList}>
         {profiles.length === 0 && !isLoading && (
           <div className="empty-state">
             <p>No profiles yet.</p>
@@ -140,69 +168,101 @@ function ProfileList() {
         )}
 
         {profiles.map((profile) => (
-          <div
+          <ProfileCard
             key={profile.id}
-            className={`profile-card ${profile.enabled ? "profile-card-enabled" : ""}`}
-          >
-            <div className="profile-card-main">
-              <div className="profile-card-header">
-                <h3
-                  className="profile-name"
-                  onClick={() => handleEdit(profile.id)}
-                >
-                  {profile.name}
-                </h3>
-                <div className="profile-tags">
-                  {profile.tags.map((tag) => (
-                    <span key={tag} className="tag">
-                      {tag}
-                    </span>
-                  ))}
-                </div>
-              </div>
-              {profile.description && (
-                <p className="profile-desc">{profile.description}</p>
-              )}
-              <div className="profile-meta">
-                <span>{profile.rules.length} rules</span>
-                <span className="meta-sep">·</span>
-                <span>{profile.enabled ? "Enabled" : "Disabled"}</span>
-                {profile.protected && (
-                  <>
-                    <span className="meta-sep">·</span>
-                    <span className="protected-badge">Protected</span>
-                  </>
-                )}
-              </div>
-            </div>
+            profile={profile}
+            isLoading={isLoading}
+            onEdit={handleEdit}
+            onToggle={handleToggle}
+            onDelete={handleDelete}
+            onExport={(id) => {
+              const target = profiles.find((p) => p.id === id);
+              if (target) {
+                setExportTarget(target);
+              }
+            }}
+            onDuplicate={(id) => {
+              const target = profiles.find((p) => p.id === id);
+              if (target) {
+                setDuplicateTarget(target);
+                setDuplicateName(`${target.name} (copy)`);
+              }
+            }}
+          />
+        ))}
+      </div>
 
-            <div className="profile-card-actions">
-              <label className="toggle">
-                <input
-                  type="checkbox"
-                  checked={profile.enabled}
-                  onChange={() => handleToggle(profile.id)}
-                  disabled={isLoading}
-                />
-                <span className="toggle-slider" />
-              </label>
+      {/* Import Dialog */}
+      <ImportDialog
+        open={showImport}
+        onClose={() => setShowImport(false)}
+        onImported={handleImported}
+      />
+
+      {/* Export Format Dialog */}
+      {exportTarget && (
+        <div className={styles.overlay} onClick={() => setExportTarget(null)}>
+          <div className={styles.dialog} onClick={(e) => e.stopPropagation()}>
+            <h3 className={styles.dialogTitle}>Export Profile</h3>
+            <p className={styles.dialogDesc}>
+              Export "{exportTarget.name}" as:
+            </p>
+            <div className={styles.dialogActions}>
               <button
-                className="btn btn-ghost btn-sm"
-                onClick={() => handleEdit(profile.id)}
+                className="btn btn-primary"
+                onClick={() => handleExport(exportTarget, "hosts")}
               >
-                Edit
+                hosts format
               </button>
               <button
-                className="btn btn-danger btn-sm"
-                onClick={() => handleDelete(profile.id)}
-                disabled={profile.protected || isLoading}
+                className="btn btn-ghost"
+                onClick={() => handleExport(exportTarget, "json")}
               >
-                Delete
+                JSON format
+              </button>
+              <button
+                className="btn btn-ghost"
+                onClick={() => setExportTarget(null)}
+              >
+                Cancel
               </button>
             </div>
           </div>
-        ))}
-      </div>
+        </div>
+      )}
+
+      {/* Duplicate Dialog */}
+      {duplicateTarget && (
+        <div className={styles.overlay} onClick={() => setDuplicateTarget(null)}>
+          <div className={styles.dialog} onClick={(e) => e.stopPropagation()}>
+            <h3 className={styles.dialogTitle}>Duplicate Profile</h3>
+            <div className="form-group">
+              <label className="form-label">New Name</label>
+              <input
+                className="input"
+                value={duplicateName}
+                onChange={(e) => setDuplicateName(e.target.value)}
+                autoFocus
+              />
+            </div>
+            <div className={styles.dialogActions}>
+              <button
+                className="btn btn-primary"
+                onClick={handleDuplicate}
+                disabled={!duplicateName.trim() || isLoading}
+              >
+                Duplicate
+              </button>
+              <button
+                className="btn btn-ghost"
+                onClick={() => setDuplicateTarget(null)}
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

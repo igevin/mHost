@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Profile, ApplyPlan } from "../types";
+import type { Profile, ApplyPlan, ValidateResult, ExportFormat } from "../types";
 
 // ---- Profile commands ----
 
@@ -46,4 +46,38 @@ export async function rollbackHosts(): Promise<void> {
 
 export async function readSystemHosts(): Promise<string> {
   return invoke("read_system_hosts");
+}
+
+// ---- Validate commands ----
+
+export async function validateHostsText(text: string): Promise<ValidateResult> {
+  return invoke("validate_hosts_text", { text });
+}
+
+// ---- Import / Export / Duplicate commands ----
+
+export async function importProfile(name: string, hostsText: string): Promise<Profile> {
+  return invoke("import_profile", { name, hostsText });
+}
+
+export async function exportProfile(id: string, format: ExportFormat): Promise<string> {
+  return invoke("export_profile", { id, format });
+}
+
+export async function exportProfileToFile(id: string, format: ExportFormat, path: string): Promise<void> {
+  return invoke("export_profile_to_file", { id, format, path });
+}
+
+export async function duplicateProfile(id: string, newName: string): Promise<Profile> {
+  return invoke("duplicate_profile", { id, newName });
+}
+
+// ---- Hosts block commands ----
+
+export async function getManagedBlockContent(): Promise<string | null> {
+  return invoke("get_managed_block_content");
+}
+
+export async function getLastApplied(): Promise<string | null> {
+  return invoke("get_last_applied");
 }

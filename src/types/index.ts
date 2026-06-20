@@ -55,3 +55,15 @@ export type AppError =
   | { type: "Storage"; message: string }
   | { type: "Io"; message: string }
   | { type: "InvalidInput"; message: string };
+
+export interface ParseErrorAtLine {
+  line_number: number;
+  error: string | Record<string, string>;
+}
+
+export interface ValidateResult {
+  rules: HostRule[];
+  errors: ParseErrorAtLine[];
+}
+
+export type ExportFormat = "hosts" | "json";

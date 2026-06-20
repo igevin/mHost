@@ -9,7 +9,10 @@ import {
   fetchProfileAtom,
   updateProfileAtom,
 } from "../stores/profiles";
-import type { Profile } from "../types";
+import type { HostRule, Profile } from "../types";
+import BasicInfoForm from "../components/BasicInfoForm";
+import RuleEditor from "../components/RuleEditor";
+import styles from "./ProfileEdit.module.css";
 
 function ProfileEdit() {
   const { id } = useParams<{ id: string }>();
@@ -25,6 +28,7 @@ function ProfileEdit() {
 
   const [draft, setDraft] = useState<Profile | null>(null);
   const [hasChanges, setHasChanges] = useState(false);
+  const [ruleErrors, setRuleErrors] = useState(false);
 
   const profile = profiles.find((p) => p.id === id);
 
@@ -43,6 +47,7 @@ function ProfileEdit() {
     if (profile) {
       setDraft({ ...profile });
       setHasChanges(false);
+      setRuleErrors(false);
     }
   }, [profile]);
 
@@ -58,23 +63,35 @@ function ProfileEdit() {
     [],
   );
 
+  const handleRulesChange = useCallback(
+    (rules: HostRule[]) => {
+      setDraft((prev) => {
+        if (!prev) return prev;
+        setHasChanges(true);
+        setRuleErrors(false);
+        return { ...prev, rules };
+      });
+    },
+    [],
+  );
+
+  const handleRulesErrorChange = useCallback((hasErrors: boolean) => {
+    setRuleErrors(hasErrors);
+  }, []);
+
   const handleSave = useCallback(async () => {
     if (!draft) return;
+    if (ruleErrors) {
+      setError("Cannot save: rules have validation errors. Please fix them before saving.");
+      return;
+    }
     try {
       await updateProfile(draft);
       setHasChanges(false);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : String(err));
     }
-  }, [draft, updateProfile, setError]);
-
-  const handleTagsChange = useCallback((value: string) => {
-    const tags = value
-      .split(",")
-      .map((t) => t.trim())
-      .filter(Boolean);
-    handleChange("tags", tags);
-  }, [handleChange]);
+  }, [draft, ruleErrors, updateProfile, setError]);
 
   if (!profile || !draft) {
     return (
@@ -100,7 +117,7 @@ function ProfileEdit() {
           <button
             className="btn btn-primary"
             onClick={handleSave}
-            disabled={!hasChanges || isLoading}
+            disabled={!hasChanges || isLoading || ruleErrors}
           >
             Save
           </button>
@@ -115,80 +132,16 @@ function ProfileEdit() {
 
       {error && <div className="alert alert-error">{error}</div>}
 
-      <div className="edit-grid">
-        <div className="card">
-          <h3 className="card-title">Basic Info</h3>
-          <div className="form-group">
-            <label className="form-label">Name</label>
-            <input
-              className="input"
-              value={draft.name}
-              onChange={(e) => handleChange("name", e.target.value)}
-            />
-          </div>
-          <div className="form-group">
-            <label className="form-label">Description</label>
-            <textarea
-              className="input textarea"
-              rows={3}
-              value={draft.description ?? ""}
-              onChange={(e) =>
-                handleChange(
-                  "description",
-                  e.target.value || null,
-                )
-              }
-            />
-          </div>
-          <div className="form-group">
-            <label className="form-label">Tags (comma separated)</label>
-            <input
-              className="input"
-              value={draft.tags.join(", ")}
-              onChange={(e) => handleTagsChange(e.target.value)}
-            />
-          </div>
-          <div className="form-group">
-            <label className="form-label">Status</label>
-            <div className="form-static">
-              {draft.enabled ? "Enabled" : "Disabled"}
-              {draft.protected && " · Protected"}
-            </div>
-          </div>
-        </div>
+      <div className={styles.editGrid}>
+        <BasicInfoForm draft={draft} onChange={handleChange} />
 
         <div className="card">
           <h3 className="card-title">Rules ({draft.rules.length})</h3>
-          {draft.rules.length === 0 ? (
-            <div className="empty-state">
-              <p>No rules in this profile.</p>
-              <p className="empty-hint">
-                Rule editing will be available in a later phase.
-              </p>
-            </div>
-          ) : (
-            <div className="rule-list">
-              {draft.rules.map((rule) => (
-                <div
-                  key={rule.id}
-                  className={`rule-item ${rule.enabled ? "" : "rule-item-disabled"}`}
-                >
-                  <div className="rule-header">
-                    <span className="rule-ip">{rule.ip}</span>
-                    <span className="rule-status">
-                      {rule.enabled ? "On" : "Off"}
-                    </span>
-                  </div>
-                  <div className="rule-domains">
-                    {rule.domains.join(", ")}
-                  </div>
-                  {rule.comment && (
-                    <div className="rule-comment">{rule.comment}</div>
-                  )}
-                </div>
-              ))}
-            </div>
-          )}
+          <RuleEditor
+            rules={draft.rules}
+            onChange={handleRulesChange}
+            onErrorChange={handleRulesErrorChange}
+          />
         </div>
       </div>
     </div>

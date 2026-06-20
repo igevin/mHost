@@ -1986,6 +1986,8 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",
+ "tempfile",
+ "uuid",
 ]
 
 [[package]]
@@ -1994,6 +1996,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "dirs 5.0.1",
+ "log",
  "mhost-core",
  "mhost-hosts",
  "mhost-storage",
@@ -2017,6 +2020,8 @@ name = "mhost-hosts"
 version = "0.1.0"
 dependencies = [
  "mhost-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

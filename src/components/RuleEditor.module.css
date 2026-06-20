@@ -1,0 +1,35 @@
+/* ---- RuleEditor ---- */
+
+.container {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.hasErrors {
+  border-color: var(--color-danger);
+}
+
+.hasErrors:focus {
+  border-color: var(--color-danger);
+}
+
+.validating {
+  font-size: 12px;
+  color: var(--color-text-muted);
+}
+
+.errorList {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.errorItem {
+  font-size: 12px;
+  color: var(--color-danger);
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  border-radius: var(--radius-sm);
+  padding: 4px 8px;
+}

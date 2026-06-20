@@ -1,0 +1,112 @@
+/* ---- ImportDialog Overlay ---- */
+
+.overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+  animation: fadeIn 0.15s ease;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* ---- Dialog ---- */
+
+.dialog {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  padding: 24px;
+  width: 90%;
+  max-width: 560px;
+  max-height: 80vh;
+  overflow-y: auto;
+  box-shadow: var(--shadow-md);
+  animation: slideUp 0.2s ease;
+}
+
+@keyframes slideUp {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.title {
+  font-size: 17px;
+  font-weight: 600;
+  margin: 0 0 16px;
+}
+
+/* ---- Form ---- */
+
+.formGroup {
+  margin-bottom: 14px;
+}
+
+.hasErrors {
+  border-color: var(--color-danger);
+}
+
+.hasErrors:focus {
+  border-color: var(--color-danger);
+}
+
+/* ---- Status / Preview ---- */
+
+.status {
+  font-size: 12px;
+  color: var(--color-text-muted);
+  margin-bottom: 8px;
+}
+
+.preview {
+  font-size: 13px;
+  color: var(--color-success);
+  background: #f0fdf4;
+  border: 1px solid #bbf7d0;
+  border-radius: var(--radius-sm);
+  padding: 6px 10px;
+  margin-bottom: 8px;
+}
+
+/* ---- Errors ---- */
+
+.errorList {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 8px;
+}
+
+.errorItem {
+  font-size: 12px;
+  color: var(--color-danger);
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  border-radius: var(--radius-sm);
+  padding: 4px 8px;
+}
+
+/* ---- Actions ---- */
+
+.actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 16px;
+}

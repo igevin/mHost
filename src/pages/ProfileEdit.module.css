@@ -1,0 +1,66 @@
+/* ---- Edit Grid ---- */
+
+.editGrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+
+@media (max-width: 768px) {
+  .editGrid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ---- Rule List ---- */
+
+.ruleList {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.ruleItem {
+  padding: 10px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg);
+}
+
+.ruleItemDisabled {
+  opacity: 0.6;
+}
+
+.ruleHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 4px;
+}
+
+.ruleIp {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+    monospace;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-primary);
+}
+
+.ruleStatus {
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--color-border);
+  color: var(--color-text-secondary);
+}
+
+.ruleDomains {
+  font-size: 13px;
+  color: var(--color-text);
+}
+
+.ruleComment {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--color-text-muted);
+}
