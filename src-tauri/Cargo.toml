@@ -1,0 +1,43 @@
+[workspace]
+members = [".", "crates/*"]
+resolver = "2"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.8", features = ["v4", "serde"] }
+thiserror = "1.0"
+tokio = { version = "1.37", features = ["full"] }
+
+[package]
+name = "mhost"
+version = "0.1.0"
+description = "mHost - A lightweight cross-platform hosts manager"
+authors = ["gevin"]
+edition = "2021"
+
+[lib]
+name = "mhost_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+mhost-core = { path = "crates/mhost-core" }
+mhost-hosts = { path = "crates/mhost-hosts" }
+mhost-storage = { path = "crates/mhost-storage" }
+mhost-apply = { path = "crates/mhost-apply" }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true
