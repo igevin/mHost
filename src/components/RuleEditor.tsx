@@ -112,7 +112,7 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEd
   return (
     <div className={styles.container}>
       <textarea
-        className={`${styles.textarea} ${errors.length > 0 ? styles.hasErrors : ""}`}
+        className={`hosts-textarea ${errors.length > 0 ? styles.hasErrors : ""}`}
         value={text}
         onChange={handleChange}
         readOnly={readOnly}

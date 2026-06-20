@@ -130,7 +130,7 @@ function ImportDialog({ open, onClose, onImported }: ImportDialogProps) {
           </label>
           <textarea
             id="import-text"
-            className={`${styles.textarea} ${errors.length > 0 ? styles.hasErrors : ""}`}
+            className={`hosts-textarea ${errors.length > 0 ? styles.hasErrors : ""}`}
             placeholder="Paste hosts file content here..."
             value={hostsText}
             onChange={handleTextChange}

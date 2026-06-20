@@ -205,6 +205,32 @@ body {
   font-family: inherit;
 }
 
+.hosts-textarea {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.6;
+  background: var(--color-surface);
+  color: var(--color-text);
+  outline: none;
+  resize: vertical;
+  min-height: 120px;
+  transition: border-color 0.15s;
+}
+
+.hosts-textarea:focus {
+  border-color: var(--color-primary);
+}
+
+.hosts-textarea[readonly] {
+  background: var(--color-bg);
+  cursor: default;
+  opacity: 0.8;
+}
+
 /* ---- Toggle ---- */
 .toggle {
   position: relative;
