@@ -28,10 +28,14 @@ pub fn apply_hosts(plan: ApplyPlan, state: State<'_, AppState>) -> Result<(), Mh
     let last_applied_path = state.storage.root().join("last_applied.json");
     let timestamp = chrono::Utc::now().to_rfc3339();
     let data = serde_json::json!({ "timestamp": timestamp });
-    if let Err(e) = std::fs::write(
-        &last_applied_path,
-        serde_json::to_string_pretty(&data).unwrap(),
-    ) {
+    let json = match serde_json::to_string_pretty(&data) {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("Warning: failed to serialize last_applied: {}", e);
+            return Ok(());
+        }
+    };
+    if let Err(e) = std::fs::write(&last_applied_path, json) {
         eprintln!(
             "[mHost] Warning: failed to write last_applied.json: {}",
             e
