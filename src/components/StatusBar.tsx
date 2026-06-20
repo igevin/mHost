@@ -3,7 +3,7 @@ import {
   enabledProfileAtom,
   isApplyingAtom,
 } from "../stores/profiles";
-import styles from "./Layout.module.css";
+import styles from "./StatusBar.module.css";
 
 function StatusBar() {
   const enabledProfile = useAtomValue(enabledProfileAtom);

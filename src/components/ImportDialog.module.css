@@ -77,8 +77,8 @@
 .preview {
   font-size: 13px;
   color: var(--color-success);
-  background: #f0fdf4;
-  border: 1px solid #bbf7d0;
+  background: var(--color-success-bg);
+  border: 1px solid var(--color-success-border);
   border-radius: var(--radius-sm);
   padding: 6px 10px;
   margin-bottom: 8px;
@@ -96,8 +96,8 @@
 .errorItem {
   font-size: 12px;
   color: var(--color-danger);
-  background: #fef2f2;
-  border: 1px solid #fecaca;
+  background: var(--color-error-bg);
+  border: 1px solid var(--color-error-border);
   border-radius: var(--radius-sm);
   padding: 4px 8px;
 }

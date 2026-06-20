@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import type { HostRule, ParseErrorAtLine } from "../types";
 import { validateHostsText } from "../lib/tauri";
 import { extractErrorMessage } from "../lib/error";
@@ -25,77 +25,81 @@ function rulesToText(rules: HostRule[]): string {
     .join("\n");
 }
 
-/** Parse text into tokens for syntax highlighting */
-function tokenize(text: string | undefined): { type: string; text: string }[] {
-  const tokens: { type: string; text: string }[] = [];
-  if (!text) return tokens;
+/** Escape HTML special chars for safe rendering in highlight layer */
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+/** Parse text into HTML with syntax highlighting */
+function highlightText(text: string): string {
+  if (!text) return "";
   const lines = text.split("\n");
 
-  lines.forEach((line, lineIdx) => {
-    const trimmed = line.trim();
+  return lines
+    .map((line) => {
+      const trimmed = line.trim();
 
-    if (trimmed === "") {
-      tokens.push({ type: "empty", text: lineIdx === lines.length - 1 ? "" : "\n" });
-      return;
-    }
+      if (trimmed === "") {
+        return "<br>";
+      }
 
-    // Full line comment
-    if (trimmed.startsWith("#")) {
-      tokens.push({ type: "comment", text: line + (lineIdx === lines.length - 1 ? "" : "\n") });
-      return;
-    }
+      // Full line comment
+      if (trimmed.startsWith("#")) {
+        return `<span class="${styles.tokenComment}">${escapeHtml(line)}</span>`;
+      }
 
-    let remaining = line;
+      let remaining = line;
+      let html = "";
 
-    // Disabled prefix
-    if (remaining.startsWith("# ")) {
-      tokens.push({ type: "comment", text: "# " });
-      remaining = remaining.slice(2);
-    }
+      // Disabled prefix
+      if (remaining.startsWith("# ")) {
+        html += `<span class="${styles.tokenComment}">${escapeHtml("# ")}</span>`;
+        remaining = remaining.slice(2);
+      }
 
-    // IP address
-    const ipMatch = remaining.match(/^(\d+\.\d+\.\d+\.\d+)/);
-    if (ipMatch) {
-      tokens.push({ type: "ip", text: ipMatch[1] });
-      remaining = remaining.slice(ipMatch[1].length);
-    }
+      // IP address
+      const ipMatch = remaining.match(/^(\d+\.\d+\.\d+\.\d+)/);
+      if (ipMatch) {
+        html += `<span class="${styles.tokenIp}">${escapeHtml(ipMatch[1])}</span>`;
+        remaining = remaining.slice(ipMatch[1].length);
+      }
 
-    // Remaining: spaces, domains, inline comment
-    const commentIdx = remaining.indexOf(" #");
-    if (commentIdx >= 0) {
-      const beforeComment = remaining.slice(0, commentIdx);
-      const comment = remaining.slice(commentIdx);
+      // Remaining: spaces, domains, inline comment
+      const commentIdx = remaining.indexOf(" #");
+      if (commentIdx >= 0) {
+        const beforeComment = remaining.slice(0, commentIdx);
+        const comment = remaining.slice(commentIdx);
 
-      // Tokenize before comment: spaces and domains
-      const parts = beforeComment.split(/(\s+)/);
-      for (const part of parts) {
-        if (part === "") continue;
-        if (/^\s+$/.test(part)) {
-          tokens.push({ type: "space", text: part });
-        } else {
-          tokens.push({ type: "domain", text: part });
+        // Tokenize before comment
+        const parts = beforeComment.split(/(\s+)/);
+        for (const part of parts) {
+          if (part === "") continue;
+          if (/^\s+$/.test(part)) {
+            html += escapeHtml(part); // spaces as-is
+          } else {
+            html += `<span class="${styles.tokenDomain}">${escapeHtml(part)}</span>`;
+          }
+        }
+
+        html += `<span class="${styles.tokenComment}">${escapeHtml(comment)}</span>`;
+      } else {
+        const parts = remaining.split(/(\s+)/);
+        for (const part of parts) {
+          if (part === "") continue;
+          if (/^\s+$/.test(part)) {
+            html += escapeHtml(part);
+          } else {
+            html += `<span class="${styles.tokenDomain}">${escapeHtml(part)}</span>`;
+          }
         }
       }
 
-      tokens.push({ type: "comment", text: comment });
-    } else {
-      const parts = remaining.split(/(\s+)/);
-      for (const part of parts) {
-        if (part === "") continue;
-        if (/^\s+$/.test(part)) {
-          tokens.push({ type: "space", text: part });
-        } else {
-          tokens.push({ type: "domain", text: part });
-        }
-      }
-    }
-
-    if (lineIdx < lines.length - 1) {
-      tokens.push({ type: "newline", text: "\n" });
-    }
-  });
-
-  return tokens;
+      return html;
+    })
+    .join("\n");
 }
 
 /** Simple debounce hook */
@@ -134,7 +138,8 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEd
   const [text, setText] = useState(() => rulesToText(rules));
   const [errors, setErrors] = useState<ParseErrorAtLine[]>([]);
   const [isValidating, setIsValidating] = useState(false);
-  const editorRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const highlightRef = useRef<HTMLDivElement>(null);
 
   // Sync text when rules prop changes externally
   const prevRulesRef = useRef<HostRule[]>([]);
@@ -177,46 +182,48 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEd
 
   const debouncedValidate = useDebouncedCallback(handleValidate, 300);
 
-  const handleInput = useCallback(
-    (e: React.FormEvent<HTMLDivElement>) => {
-      const value = e.currentTarget.innerText;
+  const handleChange = useCallback(
+    (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+      const value = e.target.value;
       setText(value);
       debouncedValidate(value);
     },
     [debouncedValidate],
   );
 
-  // Prevent formatting on paste
-  const handlePaste = useCallback((e: React.ClipboardEvent) => {
-    e.preventDefault();
-    const text = e.clipboardData.getData("text/plain");
-    document.execCommand("insertText", false, text);
+  // Sync scroll between textarea and highlight layer
+  const handleScroll = useCallback(() => {
+    if (textareaRef.current && highlightRef.current) {
+      highlightRef.current.scrollTop = textareaRef.current.scrollTop;
+      highlightRef.current.scrollLeft = textareaRef.current.scrollLeft;
+    }
   }, []);
 
   // Generate highlighted content
-  const tokens = tokenize(text);
+  const highlightedHtml = useMemo(() => highlightText(text), [text]);
 
   return (
     <div className={styles.container}>
-      <div
-        ref={editorRef}
-        role="textbox"
-        aria-multiline="true"
-        className={`${styles.editor} ${errors.length > 0 ? styles.hasErrors : ""} ${readOnly ? styles.readOnly : ""}`}
-        contentEditable={!readOnly}
-        onInput={handleInput}
-        onPaste={handlePaste}
-        suppressContentEditableWarning
-        spellCheck={false}
-      >
-        {tokens.map((token, idx) => (
-          <span
-            key={idx}
-            className={styles[`token${token.type.charAt(0).toUpperCase() + token.type.slice(1)}`]}
-          >
-            {token.text}
-          </span>
-        ))}
+      <div className={styles.editorWrapper}>
+        {/* Highlight Layer */}
+        <div
+          ref={highlightRef}
+          className={styles.highlightLayer}
+          aria-hidden="true"
+          dangerouslySetInnerHTML={{ __html: highlightedHtml }}
+        />
+
+        {/* Textarea */}
+        <textarea
+          ref={textareaRef}
+          className={`${styles.textarea} ${errors.length > 0 ? styles.hasErrors : ""}`}
+          value={text}
+          onChange={handleChange}
+          onScroll={handleScroll}
+          readOnly={readOnly}
+          spellCheck={false}
+          placeholder="Enter hosts rules, one per line:&#10;127.0.0.1 localhost # local dev&#10;192.168.1.100 api.dev.local # API server"
+        />
       </div>
 
       {isValidating && (

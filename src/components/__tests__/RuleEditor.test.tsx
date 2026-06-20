@@ -36,29 +36,21 @@ describe("RuleEditor", () => {
     vi.useRealTimers();
   });
 
-  it("renders rules as hosts text with syntax highlighting", () => {
+  it("renders rules as hosts text with syntax highlighting layer", () => {
     const onChange = vi.fn();
     render(<RuleEditor rules={sampleRules} onChange={onChange} />);
 
-    const editor = screen.getByRole("textbox");
-    expect(editor).toHaveTextContent("127.0.0.1");
-    expect(editor).toHaveTextContent("localhost");
-    expect(editor).toHaveTextContent("192.168.1.1");
-    expect(editor).toHaveTextContent("example.com");
+    const textarea = screen.getByRole("textbox");
+    expect(textarea).toHaveValue("127.0.0.1 localhost # local\n192.168.1.1 example.com www.example.com");
 
-    // Check syntax highlighting: IP tokens should be in colored spans
-    const spans = editor.querySelectorAll("span");
-    const hasIpSpan = Array.from(spans).some((s) =>
-      s.textContent?.includes("127.0.0.1"),
-    );
-    const hasDomainSpan = Array.from(spans).some((s) =>
-      s.textContent?.includes("localhost"),
-    );
-    expect(hasIpSpan).toBe(true);
-    expect(hasDomainSpan).toBe(true);
+    // Highlight layer should contain colored spans
+    const highlightLayer = document.querySelector("[aria-hidden='true']");
+    expect(highlightLayer).toBeInTheDocument();
+    expect(highlightLayer).toHaveTextContent("127.0.0.1");
+    expect(highlightLayer).toHaveTextContent("localhost");
   });
 
-  it.skip("shows validation errors inline", async () => {
+  it("shows validation errors inline", async () => {
     mockValidateHostsText.mockResolvedValue({
       rules: [],
       errors: [{ line_number: 2, error: "invalid IP address" }],
@@ -66,18 +58,14 @@ describe("RuleEditor", () => {
 
     const onChange = vi.fn();
     render(<RuleEditor rules={sampleRules} onChange={onChange} />);
-    const editor = screen.getByRole("textbox");
+    const textarea = screen.getByRole("textbox");
 
-    // Simulate typing by setting textContent and firing input event
-    editor.textContent = "127.0.0.1 localhost\ninvalid-line";
-    fireEvent.input(editor);
+    fireEvent.change(textarea, { target: { value: "127.0.0.1 localhost\ninvalid-line" } });
 
-    // Advance debounce timer
     act(() => {
       vi.advanceTimersByTime(350);
     });
 
-    // Flush async promise resolution
     await act(async () => {
       await vi.runAllTimersAsync();
     });
@@ -85,7 +73,7 @@ describe("RuleEditor", () => {
     expect(screen.getByText(/Line 2.*invalid IP address/)).toBeInTheDocument();
   });
 
-  it.skip("emits parsed rules on valid change", async () => {
+  it("emits parsed rules on valid change", async () => {
     const newRules: HostRule[] = [
       makeRule({ id: "new-1", ip: "10.0.0.1", domains: ["test.com"] }),
     ];
@@ -96,10 +84,9 @@ describe("RuleEditor", () => {
 
     const onChange = vi.fn();
     render(<RuleEditor rules={sampleRules} onChange={onChange} />);
-    const editor = screen.getByRole("textbox");
+    const textarea = screen.getByRole("textbox");
 
-    editor.textContent = "10.0.0.1 test.com";
-    fireEvent.input(editor);
+    fireEvent.change(textarea, { target: { value: "10.0.0.1 test.com" } });
 
     act(() => {
       vi.advanceTimersByTime(350);
@@ -112,7 +99,7 @@ describe("RuleEditor", () => {
     expect(onChange).toHaveBeenCalledWith(newRules);
   });
 
-  it.skip("does not emit onChange on invalid input", async () => {
+  it("does not emit onChange on invalid input", async () => {
     mockValidateHostsText.mockResolvedValue({
       rules: [],
       errors: [{ line_number: 1, error: "parse error" }],
@@ -120,10 +107,9 @@ describe("RuleEditor", () => {
 
     const onChange = vi.fn();
     render(<RuleEditor rules={sampleRules} onChange={onChange} />);
-    const editor = screen.getByRole("textbox");
+    const textarea = screen.getByRole("textbox");
 
-    editor.textContent = "bad input";
-    fireEvent.input(editor);
+    fireEvent.change(textarea, { target: { value: "bad input" } });
 
     act(() => {
       vi.advanceTimersByTime(350);
@@ -137,7 +123,7 @@ describe("RuleEditor", () => {
     expect(onChange).not.toHaveBeenCalled();
   });
 
-  it.skip("handles empty input", async () => {
+  it("handles empty input", async () => {
     mockValidateHostsText.mockResolvedValue({
       rules: [],
       errors: [],
@@ -145,10 +131,9 @@ describe("RuleEditor", () => {
 
     const onChange = vi.fn();
     render(<RuleEditor rules={sampleRules} onChange={onChange} />);
-    const editor = screen.getByRole("textbox");
+    const textarea = screen.getByRole("textbox");
 
-    editor.textContent = "";
-    fireEvent.input(editor);
+    fireEvent.change(textarea, { target: { value: "" } });
 
     act(() => {
       vi.advanceTimersByTime(350);
@@ -165,7 +150,7 @@ describe("RuleEditor", () => {
     const onChange = vi.fn();
     render(<RuleEditor rules={sampleRules} onChange={onChange} readOnly />);
 
-    const editor = screen.getByRole("textbox");
-    expect(editor).toHaveAttribute("contenteditable", "false");
+    const textarea = screen.getByRole("textbox");
+    expect(textarea).toHaveAttribute("readonly");
   });
 });

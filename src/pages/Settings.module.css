@@ -117,7 +117,7 @@
 /* ---- Hosts Preview ---- */
 
 .hostsPreview {
-  background: #f6f8fa;
+  background: var(--color-readonly-bg);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-sm);
   padding: 12px;

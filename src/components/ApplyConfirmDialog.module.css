@@ -43,12 +43,12 @@
 
 .diffAdded {
   color: var(--color-success);
-  background: #f0fdf4;
+  background: var(--color-success-bg);
 }
 
 .diffRemoved {
   color: var(--color-danger);
-  background: #fef2f2;
+  background: var(--color-error-bg);
   text-decoration: line-through;
 }
 
@@ -79,8 +79,8 @@
   align-items: center;
   gap: 6px;
   padding: 8px 12px;
-  background: #fef2f2;
-  border: 1px solid #fecaca;
+  background: var(--color-error-bg);
+  border: 1px solid var(--color-error-border);
   border-radius: var(--radius-sm);
   font-size: 13px;
   color: var(--color-danger);
