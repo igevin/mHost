@@ -66,6 +66,17 @@ fn test_build_content_empty_rules_no_block() {
     assert!(!content.contains(MANAGED_START));
 }
 
+#[test]
+fn test_build_hosts_content_empty_file() {
+    let current = "";
+    let plan = plan_with_rules(vec![resolved_rule("127.0.0.1", "example.com", "p1")]);
+    let content = content::build_hosts_content(current, &plan);
+
+    assert!(content.contains(MANAGED_START));
+    assert!(content.contains(MANAGED_END));
+    assert!(content.contains("127.0.0.1 example.com"));
+}
+
 // -----------------------------------------------------------------------
 // apply tests (integration-style with temp dirs)
 // -----------------------------------------------------------------------
