@@ -9,9 +9,9 @@ import {
   fetchProfileAtom,
   updateProfileAtom,
 } from "../stores/profiles";
-import type { Profile } from "../types";
+import type { HostRule, Profile } from "../types";
 import BasicInfoForm from "../components/BasicInfoForm";
-import RuleList from "../components/RuleList";
+import RuleEditor from "../components/RuleEditor";
 import styles from "./ProfileEdit.module.css";
 
 function ProfileEdit() {
@@ -28,6 +28,7 @@ function ProfileEdit() {
 
   const [draft, setDraft] = useState<Profile | null>(null);
   const [hasChanges, setHasChanges] = useState(false);
+  const [ruleErrors, setRuleErrors] = useState(false);
 
   const profile = profiles.find((p) => p.id === id);
 
@@ -46,6 +47,7 @@ function ProfileEdit() {
     if (profile) {
       setDraft({ ...profile });
       setHasChanges(false);
+      setRuleErrors(false);
     }
   }, [profile]);
 
@@ -61,15 +63,35 @@ function ProfileEdit() {
     [],
   );
 
+  const handleRulesChange = useCallback(
+    (rules: HostRule[]) => {
+      setDraft((prev) => {
+        if (!prev) return prev;
+        setHasChanges(true);
+        setRuleErrors(false);
+        return { ...prev, rules };
+      });
+    },
+    [],
+  );
+
+  const handleRulesErrorChange = useCallback((hasErrors: boolean) => {
+    setRuleErrors(hasErrors);
+  }, []);
+
   const handleSave = useCallback(async () => {
     if (!draft) return;
+    if (ruleErrors) {
+      setError("Cannot save: rules have validation errors. Please fix them before saving.");
+      return;
+    }
     try {
       await updateProfile(draft);
       setHasChanges(false);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : String(err));
     }
-  }, [draft, updateProfile, setError]);
+  }, [draft, ruleErrors, updateProfile, setError]);
 
   if (!profile || !draft) {
     return (
@@ -95,7 +117,7 @@ function ProfileEdit() {
           <button
             className="btn btn-primary"
             onClick={handleSave}
-            disabled={!hasChanges || isLoading}
+            disabled={!hasChanges || isLoading || ruleErrors}
           >
             Save
           </button>
@@ -115,7 +137,11 @@ function ProfileEdit() {
 
         <div className="card">
           <h3 className="card-title">Rules ({draft.rules.length})</h3>
-          <RuleList rules={draft.rules} />
+          <RuleEditor
+            rules={draft.rules}
+            onChange={handleRulesChange}
+            onErrorChange={handleRulesErrorChange}
+          />
         </div>
       </div>
     </div>

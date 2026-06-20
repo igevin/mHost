@@ -2,7 +2,7 @@ pub mod commands;
 pub mod platform;
 pub mod state;
 
-use commands::{apply::*, profile::*};
+use commands::{apply::*, io::*, profile::*, profile_io::*, validate::*};
 use state::AppState;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -29,6 +29,14 @@ pub fn run() {
             apply_hosts,
             rollback_hosts,
             read_system_hosts,
+            validate_hosts_text,
+            get_managed_block_content,
+            get_last_applied,
+            read_file_text,
+            write_file_text,
+            import_profile,
+            export_profile,
+            duplicate_profile,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

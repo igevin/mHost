@@ -1,4 +1,4 @@
-import type { Profile } from "../types";
+import type { Profile, ExportFormat } from "../types";
 import styles from "../pages/ProfileList.module.css";
 
 interface ProfileCardProps {
@@ -7,9 +7,19 @@ interface ProfileCardProps {
   onEdit: (id: string) => void;
   onToggle: (id: string) => void;
   onDelete: (id: string) => void;
+  onExport?: (id: string, format: ExportFormat) => void;
+  onDuplicate?: (id: string) => void;
 }
 
-function ProfileCard({ profile, isLoading, onEdit, onToggle, onDelete }: ProfileCardProps) {
+function ProfileCard({
+  profile,
+  isLoading,
+  onEdit,
+  onToggle,
+  onDelete,
+  onExport,
+  onDuplicate,
+}: ProfileCardProps) {
   return (
     <div
       className={`${styles.profileCard} ${profile.enabled ? styles.profileCardEnabled : ""}`}
@@ -62,6 +72,24 @@ function ProfileCard({ profile, isLoading, onEdit, onToggle, onDelete }: Profile
         >
           Edit
         </button>
+        {onExport && (
+          <button
+            className="btn btn-ghost btn-sm"
+            onClick={() => onExport(profile.id, "hosts")}
+            disabled={isLoading}
+          >
+            Export
+          </button>
+        )}
+        {onDuplicate && (
+          <button
+            className="btn btn-ghost btn-sm"
+            onClick={() => onDuplicate(profile.id)}
+            disabled={isLoading}
+          >
+            Duplicate
+          </button>
+        )}
         <button
           className="btn btn-danger btn-sm"
           onClick={() => onDelete(profile.id)}

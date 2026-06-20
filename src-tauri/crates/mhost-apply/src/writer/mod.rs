@@ -100,6 +100,11 @@ impl HostsWriter {
         }
     }
 
+    /// Return the path to the system hosts file.
+    pub fn hosts_path(&self) -> &Path {
+        &self.hosts_path
+    }
+
     /// Create a new `HostsWriter` with custom paths (for testing).
     ///
     /// Uses `TestMover` internally wrapped as a `PlatformAdapter`.

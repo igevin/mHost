@@ -11,8 +11,11 @@ import {
   deleteProfileAtom,
   toggleProfileEnabledAtom,
 } from "../stores/profiles";
+import type { Profile, ExportFormat } from "../types";
+import { exportProfile, duplicateProfile, writeFileText } from "../lib/tauri";
 import ProfileCard from "../components/ProfileCard";
 import CreateProfileForm from "../components/CreateProfileForm";
+import ImportDialog from "../components/ImportDialog";
 import styles from "./ProfileList.module.css";
 
 function ProfileList() {
@@ -29,6 +32,10 @@ function ProfileList() {
   const toggleEnabled = useSetAtom(toggleProfileEnabledAtom);
 
   const [showCreate, setShowCreate] = useState(false);
+  const [showImport, setShowImport] = useState(false);
+  const [duplicateTarget, setDuplicateTarget] = useState<Profile | null>(null);
+  const [duplicateName, setDuplicateName] = useState("");
+  const [exportTarget, setExportTarget] = useState<Profile | null>(null);
 
   useEffect(() => {
     // Load profiles on mount; gracefully handle missing backend
@@ -79,17 +86,60 @@ function ProfileList() {
     [setSelectedId, navigate],
   );
 
+  const handleImported = useCallback(
+    (profile: Profile) => {
+      setShowImport(false);
+      setSelectedId(profile.id);
+    },
+    [setSelectedId],
+  );
+
+  const handleExport = useCallback(async (id: string, format: ExportFormat) => {
+    try {
+      const content = await exportProfile(id, format);
+      const profile = profiles.find((p) => p.id === id);
+      const fileName = `${profile?.name ?? "profile"}.${format}`;
+      // Use save dialog via Tauri's writeFileText
+      await writeFileText(fileName, content);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+    setExportTarget(null);
+  }, [profiles, setError]);
+
+  const handleDuplicate = useCallback(async () => {
+    if (!duplicateTarget || !duplicateName.trim()) return;
+    try {
+      const profile = await duplicateProfile(duplicateTarget.id, duplicateName.trim());
+      setDuplicateTarget(null);
+      setDuplicateName("");
+      setSelectedId(profile.id);
+      navigate(`/profiles/${profile.id}`);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }, [duplicateTarget, duplicateName, setSelectedId, navigate, setError]);
+
   return (
     <div className="mhost-page">
       <header className="mhost-page-header">
         <h1 className="mhost-page-title">Profiles</h1>
-        <button
-          className="btn btn-primary"
-          onClick={() => setShowCreate(true)}
-          disabled={isLoading}
-        >
-          + New Profile
-        </button>
+        <div className="mhost-page-actions">
+          <button
+            className="btn btn-ghost"
+            onClick={() => setShowImport(true)}
+            disabled={isLoading}
+          >
+            Import
+          </button>
+          <button
+            className="btn btn-primary"
+            onClick={() => setShowCreate(true)}
+            disabled={isLoading}
+          >
+            + New Profile
+          </button>
+        </div>
       </header>
 
       {error && <div className="alert alert-error">{error}</div>}
@@ -120,9 +170,91 @@ function ProfileList() {
             onEdit={handleEdit}
             onToggle={handleToggle}
             onDelete={handleDelete}
+            onExport={(id) => {
+              setExportTarget(profiles.find((p) => p.id === id) ?? null);
+            }}
+            onDuplicate={(id) => {
+              const target = profiles.find((p) => p.id === id);
+              if (target) {
+                setDuplicateTarget(target);
+                setDuplicateName(`${target.name} (copy)`);
+              }
+            }}
           />
         ))}
       </div>
+
+      {/* Import Dialog */}
+      <ImportDialog
+        open={showImport}
+        onClose={() => setShowImport(false)}
+        onImported={handleImported}
+      />
+
+      {/* Export Format Dialog */}
+      {exportTarget && (
+        <div className={styles.overlay} onClick={() => setExportTarget(null)}>
+          <div className={styles.dialog} onClick={(e) => e.stopPropagation()}>
+            <h3 className={styles.dialogTitle}>Export Profile</h3>
+            <p className={styles.dialogDesc}>
+              Export "{exportTarget.name}" as:
+            </p>
+            <div className={styles.dialogActions}>
+              <button
+                className="btn btn-primary"
+                onClick={() => handleExport(exportTarget.id, "hosts")}
+              >
+                hosts format
+              </button>
+              <button
+                className="btn btn-ghost"
+                onClick={() => handleExport(exportTarget.id, "json")}
+              >
+                JSON format
+              </button>
+              <button
+                className="btn btn-ghost"
+                onClick={() => setExportTarget(null)}
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Duplicate Dialog */}
+      {duplicateTarget && (
+        <div className={styles.overlay} onClick={() => setDuplicateTarget(null)}>
+          <div className={styles.dialog} onClick={(e) => e.stopPropagation()}>
+            <h3 className={styles.dialogTitle}>Duplicate Profile</h3>
+            <div className="form-group">
+              <label className="form-label">New Name</label>
+              <input
+                className="input"
+                value={duplicateName}
+                onChange={(e) => setDuplicateName(e.target.value)}
+                autoFocus
+              />
+            </div>
+            <div className={styles.dialogActions}>
+              <button
+                className="btn btn-primary"
+                onClick={handleDuplicate}
+                disabled={!duplicateName.trim() || isLoading}
+              >
+                Duplicate
+              </button>
+              <button
+                className="btn btn-ghost"
+                onClick={() => setDuplicateTarget(null)}
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

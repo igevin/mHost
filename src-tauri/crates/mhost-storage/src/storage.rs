@@ -28,6 +28,8 @@ pub trait Storage {
     fn load_manifest(&self) -> Result<Manifest, StorageError>;
     /// 保存 Manifest。
     fn save_manifest(&self, manifest: &Manifest) -> Result<(), StorageError>;
+    /// 返回存储根目录路径。
+    fn root(&self) -> &Path;
 }
 
 // ---------------------------------------------------------------------------
@@ -64,6 +66,11 @@ impl FileStorage {
         Self {
             root: root.to_path_buf(),
         }
+    }
+
+    /// 返回存储根目录路径。
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     /// 返回 profiles 目录路径。
@@ -200,6 +207,10 @@ impl Storage for FileStorage {
         atomic_write(&path, json.as_bytes())
             .map_err(|e| StorageError::Io(format!("写入 manifest 失败: {}", e)))?;
         Ok(())
+    }
+
+    fn root(&self) -> &Path {
+        &self.root
     }
 }
 

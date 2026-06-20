@@ -1,0 +1,145 @@
+.overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.dialog {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  padding: 24px;
+  width: 90%;
+  max-width: 640px;
+  max-height: 80vh;
+  overflow-y: auto;
+  box-shadow: var(--shadow-md);
+}
+
+.dialogTitle {
+  font-size: 18px;
+  font-weight: 600;
+  margin: 0 0 16px;
+}
+
+/* ---- Diff Preview ---- */
+
+.diffPreview {
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  padding: 12px;
+  margin-bottom: 16px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.8;
+  overflow: auto;
+  max-height: 300px;
+}
+
+.diffAdded {
+  color: var(--color-success);
+  background: #f0fdf4;
+}
+
+.diffRemoved {
+  color: var(--color-danger);
+  background: #fef2f2;
+  text-decoration: line-through;
+}
+
+.diffUnchanged {
+  color: var(--color-text-muted);
+}
+
+.diffLine {
+  padding: 1px 4px;
+  white-space: pre;
+}
+
+.diffEmpty {
+  color: var(--color-text-muted);
+  font-size: 13px;
+  text-align: center;
+  padding: 12px;
+}
+
+/* ---- Conflicts ---- */
+
+.conflictSection {
+  margin-bottom: 16px;
+}
+
+.conflictItem {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  color: var(--color-danger);
+  margin-bottom: 6px;
+}
+
+.conflictItem:last-child {
+  margin-bottom: 0;
+}
+
+.conflictDomain {
+  font-weight: 600;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+/* ---- Progress ---- */
+
+.progressSection {
+  text-align: center;
+  padding: 24px 0;
+}
+
+.progressText {
+  font-size: 15px;
+  font-weight: 500;
+  color: var(--color-primary);
+}
+
+/* ---- Result ---- */
+
+.resultSection {
+  text-align: center;
+  padding: 16px 0;
+}
+
+.resultSuccess {
+  color: var(--color-success);
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.resultError {
+  color: var(--color-danger);
+  font-size: 15px;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+.resultErrorMessage {
+  color: var(--color-text-secondary);
+  font-size: 13px;
+  margin-bottom: 12px;
+}
+
+/* ---- Actions ---- */
+
+.dialogActions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+}

@@ -35,6 +35,15 @@
   font-weight: 500;
 }
 
+/* ---- Section Description ---- */
+
+.sectionDesc {
+  font-size: 13px;
+  color: var(--color-text-secondary);
+  margin: 0 0 12px;
+  line-height: 1.5;
+}
+
 /* ---- Hosts Preview ---- */
 
 .hostsPreview {

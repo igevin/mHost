@@ -1,10 +1,14 @@
 import { useState, useEffect } from "react";
+import { useSetAtom } from "jotai";
 import { readSystemHosts } from "../lib/tauri";
+import { rollbackHostsActionAtom } from "../stores/profiles";
+import RollbackButton from "../components/RollbackButton";
 import styles from "./Settings.module.css";
 
 function Settings() {
   const [hostsContent, setHostsContent] = useState<string | null>(null);
   const [hostsError, setHostsError] = useState<string | null>(null);
+  const rollback = useSetAtom(rollbackHostsActionAtom);
 
   useEffect(() => {
     readSystemHosts()
@@ -49,6 +53,14 @@ function Settings() {
             <span className={styles.infoLabel}>Backups</span>
             <span className={styles.infoValue}>backups/</span>
           </div>
+        </div>
+
+        <div className="card">
+          <h3 className="card-title">Hosts Management</h3>
+          <p className={styles.sectionDesc}>
+            Rollback the system hosts file to the last backed-up version.
+          </p>
+          <RollbackButton onRollback={rollback} />
         </div>
 
         <div className="card card-full">
