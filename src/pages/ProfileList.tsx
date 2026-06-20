@@ -13,6 +13,7 @@ import {
 } from "../stores/profiles";
 import type { Profile, ExportFormat } from "../types";
 import { exportProfile, duplicateProfile, writeFileText } from "../lib/tauri";
+import { save } from "@tauri-apps/plugin-dialog";
 import ProfileCard from "../components/ProfileCard";
 import CreateProfileForm from "../components/CreateProfileForm";
 import ImportDialog from "../components/ImportDialog";
@@ -94,18 +95,23 @@ function ProfileList() {
     [setSelectedId],
   );
 
-  const handleExport = useCallback(async (id: string, format: ExportFormat) => {
+  const handleExport = useCallback(async (profile: Profile, format: ExportFormat) => {
     try {
-      const content = await exportProfile(id, format);
-      const profile = profiles.find((p) => p.id === id);
-      const fileName = `${profile?.name ?? "profile"}.${format}`;
-      // Use save dialog via Tauri's writeFileText
-      await writeFileText(fileName, content);
+      const content = await exportProfile(profile.id, format);
+      const path = await save({
+        defaultPath: `${profile.name}.${format === "hosts" ? "hosts" : "json"}`,
+        filters: format === "hosts"
+          ? [{ name: "Hosts", extensions: ["hosts", "txt"] }]
+          : [{ name: "JSON", extensions: ["json"] }],
+      });
+      if (path) {
+        await writeFileText(path, content);
+      }
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : String(err));
     }
     setExportTarget(null);
-  }, [profiles, setError]);
+  }, [setError]);
 
   const handleDuplicate = useCallback(async () => {
     if (!duplicateTarget || !duplicateName.trim()) return;
@@ -171,7 +177,10 @@ function ProfileList() {
             onToggle={handleToggle}
             onDelete={handleDelete}
             onExport={(id) => {
-              setExportTarget(profiles.find((p) => p.id === id) ?? null);
+              const target = profiles.find((p) => p.id === id);
+              if (target) {
+                setExportTarget(target);
+              }
             }}
             onDuplicate={(id) => {
               const target = profiles.find((p) => p.id === id);
