@@ -11,7 +11,10 @@ impl ApplyLock {
     /// Acquire the lock, recovering from poison if a previous holder panicked.
     /// This prevents the entire app from becoming unusable after one failed apply.
     pub fn lock(&self) -> MutexGuard<'_, ()> {
-        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.0.lock().unwrap_or_else(|poisoned| {
+            eprintln!("[mHost] Warning: ApplyLock was poisoned (previous apply panicked). Recovering...");
+            poisoned.into_inner()
+        })
     }
 }
 

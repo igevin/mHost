@@ -129,7 +129,7 @@ pub fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::Men
                 let state = app_clone.state::<AppState>();
                 // Security fix (#16): Acquire apply lock to prevent concurrent writes
                 let _guard = state.apply_lock.lock();
-                log::info!("[mHost] Tray: waiting for user authorization (if needed)...");
+                eprintln!("[mHost] Tray: waiting for user authorization (if needed)...");
                 let storage = state.storage.as_ref();
                 let writer = &state.writer;
 

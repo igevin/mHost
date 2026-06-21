@@ -31,7 +31,7 @@ pub fn generate_apply_plan(state: State<'_, AppState>) -> Result<ApplyPlan, Mhos
 #[tauri::command]
 pub fn apply_hosts(state: State<'_, AppState>) -> Result<(), MhostError> {
     let _guard = state.apply_lock.lock();
-    log::info!("[mHost] Waiting for user authorization (if needed)...");
+    eprintln!("[mHost] Waiting for user authorization (if needed)...");
     let profiles = state.storage.list_profiles()?;
     let current_hosts = match std::fs::read_to_string(state.writer.hosts_path()) {
         Ok(content) => content,

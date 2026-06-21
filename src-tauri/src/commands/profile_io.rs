@@ -33,7 +33,9 @@ fn validate_user_path(path: &str, must_exist: bool) -> Result<std::path::PathBuf
         }
         Ok(canonical)
     } else {
-        // Export: file may not exist yet, validate parent directory
+        // Export: file may not exist yet, validate parent directory.
+        // Security note: canonicalize parent, then reconstruct the full path
+        // to avoid TOCTOU where the parent is replaced by a symlink after check.
         let parent = p.parent().ok_or_else(|| {
             MhostError::InvalidInput(format!("Path '{}' has no parent directory", path))
         })?;
@@ -46,7 +48,11 @@ fn validate_user_path(path: &str, must_exist: bool) -> Result<std::path::PathBuf
                 path
             )));
         }
-        Ok(p.to_path_buf())
+        // Reconstruct path using canonicalized parent + original filename
+        let file_name = p.file_name().ok_or_else(|| {
+            MhostError::InvalidInput(format!("Path '{}' has no file name", path))
+        })?;
+        Ok(canonical_parent.join(file_name))
     }
 }
 
