@@ -127,6 +127,9 @@ pub fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::Men
 
             tauri::async_runtime::spawn_blocking(move || {
                 let state = app_clone.state::<AppState>();
+                // Security fix (#16): Acquire apply lock to prevent concurrent writes
+                let _guard = state.apply_lock.lock();
+                eprintln!("[mHost] Tray: waiting for user authorization (if needed)...");
                 let storage = state.storage.as_ref();
                 let writer = &state.writer;
 
@@ -135,7 +138,9 @@ pub fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::Men
                 let profile_id = match profile_id_clone.parse::<ProfileId>() {
                     Ok(id) => id,
                     Err(e) => {
-                        eprintln!("[mHost] Tray switch profile failed: invalid profile ID '{}': {}", profile_id_clone, e);
+                        // Security fix (#22): truncate profile ID to first 8 chars to prevent log injection
+                        let safe_id = &profile_id_clone[..8.min(profile_id_clone.len())];
+                        eprintln!("[mHost] Tray switch profile failed: invalid profile ID '{}...': {}", safe_id, e);
                         return;
                     }
                 };

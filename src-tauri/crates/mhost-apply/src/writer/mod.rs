@@ -24,52 +24,6 @@ pub const MANAGED_START: &str = "# ---- mHost start ----";
 #[allow(dead_code)]
 pub const MANAGED_END: &str = "# ---- mHost end ----";
 
-/// Trait for moving a file to another path, potentially with elevated privileges.
-#[deprecated(
-    note = "Use PlatformAdapter instead. This trait is retained for backward compatibility."
-)]
-pub trait ElevatedMover: Send + Sync {
-    /// Move `from` to `to`.
-    fn elevated_move(&self, from: &Path, to: &Path) -> Result<(), MhostError>;
-}
-
-/// Production mover using osascript to request administrator privileges.
-#[deprecated(note = "Use MacOsAdapter via PlatformAdapter instead.")]
-pub struct OsascriptMover;
-
-#[allow(deprecated)]
-impl ElevatedMover for OsascriptMover {
-    fn elevated_move(&self, from: &Path, to: &Path) -> Result<(), MhostError> {
-        let from_escaped = crate::platform::macos::escape_applescript_path(&from.to_string_lossy())?;
-        let to_escaped = crate::platform::macos::escape_applescript_path(&to.to_string_lossy())?;
-        let script = format!(
-            "do shell script \"mv {} {}\" with administrator privileges",
-            from_escaped, to_escaped
-        );
-        let output = std::process::Command::new("osascript")
-            .arg("-e")
-            .arg(&script)
-            .output()?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(ApplyError::PermissionDenied(stderr.to_string()).into());
-        }
-
-        Ok(())
-    }
-}
-
-/// Test mover using regular `fs::rename`.
-pub struct TestMover;
-
-#[allow(deprecated)]
-impl ElevatedMover for TestMover {
-    fn elevated_move(&self, from: &Path, to: &Path) -> Result<(), MhostError> {
-        fs::rename(from, to).map_err(|e| e.into())
-    }
-}
-
 /// Writes hosts changes to the system hosts file.
 ///
 /// `HostsWriter` handles:
@@ -106,32 +60,14 @@ impl HostsWriter {
     }
 
     /// Create a new `HostsWriter` with custom paths (for testing).
-    ///
-    /// Uses `TestMover` internally wrapped as a `PlatformAdapter`.
     pub fn with_paths(hosts_path: impl Into<PathBuf>, backup_dir: impl Into<PathBuf>) -> Self {
+        let hosts_path = hosts_path.into();
         Self {
-            hosts_path: hosts_path.into(),
+            hosts_path: hosts_path.clone(),
             backup_dir: backup_dir.into(),
-            platform: Box::new(MoverAdapter(Box::new(TestMover))),
-        }
-    }
-
-    /// Create a new `HostsWriter` with a custom mover (for advanced testing).
-    ///
-    /// Retained for backward compatibility. The mover is wrapped into a
-    /// `PlatformAdapter` internally.
-    #[allow(dead_code)]
-    #[allow(deprecated)]
-    #[deprecated(note = "Prefer with_platform() or with_paths() for new code.")]
-    pub fn with_mover(
-        hosts_path: impl Into<PathBuf>,
-        backup_dir: impl Into<PathBuf>,
-        mover: Box<dyn ElevatedMover>,
-    ) -> Self {
-        Self {
-            hosts_path: hosts_path.into(),
-            backup_dir: backup_dir.into(),
-            platform: Box::new(MoverAdapter(mover)),
+            platform: Box::new(TestPlatformAdapter {
+                hosts_path,
+            }),
         }
     }
 
@@ -147,6 +83,9 @@ impl HostsWriter {
     /// 7. Verify written content
     /// 8. Rollback on verification failure
     pub fn apply(&self, plan: &ApplyPlan) -> Result<(), MhostError> {
+        // Security fix (#19): Verify hosts_path is a regular file, not a symlink
+        ensure_regular_file(&self.hosts_path)?;
+
         // 1. Read current system hosts
         let current = fs::read_to_string(&self.hosts_path)?;
 
@@ -215,6 +154,9 @@ impl HostsWriter {
     ///
     /// Also enforces a maximum number of backups (retains the most recent).
     pub fn rollback(&self) -> Result<(), MhostError> {
+        // Security fix (#19): Verify hosts_path is a regular file before rollback
+        ensure_regular_file(&self.hosts_path)?;
+
         let mut backups: Vec<_> = fs::read_dir(&self.backup_dir)?
             .filter_map(|e| e.ok())
             .filter(|e| {
@@ -288,31 +230,32 @@ impl Default for HostsWriter {
 }
 
 // ---------------------------------------------------------------------------
-// MoverAdapter: wraps an ElevatedMover into a PlatformAdapter
+// TestPlatformAdapter: simple adapter for testing without elevated privileges
 // ---------------------------------------------------------------------------
 
-/// Adapter that wraps a legacy `ElevatedMover` into the new `PlatformAdapter`
-/// trait. Used for backward compatibility with existing tests.
-#[allow(deprecated)]
-struct MoverAdapter(Box<dyn ElevatedMover>);
+/// A simple platform adapter for testing that uses `fs::copy` + `fs::remove_file`
+/// instead of elevated moves.
+struct TestPlatformAdapter {
+    hosts_path: PathBuf,
+}
 
-#[allow(deprecated)]
-impl PlatformAdapter for MoverAdapter {
+impl PlatformAdapter for TestPlatformAdapter {
     fn hosts_path(&self) -> PathBuf {
-        PathBuf::from("/etc/hosts")
+        self.hosts_path.clone()
     }
 
     fn elevated_move(&self, from: &Path, to: &Path) -> Result<(), MhostError> {
-        self.0.elevated_move(from, to)
+        fs::copy(from, to).map_err(MhostError::from)?;
+        let _ = fs::remove_file(from);
+        Ok(())
     }
 
     fn flush_dns_cache(&self) -> Result<(), MhostError> {
-        // Test movers should not flush DNS
         Ok(())
     }
 
     fn platform_name(&self) -> &'static str {
-        "mover-adapter"
+        "test-adapter"
     }
 }
 
@@ -325,4 +268,20 @@ fn storage_root() -> PathBuf {
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("mHost")
+}
+
+/// Verify that a path is a regular file (not a symlink).
+/// Security fix (#19): Prevents following symlinks when writing to /etc/hosts.
+fn ensure_regular_file(path: &Path) -> Result<(), MhostError> {
+    let metadata = fs::symlink_metadata(path).map_err(|e| MhostError::Io {
+        kind: e.kind().to_string(),
+        message: format!("Cannot stat '{}': {}", path.display(), e),
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(MhostError::InvalidInput(format!(
+            "'{}' is not a regular file (may be a symlink or special file). Refusing to write.",
+            path.display()
+        )));
+    }
+    Ok(())
 }
