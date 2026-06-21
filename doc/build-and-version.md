@@ -51,12 +51,14 @@ Tauri 2 bundler 模板：
 + "version": "0.2.0",
 ```
 
-### 3. 发版时打 git tag（建议）
+### 3. 发版时打 git tag 并推送（触发 CI 自动构建）
 
 ```bash
 git tag v0.2.0
 git push origin v0.2.0
 ```
+
+推送 `v*` 格式的 tag 后，GitHub Actions 会自动触发 Release 构建（见下方 CI 自动构建章节）。
 
 ## 注意事项
 
@@ -90,6 +92,53 @@ pnpm tauri build
 
 - `macos/` — `.app` 应用包
 - `dmg/` — `.dmg` 安装镜像
+
+## CI 自动构建（GitHub Actions）
+
+### 触发条件
+
+推送 `v*` 格式的 git tag 时自动触发，例如：
+
+```bash
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+配置文件：`.github/workflows/release.yml`
+
+### 构建矩阵
+
+push tag 后会**并行**触发两个构建 job：
+
+| Job | Runner | Target | 产物 |
+|-----|--------|--------|------|
+| macOS ARM | `macos-latest` (M1) | `aarch64-apple-darwin` | `.dmg` / `.app` |
+| macOS Intel | `macos-latest` (M1) | `x86_64-apple-darwin` | `.dmg` / `.app` |
+
+两个 job 的产物会自动上传到**同一个 GitHub Release** 中。
+
+### Release 策略
+
+- **Draft 模式**：Release 先创建为草稿（draft），手动确认后再正式发布
+- **fail-fast: false**：某个架构构建失败不影响另一个
+- **无需额外配置**：使用 GitHub Actions 自带的 `GITHUB_TOKEN`
+
+### 发版完整流程
+
+```bash
+# 1. 修改版本号（tauri.conf.json + package.json）
+# 2. 提交并推送
+git add .
+git commit -m "chore: bump version to 0.2.0"
+git push
+
+# 3. 打 tag 并推送（触发 CI 构建）
+git tag v0.2.0
+git push origin v0.2.0
+
+# 4. 等待 CI 完成，在 GitHub Releases 页面检查 draft release
+# 5. 确认无误后，手动发布 release
+```
 
 ## 项目版本号一览
 
