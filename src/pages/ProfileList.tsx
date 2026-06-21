@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useMemo } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAtomValue, useSetAtom } from "jotai";
 import {
@@ -126,10 +126,12 @@ function ProfileList() {
     }
   }, [duplicateTarget, duplicateName, setSelectedId, navigate, setError]);
 
-  // Stats calculation
-  const totalProfiles = profiles.length;
-  const enabledProfiles = profiles.filter((p) => p.enabled).length;
-  const totalRules = profiles.reduce((sum, p) => sum + p.rules.length, 0);
+  // Stats calculation — Perf fix (#35): useMemo to avoid recalculating on every render
+  const { totalProfiles, enabledProfiles, totalRules } = useMemo(() => ({
+    totalProfiles: profiles.length,
+    enabledProfiles: profiles.filter((p) => p.enabled).length,
+    totalRules: profiles.reduce((sum, p) => sum + p.rules.length, 0),
+  }), [profiles]);
 
   return (
     <div className="mhost-page">

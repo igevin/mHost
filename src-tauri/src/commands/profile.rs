@@ -127,16 +127,22 @@ pub fn delete_profile(
 /// Disable all profiles except the given one.
 ///
 /// Phase 0 constraint: only one profile can be enabled at a time.
+/// Perf fix (#31): Collect profiles to disable first to avoid unnecessary iterations.
 pub fn disable_other_profiles(
     storage: &(dyn Storage + Send + Sync),
     except_id: &ProfileId,
 ) -> Result<(), MhostError> {
     let all_profiles = storage.list_profiles()?;
-    for mut p in all_profiles {
-        if p.enabled && p.id != *except_id {
-            p.enabled = false;
-            storage.save_profile(&p)?;
-        }
+    let to_disable: Vec<_> = all_profiles
+        .into_iter()
+        .filter(|p| p.enabled && p.id != *except_id)
+        .collect();
+
+    // TODO(#31): Each save_profile is an atomic write. Consider batching at the storage level
+    // (e.g., a single manifest file) to reduce disk I/O when many profiles need disabling.
+    for mut p in to_disable {
+        p.enabled = false;
+        storage.save_profile(&p)?;
     }
     Ok(())
 }

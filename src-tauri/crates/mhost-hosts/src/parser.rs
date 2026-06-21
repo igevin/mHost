@@ -54,32 +54,37 @@ impl Parser {
     /// Parse hosts text into a serializable validation result with line numbers.
     /// Each error is annotated with its 1-based line number in the input text.
     pub fn parse_with_lines(text: &str) -> ValidateResult {
-        let parse_result = Self::parse(text);
+        let mut rules = Vec::new();
+        let mut errors = Vec::new();
 
-        // Build a mapping from line content to 1-based line numbers.
-        // A single line may produce at most one error, so we can collect all
-        // line numbers first, then zip with errors.
-        let mut error_line_numbers: Vec<usize> = Vec::new();
         for (idx, line) in text.lines().enumerate() {
-            if Self::parse_line(line).is_err() {
-                error_line_numbers.push(idx + 1);
+            match Self::parse_line(line) {
+                Ok(Some(rule)) => rules.push(rule),
+                Ok(None) => {}
+                Err(error) => errors.push(ParseErrorAtLine {
+                    line_number: idx + 1,
+                    error,
+                }),
             }
         }
 
-        let errors: Vec<ParseErrorAtLine> = parse_result
-            .errors
-            .into_iter()
-            .zip(error_line_numbers)
-            .map(|(error, line_number)| ParseErrorAtLine {
-                line_number,
-                error,
-            })
-            .collect();
+        ValidateResult { rules, errors }
+    }
 
-        ValidateResult {
-            rules: parse_result.rules,
-            errors,
+    /// Parse hosts text and collect only errors with their line numbers.
+    pub fn parse_errors_only(text: &str) -> Vec<ParseErrorAtLine> {
+        let mut errors = Vec::new();
+
+        for (idx, line) in text.lines().enumerate() {
+            if let Err(error) = Self::parse_line(line) {
+                errors.push(ParseErrorAtLine {
+                    line_number: idx + 1,
+                    error,
+                });
+            }
         }
+
+        errors
     }
 
     /// Format a slice of HostRule back into hosts text.

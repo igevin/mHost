@@ -34,6 +34,7 @@ pub fn run() {
             rollback_hosts,
             read_system_hosts,
             validate_hosts_text,
+            validate_hosts_errors,
             get_managed_block_content,
             get_last_applied,
             import_profile,

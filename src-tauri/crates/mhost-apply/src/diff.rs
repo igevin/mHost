@@ -5,7 +5,7 @@
 
 use mhost_core::{HostsDiff, ResolvedRule};
 use mhost_hosts::Parser;
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 
 /// Calculate the diff between current hosts content and target rules.
 ///
@@ -23,20 +23,15 @@ pub fn calculate_diff(current_hosts: &str, resolved_rules: &[ResolvedRule]) -> H
         .map(|r| format!("{} {}", r.ip, r.domain))
         .collect();
 
-    // Compute diff using set operations
-    let existing_set: HashSet<String> = existing_lines.iter().cloned().collect();
-    let target_set: HashSet<String> = target_lines.iter().cloned().collect();
+    // Compute diff using set operations (BTreeSet for deterministic ordering)
+    let existing_set: BTreeSet<&str> = existing_lines.iter().map(|s| s.as_str()).collect();
+    let target_set: BTreeSet<&str> = target_lines.iter().map(|s| s.as_str()).collect();
 
-    let mut added: Vec<String> = target_set.difference(&existing_set).cloned().collect();
+    let added: Vec<String> = target_set.difference(&existing_set).map(|&s| s.to_string()).collect();
 
-    let mut removed: Vec<String> = existing_set.difference(&target_set).cloned().collect();
+    let removed: Vec<String> = existing_set.difference(&target_set).map(|&s| s.to_string()).collect();
 
-    let mut unchanged: Vec<String> = existing_set.intersection(&target_set).cloned().collect();
-
-    // Sort for deterministic output
-    added.sort();
-    removed.sort();
-    unchanged.sort();
+    let unchanged: Vec<String> = existing_set.intersection(&target_set).map(|&s| s.to_string()).collect();
 
     HostsDiff {
         added,

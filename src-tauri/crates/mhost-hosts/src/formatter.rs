@@ -1,22 +1,22 @@
 //! Hosts file formatter
 
 use mhost_core::HostRule;
+use std::fmt::Write;
 
 /// Re-export the format function from the parser module.
 /// Multi-domain rules are expanded to one line per domain.
 pub fn format_rules(rules: &[HostRule]) -> String {
-    let mut lines = Vec::new();
+    let mut out = String::new();
     for rule in rules {
         for domain in &rule.domains {
-            let line = if let Some(ref comment) = rule.comment {
-                format!("{} {} # {}", rule.ip, domain, comment)
+            if let Some(ref c) = rule.comment {
+                writeln!(out, "{} {} # {}", rule.ip, domain, c).unwrap();
             } else {
-                format!("{} {}", rule.ip, domain)
-            };
-            lines.push(line);
+                writeln!(out, "{} {}", rule.ip, domain).unwrap();
+            }
         }
     }
-    lines.join("\n") + if lines.is_empty() { "" } else { "\n" }
+    out
 }
 
 /// Format rules wrapped in a managed block.

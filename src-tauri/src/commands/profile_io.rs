@@ -190,8 +190,9 @@ pub fn duplicate_profile(
 /// Export a profile to a file.
 ///
 /// Security fix (#17): Path is validated to stay within home directory.
+/// Perf fix (#26): Async with spawn_blocking for file I/O.
 #[tauri::command]
-pub fn export_profile_to_file(
+pub async fn export_profile_to_file(
     id: String,
     format: ExportFormat,
     path: String,
@@ -199,29 +200,35 @@ pub fn export_profile_to_file(
 ) -> Result<(), MhostError> {
     let validated = validate_user_path(&path, false)?;
     let content = export_profile_logic(&id, format, state.storage.as_ref())?;
-    std::fs::write(&validated, &content).map_err(Into::into)
+    tauri::async_runtime::spawn_blocking(move || {
+        std::fs::write(&validated, &content).map_err(Into::into)
+    }).await.map_err(|e| MhostError::InvalidInput(e.to_string()))?
 }
 
 /// Import a profile from a file.
 ///
 /// Security fix (#17): Path is validated to stay within home directory.
 /// Reads file content (limited to 1MB) and imports it as a new profile.
+/// Perf fix (#26): Async with spawn_blocking for file I/O.
 #[tauri::command]
-pub fn import_profile_from_file(
+pub async fn import_profile_from_file(
     name: String,
     path: String,
     state: State<'_, AppState>,
 ) -> Result<Profile, MhostError> {
     let canonical = validate_user_path(&path, true)?;
-    let metadata = std::fs::metadata(&canonical)?;
-    if metadata.len() > MAX_FILE_READ_SIZE as u64 {
-        return Err(MhostError::InvalidInput(format!(
-            "File too large (max {} bytes)",
-            MAX_FILE_READ_SIZE
-        )));
-    }
-    let hosts_text = std::fs::read_to_string(&canonical)?;
-    import_profile_logic(name, &hosts_text, state.storage.as_ref())
+    let storage = state.storage.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let metadata = std::fs::metadata(&canonical)?;
+        if metadata.len() > MAX_FILE_READ_SIZE as u64 {
+            return Err(MhostError::InvalidInput(format!(
+                "File too large (max {} bytes)",
+                MAX_FILE_READ_SIZE
+            )));
+        }
+        let hosts_text = std::fs::read_to_string(&canonical)?;
+        import_profile_logic(name, &hosts_text, storage.as_ref())
+    }).await.map_err(|e| MhostError::InvalidInput(e.to_string()))?
 }
 
 // ---------------------------------------------------------------------------

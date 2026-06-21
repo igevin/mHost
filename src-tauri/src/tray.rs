@@ -51,6 +51,12 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>) -> Result<Menu<R>, Box<dyn std::er
     let state = app.state::<AppState>();
     let profiles = state.storage.list_profiles()?;
 
+    // Perf fix (#29): Track last rendered profile IDs
+    let profile_ids: Vec<String> = profiles.iter().map(|p| p.id.to_string()).collect();
+    if let Ok(mut last) = state.last_profile_ids.lock() {
+        *last = profile_ids;
+    }
+
     // Build profile check menu items
     let mut profile_items: Vec<CheckMenuItem<R>> = Vec::new();
     for p in &profiles {
@@ -128,10 +134,11 @@ pub fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::Men
             tauri::async_runtime::spawn_blocking(move || {
                 let state = app_clone.state::<AppState>();
                 // Security fix (#16): Acquire apply lock to prevent concurrent writes
-                let _guard = state.apply_lock.lock();
+                // Note: tray uses blocking context, so we use try_lock or a blocking approach
+                let _guard = state.apply_lock.0.blocking_lock();
                 eprintln!("[mHost] Tray: waiting for user authorization (if needed)...");
                 let storage = state.storage.as_ref();
-                let writer = &state.writer;
+                let writer = &*state.writer;
 
                 // Determine target enabled state: if already enabled, disable it;
                 // otherwise enable it (disable others).
@@ -253,10 +260,11 @@ fn rebuild_tray_menu<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::
 }
 
 /// Extract current profile IDs from the tray menu.
+/// Perf fix (#29): Read from AppState instead of returning empty.
 fn get_current_profile_ids_from_menu<R: Runtime>(
-    _app: &AppHandle<R>,
+    app: &AppHandle<R>,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    // Since TrayIcon doesn't expose menu() getter, we can't read the existing menu items.
-    // Return empty to force a rebuild on first call after startup.
-    Ok(Vec::new())
+    let state = app.state::<AppState>();
+    let ids = state.last_profile_ids.lock().map_err(|e| e.to_string())?;
+    Ok(ids.clone())
 }
