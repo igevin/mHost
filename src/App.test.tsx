@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, cleanup, waitFor, act } from "@testing-library/react";
+import { render, cleanup, waitFor, act } from "@testing-library/react";
 import { BrowserRouter } from "react-router-dom";
 import { Provider } from "jotai";
 import App from "./App";
