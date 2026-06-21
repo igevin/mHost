@@ -14,7 +14,7 @@ const PROFILES_SUBMENU_ID: &str = "profiles_submenu";
 
 /// Build the initial tray icon and menu.
 pub fn build_tray<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::Error>> {
-    let icon = tauri::image::Image::from_path("icons/tray-icon.png")?;
+    let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/tray-icon.png"))?;
 
     let menu = build_menu(app)?;
 
