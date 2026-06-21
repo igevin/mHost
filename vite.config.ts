@@ -23,12 +23,17 @@ export default defineConfig(() => ({
   },
 
   // Perf fix (#37): Code splitting to reduce initial bundle size
+  // Note: Vite 8 + Rolldown requires manualChunks to be a function.
   build: {
     rollupOptions: {
       output: {
-        manualChunks: {
-          react: ["react", "react-dom", "react-router-dom"],
-          tauri: ["@tauri-apps/api", "@tauri-apps/plugin-dialog"],
+        manualChunks(id: string) {
+          if (id.includes("node_modules/react") || id.includes("node_modules/react-dom") || id.includes("node_modules/react-router-dom")) {
+            return "react";
+          }
+          if (id.includes("node_modules/@tauri-apps")) {
+            return "tauri";
+          }
         },
       },
     },
