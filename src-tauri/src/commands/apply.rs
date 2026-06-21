@@ -10,7 +10,7 @@ use crate::state::AppState;
 #[tauri::command]
 pub fn generate_apply_plan(state: State<'_, AppState>) -> Result<ApplyPlan, MhostError> {
     let profiles = state.storage.list_profiles()?;
-    let current_hosts = match std::fs::read_to_string("/etc/hosts") {
+    let current_hosts = match std::fs::read_to_string(state.writer.hosts_path()) {
         Ok(content) => content,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => {
@@ -23,11 +23,31 @@ pub fn generate_apply_plan(state: State<'_, AppState>) -> Result<ApplyPlan, Mhos
     generate_plan(&profiles, &current_hosts).map_err(Into::into)
 }
 
+/// Apply hosts using server-side generated plan.
+///
+/// Security fix (#14): No longer accepts `ApplyPlan` from the frontend.
+/// The plan is generated server-side from storage to prevent arbitrary hosts injection.
+/// Security fix (#16): Uses apply_lock to prevent concurrent writes.
 #[tauri::command]
-pub fn apply_hosts(plan: ApplyPlan, state: State<'_, AppState>) -> Result<(), MhostError> {
+pub fn apply_hosts(state: State<'_, AppState>) -> Result<(), MhostError> {
+    let _guard = state.apply_lock.lock();
+    log::info!("[mHost] Waiting for user authorization (if needed)...");
+    let profiles = state.storage.list_profiles()?;
+    let current_hosts = match std::fs::read_to_string(state.writer.hosts_path()) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(MhostError::Io {
+                kind: e.kind().to_string(),
+                message: e.to_string(),
+            });
+        }
+    };
+    let plan = generate_plan(&profiles, &current_hosts)?;
+
     state.writer.apply(&plan)?;
 
-    // Write last_applied timestamp on success (non-fatal: must not break apply)
+    // Write last_applied timestamp only on success
     write_last_applied(&state.storage.root())?;
 
     Ok(())
@@ -54,7 +74,7 @@ pub fn enable_and_apply_logic(
 
     // 2. Reload all profiles and generate plan
     let profiles = storage.list_profiles()?;
-    let current_hosts = match std::fs::read_to_string("/etc/hosts") {
+    let current_hosts = match std::fs::read_to_string(writer.hosts_path()) {
         Ok(content) => content,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => {
@@ -69,7 +89,7 @@ pub fn enable_and_apply_logic(
     // 3. Apply to system hosts
     writer.apply(&plan)?;
 
-    // 4. Record timestamp
+    // 4. Record timestamp (only after successful apply)
     write_last_applied(&storage.root())?;
 
     Ok(())
@@ -89,6 +109,7 @@ pub fn enable_and_apply_logic(
 ///
 /// If `enabled` is `false`, the managed block is removed from hosts (all profiles
 /// disabled → empty plan → managed block cleared).
+/// Security fix (#16): Uses apply_lock to prevent concurrent writes.
 #[tauri::command]
 pub fn enable_and_apply(
     id: String,
@@ -96,6 +117,7 @@ pub fn enable_and_apply(
     state: State<'_, AppState>,
     app_handle: AppHandle,
 ) -> Result<(), MhostError> {
+    let _guard = state.apply_lock.lock();
     enable_and_apply_logic(&id, enabled, state.storage.as_ref(), &state.writer)?;
     crate::tray::update_tray_menu(&app_handle);
     Ok(())
@@ -103,6 +125,7 @@ pub fn enable_and_apply(
 
 #[tauri::command]
 pub fn rollback_hosts(state: State<'_, AppState>) -> Result<(), MhostError> {
+    let _guard = state.apply_lock.lock();
     state.writer.rollback().map_err(Into::into)
 }
 
@@ -129,6 +152,15 @@ pub fn get_managed_block_content(
     ))
 }
 
+/// Strong-typed struct for last_applied.json to prevent recursive deserialization attacks.
+/// Security fix (#20): Replaces bare `serde_json::Value` deserialization.
+#[derive(serde::Deserialize)]
+struct LastApplied {
+    timestamp: String,
+    #[allow(dead_code)]
+    profile_id: Option<String>,
+}
+
 #[tauri::command]
 pub fn get_last_applied(state: State<'_, AppState>) -> Result<Option<String>, MhostError> {
     let path = state.storage.root().join("last_applied.json");
@@ -139,14 +171,11 @@ pub fn get_last_applied(state: State<'_, AppState>) -> Result<Option<String>, Mh
         kind: e.kind().to_string(),
         message: e.to_string(),
     })?;
-    let data: serde_json::Value = serde_json::from_str(&content).map_err(|e| MhostError::Io {
+    let data: LastApplied = serde_json::from_str(&content).map_err(|e| MhostError::Io {
         kind: "serde_json".to_string(),
         message: e.to_string(),
     })?;
-    Ok(data
-        .get("timestamp")
-        .and_then(|v| v.as_str())
-        .map(String::from))
+    Ok(Some(data.timestamp))
 }
 
 // ---------------------------------------------------------------------------

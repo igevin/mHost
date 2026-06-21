@@ -35,6 +35,8 @@ mhost-core = { path = "crates/mhost-core" }
 mhost-hosts = { path = "crates/mhost-hosts" }
 mhost-storage = { path = "crates/mhost-storage" }
 mhost-apply = { path = "crates/mhost-apply" }
+dirs = "5"
+log = "0.4"
 
 [dev-dependencies]
 tempfile = "3"

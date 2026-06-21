@@ -1,10 +1,78 @@
 use std::str::FromStr;
 
 use mhost_core::{MhostError, Profile, ProfileId};
+use mhost_hosts::parser::Parser;
 use mhost_storage::storage::Storage;
 use tauri::{AppHandle, State};
 
 use crate::state::AppState;
+
+const MAX_NAME_LENGTH: usize = 200;
+const MAX_DESCRIPTION_LENGTH: usize = 2000;
+
+/// Validate profile fields before saving.
+/// Security fix (#18): Prevents injection of control characters, excessive length, and invalid rules.
+fn validate_profile(profile: &Profile) -> Result<(), MhostError> {
+    // 1. Length limits
+    if profile.name.len() > MAX_NAME_LENGTH {
+        return Err(MhostError::InvalidInput(format!(
+            "Profile name exceeds maximum length of {} characters",
+            MAX_NAME_LENGTH
+        )));
+    }
+    if profile
+        .description
+        .as_ref()
+        .map_or(0, |s| s.len())
+        > MAX_DESCRIPTION_LENGTH
+    {
+        return Err(MhostError::InvalidInput(format!(
+            "Profile description exceeds maximum length of {} characters",
+            MAX_DESCRIPTION_LENGTH
+        )));
+    }
+
+    // 2. Reject control characters in name
+    if profile.name.chars().any(|c| c.is_control()) {
+        return Err(MhostError::InvalidInput(
+            "Profile name contains control characters".to_string(),
+        ));
+    }
+
+    // 3. Re-validate all rules through the parser
+    for rule in &profile.rules {
+        let line = format!("{} {}", rule.ip, rule.domains.join(" "));
+        let result = Parser::parse(&line);
+        if !result.errors.is_empty() {
+            return Err(MhostError::InvalidInput(format!(
+                "Invalid rule in profile: {} {}",
+                rule.ip,
+                rule.domains.join(" ")
+            )));
+        }
+        // Reject control characters in comments (they would be written to /etc/hosts)
+        if let Some(c) = &rule.comment {
+            if c.chars().any(|ch| ch.is_control()) {
+                return Err(MhostError::InvalidInput(format!(
+                    "Rule comment contains control characters: {:?}",
+                    c
+                )));
+            }
+        }
+    }
+
+    // 4. Validate tags (reject control characters and excessive length)
+    for tag in &profile.tags {
+        if tag.chars().any(|c| c.is_control()) || tag.len() > 50 {
+            return Err(MhostError::InvalidInput(format!(
+                "Invalid tag: {:?}",
+                tag
+            )));
+        }
+    }
+
+    Ok(())
+}
 
 #[tauri::command]
 pub fn list_profiles(state: State<'_, AppState>) -> Result<Vec<Profile>, MhostError> {
@@ -24,6 +92,8 @@ pub fn create_profile(
     app_handle: AppHandle,
 ) -> Result<Profile, MhostError> {
     let profile = Profile::new(name);
+    // Security fix (#18): Validate profile before saving
+    validate_profile(&profile)?;
     state.storage.save_profile(&profile)?;
     crate::tray::update_tray_menu(&app_handle);
     Ok(profile)
@@ -35,6 +105,8 @@ pub fn update_profile(
     state: State<'_, AppState>,
     app_handle: AppHandle,
 ) -> Result<Profile, MhostError> {
+    // Security fix (#18): Validate profile before saving
+    validate_profile(&profile)?;
     state.storage.save_profile(&profile)?;
     crate::tray::update_tray_menu(&app_handle);
     Ok(profile)

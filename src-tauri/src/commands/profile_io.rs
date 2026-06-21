@@ -10,6 +10,46 @@ use crate::state::AppState;
 
 const MAX_FILE_READ_SIZE: usize = 1_048_576; // 1MB
 
+/// Validate that a file path stays within the user's home directory.
+/// For existing files, canonicalizes the full path. For new files (export),
+/// validates the parent directory instead.
+/// Security fix (#17): Prevents arbitrary file read/write via IPC.
+fn validate_user_path(path: &str, must_exist: bool) -> Result<std::path::PathBuf, MhostError> {
+    let p = std::path::Path::new(path);
+    let home = dirs::home_dir().ok_or_else(|| {
+        MhostError::InvalidInput("Cannot determine home directory".to_string())
+    })?;
+
+    if must_exist {
+        // Import: file must exist, canonicalize full path
+        let canonical = p
+            .canonicalize()
+            .map_err(|e| MhostError::InvalidInput(format!("Invalid path '{}': {}", path, e)))?;
+        if !canonical.starts_with(&home) {
+            return Err(MhostError::InvalidInput(format!(
+                "Path '{}' is outside home directory",
+                path
+            )));
+        }
+        Ok(canonical)
+    } else {
+        // Export: file may not exist yet, validate parent directory
+        let parent = p.parent().ok_or_else(|| {
+            MhostError::InvalidInput(format!("Path '{}' has no parent directory", path))
+        })?;
+        let canonical_parent = parent
+            .canonicalize()
+            .map_err(|e| MhostError::InvalidInput(format!("Invalid parent path '{}': {}", path, e)))?;
+        if !canonical_parent.starts_with(&home) {
+            return Err(MhostError::InvalidInput(format!(
+                "Path '{}' is outside home directory",
+                path
+            )));
+        }
+        Ok(p.to_path_buf())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Core logic (testable without Tauri State)
 // ---------------------------------------------------------------------------
@@ -143,7 +183,7 @@ pub fn duplicate_profile(
 
 /// Export a profile to a file.
 ///
-/// Path is from user dialog selection; we reject paths containing ".." for safety.
+/// Security fix (#17): Path is validated to stay within home directory.
 #[tauri::command]
 pub fn export_profile_to_file(
     id: String,
@@ -151,17 +191,14 @@ pub fn export_profile_to_file(
     path: String,
     state: State<'_, AppState>,
 ) -> Result<(), MhostError> {
-    if path.contains("..") {
-        return Err(MhostError::InvalidInput(
-            "Path cannot contain '..'".to_string(),
-        ));
-    }
+    let validated = validate_user_path(&path, false)?;
     let content = export_profile_logic(&id, format, state.storage.as_ref())?;
-    std::fs::write(&path, &content).map_err(Into::into)
+    std::fs::write(&validated, &content).map_err(Into::into)
 }
 
 /// Import a profile from a file.
 ///
+/// Security fix (#17): Path is validated to stay within home directory.
 /// Reads file content (limited to 1MB) and imports it as a new profile.
 #[tauri::command]
 pub fn import_profile_from_file(
@@ -169,19 +206,15 @@ pub fn import_profile_from_file(
     path: String,
     state: State<'_, AppState>,
 ) -> Result<Profile, MhostError> {
-    if path.contains("..") {
-        return Err(MhostError::InvalidInput(
-            "Path cannot contain '..'".to_string(),
-        ));
-    }
-    let metadata = std::fs::metadata(&path)?;
+    let canonical = validate_user_path(&path, true)?;
+    let metadata = std::fs::metadata(&canonical)?;
     if metadata.len() > MAX_FILE_READ_SIZE as u64 {
         return Err(MhostError::InvalidInput(format!(
             "File too large (max {} bytes)",
             MAX_FILE_READ_SIZE
         )));
     }
-    let hosts_text = std::fs::read_to_string(&path)?;
+    let hosts_text = std::fs::read_to_string(&canonical)?;
     import_profile_logic(name, &hosts_text, state.storage.as_ref())
 }
 
