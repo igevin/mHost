@@ -5,6 +5,7 @@
 
 use mhost_core::{ApplyError, ApplyPlan, MhostError};
 use mhost_hosts::Parser;
+use std::collections::HashSet;
 
 /// Verify that the written content matches the expected plan.
 pub fn verify(written: &str, plan: &ApplyPlan) -> Result<(), MhostError> {
@@ -28,10 +29,13 @@ pub fn verify(written: &str, plan: &ApplyPlan) -> Result<(), MhostError> {
         );
     }
 
-    // Verify each rule appears in the written content
+    // Extract managed block lines into a HashSet for O(1) lookup
+    let managed_content = Parser::extract_managed_block_content(written).unwrap_or_default();
+    let written_lines: HashSet<&str> = managed_content.lines().collect();
+
     for rule in &plan.rules {
         let expected = format!("{} {}", rule.ip, rule.domain);
-        if !written.contains(&expected) {
+        if !written_lines.contains(expected.as_str()) {
             return Err(ApplyError::VerificationFailed(format!(
                 "expected rule '{}' not found",
                 expected

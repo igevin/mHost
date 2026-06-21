@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo, useDeferredValue } from "react";
 import type { HostRule, ParseErrorAtLine } from "../types";
 import { validateHostsText } from "../lib/tauri";
 import { extractErrorMessage } from "../lib/error";
@@ -203,8 +203,9 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEd
     }
   }, []);
 
-  // Generate highlighted content
-  const highlightedHtml = useMemo(() => highlightText(text), [text]);
+  // Generate highlighted content — Perf fix (#30): use deferred value to avoid blocking on every keystroke
+  const deferredText = useDeferredValue(text);
+  const highlightedHtml = useMemo(() => highlightText(deferredText), [deferredText]);
 
   return (
     <div className={styles.container}>

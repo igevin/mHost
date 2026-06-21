@@ -8,19 +8,23 @@ use crate::commands::profile::disable_other_profiles;
 use crate::state::AppState;
 
 #[tauri::command]
-pub fn generate_apply_plan(state: State<'_, AppState>) -> Result<ApplyPlan, MhostError> {
-    let profiles = state.storage.list_profiles()?;
-    let current_hosts = match std::fs::read_to_string(state.writer.hosts_path()) {
-        Ok(content) => content,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => {
-            return Err(MhostError::Io {
-                kind: e.kind().to_string(),
-                message: e.to_string(),
-            });
-        }
-    };
-    generate_plan(&profiles, &current_hosts).map_err(Into::into)
+pub async fn generate_apply_plan(state: State<'_, AppState>) -> Result<ApplyPlan, MhostError> {
+    let storage = state.storage.clone();
+    let writer = state.writer.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let profiles = storage.list_profiles()?;
+        let current_hosts = match std::fs::read_to_string(writer.hosts_path()) {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => {
+                return Err(MhostError::Io {
+                    kind: e.kind().to_string(),
+                    message: e.to_string(),
+                });
+            }
+        };
+        generate_plan(&profiles, &current_hosts).map_err(Into::into)
+    }).await.map_err(|e| MhostError::InvalidInput(e.to_string()))?
 }
 
 /// Apply hosts using server-side generated plan.
@@ -28,29 +32,34 @@ pub fn generate_apply_plan(state: State<'_, AppState>) -> Result<ApplyPlan, Mhos
 /// Security fix (#14): No longer accepts `ApplyPlan` from the frontend.
 /// The plan is generated server-side from storage to prevent arbitrary hosts injection.
 /// Security fix (#16): Uses apply_lock to prevent concurrent writes.
+/// Perf fix (#26): Async with spawn_blocking to avoid blocking executor.
 #[tauri::command]
-pub fn apply_hosts(state: State<'_, AppState>) -> Result<(), MhostError> {
-    let _guard = state.apply_lock.lock();
-    eprintln!("[mHost] Waiting for user authorization (if needed)...");
-    let profiles = state.storage.list_profiles()?;
-    let current_hosts = match std::fs::read_to_string(state.writer.hosts_path()) {
-        Ok(content) => content,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => {
-            return Err(MhostError::Io {
-                kind: e.kind().to_string(),
-                message: e.to_string(),
-            });
-        }
-    };
-    let plan = generate_plan(&profiles, &current_hosts)?;
+pub async fn apply_hosts(state: State<'_, AppState>) -> Result<(), MhostError> {
+    let _guard = state.apply_lock.lock().await;
+    let writer = state.writer.clone();
+    let storage = state.storage.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        eprintln!("[mHost] Waiting for user authorization (if needed)...");
+        let profiles = storage.list_profiles()?;
+        let current_hosts = match std::fs::read_to_string(writer.hosts_path()) {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => {
+                return Err(MhostError::Io {
+                    kind: e.kind().to_string(),
+                    message: e.to_string(),
+                });
+            }
+        };
+        let plan = generate_plan(&profiles, &current_hosts)?;
 
-    state.writer.apply(&plan)?;
+        writer.apply(&plan)?;
 
-    // Write last_applied timestamp only on success
-    write_last_applied(&state.storage.root())?;
+        // Write last_applied timestamp only on success
+        write_last_applied(&storage.root())?;
 
-    Ok(())
+        Ok(())
+    }).await.map_err(|e| MhostError::InvalidInput(e.to_string()))?
 }
 
 /// Core logic: enable a profile and immediately apply its rules to the system hosts file.
@@ -110,46 +119,57 @@ pub fn enable_and_apply_logic(
 /// If `enabled` is `false`, the managed block is removed from hosts (all profiles
 /// disabled → empty plan → managed block cleared).
 /// Security fix (#16): Uses apply_lock to prevent concurrent writes.
+/// Perf fix (#26): Async with spawn_blocking to avoid blocking executor.
 #[tauri::command]
-pub fn enable_and_apply(
+pub async fn enable_and_apply(
     id: String,
     enabled: bool,
     state: State<'_, AppState>,
     app_handle: AppHandle,
 ) -> Result<(), MhostError> {
-    let _guard = state.apply_lock.lock();
-    enable_and_apply_logic(&id, enabled, state.storage.as_ref(), &state.writer)?;
+    let _guard = state.apply_lock.lock().await;
+    let writer = state.writer.clone();
+    let storage = state.storage.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        enable_and_apply_logic(&id, enabled, storage.as_ref(), &writer)
+    }).await.map_err(|e| MhostError::InvalidInput(e.to_string()))??;
     crate::tray::update_tray_menu(&app_handle);
     Ok(())
 }
 
 #[tauri::command]
-pub fn rollback_hosts(state: State<'_, AppState>) -> Result<(), MhostError> {
-    let _guard = state.apply_lock.lock();
-    state.writer.rollback().map_err(Into::into)
+pub async fn rollback_hosts(state: State<'_, AppState>) -> Result<(), MhostError> {
+    let _guard = state.apply_lock.lock().await;
+    let writer = state.writer.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        writer.rollback().map_err(Into::into)
+    }).await.map_err(|e| MhostError::InvalidInput(e.to_string()))?
 }
 
 #[tauri::command]
-pub fn read_system_hosts() -> Result<String, MhostError> {
-    std::fs::read_to_string("/etc/hosts").map_err(|e| MhostError::Io {
-        kind: e.kind().to_string(),
-        message: e.to_string(),
-    })
-}
-
-#[tauri::command]
-pub fn get_managed_block_content(
-    state: State<'_, AppState>,
-) -> Result<Option<String>, MhostError> {
-    let hosts_text = std::fs::read_to_string(state.writer.hosts_path()).map_err(|e| {
-        MhostError::Io {
+pub async fn read_system_hosts() -> Result<String, MhostError> {
+    tauri::async_runtime::spawn_blocking(|| {
+        std::fs::read_to_string("/etc/hosts").map_err(|e| MhostError::Io {
             kind: e.kind().to_string(),
             message: e.to_string(),
-        }
-    })?;
-    Ok(mhost_hosts::parser::Parser::extract_managed_block_content(
-        &hosts_text,
-    ))
+        })
+    }).await.map_err(|e| MhostError::InvalidInput(e.to_string()))?
+}
+
+#[tauri::command]
+pub async fn get_managed_block_content(
+    state: State<'_, AppState>,
+) -> Result<Option<String>, MhostError> {
+    let writer = state.writer.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let hosts_text = std::fs::read_to_string(writer.hosts_path()).map_err(|e| MhostError::Io {
+            kind: e.kind().to_string(),
+            message: e.to_string(),
+        })?;
+        Ok(mhost_hosts::parser::Parser::extract_managed_block_content(
+            &hosts_text,
+        ))
+    }).await.map_err(|e| MhostError::InvalidInput(e.to_string()))?
 }
 
 /// Strong-typed struct for last_applied.json to prevent recursive deserialization attacks.
@@ -162,20 +182,23 @@ struct LastApplied {
 }
 
 #[tauri::command]
-pub fn get_last_applied(state: State<'_, AppState>) -> Result<Option<String>, MhostError> {
-    let path = state.storage.root().join("last_applied.json");
-    if !path.exists() {
-        return Ok(None);
-    }
-    let content = std::fs::read_to_string(&path).map_err(|e| MhostError::Io {
-        kind: e.kind().to_string(),
-        message: e.to_string(),
-    })?;
-    let data: LastApplied = serde_json::from_str(&content).map_err(|e| MhostError::Io {
-        kind: "serde_json".to_string(),
-        message: e.to_string(),
-    })?;
-    Ok(Some(data.timestamp))
+pub async fn get_last_applied(state: State<'_, AppState>) -> Result<Option<String>, MhostError> {
+    let root = state.storage.root().to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = root.join("last_applied.json");
+        if !path.exists() {
+            return Ok(None);
+        }
+        let content = std::fs::read_to_string(&path).map_err(|e| MhostError::Io {
+            kind: e.kind().to_string(),
+            message: e.to_string(),
+        })?;
+        let data: LastApplied = serde_json::from_str(&content).map_err(|e| MhostError::Io {
+            kind: "serde_json".to_string(),
+            message: e.to_string(),
+        })?;
+        Ok(Some(data.timestamp))
+    }).await.map_err(|e| MhostError::InvalidInput(e.to_string()))?
 }
 
 // ---------------------------------------------------------------------------

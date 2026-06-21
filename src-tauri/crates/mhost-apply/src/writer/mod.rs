@@ -115,9 +115,8 @@ impl HostsWriter {
             log::warn!("DNS cache flush failed: {}", e);
         }
 
-        // 14. Verify write result
-        let written = fs::read_to_string(&self.hosts_path)?;
-        if let Err(verify_err) = verification::verify(&written, plan) {
+        // 14. Verify write result (use in-memory new_content to avoid re-reading)
+        if let Err(verify_err) = verification::verify(&new_content, plan) {
             // Rollback to backup on verification failure
             if let Some(ref backup) = backup_path {
                 log::warn!("Verification failed, rolling back...");

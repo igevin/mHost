@@ -22,6 +22,18 @@ export default defineConfig(() => ({
     __APP_VERSION__: JSON.stringify(packageJson.version),
   },
 
+  // Perf fix (#37): Code splitting to reduce initial bundle size
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          react: ["react", "react-dom", "react-router-dom"],
+          tauri: ["@tauri-apps/api", "@tauri-apps/plugin-dialog"],
+        },
+      },
+    },
+  },
+
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
   // 1. prevent Vite from obscuring rust errors

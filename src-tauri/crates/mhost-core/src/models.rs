@@ -53,6 +53,7 @@ impl fmt::Display for SourceId {
 pub struct Profile {
     pub id: ProfileId,
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub enabled: bool,
     pub protected: bool,
@@ -89,6 +90,7 @@ pub struct HostRule {
     pub ip: IpAddr,
     pub domains: Vec<String>,
     pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
     pub source: RuleSource,
 }

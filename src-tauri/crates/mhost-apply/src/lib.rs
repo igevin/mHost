@@ -35,15 +35,19 @@ pub fn generate_plan(profiles: &[Profile], current_hosts: &str) -> Result<ApplyP
 ///
 /// Wraps the rules in `# ---- mHost start ----` / `# ---- mHost end ----` markers.
 pub fn format_as_hosts(rules: &[ResolvedRule]) -> String {
-    use mhost_hosts::formatter::format_managed_block;
+    use std::fmt::Write;
 
-    // Convert ResolvedRule to HostRule for formatting
-    let host_rules: Vec<mhost_core::HostRule> = rules
-        .iter()
-        .map(|r| mhost_core::HostRule::new(r.ip, vec![r.domain.clone()]))
-        .collect();
+    if rules.is_empty() {
+        return String::new();
+    }
 
-    format_managed_block(&host_rules)
+    let mut output = String::new();
+    output.push_str("# ---- mHost start ----\n");
+    for rule in rules {
+        writeln!(output, "{} {}", rule.ip, rule.domain).unwrap();
+    }
+    output.push_str("# ---- mHost end ----\n");
+    output
 }
 
 // ---------------------------------------------------------------------------
