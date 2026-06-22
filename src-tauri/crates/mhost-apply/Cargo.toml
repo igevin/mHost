@@ -9,7 +9,7 @@ mhost-hosts = { path = "../mhost-hosts" }
 uuid = { version = "1.8", features = ["v4"] }
 chrono = { workspace = true }
 dirs = "5.0"
-tempfile = "3.10"
+tempfile = { workspace = true }
 log = "0.4"
 
 [dev-dependencies]

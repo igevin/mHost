@@ -1,6 +1,7 @@
 pub mod commands;
 pub mod platform;
 pub mod state;
+#[cfg(target_os = "macos")]
 pub mod tray;
 pub mod tray_logic;
 
@@ -44,6 +45,7 @@ pub fn run() {
             import_profile_from_file,
         ])
         .setup(|app| {
+            #[cfg(target_os = "macos")]
             if let Err(e) = crate::tray::build_tray(&app.handle()) {
                 eprintln!("[mHost] Failed to build tray: {}", e);
             }

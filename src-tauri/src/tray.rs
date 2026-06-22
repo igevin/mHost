@@ -1,3 +1,9 @@
+//! macOS tray menu implementation.
+//!
+//! This module is only compiled on macOS. It provides the system tray icon,
+//! menu, and event handling for profile switching via the menu bar.
+#![cfg(target_os = "macos")]
+
 use tauri::{
     menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu},
     tray::{TrayIconBuilder, TrayIconEvent},
@@ -11,6 +17,15 @@ use mhost_core::ProfileId;
 
 const TRAY_ID: &str = "main-tray";
 const PROFILES_SUBMENU_ID: &str = "profiles_submenu";
+
+/// Re-export from tray_logic to ensure single source of truth.
+pub use crate::tray_logic::PROFILE_ID_PREFIX;
+
+/// Event emitted when tray profile selection changes.
+///
+/// Payload: `()` (empty tuple). Frontend should refresh profile list.
+/// Emitted after a successful profile switch via the tray menu.
+pub const TRAY_PROFILES_UPDATED_EVENT: &str = "tray:profiles-updated";
 
 /// Build the initial tray icon and menu.
 pub fn build_tray<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::Error>> {
@@ -60,7 +75,7 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>) -> Result<Menu<R>, Box<dyn std::er
     // Build profile check menu items
     let mut profile_items: Vec<CheckMenuItem<R>> = Vec::new();
     for p in &profiles {
-        let id = format!("profile.{}", p.id);
+        let id = format!("{}{}", PROFILE_ID_PREFIX, p.id);
         let item = CheckMenuItem::with_id(
             app,
             id,
@@ -160,7 +175,7 @@ pub fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::Men
                 match enable_and_apply_logic(&profile_id_clone, target_enabled, storage, writer) {
                     Ok(()) => {
                         let _ = update_tray_checkmark(&app_clone);
-                        let _ = app_clone.emit("tray:profiles-updated", ());
+                        let _ = app_clone.emit(TRAY_PROFILES_UPDATED_EVENT, ());
                     }
                     Err(e) => {
                         eprintln!("[mHost] Tray switch profile failed: {}", e);

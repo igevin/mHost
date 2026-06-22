@@ -21,10 +21,16 @@ pub enum MenuUpdateKind {
     Rebuild,
 }
 
+/// Prefix for profile menu item IDs.
+///
+/// Profile menu items use the format `{PROFILE_ID_PREFIX}{profile_id}`,
+/// e.g., `profile.550e8400-e29b-41d4-a716-446655440000`.
+pub const PROFILE_ID_PREFIX: &str = "profile.";
+
 pub fn resolve_menu_action(menu_id: &str) -> TrayMenuAction {
     match menu_id {
-        id if id.starts_with("profile.") => {
-            TrayMenuAction::SwitchProfile(id.strip_prefix("profile.").unwrap().to_string())
+        id if id.starts_with(PROFILE_ID_PREFIX) => {
+            TrayMenuAction::SwitchProfile(id.strip_prefix(PROFILE_ID_PREFIX).unwrap().to_string())
         }
         "refresh_rules" => TrayMenuAction::RefreshRules,
         "open_window" => TrayMenuAction::OpenWindow,

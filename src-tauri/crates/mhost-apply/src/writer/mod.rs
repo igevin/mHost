@@ -273,7 +273,7 @@ fn storage_root() -> PathBuf {
 /// Security fix (#19): Prevents following symlinks when writing to /etc/hosts.
 fn ensure_regular_file(path: &Path) -> Result<(), MhostError> {
     let metadata = fs::symlink_metadata(path).map_err(|e| MhostError::Io {
-        kind: e.kind().to_string(),
+        kind: format!("{:?}", e.kind()),
         message: format!("Cannot stat '{}': {}", path.display(), e),
     })?;
     if !metadata.file_type().is_file() {

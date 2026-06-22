@@ -89,12 +89,13 @@ pub fn get_profile(id: String, state: State<'_, AppState>) -> Result<Profile, Mh
 pub fn create_profile(
     name: String,
     state: State<'_, AppState>,
-    app_handle: AppHandle,
+    #[allow(unused_variables)] app_handle: AppHandle,
 ) -> Result<Profile, MhostError> {
     let profile = Profile::new(name);
     // Security fix (#18): Validate profile before saving
     validate_profile(&profile)?;
     state.storage.save_profile(&profile)?;
+    #[cfg(target_os = "macos")]
     crate::tray::update_tray_menu(&app_handle);
     Ok(profile)
 }
@@ -103,11 +104,12 @@ pub fn create_profile(
 pub fn update_profile(
     profile: Profile,
     state: State<'_, AppState>,
-    app_handle: AppHandle,
+    #[allow(unused_variables)] app_handle: AppHandle,
 ) -> Result<Profile, MhostError> {
     // Security fix (#18): Validate profile before saving
     validate_profile(&profile)?;
     state.storage.save_profile(&profile)?;
+    #[cfg(target_os = "macos")]
     crate::tray::update_tray_menu(&app_handle);
     Ok(profile)
 }
@@ -116,10 +118,11 @@ pub fn update_profile(
 pub fn delete_profile(
     id: String,
     state: State<'_, AppState>,
-    app_handle: AppHandle,
+    #[allow(unused_variables)] app_handle: AppHandle,
 ) -> Result<(), MhostError> {
     let profile_id = ProfileId::from_str(&id)?;
     state.storage.delete_profile(&profile_id)?;
+    #[cfg(target_os = "macos")]
     crate::tray::update_tray_menu(&app_handle);
     Ok(())
 }
@@ -152,7 +155,7 @@ pub fn set_profile_enabled(
     id: String,
     enabled: bool,
     state: State<'_, AppState>,
-    app_handle: AppHandle,
+    #[allow(unused_variables)] app_handle: AppHandle,
 ) -> Result<Profile, MhostError> {
     let profile_id = ProfileId::from_str(&id)?;
 
@@ -165,6 +168,7 @@ pub fn set_profile_enabled(
     profile.enabled = enabled;
     profile.updated_at = chrono::Utc::now();
     state.storage.save_profile(&profile)?;
+    #[cfg(target_os = "macos")]
     crate::tray::update_tray_menu(&app_handle);
     Ok(profile)
 }
