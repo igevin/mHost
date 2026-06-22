@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::io;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use mhost_core::{Profile, ProfileId, StorageError};
@@ -218,22 +219,20 @@ impl Storage for FileStorage {
 // Atomic write helper
 // ---------------------------------------------------------------------------
 
-/// 原子写入：先写入 `.tmp` 临时文件，再通过 `fs::rename` 替换目标文件。
+/// 原子写入：使用 `tempfile::NamedTempFile` 生成唯一临时文件，再通过 `fs::rename` 替换目标文件。
 ///
-/// 如果写入过程中发生错误，会尝试清理临时文件。
+/// 使用 `NamedTempFile` 避免并发写入时的固定临时文件名竞态条件。
+/// 如果写入过程中发生错误，临时文件会自动清理。
 fn atomic_write(path: &Path, content: &[u8]) -> io::Result<()> {
-    let temp = path.with_extension("tmp");
-    match fs::write(&temp, content) {
-        Ok(()) => {
-            fs::rename(&temp, path)?;
-            Ok(())
-        }
-        Err(e) => {
-            // 尝试清理临时文件，忽略清理失败
-            let _ = fs::remove_file(&temp);
-            Err(e)
-        }
-    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut temp_file = tempfile::NamedTempFile::new_in(parent)?;
+    temp_file.write_all(content)?;
+    temp_file.flush()?;
+
+    let temp_path = temp_file.into_temp_path();
+    fs::rename(&temp_path, path)?;
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

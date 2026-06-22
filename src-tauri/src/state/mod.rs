@@ -16,6 +16,11 @@ impl ApplyLock {
     pub async fn lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.0.lock().await
     }
+
+    /// Acquire the lock in a blocking context (e.g., `spawn_blocking`).
+    pub fn blocking_lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.0.blocking_lock()
+    }
 }
 
 pub struct AppState {

@@ -28,7 +28,7 @@ pub enum MhostError {
 impl From<std::io::Error> for MhostError {
     fn from(err: std::io::Error) -> Self {
         MhostError::Io {
-            kind: err.kind().to_string(),
+            kind: format!("{:?}", err.kind()),
             message: err.to_string(),
         }
     }
@@ -172,6 +172,14 @@ mod tests {
                 "io error",
             ),
             (
+                "io_with_debug_kind",
+                MhostError::Io {
+                    kind: "NotFound".to_string(),
+                    message: "file gone".to_string(),
+                },
+                "NotFound",
+            ),
+            (
                 "storage_version_mismatch",
                 MhostError::Storage(StorageError::VersionMismatch {
                     expected: 1,
@@ -228,7 +236,7 @@ mod tests {
         let mhost_err: MhostError = io_err.into();
         let msg = mhost_err.to_string();
         assert!(msg.contains("file gone"), "message should contain 'file gone'");
-        assert!(msg.contains("entity not found"), "message should contain ErrorKind 'entity not found'");
+        assert!(msg.contains("NotFound"), "message should contain ErrorKind 'NotFound' (Debug format)");
         // Verify it serializes correctly
         let json = serde_json::to_string(&mhost_err).unwrap();
         let restored: MhostError = serde_json::from_str(&json).unwrap();
