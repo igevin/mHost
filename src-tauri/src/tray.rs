@@ -150,7 +150,7 @@ pub fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::Men
                 let state = app_clone.state::<AppState>();
                 // Security fix (#16): Acquire apply lock to prevent concurrent writes
                 // Note: tray uses blocking context, so we use try_lock or a blocking approach
-                let _guard = state.apply_lock.0.blocking_lock();
+                let _guard = state.apply_lock.blocking_lock();
                 eprintln!("[mHost] Tray: waiting for user authorization (if needed)...");
                 let storage = state.storage.as_ref();
                 let writer = &*state.writer;
@@ -166,13 +166,18 @@ pub fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::Men
                         return;
                     }
                 };
-                let target_enabled = if let Ok(p) = storage.load_profile(&profile_id) {
-                    !p.enabled
-                } else {
-                    true
+                let target_enabled = match storage.load_profile(&profile_id) {
+                    Ok(p) => !p.enabled,
+                    Err(e) => {
+                        eprintln!(
+                            "[mHost] Tray switch profile failed: could not load profile '{}': {}",
+                            profile_id, e
+                        );
+                        return;
+                    }
                 };
 
-                match enable_and_apply_logic(&profile_id_clone, target_enabled, storage, writer) {
+                match enable_and_apply_logic(&profile_id, target_enabled, storage, writer) {
                     Ok(()) => {
                         let _ = update_tray_checkmark(&app_clone);
                         let _ = app_clone.emit(TRAY_PROFILES_UPDATED_EVENT, ());

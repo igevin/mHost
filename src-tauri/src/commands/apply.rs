@@ -1,6 +1,6 @@
 use mhost_apply::{ApplyPlan, generate_plan};
 use mhost_apply::writer::HostsWriter;
-use mhost_core::MhostError;
+use mhost_core::{MhostError, ProfileId};
 use mhost_storage::storage::Storage;
 use tauri::{AppHandle, State};
 
@@ -22,6 +22,19 @@ pub async fn generate_apply_plan(state: State<'_, AppState>) -> Result<ApplyPlan
         };
         generate_plan(&profiles, &current_hosts).map_err(Into::into)
     }).await.map_err(|e| MhostError::InvalidInput(e.to_string()))?
+}
+
+/// Reject an empty plan (no enabled profiles with rules).
+///
+/// Extracted as a pure function so it can be tested without Tauri `State`.
+/// Enhancement (#2-N1): Avoids writing empty managed block.
+pub fn reject_empty_plan(plan: &ApplyPlan) -> Result<(), MhostError> {
+    if plan.rules.is_empty() {
+        return Err(MhostError::InvalidInput(
+            "No enabled profiles with rules to apply".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Apply hosts using server-side generated plan.
@@ -49,11 +62,7 @@ pub async fn apply_hosts(state: State<'_, AppState>) -> Result<(), MhostError> {
         let plan = generate_plan(&profiles, &current_hosts)?;
 
         // N1: Reject empty plan to avoid writing empty managed block
-        if plan.rules.is_empty() {
-            return Err(MhostError::InvalidInput(
-                "No enabled profiles with rules to apply".to_string(),
-            ));
-        }
+        reject_empty_plan(&plan)?;
 
         writer.apply(&plan)?;
 
@@ -68,17 +77,16 @@ pub async fn apply_hosts(state: State<'_, AppState>) -> Result<(), MhostError> {
 ///
 /// Testable without Tauri `State`.
 pub fn enable_and_apply_logic(
-    id: &str,
+    id: &ProfileId,
     enabled: bool,
     storage: &(dyn Storage + Send + Sync),
     writer: &HostsWriter,
 ) -> Result<(), MhostError> {
     // 1. Toggle enabled state in storage (same logic as set_profile_enabled)
-    let profile_id = std::str::FromStr::from_str(id)?;
     if enabled {
-        disable_other_profiles(storage, &profile_id)?;
+        disable_other_profiles(storage, id)?;
     }
-    let mut profile = storage.load_profile(&profile_id)?;
+    let mut profile = storage.load_profile(id)?;
     profile.enabled = enabled;
     profile.updated_at = chrono::Utc::now();
     storage.save_profile(&profile)?;
@@ -136,7 +144,8 @@ pub async fn enable_and_apply(
     let writer = state.writer.clone();
     let storage = state.storage.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        enable_and_apply_logic(&id, enabled, storage.as_ref(), &writer)
+        let profile_id = std::str::FromStr::from_str(&id)?;
+        enable_and_apply_logic(&profile_id, enabled, storage.as_ref(), &writer)
     }).await.map_err(|e| MhostError::InvalidInput(e.to_string()))??;
     #[cfg(target_os = "macos")]
     crate::tray::update_tray_menu(&app_handle);
@@ -255,7 +264,7 @@ mod tests {
 
         // Enable profile_b via enable_and_apply_logic
         let result = enable_and_apply_logic(
-            &profile_b.id.to_string(),
+            &profile_b.id,
             true,
             storage.as_ref(),
             &writer,
@@ -299,7 +308,7 @@ mod tests {
 
         // Apply first so there's a managed block
         let result = enable_and_apply_logic(
-            &profile.id.to_string(),
+            &profile.id,
             true,
             storage.as_ref(),
             &writer,
@@ -311,7 +320,7 @@ mod tests {
 
         // Now disable the profile
         let result = enable_and_apply_logic(
-            &profile.id.to_string(),
+            &profile.id,
             false,
             storage.as_ref(),
             &writer,
@@ -354,7 +363,7 @@ mod tests {
         // profile.enabled defaults to false
         storage.save_profile(&profile).unwrap();
 
-        // Attempt to apply with no enabled profiles
+        // Generate plan through the actual business logic
         let profiles = storage.list_profiles().unwrap();
         let current_hosts = std::fs::read_to_string(writer.hosts_path()).unwrap();
         let plan = generate_plan(&profiles, &current_hosts).unwrap();
@@ -362,19 +371,42 @@ mod tests {
         // Verify plan is empty
         assert!(plan.rules.is_empty(), "plan should be empty when no profiles are enabled");
 
-        // Verify writer.apply with empty plan would clear managed block
-        // (the rejection logic is at the command layer, not in generate_plan)
-        // We simulate the command-level rejection here:
-        if plan.rules.is_empty() {
-            let err = MhostError::InvalidInput(
-                "No enabled profiles with rules to apply".to_string(),
-            );
-            assert!(
-                err.to_string().contains("No enabled profiles"),
-                "should reject empty plan: {}",
-                err
-            );
-        }
+        // Verify reject_empty_plan correctly rejects the empty plan
+        let result = reject_empty_plan(&plan);
+        assert!(result.is_err(), "should reject empty plan");
+        let err = result.unwrap_err();
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("No enabled profiles"),
+            "error message should mention 'No enabled profiles': {}",
+            err_str
+        );
+    }
+
+    #[test]
+    fn test_reject_empty_plan_accepts_non_empty() {
+        let (_temp, storage, writer) = create_test_storage_and_writer();
+
+        // Create and enable a profile
+        let mut profile = create_profile_with_rules(
+            &storage,
+            "dev",
+            vec![("127.0.0.1", "example.com")],
+        );
+        profile.enabled = true;
+        storage.save_profile(&profile).unwrap();
+
+        // Generate plan through the actual business logic
+        let profiles = storage.list_profiles().unwrap();
+        let current_hosts = std::fs::read_to_string(writer.hosts_path()).unwrap();
+        let plan = generate_plan(&profiles, &current_hosts).unwrap();
+
+        // Verify plan is NOT empty
+        assert!(!plan.rules.is_empty(), "plan should have rules when a profile is enabled");
+
+        // Verify reject_empty_plan accepts the non-empty plan
+        let result = reject_empty_plan(&plan);
+        assert!(result.is_ok(), "should accept non-empty plan: {:?}", result.err());
     }
 }
 

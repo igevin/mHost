@@ -98,9 +98,9 @@ mod tests {
             let name = format!("hosts-202401{:02}_120000.bak", i);
             let path = dir.path().join(&name);
             fs::write(&path, format!("backup {}", i)).unwrap();
-            // Ensure distinct modification times so sorting is deterministic
-            // touch the file to slightly stagger mtime
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            // Set distinct modification times so sorting is deterministic
+            let mtime = filetime::FileTime::from_unix_time(i as i64, 0);
+            filetime::set_file_mtime(&path, mtime).unwrap();
         }
 
         // Verify we created 15 files
@@ -160,12 +160,13 @@ mod tests {
     fn test_prune_old_backups_retains_10_latest() {
         let dir = tempfile::tempdir().unwrap();
 
-        // Create 12 backup files with staggered modification times
+        // Create 12 backup files with distinct modification times
         for i in 0..12 {
             let name = format!("hosts-202401{:02}_120000.bak", i);
             let path = dir.path().join(&name);
             fs::write(&path, format!("backup {}", i)).unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            let mtime = filetime::FileTime::from_unix_time(i as i64, 0);
+            filetime::set_file_mtime(&path, mtime).unwrap();
         }
 
         prune_old_backups(dir.path()).unwrap();
