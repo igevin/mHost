@@ -12,7 +12,7 @@ export interface Profile {
 
 export interface HostRule {
   id: string;
-  ip: string;
+  ip: string | null;
   domains: string[];
   enabled: boolean;
   comment: string | null;

@@ -27,9 +27,14 @@ impl Merger {
 
         for profile in profiles.iter().filter(|p| p.enabled) {
             for rule in profile.rules.iter().filter(|r| r.enabled) {
+                // Skip comment-only rules — they don't contribute to DNS resolution
+                let ip = match rule.ip {
+                    Some(ip) => ip,
+                    None => continue,
+                };
                 for domain in &rule.domains {
                     all_rules.push(ResolvedRule {
-                        ip: rule.ip,
+                        ip,
                         domain: domain.clone(),
                         source_profile_id: profile.id.clone(),
                         source_profile_name: profile.name.clone(),

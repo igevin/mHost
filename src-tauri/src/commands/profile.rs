@@ -41,13 +41,20 @@ fn validate_profile(profile: &Profile) -> Result<(), MhostError> {
 
     // 3. Re-validate all rules through the parser
     for rule in &profile.rules {
+        // Skip comment-only rules for IP/domain validation
+        if rule.is_comment_only() {
+            continue;
+        }
+        let ip = rule.ip.unwrap_or_else(|| {
+            "0.0.0.0".parse::<std::net::IpAddr>().unwrap()
+        });
         let domains_str = rule.domains.join(" ");
-        let line = format!("{} {}", rule.ip, domains_str);
+        let line = format!("{} {}", ip, domains_str);
         let result = Parser::parse(&line);
         if !result.errors.is_empty() {
             return Err(MhostError::InvalidInput(format!(
                 "Invalid rule in profile: {} {}",
-                rule.ip, domains_str
+                ip, domains_str
             )));
         }
         // Reject control characters in comments (they would be written to /etc/hosts)

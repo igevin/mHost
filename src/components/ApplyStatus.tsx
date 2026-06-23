@@ -75,7 +75,7 @@ function ApplyStatus() {
                   .filter((r) => r.enabled)
                   .map((rule) => (
                     <div key={rule.id} className={styles.ruleItem}>
-                      <span className={styles.ruleIp}>{rule.ip}</span>
+                      <span className={styles.ruleIp}>{rule.ip ?? ""}</span>
                       <span className={styles.ruleDomains}>
                         {rule.domains.join(", ")}
                       </span>

@@ -25,7 +25,7 @@ function RuleList({ rules }: RuleListProps) {
           className={`${styles.ruleItem} ${rule.enabled ? "" : styles.ruleItemDisabled}`}
         >
           <div className={styles.ruleHeader}>
-            <span className={styles.ruleIp}>{rule.ip}</span>
+            <span className={styles.ruleIp}>{rule.ip ?? ""}</span>
             <span className={styles.ruleStatus}>
               {rule.enabled ? "On" : "Off"}
             </span>

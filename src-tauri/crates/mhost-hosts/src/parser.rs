@@ -146,9 +146,14 @@ impl Parser {
     fn parse_line(line: &str) -> Result<Option<HostRule>, ParseError> {
         let trimmed = line.trim();
 
-        // Empty or comment line -> no rule
-        if trimmed.is_empty() || trimmed.starts_with('#') {
+        // Empty line -> no rule
+        if trimmed.is_empty() {
             return Ok(None);
+        }
+
+        // Standalone comment line -> comment-only rule
+        if trimmed.starts_with('#') {
+            return Ok(Some(HostRule::comment_only(trimmed)));
         }
 
         // Strip inline comment (everything after the first '#')
@@ -319,7 +324,7 @@ mod tests {
     #[test]
     fn test_parse_comment_and_empty() {
         let cases = vec![
-            ("comment", "# this is a comment", 0),
+            ("comment", "# this is a comment", 1),
             ("empty", "", 0),
             ("whitespace", "   ", 0),
         ];
@@ -340,6 +345,12 @@ mod tests {
                 result.errors
             );
         }
+
+        // Verify the comment rule has correct content
+        let comment_result = Parser::parse("# this is a comment");
+        assert!(comment_result.rules[0].is_comment_only());
+        assert_eq!(comment_result.rules[0].comment, Some("# this is a comment".to_string()));
+        assert_eq!(comment_result.rules[0].ip, None);
     }
 
     #[test]
@@ -399,6 +410,17 @@ mod tests {
     }
 
     #[test]
+    fn test_format_roundtrip_with_comments() {
+        let input = "# header comment\n127.0.0.1 example.com\n# footer comment\n";
+        let result = Parser::parse(input);
+        assert_eq!(result.rules.len(), 3); // 2 comment-only + 1 host rule
+        let formatted = Parser::format(&result.rules);
+        assert_eq!(formatted, "# header comment\n127.0.0.1 example.com\n# footer comment\n");
+        let reparsed = Parser::parse(&formatted);
+        assert_rules_eq(&result.rules, &reparsed.rules);
+    }
+
+    #[test]
     fn test_format_multi_domain_expansion() {
         let rules = vec![make_rule("127.0.0.1", vec!["a.com", "b.com"])];
         let formatted = Parser::format(&rules);
@@ -420,7 +442,7 @@ mod tests {
         let result = Parser::parse(input);
         assert!(result.errors.is_empty());
         assert_eq!(result.rules.len(), 1);
-        assert_eq!(result.rules[0].ip, "127.0.0.1".parse::<IpAddr>().unwrap());
+        assert_eq!(result.rules[0].ip, Some("127.0.0.1".parse::<IpAddr>().unwrap()));
         assert_eq!(result.rules[0].domains, vec!["example.com"]);
         // empty comment after # is stored as None because we trim and check empty
         assert_eq!(result.rules[0].comment, None);
@@ -440,11 +462,16 @@ mod tests {
         let input = "# header\n127.0.0.1 a.com\n\n::1 localhost\n# footer\n";
         let result = Parser::parse(input);
         assert!(result.errors.is_empty());
-        assert_eq!(result.rules.len(), 2);
-        assert_eq!(result.rules[0].ip, "127.0.0.1".parse::<IpAddr>().unwrap());
-        assert_eq!(result.rules[0].domains, vec!["a.com"]);
-        assert_eq!(result.rules[1].ip, "::1".parse::<IpAddr>().unwrap());
-        assert_eq!(result.rules[1].domains, vec!["localhost"]);
+        // 2 comment-only rules + 2 host rules = 4
+        assert_eq!(result.rules.len(), 4);
+        assert!(result.rules[0].is_comment_only());
+        assert_eq!(result.rules[0].comment, Some("# header".to_string()));
+        assert_eq!(result.rules[1].ip, Some("127.0.0.1".parse::<IpAddr>().unwrap()));
+        assert_eq!(result.rules[1].domains, vec!["a.com"]);
+        assert_eq!(result.rules[2].ip, Some("::1".parse::<IpAddr>().unwrap()));
+        assert_eq!(result.rules[2].domains, vec!["localhost"]);
+        assert!(result.rules[3].is_comment_only());
+        assert_eq!(result.rules[3].comment, Some("# footer".to_string()));
     }
 
     #[test]
@@ -551,17 +578,23 @@ mod tests {
              vec![("127.0.0.1", vec!["x.com"])], 0),
             ("empty_lines", "\n\n127.0.0.1 x.com\n\n",
              vec![("127.0.0.1", vec!["x.com"])], 0),
-            ("comment_only", "# this is a comment", vec![], 0),
         ];
         for (name, input, expected_rules, expected_errors) in cases {
             let result = Parser::parse_with_lines(input);
             assert_eq!(result.rules.len(), expected_rules.len(), "case: {}", name);
             for (i, (expected_ip, expected_domains)) in expected_rules.iter().enumerate() {
-                assert_eq!(result.rules[i].ip, expected_ip.parse::<IpAddr>().unwrap(), "case: {} rule {} ip", name, i);
+                assert_eq!(result.rules[i].ip, Some(expected_ip.parse::<IpAddr>().unwrap()), "case: {} rule {} ip", name, i);
                 assert_eq!(result.rules[i].domains, *expected_domains, "case: {} rule {} domains", name, i);
             }
             assert_eq!(result.errors.len(), expected_errors, "case: {}", name);
         }
+
+        // Comment-only case: produces 1 comment-only rule
+        let comment_result = Parser::parse_with_lines("# this is a comment");
+        assert_eq!(comment_result.rules.len(), 1);
+        assert!(comment_result.rules[0].is_comment_only());
+        assert_eq!(comment_result.rules[0].comment, Some("# this is a comment".to_string()));
+        assert_eq!(comment_result.errors.len(), 0);
     }
 
     #[test]
