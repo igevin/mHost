@@ -41,13 +41,19 @@ fn validate_profile(profile: &Profile) -> Result<(), MhostError> {
 
     // 3. Re-validate all rules through the parser
     for rule in &profile.rules {
-        // Skip comment-only rules for IP/domain validation
+        // Comment-only rules: skip IP/domain validation, but still validate the comment
         if rule.is_comment_only() {
+            if let Some(c) = &rule.comment {
+                if c.chars().any(|ch| ch.is_control()) {
+                    return Err(MhostError::InvalidInput(format!(
+                        "Comment-only rule contains control characters: {:?}",
+                        c
+                    )));
+                }
+            }
             continue;
         }
-        let ip = rule.ip.unwrap_or_else(|| {
-            "0.0.0.0".parse::<std::net::IpAddr>().unwrap()
-        });
+        let ip = rule.ip.expect("non-comment-only rule must have an ip");
         let domains_str = rule.domains.join(" ");
         let line = format!("{} {}", ip, domains_str);
         let result = Parser::parse(&line);

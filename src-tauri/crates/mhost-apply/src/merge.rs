@@ -339,4 +339,15 @@ mod tests {
         // Verify profile ID is set (non-nil)
         assert_ne!(result.rules[0].source_profile_id.0, uuid::Uuid::nil());
     }
+
+    #[test]
+    fn test_merge_comment_only_rule_ignored() {
+        let mut p1 = profile_with_rules("p1", vec![("127.0.0.1", "a.com")]);
+        p1.rules.push(HostRule::comment_only("# a comment"));
+
+        let result = Merger::merge(&[p1]);
+        // Comment-only rule should not be included in merged rules
+        assert_eq!(result.rules.len(), 1);
+        assert_eq!(result.rules[0].domain, "a.com");
+    }
 }

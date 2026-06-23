@@ -160,7 +160,9 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEd
 
     // If the generated text matches current text, just update the ref
     // and skip overwriting (preserves cursor position).
+    // Also reset editing flag — user has converged on the validated state.
     if (newText === text) {
+      isEditingRef.current = false;
       prevRulesRef.current = rules;
       return;
     }

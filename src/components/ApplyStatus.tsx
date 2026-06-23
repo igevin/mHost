@@ -72,7 +72,7 @@ function ApplyStatus() {
             {enabledProfile.rules.length > 0 && (
               <div className={styles.rulesList}>
                 {enabledProfile.rules
-                  .filter((r) => r.enabled)
+                  .filter((r) => r.enabled && r.ip !== null)
                   .map((rule) => (
                     <div key={rule.id} className={styles.ruleItem}>
                       <span className={styles.ruleIp}>{rule.ip ?? ""}</span>
