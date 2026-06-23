@@ -73,6 +73,39 @@ pub async fn apply_hosts(state: State<'_, AppState>) -> Result<(), MhostError> {
     }).await.map_err(|e| MhostError::InvalidInput(e.to_string()))?
 }
 
+/// Core logic: regenerate plan from all enabled profiles and apply to system hosts.
+///
+/// Testable without Tauri `State`.
+/// Fix (#44): Extracted as a reusable function so `update_profile` can re-apply
+/// when saving an enabled profile.
+pub fn apply_current_plan_logic(
+    storage: &(dyn Storage + Send + Sync),
+    writer: &HostsWriter,
+) -> Result<(), MhostError> {
+    let profiles = storage.list_profiles()?;
+    let current_hosts = match std::fs::read_to_string(writer.hosts_path()) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(e.into());
+        }
+    };
+    let plan = generate_plan(&profiles, &current_hosts)?;
+
+    // Note: When no profiles are enabled, empty plan is expected (clears managed block).
+    // When a profile is enabled but has no rules, empty plan is still valid
+    // (managed block will be empty until rules are added).
+    // This is intentionally NOT rejected here; rejection of empty plans is the
+    // responsibility of the `apply_hosts` command (issue #2-N1) to avoid writing
+    // an empty managed block when the user explicitly clicks "Apply".
+    writer.apply(&plan)?;
+
+    // Record timestamp (only after successful apply)
+    write_last_applied(&storage.root())?;
+
+    Ok(())
+}
+
 /// Core logic: enable a profile and immediately apply its rules to the system hosts file.
 ///
 /// Testable without Tauri `State`.
@@ -91,28 +124,8 @@ pub fn enable_and_apply_logic(
     profile.updated_at = chrono::Utc::now();
     storage.save_profile(&profile)?;
 
-    // 2. Reload all profiles and generate plan
-    let profiles = storage.list_profiles()?;
-    let current_hosts = match std::fs::read_to_string(writer.hosts_path()) {
-        Ok(content) => content,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => {
-            return Err(e.into());
-        }
-    };
-    let plan = generate_plan(&profiles, &current_hosts)?;
-
-    // 3. Apply to system hosts
-    // Note: When enabled=false, empty plan is expected (clears managed block).
-    // When enabled=true, empty plan means the profile has no rules — still valid
-    // (managed block will be empty until rules are added).
-    // This is intentionally NOT rejected here; rejection of empty plans is the
-    // responsibility of the `apply_hosts` command (issue #2-N1) to avoid writing
-    // an empty managed block when the user explicitly clicks "Apply".
-    writer.apply(&plan)?;
-
-    // 4. Record timestamp (only after successful apply)
-    write_last_applied(&storage.root())?;
+    // 2. Apply current plan
+    apply_current_plan_logic(storage, writer)?;
 
     Ok(())
 }
@@ -407,6 +420,106 @@ mod tests {
         // Verify reject_empty_plan accepts the non-empty plan
         let result = reject_empty_plan(&plan);
         assert!(result.is_ok(), "should accept non-empty plan: {:?}", result.err());
+    }
+
+    // Fix (#44): Test that apply_current_plan_logic re-applies enabled profiles
+    // after their rules are updated (simulating update_profile on an enabled profile).
+    #[test]
+    fn test_apply_current_plan_logic_reapplies_after_rule_update() {
+        let (_temp, storage, writer) = create_test_storage_and_writer();
+
+        // Create and enable a profile with initial rules
+        let mut profile = create_profile_with_rules(
+            &storage,
+            "dev",
+            vec![("127.0.0.1", "example.com")],
+        );
+        profile.enabled = true;
+        storage.save_profile(&profile).unwrap();
+
+        // Initial apply
+        let result = apply_current_plan_logic(storage.as_ref(), &writer);
+        assert!(result.is_ok(), "initial apply should succeed: {:?}", result.err());
+
+        let hosts_before = std::fs::read_to_string(writer.hosts_path()).unwrap();
+        assert!(
+            hosts_before.contains("127.0.0.1 example.com"),
+            "hosts should contain initial rule: {}",
+            hosts_before
+        );
+        assert!(
+            !hosts_before.contains("192.168.1.1 new.local"),
+            "hosts should NOT contain new rule yet: {}",
+            hosts_before
+        );
+
+        // Simulate update_profile: update rules and save
+        profile.rules.push(HostRule::new(
+            "192.168.1.1".parse().unwrap(),
+            vec!["new.local".to_string()],
+        ));
+        profile.updated_at = chrono::Utc::now();
+        storage.save_profile(&profile).unwrap();
+
+        // Re-apply (this is what update_profile does when profile.enabled == true)
+        let result = apply_current_plan_logic(storage.as_ref(), &writer);
+        assert!(result.is_ok(), "re-apply after rule update should succeed: {:?}", result.err());
+
+        // Verify new rules are now in hosts file
+        let hosts_after = std::fs::read_to_string(writer.hosts_path()).unwrap();
+        assert!(
+            hosts_after.contains("127.0.0.1 example.com"),
+            "hosts should still contain original rule: {}",
+            hosts_after
+        );
+        assert!(
+            hosts_after.contains("192.168.1.1 new.local"),
+            "hosts should now contain new rule: {}",
+            hosts_after
+        );
+    }
+
+    // Fix (#44): Test that apply_current_plan_logic clears rules when profile is disabled.
+    #[test]
+    fn test_apply_current_plan_logic_clears_when_no_enabled_profiles() {
+        let (_temp, storage, writer) = create_test_storage_and_writer();
+
+        // Create and enable a profile
+        let mut profile = create_profile_with_rules(
+            &storage,
+            "dev",
+            vec![("127.0.0.1", "example.com")],
+        );
+        profile.enabled = true;
+        storage.save_profile(&profile).unwrap();
+
+        // Apply so managed block exists
+        let result = apply_current_plan_logic(storage.as_ref(), &writer);
+        assert!(result.is_ok());
+
+        let hosts_before = std::fs::read_to_string(writer.hosts_path()).unwrap();
+        assert!(hosts_before.contains("# ---- mHost start ----"));
+
+        // Disable the profile (simulating set_profile_enabled -> false)
+        profile.enabled = false;
+        storage.save_profile(&profile).unwrap();
+
+        // Re-apply
+        let result = apply_current_plan_logic(storage.as_ref(), &writer);
+        assert!(result.is_ok(), "re-apply after disable should succeed: {:?}", result.err());
+
+        // Verify managed block is removed
+        let hosts_after = std::fs::read_to_string(writer.hosts_path()).unwrap();
+        assert!(
+            !hosts_after.contains("# ---- mHost start ----"),
+            "managed block should be removed when no profiles enabled: {}",
+            hosts_after
+        );
+        assert!(
+            hosts_after.contains("# original hosts"),
+            "original content should be preserved: {}",
+            hosts_after
+        );
     }
 }
 

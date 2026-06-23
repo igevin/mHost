@@ -101,14 +101,30 @@ pub fn create_profile(
 }
 
 #[tauri::command]
-pub fn update_profile(
+pub async fn update_profile(
     profile: Profile,
     state: State<'_, AppState>,
     #[allow(unused_variables)] app_handle: AppHandle,
 ) -> Result<Profile, MhostError> {
     // Security fix (#18): Validate profile before saving
     validate_profile(&profile)?;
+
+    // Fix (#44): Always acquire apply_lock and re-apply after saving.
+    // This ensures that:
+    // 1. Rule changes in an enabled profile take effect immediately.
+    // 2. When a profile is disabled, the managed block is cleared.
+    // 3. No TOCTOU race between save_profile and apply.
+    let _guard = state.apply_lock.lock().await;
     state.storage.save_profile(&profile)?;
+
+    let writer = state.writer.clone();
+    let storage = state.storage.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::commands::apply::apply_current_plan_logic(storage.as_ref(), &writer)
+    })
+    .await
+    .map_err(|e| MhostError::InvalidInput(e.to_string()))??;
+
     #[cfg(target_os = "macos")]
     crate::tray::update_tray_menu(&app_handle);
     Ok(profile)
