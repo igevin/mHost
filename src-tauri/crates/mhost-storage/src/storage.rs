@@ -299,7 +299,7 @@ mod tests {
         assert_eq!(profile, loaded);
         assert_eq!(loaded.rules.len(), 2);
         assert_eq!(loaded.rules[0].domains, vec!["a.com", "b.com"]);
-        assert_eq!(loaded.rules[1].ip, "::1".parse::<IpAddr>().unwrap());
+        assert_eq!(loaded.rules[1].ip, Some("::1".parse::<IpAddr>().unwrap()));
     }
 
     #[test]

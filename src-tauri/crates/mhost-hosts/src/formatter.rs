@@ -8,11 +8,20 @@ use std::fmt::Write;
 pub fn format_rules(rules: &[HostRule]) -> String {
     let mut out = String::new();
     for rule in rules {
-        for domain in &rule.domains {
+        // Comment-only rule: output the stored comment text as-is
+        if rule.is_comment_only() {
             if let Some(ref c) = rule.comment {
-                writeln!(out, "{} {} # {}", rule.ip, domain, c).unwrap();
-            } else {
-                writeln!(out, "{} {}", rule.ip, domain).unwrap();
+                writeln!(out, "{}", c).unwrap();
+            }
+            continue;
+        }
+        for domain in &rule.domains {
+            if let Some(ref ip) = rule.ip {
+                if let Some(ref c) = rule.comment {
+                    writeln!(out, "{} {} # {}", ip, domain, c).unwrap();
+                } else {
+                    writeln!(out, "{} {}", ip, domain).unwrap();
+                }
             }
         }
     }
@@ -84,5 +93,24 @@ mod tests {
     #[test]
     fn test_format_managed_block_empty() {
         assert_eq!(format_managed_block(&[]), "");
+    }
+
+    #[test]
+    fn test_format_rules_comment_only() {
+        let comment_rule = HostRule::comment_only("# this is a comment");
+        assert_eq!(format_rules(&[comment_rule]), "# this is a comment\n");
+    }
+
+    #[test]
+    fn test_format_rules_mixed_with_comments() {
+        let rules = vec![
+            HostRule::comment_only("# header"),
+            make_rule("127.0.0.1", vec!["example.com"]),
+            HostRule::comment_only("# footer"),
+        ];
+        assert_eq!(
+            format_rules(&rules),
+            "# header\n127.0.0.1 example.com\n# footer\n"
+        );
     }
 }

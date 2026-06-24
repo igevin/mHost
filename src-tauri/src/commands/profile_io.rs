@@ -276,7 +276,7 @@ mod tests {
         let cases = vec![
             ("simple", "127.0.0.1 example.com", 1),
             ("multiple", "127.0.0.1 a.com\n192.168.1.1 b.com", 2),
-            ("with_comments", "# header\n127.0.0.1 x.com # inline", 1),
+            ("with_comments", "# header\n127.0.0.1 x.com # inline", 2),
             ("empty", "", 0),
         ];
 

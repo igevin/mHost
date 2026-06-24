@@ -15,6 +15,10 @@ interface RuleEditorProps {
 function rulesToText(rules: HostRule[]): string {
   return rules
     .map((rule) => {
+      // Comment-only rule: output the comment as-is
+      if (rule.ip === null || rule.ip === undefined) {
+        return rule.comment || "";
+      }
       const prefix = rule.enabled ? "" : "# ";
       const line = rule.ip + " " + rule.domains.join(" ");
       if (rule.comment) {
@@ -145,9 +149,31 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEd
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const highlightRef = useRef<HTMLDivElement>(null);
 
-  // Sync text when rules prop changes externally
+  // Track whether the user is actively editing — prevents external rule sync
+  // from overwriting the textarea while the user is typing.
+  const isEditingRef = useRef(false);
+
+  // Sync text when rules prop changes externally (not from our own onChange)
   const prevRulesRef = useRef<HostRule[]>([]);
   useEffect(() => {
+    const newText = rulesToText(rules);
+
+    // If the generated text matches current text, just update the ref
+    // and skip overwriting (preserves cursor position).
+    // Also reset editing flag — user has converged on the validated state.
+    if (newText === text) {
+      isEditingRef.current = false;
+      prevRulesRef.current = rules;
+      return;
+    }
+
+    // Skip text overwrite if the change originated from our own editing.
+    if (isEditingRef.current) {
+      isEditingRef.current = false;
+      prevRulesRef.current = rules;
+      return;
+    }
+
     const prevRules = prevRulesRef.current;
     const rulesChanged =
       rules.length !== prevRules.length ||
@@ -159,7 +185,7 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEd
           r.comment !== prevRules[i]?.comment,
       );
     if (rulesChanged) {
-      setText(rulesToText(rules));
+      setText(newText);
       setErrors([]);
       prevRulesRef.current = rules;
     }
@@ -189,6 +215,7 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEd
   const handleChange = useCallback(
     (e: React.ChangeEvent<HTMLTextAreaElement>) => {
       const value = e.target.value;
+      isEditingRef.current = true; // mark as editing to prevent external sync
       setText(value);
       debouncedValidate(value);
     },

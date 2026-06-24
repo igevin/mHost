@@ -57,6 +57,12 @@
   opacity: 0.6;
 }
 
+.ruleItemComment {
+  opacity: 0.7;
+  border-style: dashed;
+  background: transparent;
+}
+
 .ruleHeader {
   display: flex;
   align-items: center;

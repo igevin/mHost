@@ -87,9 +87,13 @@ impl Profile {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HostRule {
     pub id: RuleId,
-    pub ip: IpAddr,
+    /// For comment-only lines, this is `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ip: Option<IpAddr>,
     pub domains: Vec<String>,
     pub enabled: bool,
+    /// For comment-only lines, stores the full comment text (e.g. "# this is a comment").
+    /// For inline comments on rule lines, stores the comment after `#`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
     pub source: RuleSource,
@@ -99,12 +103,29 @@ impl HostRule {
     pub fn new(ip: IpAddr, domains: Vec<String>) -> Self {
         Self {
             id: RuleId(Uuid::new_v4()),
-            ip,
+            ip: Some(ip),
             domains,
             enabled: true,
             comment: None,
             source: RuleSource::Manual,
         }
+    }
+
+    /// Create a standalone comment-only rule.
+    pub fn comment_only(text: impl Into<String>) -> Self {
+        Self {
+            id: RuleId(Uuid::new_v4()),
+            ip: None,
+            domains: Vec::new(),
+            enabled: false,
+            comment: Some(text.into()),
+            source: RuleSource::Manual,
+        }
+    }
+
+    /// Returns `true` if this rule represents a standalone comment line.
+    pub fn is_comment_only(&self) -> bool {
+        self.ip.is_none()
     }
 }
 

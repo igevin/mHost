@@ -71,8 +71,13 @@ fn extract_existing_lines(current_hosts: &str) -> Vec<String> {
     // Convert parsed rules back to lines (one per domain)
     let mut lines = Vec::new();
     for rule in &parse_result.rules {
-        for domain in &rule.domains {
-            lines.push(format!("{} {}", rule.ip, domain));
+        if let Some(ip) = rule.ip {
+            for domain in &rule.domains {
+                lines.push(format!("{} {}", ip, domain));
+            }
+        } else if let Some(ref c) = rule.comment {
+            // Preserve comment-only lines in the diff
+            lines.push(c.clone());
         }
     }
 
@@ -250,9 +255,16 @@ mod tests {
         ];
 
         let diff = calculate_diff(current, &rules);
+        // Comments are now parsed as rules, so they appear in current lines
+        // but not in desired lines -> they show as "removed"
+        // BTreeSet sorts alphabetically, so "# Another comment" < "# Header"
         assert!(diff.added.is_empty());
-        assert!(diff.removed.is_empty());
+        assert_eq!(diff.removed.len(), 2);
+        assert_eq!(diff.removed[0], "# Another comment");
+        assert_eq!(diff.removed[1], "# Header");
         assert_eq!(diff.unchanged.len(), 2);
+        assert_eq!(diff.unchanged[0], "127.0.0.1 a.com");
+        assert_eq!(diff.unchanged[1], "::1 localhost");
     }
 
     #[test]
@@ -289,5 +301,28 @@ mod tests {
         assert!(diff.removed.is_empty());
         assert_eq!(diff.unchanged.len(), 1);
         assert_eq!(diff.unchanged[0], "127.0.0.1 b.com");
+    }
+
+    #[test]
+    fn test_diff_comment_only_rules() {
+        // Comment-only rules in the managed block are correctly identified
+        let current = r#"# ---- mHost start ----
+# Header comment
+127.0.0.1 a.com
+# Footer comment
+# ---- mHost end ----
+"#;
+        // Desired rules don't include the comments
+        let rules = vec![make_rule("127.0.0.1", "a.com", "p1")];
+
+        let diff = calculate_diff(current, &rules);
+        // Comments should be removed, host rule unchanged
+        assert!(diff.added.is_empty());
+        assert_eq!(diff.removed.len(), 2);
+        // BTreeSet sorts alphabetically
+        assert_eq!(diff.removed[0], "# Footer comment");
+        assert_eq!(diff.removed[1], "# Header comment");
+        assert_eq!(diff.unchanged.len(), 1);
+        assert_eq!(diff.unchanged[0], "127.0.0.1 a.com");
     }
 }
