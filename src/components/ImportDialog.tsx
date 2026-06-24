@@ -92,19 +92,12 @@ function ImportDialog({ open, onClose, onImported }: ImportDialogProps) {
           ? [{ name: "Hosts", extensions: ["hosts", "txt"] }]
           : [{ name: "JSON", extensions: ["json"] }];
       const path = await openFileDialog({ multiple: false, filters });
-      if (path) {
-        setFilePath(path as string);
+      if (typeof path === "string") {
+        setFilePath(path);
         setImportError(null);
-        // For hosts files, validate the content
-        if (source === "file-hosts") {
-          // We cannot read file content in frontend; validation will happen on import
-          setRuleCount(null);
-          setErrors([]);
-        } else {
-          // JSON files: trust the backend to parse
-          setRuleCount(null);
-          setErrors([]);
-        }
+        // Validation will happen on import; clear any stale state
+        setRuleCount(null);
+        setErrors([]);
       }
     } catch (err) {
       setImportError(extractErrorMessage(err));
@@ -135,7 +128,8 @@ function ImportDialog({ open, onClose, onImported }: ImportDialogProps) {
       if (source === "text") {
         profile = await importProfile(name.trim(), hostsText);
       } else {
-        profile = await importProfileFromFile(name.trim(), filePath!);
+        if (!filePath) return;
+        profile = await importProfileFromFile(name.trim(), filePath);
       }
       onImported(profile);
       onClose();

@@ -207,6 +207,10 @@ pub async fn export_profile_to_file(
 
 /// Import a profile from a file.
 ///
+/// Supports two formats:
+/// - `.json`: Deserializes the file as a Profile JSON, then re-saves with the given name.
+/// - `.hosts` / `.txt` / other: Parses the file content as hosts text.
+///
 /// Security fix (#17): Path is validated to stay within home directory.
 /// Reads file content (limited to 1MB) and imports it as a new profile.
 /// Perf fix (#26): Async with spawn_blocking for file I/O.
@@ -226,9 +230,40 @@ pub async fn import_profile_from_file(
                 MAX_FILE_READ_SIZE
             )));
         }
-        let hosts_text = std::fs::read_to_string(&canonical)?;
-        import_profile_logic(name, &hosts_text, storage.as_ref())
+        let content = std::fs::read_to_string(&canonical)?;
+
+        // Detect format by file extension
+        if canonical.extension().map_or(false, |ext| ext == "json") {
+            import_profile_from_json(name, &content, storage.as_ref())
+        } else {
+            import_profile_logic(name, &content, storage.as_ref())
+        }
     }).await.map_err(|e| MhostError::InvalidInput(e.to_string()))?
+}
+
+/// Import a profile from JSON content.
+/// Deserializes the JSON as a Profile, then re-saves with the given name.
+fn import_profile_from_json(
+    name: String,
+    json_str: &str,
+    storage: &dyn Storage,
+) -> Result<Profile, MhostError> {
+    if name.trim().is_empty() {
+        return Err(MhostError::InvalidInput(
+            "Profile name must not be empty".to_string(),
+        ));
+    }
+
+    let mut profile: Profile = serde_json::from_str(json_str)
+        .map_err(|e| MhostError::InvalidInput(format!("Invalid JSON profile: {}", e)))?;
+
+    let final_name = resolve_name_conflict(&name, storage)?;
+    profile.name = final_name;
+    profile.id = ProfileId(uuid::Uuid::new_v4()); // Assign a new ID to avoid collisions
+    profile.enabled = false;
+    profile.protected = false;
+    storage.save_profile(&profile)?;
+    Ok(profile)
 }
 
 // ---------------------------------------------------------------------------
