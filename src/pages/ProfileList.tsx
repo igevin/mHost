@@ -14,7 +14,7 @@ import {
 import { extractErrorMessage } from "../lib/error";
 import type { Profile, ExportFormat } from "../types";
 import { exportProfileToFile, duplicateProfile } from "../lib/tauri";
-import { save } from "@tauri-apps/plugin-dialog";
+import { save, confirm } from "@tauri-apps/plugin-dialog";
 import ProfileCard from "../components/ProfileCard";
 import CreateProfileForm from "../components/CreateProfileForm";
 import ImportDialog from "../components/ImportDialog";
@@ -59,7 +59,8 @@ function ProfileList() {
 
   const handleDelete = useCallback(
     async (id: string) => {
-      if (!confirm("Delete this profile?")) return;
+      const confirmed = await confirm("Delete this profile?");
+      if (!confirmed) return;
       try {
         await deleteProfile(id);
       } catch (err: unknown) {
@@ -92,8 +93,12 @@ function ProfileList() {
     (profile: Profile) => {
       setShowImport(false);
       setSelectedId(profile.id);
+      // Refresh profile list so the imported profile appears
+      fetchProfiles().catch((err: unknown) => {
+        setError(extractErrorMessage(err));
+      });
     },
-    [setSelectedId],
+    [setSelectedId, fetchProfiles, setError],
   );
 
   const handleExport = useCallback(async (profile: Profile, format: ExportFormat) => {

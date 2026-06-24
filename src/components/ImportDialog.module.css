@@ -111,3 +111,27 @@
   justify-content: flex-end;
   margin-top: 16px;
 }
+
+/* ---- Source Selector ---- */
+
+.sourceSelector {
+  display: flex;
+  gap: 6px;
+}
+
+/* ---- File Row ---- */
+
+.fileRow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.filePath {
+  font-size: 13px;
+  color: var(--color-text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 300px;
+}

@@ -69,6 +69,10 @@ export async function importProfile(name: string, hostsText: string): Promise<Pr
   return invoke("import_profile", { name, hostsText });
 }
 
+export async function importProfileFromFile(name: string, path: string): Promise<Profile> {
+  return invoke("import_profile_from_file", { name, path });
+}
+
 export async function exportProfile(id: string, format: ExportFormat): Promise<string> {
   return invoke("export_profile", { id, format });
 }
