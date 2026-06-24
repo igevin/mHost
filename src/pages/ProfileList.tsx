@@ -93,8 +93,12 @@ function ProfileList() {
     (profile: Profile) => {
       setShowImport(false);
       setSelectedId(profile.id);
+      // Refresh profile list so the imported profile appears
+      fetchProfiles().catch((err: unknown) => {
+        setError(extractErrorMessage(err));
+      });
     },
-    [setSelectedId],
+    [setSelectedId, fetchProfiles, setError],
   );
 
   const handleExport = useCallback(async (profile: Profile, format: ExportFormat) => {
