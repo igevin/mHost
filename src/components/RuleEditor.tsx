@@ -47,7 +47,7 @@ function highlightText(text: string): string {
       const trimmed = line.trim();
 
       if (trimmed === "") {
-        return "<br>";
+        return "";
       }
 
       // Full line comment
