@@ -1,8 +1,11 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import type { Profile, ParseErrorAtLine } from "../types";
-import { validateHostsText, importProfile } from "../lib/tauri";
+import { validateHostsText, importProfile, importProfileFromFile } from "../lib/tauri";
 import { extractErrorMessage } from "../lib/error";
+import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import styles from "./ImportDialog.module.css";
+
+type ImportSource = "text" | "file-hosts" | "file-json";
 
 interface ImportDialogProps {
   open: boolean;
@@ -12,7 +15,9 @@ interface ImportDialogProps {
 
 function ImportDialog({ open, onClose, onImported }: ImportDialogProps) {
   const [name, setName] = useState("");
+  const [source, setSource] = useState<ImportSource>("text");
   const [hostsText, setHostsText] = useState("");
+  const [filePath, setFilePath] = useState<string | null>(null);
   const [errors, setErrors] = useState<ParseErrorAtLine[]>([]);
   const [ruleCount, setRuleCount] = useState<number | null>(null);
   const [isValidating, setIsValidating] = useState(false);
@@ -24,7 +29,9 @@ function ImportDialog({ open, onClose, onImported }: ImportDialogProps) {
   useEffect(() => {
     if (open) {
       setName("");
+      setSource("text");
       setHostsText("");
+      setFilePath(null);
       setErrors([]);
       setRuleCount(null);
       setIsValidating(false);
@@ -69,6 +76,41 @@ function ImportDialog({ open, onClose, onImported }: ImportDialogProps) {
     [validateText],
   );
 
+  const handleSourceChange = useCallback((newSource: ImportSource) => {
+    setSource(newSource);
+    setFilePath(null);
+    setHostsText("");
+    setErrors([]);
+    setRuleCount(null);
+    setImportError(null);
+  }, []);
+
+  const handleSelectFile = useCallback(async () => {
+    try {
+      const filters =
+        source === "file-hosts"
+          ? [{ name: "Hosts", extensions: ["hosts", "txt"] }]
+          : [{ name: "JSON", extensions: ["json"] }];
+      const path = await openFileDialog({ multiple: false, filters });
+      if (path) {
+        setFilePath(path as string);
+        setImportError(null);
+        // For hosts files, validate the content
+        if (source === "file-hosts") {
+          // We cannot read file content in frontend; validation will happen on import
+          setRuleCount(null);
+          setErrors([]);
+        } else {
+          // JSON files: trust the backend to parse
+          setRuleCount(null);
+          setErrors([]);
+        }
+      }
+    } catch (err) {
+      setImportError(extractErrorMessage(err));
+    }
+  }, [source]);
+
   // Cleanup timer on unmount
   useEffect(() => {
     return () => {
@@ -78,14 +120,23 @@ function ImportDialog({ open, onClose, onImported }: ImportDialogProps) {
     };
   }, []);
 
-  const canImport = name.trim().length > 0 && errors.length === 0 && ruleCount !== null;
+  const canImport =
+    name.trim().length > 0 &&
+    (source === "text"
+      ? errors.length === 0 && ruleCount !== null
+      : filePath !== null);
 
   const handleImport = useCallback(async () => {
     if (!canImport) return;
     setIsImporting(true);
     setImportError(null);
     try {
-      const profile = await importProfile(name.trim(), hostsText);
+      let profile: Profile;
+      if (source === "text") {
+        profile = await importProfile(name.trim(), hostsText);
+      } else {
+        profile = await importProfileFromFile(name.trim(), filePath!);
+      }
       onImported(profile);
       onClose();
     } catch (err) {
@@ -93,7 +144,7 @@ function ImportDialog({ open, onClose, onImported }: ImportDialogProps) {
     } finally {
       setIsImporting(false);
     }
-  }, [canImport, name, hostsText, onImported, onClose]);
+  }, [canImport, name, hostsText, filePath, source, onImported, onClose]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -126,19 +177,65 @@ function ImportDialog({ open, onClose, onImported }: ImportDialogProps) {
         </div>
 
         <div className={styles.formGroup}>
-          <label className="form-label" htmlFor="import-text">
-            Hosts Text
-          </label>
-          <textarea
-            id="import-text"
-            className={`hosts-textarea ${errors.length > 0 ? styles.hasErrors : ""}`}
-            placeholder="Paste hosts file content here..."
-            value={hostsText}
-            onChange={handleTextChange}
-            rows={10}
-            spellCheck={false}
-          />
+          <label className="form-label">Import Source</label>
+          <div className={styles.sourceSelector}>
+            <button
+              className={`btn btn-sm ${source === "text" ? "btn-primary" : "btn-ghost"}`}
+              onClick={() => handleSourceChange("text")}
+            >
+              Paste Text
+            </button>
+            <button
+              className={`btn btn-sm ${source === "file-hosts" ? "btn-primary" : "btn-ghost"}`}
+              onClick={() => handleSourceChange("file-hosts")}
+            >
+              Hosts File
+            </button>
+            <button
+              className={`btn btn-sm ${source === "file-json" ? "btn-primary" : "btn-ghost"}`}
+              onClick={() => handleSourceChange("file-json")}
+            >
+              JSON File
+            </button>
+          </div>
         </div>
+
+        {source === "text" && (
+          <div className={styles.formGroup}>
+            <label className="form-label" htmlFor="import-text">
+              Hosts Text
+            </label>
+            <textarea
+              id="import-text"
+              className={`hosts-textarea ${errors.length > 0 ? styles.hasErrors : ""}`}
+              placeholder="Paste hosts file content here..."
+              value={hostsText}
+              onChange={handleTextChange}
+              rows={10}
+              spellCheck={false}
+            />
+          </div>
+        )}
+
+        {(source === "file-hosts" || source === "file-json") && (
+          <div className={styles.formGroup}>
+            <label className="form-label">File</label>
+            <div className={styles.fileRow}>
+              <button
+                className="btn btn-ghost btn-sm"
+                onClick={handleSelectFile}
+                disabled={isImporting}
+              >
+                Select File...
+              </button>
+              {filePath && (
+                <span className={styles.filePath}>
+                  {filePath.split("/").pop() || filePath}
+                </span>
+              )}
+            </div>
+          </div>
+        )}
 
         {isValidating && (
           <div className={styles.status}>Validating...</div>
