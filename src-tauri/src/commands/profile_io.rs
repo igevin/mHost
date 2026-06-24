@@ -1,8 +1,10 @@
 use std::str::FromStr;
 
+use chrono::Utc;
 use mhost_core::{ExportFormat, MhostError, Profile, ProfileId};
 use mhost_hosts::formatter::format_rules;
 use mhost_hosts::parser::Parser;
+use mhost_hosts::validator;
 use mhost_storage::storage::Storage;
 use tauri::State;
 
@@ -232,8 +234,12 @@ pub async fn import_profile_from_file(
         }
         let content = std::fs::read_to_string(&canonical)?;
 
-        // Detect format by file extension
-        if canonical.extension().map_or(false, |ext| ext == "json") {
+        // Detect format by file extension (case-insensitive)
+        let is_json = canonical
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map_or(false, |ext| ext.eq_ignore_ascii_case("json"));
+        if is_json {
             import_profile_from_json(name, &content, storage.as_ref())
         } else {
             import_profile_logic(name, &content, storage.as_ref())
@@ -242,7 +248,7 @@ pub async fn import_profile_from_file(
 }
 
 /// Import a profile from JSON content.
-/// Deserializes the JSON as a Profile, then re-saves with the given name.
+/// Deserializes the JSON as a Profile, validates rules, then re-saves with the given name.
 fn import_profile_from_json(
     name: String,
     json_str: &str,
@@ -257,11 +263,34 @@ fn import_profile_from_json(
     let mut profile: Profile = serde_json::from_str(json_str)
         .map_err(|e| MhostError::InvalidInput(format!("Invalid JSON profile: {}", e)))?;
 
+    // Validate rules: check IP and domain formats
+    for rule in &profile.rules {
+        if let Some(ip) = &rule.ip {
+            if ip.to_string().is_empty() {
+                return Err(MhostError::InvalidInput(format!(
+                    "Rule {} has an empty IP address",
+                    rule.id
+                )));
+            }
+        }
+        for domain in &rule.domains {
+            if !validator::is_valid_domain(domain) {
+                return Err(MhostError::InvalidInput(format!(
+                    "Rule {} has an invalid domain: {}",
+                    rule.id, domain
+                )));
+            }
+        }
+    }
+
+    let now = Utc::now();
     let final_name = resolve_name_conflict(&name, storage)?;
     profile.name = final_name;
     profile.id = ProfileId(uuid::Uuid::new_v4()); // Assign a new ID to avoid collisions
     profile.enabled = false;
     profile.protected = false;
+    profile.created_at = now;
+    profile.updated_at = now;
     storage.save_profile(&profile)?;
     Ok(profile)
 }
