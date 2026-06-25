@@ -44,7 +44,7 @@ function ProfileCard({
           <p className={styles.profileDesc}>{profile.description}</p>
         )}
         <div className={styles.profileMeta}>
-          <span>{profile.rules.length} rules</span>
+          <span>{profile.rules.filter((r) => r.ip !== null).length} rules</span>
           <span className={styles.metaSep}>·</span>
           <span>{profile.enabled ? "Enabled" : "Disabled"}</span>
           {profile.protected && (

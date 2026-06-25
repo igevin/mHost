@@ -137,7 +137,7 @@ function ProfileEdit() {
         <BasicInfoForm draft={draft} onChange={handleChange} />
 
         <div className="card">
-          <h3 className="card-title">Rules ({draft.rules.length})</h3>
+          <h3 className="card-title">Rules ({draft.rules.filter((r) => r.ip !== null).length})</h3>
           <RuleEditor
             rules={draft.rules}
             onChange={handleRulesChange}
