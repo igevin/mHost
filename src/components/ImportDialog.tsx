@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import type { Profile, ParseErrorAtLine } from "../types";
+import { countRealRules } from "../lib/rules";
 import { validateHostsText, importProfile, importProfileFromFile } from "../lib/tauri";
 import { extractErrorMessage } from "../lib/error";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
@@ -50,7 +51,7 @@ function ImportDialog({ open, onClose, onImported }: ImportDialogProps) {
     try {
       const result = await validateHostsText(text);
       setErrors(result.errors);
-      setRuleCount(result.errors.length === 0 ? result.rules.length : null);
+      setRuleCount(result.errors.length === 0 ? countRealRules(result.rules) : null);
     } catch (_err) {
       setErrors([{ line_number: 0, error: "Validation failed" }]);
       setRuleCount(null);
