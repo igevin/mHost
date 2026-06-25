@@ -1,13 +1,9 @@
 import type { HostRule } from "../types";
+import { isCommentOnly } from "../lib/rules";
 import styles from "../pages/ProfileEdit.module.css";
 
 interface RuleListProps {
   rules: HostRule[];
-}
-
-/** Returns true if the rule is a standalone comment (no IP, no domains) */
-function isCommentOnly(rule: HostRule): boolean {
-  return rule.ip === null || rule.ip === undefined;
 }
 
 function RuleList({ rules }: RuleListProps) {

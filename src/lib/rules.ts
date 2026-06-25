@@ -4,7 +4,7 @@ import type { HostRule } from "../types";
  * Count only real hosts rules, excluding comment-only entries.
  */
 export function countRealRules(rules: HostRule[]): number {
-  return rules.filter((r) => r.ip !== null).length;
+  return rules.filter((r) => r.ip != null).length;
 }
 
 /**
