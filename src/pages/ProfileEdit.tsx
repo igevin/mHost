@@ -10,6 +10,7 @@ import {
   updateProfileAtom,
 } from "../stores/profiles";
 import { extractErrorMessage } from "../lib/error";
+import { countRealRules } from "../lib/rules";
 import type { HostRule, Profile } from "../types";
 import BasicInfoForm from "../components/BasicInfoForm";
 import RuleEditor from "../components/RuleEditor";
@@ -137,7 +138,7 @@ function ProfileEdit() {
         <BasicInfoForm draft={draft} onChange={handleChange} />
 
         <div className="card">
-          <h3 className="card-title">Rules ({draft.rules.filter((r) => r.ip !== null).length})</h3>
+          <h3 className="card-title">Rules ({countRealRules(draft.rules)})</h3>
           <RuleEditor
             rules={draft.rules}
             onChange={handleRulesChange}

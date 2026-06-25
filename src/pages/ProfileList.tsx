@@ -12,6 +12,7 @@ import {
   toggleProfileEnabledAtom,
 } from "../stores/profiles";
 import { extractErrorMessage } from "../lib/error";
+import { countRealRules } from "../lib/rules";
 import type { Profile, ExportFormat } from "../types";
 import { exportProfileToFile, duplicateProfile } from "../lib/tauri";
 import { save, confirm } from "@tauri-apps/plugin-dialog";
@@ -135,7 +136,7 @@ function ProfileList() {
   const { totalProfiles, enabledProfiles, totalRules } = useMemo(() => ({
     totalProfiles: profiles.length,
     enabledProfiles: profiles.filter((p) => p.enabled).length,
-    totalRules: profiles.reduce((sum, p) => sum + p.rules.length, 0),
+    totalRules: profiles.reduce((sum, p) => sum + countRealRules(p.rules), 0),
   }), [profiles]);
 
   return (
