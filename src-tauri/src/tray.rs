@@ -50,6 +50,7 @@ pub fn build_tray<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::err
             {
                 let app = tray.app_handle();
                 if let Some(window) = app.get_webview_window("main") {
+                    crate::platform::macos::set_activation_policy_regular();
                     let _ = window.unminimize();
                     let _ = window.show();
                     let _ = window.set_focus();
@@ -194,6 +195,7 @@ pub fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::Men
         }
         tray_logic::TrayMenuAction::OpenWindow => {
             if let Some(window) = app.get_webview_window("main") {
+                crate::platform::macos::set_activation_policy_regular();
                 let _ = window.unminimize();
                 let _ = window.show();
                 let _ = window.set_focus();
