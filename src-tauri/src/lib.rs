@@ -59,6 +59,8 @@ pub fn run() {
                         api.prevent_close();
                         if let Some(window) = handle.get_webview_window("main") {
                             let _ = window.hide();
+                            #[cfg(target_os = "macos")]
+                            crate::platform::macos::set_activation_policy_accessory();
                         }
                     }
                 });
