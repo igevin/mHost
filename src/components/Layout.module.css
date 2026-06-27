@@ -395,7 +395,7 @@
   position: fixed;
   inset: 0;
   background: rgba(0, 0, 0, 0.3);
-  z-index: 200;
+  z-index: 200; /* Z_INDEX.CREATE_OVERLAY */
   display: flex;
   align-items: center;
   justify-content: center;
@@ -408,7 +408,7 @@
   padding: 16px 20px;
   width: 360px;
   box-shadow: var(--shadow-md);
-  z-index: 201;
+  z-index: 210; /* Z_INDEX.CREATE_CONTENT */
 }
 
 .createDialogTitle {

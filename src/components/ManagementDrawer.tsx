@@ -17,6 +17,7 @@ import { extractErrorMessage } from "../lib/error";
 import { save, confirm } from "@tauri-apps/plugin-dialog";
 import type { Profile, ExportFormat } from "../types";
 import ImportDialog from "./ImportDialog";
+import CreateProfileDialog from "./CreateProfileDialog";
 import styles from "./ManagementDrawer.module.css";
 
 interface ManagementDrawerProps {
@@ -42,7 +43,6 @@ function ManagementDrawer({ open, onClose }: ManagementDrawerProps) {
 
   // Create profile dialog state
   const [showCreateDialog, setShowCreateDialog] = useState(false);
-  const [newProfileName, setNewProfileName] = useState("");
 
   // Escape key handler
   useEffect(() => {
@@ -80,13 +80,10 @@ function ManagementDrawer({ open, onClose }: ManagementDrawerProps) {
   );
 
   const handleNewProfile = useCallback(() => {
-    setNewProfileName("");
     setShowCreateDialog(true);
   }, []);
 
-  const handleCreateProfile = useCallback(async () => {
-    const name = newProfileName.trim();
-    if (!name) return;
+  const handleCreateProfile = useCallback(async (name: string) => {
     try {
       const profile = await createProfile(name);
       setShowCreateDialog(false);
@@ -95,7 +92,7 @@ function ManagementDrawer({ open, onClose }: ManagementDrawerProps) {
     } catch (err: unknown) {
       setError(extractErrorMessage(err));
     }
-  }, [newProfileName, createProfile, onClose, navigate, setError]);
+  }, [createProfile, onClose, navigate, setError]);
 
   const handleImport = useCallback(() => {
     onClose();
@@ -199,7 +196,7 @@ function ManagementDrawer({ open, onClose }: ManagementDrawerProps) {
               aria-label="Close"
               title="Close"
             >
-              x
+              ×
             </button>
           </div>
 
@@ -340,36 +337,12 @@ function ManagementDrawer({ open, onClose }: ManagementDrawerProps) {
       />
 
       {/* Create Profile Dialog */}
-      {showCreateDialog && (
-        <div className={styles.createDialogOverlay} onClick={() => setShowCreateDialog(false)}>
-          <div className={styles.createDialog} onClick={(e) => e.stopPropagation()}>
-            <h3 className={styles.createDialogTitle}>Create Profile</h3>
-            <div className="form-row">
-              <input
-                className="input"
-                placeholder="Profile name"
-                value={newProfileName}
-                onChange={(e) => setNewProfileName(e.target.value)}
-                onKeyDown={(e) => { if (e.key === "Enter") handleCreateProfile(); }}
-                autoFocus
-              />
-              <button
-                className="btn btn-primary"
-                onClick={handleCreateProfile}
-                disabled={!newProfileName.trim() || isLoading}
-              >
-                Create
-              </button>
-              <button
-                className="btn btn-ghost"
-                onClick={() => setShowCreateDialog(false)}
-              >
-                Cancel
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      <CreateProfileDialog
+        open={showCreateDialog}
+        onClose={() => setShowCreateDialog(false)}
+        onCreate={handleCreateProfile}
+        isLoading={isLoading}
+      />
     </>,
     document.body,
   );

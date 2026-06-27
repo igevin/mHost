@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
 import { BrowserRouter } from "react-router-dom";
 import { getDefaultStore, Provider as JotaiProvider } from "jotai";
 import type { Profile } from "../../types";
@@ -234,5 +234,45 @@ describe("ManagementDrawer", () => {
 
     const deleteButtons = screen.getAllByRole("button", { name: /delete/i });
     expect(deleteButtons.length).toBeGreaterThanOrEqual(1);
+  });
+
+  // 11. Toggle button shows correct label based on profile enabled state
+  it("shows Disable button for enabled profile and Enable button for disabled profile", () => {
+    const profiles = [
+      makeProfile({ id: "p1", name: "dev", enabled: true, rules: [] }),
+      makeProfile({ id: "p2", name: "staging", enabled: false, rules: [] }),
+    ];
+    const store = getDefaultStore();
+    store.set(profilesAtom, profiles);
+
+    renderWithProviders(
+      <ManagementDrawer open={true} onClose={vi.fn()} />,
+    );
+
+    // Enabled profile shows "Disable" button
+    expect(screen.getByRole("button", { name: /disable/i })).toBeInTheDocument();
+    // Disabled profile shows "Enable" button
+    expect(screen.getByRole("button", { name: /enable/i })).toBeInTheDocument();
+  });
+
+  // 12. Delete button click triggers confirm dialog
+  it("calls confirm dialog when Delete button is clicked", async () => {
+    const { confirm } = await import("@tauri-apps/plugin-dialog");
+    const profiles = [
+      makeProfile({ id: "p1", name: "dev", protected: false, rules: [] }),
+    ];
+    const store = getDefaultStore();
+    store.set(profilesAtom, profiles);
+
+    renderWithProviders(
+      <ManagementDrawer open={true} onClose={vi.fn()} />,
+    );
+
+    const deleteButton = screen.getByRole("button", { name: /delete/i });
+    await act(async () => {
+      fireEvent.click(deleteButton);
+    });
+
+    expect(confirm).toHaveBeenCalledWith("Delete this profile?");
   });
 });

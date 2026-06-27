@@ -6,11 +6,13 @@ import {
   selectedProfileIdAtom,
   toggleProfileEnabledAtom,
   createProfileAtom,
+  errorAtom,
   isLoadingAtom,
 } from "../stores/profiles";
 import { extractErrorMessage } from "../lib/error";
 import StatusBar from "./StatusBar";
 import ManagementDrawer from "./ManagementDrawer";
+import CreateProfileDialog from "./CreateProfileDialog";
 import styles from "./Layout.module.css";
 
 interface NavItem {
@@ -122,9 +124,9 @@ function Layout() {
   const isLoading = useAtomValue(isLoadingAtom);
 
   const navigate = useNavigate();
+  const setError = useSetAtom(errorAtom);
   const [showManagement, setShowManagement] = useState(false);
   const [showCreateDialog, setShowCreateDialog] = useState(false);
-  const [newProfileName, setNewProfileName] = useState("");
 
   const handleProfileClick = useCallback(
     (id: string) => {
@@ -138,28 +140,25 @@ function Layout() {
       e.stopPropagation();
       e.preventDefault();
       toggleEnabled(id).catch((err) => {
-        console.warn("Failed to toggle profile:", err);
+        setError(extractErrorMessage(err));
       });
     },
-    [toggleEnabled],
+    [toggleEnabled, setError],
   );
 
   const handleNewProfile = useCallback(() => {
-    setNewProfileName("");
     setShowCreateDialog(true);
   }, []);
 
-  const handleCreateProfile = useCallback(async () => {
-    const name = newProfileName.trim();
-    if (!name) return;
+  const handleCreateProfile = useCallback(async (name: string) => {
     try {
       const profile = await createProfile(name);
       setShowCreateDialog(false);
       navigate(`/profiles/${profile.id}`);
     } catch (err) {
-      console.warn("Failed to create profile:", err);
+      setError(extractErrorMessage(err));
     }
-  }, [newProfileName, createProfile, navigate]);
+  }, [createProfile, navigate, setError]);
 
   return (
     <div className={styles.mhostLayout}>
@@ -235,36 +234,12 @@ function Layout() {
           >
             + New Profile
           </button>
-          {showCreateDialog && (
-            <div className={styles.createDialogOverlay} onClick={() => setShowCreateDialog(false)}>
-              <div className={styles.createDialog} onClick={(e) => e.stopPropagation()}>
-                <h3 className={styles.createDialogTitle}>Create Profile</h3>
-                <div className="form-row">
-                  <input
-                    className="input"
-                    placeholder="Profile name"
-                    value={newProfileName}
-                    onChange={(e) => setNewProfileName(e.target.value)}
-                    onKeyDown={(e) => { if (e.key === "Enter") handleCreateProfile(); }}
-                    autoFocus
-                  />
-                  <button
-                    className="btn btn-primary"
-                    onClick={handleCreateProfile}
-                    disabled={!newProfileName.trim() || isLoading}
-                  >
-                    Create
-                  </button>
-                  <button
-                    className="btn btn-ghost"
-                    onClick={() => setShowCreateDialog(false)}
-                  >
-                    Cancel
-                  </button>
-                </div>
-              </div>
-            </div>
-          )}
+          <CreateProfileDialog
+            open={showCreateDialog}
+            onClose={() => setShowCreateDialog(false)}
+            onCreate={handleCreateProfile}
+            isLoading={isLoading}
+          />
         </div>
 
         {/* Tools Section */}

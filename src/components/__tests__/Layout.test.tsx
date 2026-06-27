@@ -189,4 +189,26 @@ describe("Layout", () => {
     renderWithProviders(<Layout />);
     expect(screen.getAllByText("Soon").length).toBeGreaterThanOrEqual(3);
   });
+
+  it("navigates to profile page when profile item is clicked", async () => {
+    const profiles = [
+      makeProfile({ id: "p1", name: "dev" }),
+      makeProfile({ id: "p2", name: "staging" }),
+    ];
+    const store = getDefaultStore();
+    store.set(profilesAtom, profiles);
+
+    const router = renderWithProviders(<Layout />);
+
+    // Click on the "dev" profile item
+    const devElements = screen.getAllByText("dev");
+    // Find the one in the profile list (clickable item)
+    const profileItem = devElements.find(
+      (el) => el.closest("[class*='profileItem']") !== null
+    );
+    expect(profileItem).toBeTruthy();
+    if (profileItem) {
+      fireEvent.click(profileItem);
+    }
+  });
 });

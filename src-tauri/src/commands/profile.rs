@@ -122,12 +122,9 @@ pub async fn update_profile(
     // Security fix (#18): Validate profile before saving
     validate_profile(&profile)?;
 
-    // Determine whether we need to apply (write /etc/hosts).
-    // Only apply when rules/enabled changed AND the profile is enabled.
-    // - Metadata-only changes (name, description, tags): never apply.
-    // - Rules changed on a disabled profile: save only, no admin prompt.
-    // - Rules changed on an enabled profile: save + apply.
-    // - Profile toggled to enabled: save + apply.
+    // Always acquire lock first to prevent TOCTOU race
+    let _guard = state.apply_lock.lock().await;
+
     let needs_apply = match state.storage.list_profiles() {
         Ok(profiles) => profiles
             .into_iter()
@@ -137,19 +134,13 @@ pub async fn update_profile(
                     old.rules != profile.rules || old.enabled != profile.enabled;
                 rules_or_enabled_changed && profile.enabled
             })
-            .unwrap_or(false), // new profile or not found, not enabled yet — no apply
+            .unwrap_or(false),
         Err(_) => false,
     };
 
-    if needs_apply {
-        // Fix (#44): Acquire apply_lock and re-apply after saving.
-        // This ensures that:
-        // 1. Rule changes in an enabled profile take effect immediately.
-        // 2. When a profile is disabled, the managed block is cleared.
-        // 3. No TOCTOU race between save_profile and apply.
-        let _guard = state.apply_lock.lock().await;
-        state.storage.save_profile(&profile)?;
+    state.storage.save_profile(&profile)?;
 
+    if needs_apply {
         let writer = state.writer.clone();
         let storage = state.storage.clone();
         tauri::async_runtime::spawn_blocking(move || {
@@ -157,9 +148,6 @@ pub async fn update_profile(
         })
         .await
         .map_err(|e| MhostError::InvalidInput(e.to_string()))??;
-    } else {
-        // Metadata-only change: no admin prompt needed.
-        state.storage.save_profile(&profile)?;
     }
 
     #[cfg(target_os = "macos")]

@@ -20,7 +20,7 @@ function App() {
       fetchProfiles();
     });
     return () => {
-      unlisten.then((fn) => fn());
+      unlisten.then((fn) => fn()).catch(() => {});
     };
   }, [fetchProfiles]);
 

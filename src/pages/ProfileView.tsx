@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useMemo, useRef } from "react";
 import { useParams, useNavigate, Navigate } from "react-router-dom";
 import { useAtomValue, useSetAtom } from "jotai";
 import { save, confirm } from "@tauri-apps/plugin-dialog";
@@ -18,6 +18,7 @@ import { extractErrorMessage } from "../lib/error";
 import type { HostRule, Profile } from "../types";
 import RuleEditor from "../components/RuleEditor";
 import ImportDialog from "../components/ImportDialog";
+import CreateProfileDialog from "../components/CreateProfileDialog";
 import styles from "./ProfileView.module.css";
 
 function ProfileView() {
@@ -41,7 +42,6 @@ function ProfileView() {
   const [isEditingInfo, setIsEditingInfo] = useState(false);
   const [importDialogOpen, setImportDialogOpen] = useState(false);
   const [showCreateDialog, setShowCreateDialog] = useState(false);
-  const [newProfileName, setNewProfileName] = useState("");
 
   // Draft state for editing rules
   const [draftRules, setDraftRules] = useState<HostRule[]>([]);
@@ -62,17 +62,31 @@ function ProfileView() {
     }
   }, [id, setSelectedId]);
 
-  // Reset draft when profile changes (only when not editing)
+  // Track whether we are currently editing to reset draft when profile changes
+  const isEditingRef = useRef(false);
+
+  // Reset draft when profile changes
   useEffect(() => {
-    if (profile && !isEditing) {
+    if (profile && !isEditingRef.current) {
       setDraftRules([...profile.rules]);
       setHasChanges(false);
       setRuleErrors(false);
+    } else if (profile && isEditingRef.current) {
+      // Profile changed while editing — reset to new profile's rules
+      setDraftRules([...profile.rules]);
+      setHasChanges(false);
+      setRuleErrors(false);
+      setIsEditing(false);
+      isEditingRef.current = false;
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentionally depend on profile?.id only
   }, [profile?.id]);
 
-  const ruleCount = countRealRules(profile?.rules ?? []);
+  // Clear error on unmount
+  useEffect(() => {
+    return () => { setError(null); };
+  }, [setError]);
+
+  const ruleCount = useMemo(() => countRealRules(profile?.rules ?? []), [profile?.rules]);
 
   const handleEditRules = useCallback(() => {
     if (profile) {
@@ -80,6 +94,7 @@ function ProfileView() {
       setHasChanges(false);
       setRuleErrors(false);
       setIsEditing(true);
+      isEditingRef.current = true;
     }
   }, [profile]);
 
@@ -88,6 +103,7 @@ function ProfileView() {
     setHasChanges(false);
     setRuleErrors(false);
     setIsEditing(false);
+    isEditingRef.current = false;
   }, []);
 
   const handleRulesChange = useCallback((rules: HostRule[]) => {
@@ -152,6 +168,7 @@ function ProfileView() {
       await updateProfile(updated);
       setHasChanges(false);
       setIsEditing(false);
+      isEditingRef.current = false;
     } catch (err: unknown) {
       setError(extractErrorMessage(err));
     }
@@ -186,7 +203,10 @@ function ProfileView() {
 
   const handleRulesParsed = useCallback(async (rules: HostRule[], tempProfileId?: string) => {
     setImportDialogOpen(false);
-    if (!profile) return;
+    if (!profile) {
+      setError("No profile selected. Cannot import rules.");
+      return;
+    }
     try {
       // Update current profile with imported rules
       const updated = { ...profile, rules };
@@ -201,9 +221,7 @@ function ProfileView() {
     }
   }, [profile, updateProfile, setError, fetchProfiles]);
 
-  const handleCreateProfile = useCallback(async () => {
-    const name = newProfileName.trim();
-    if (!name) return;
+  const handleCreateProfile = useCallback(async (name: string) => {
     try {
       const profile = await createProfile(name);
       setShowCreateDialog(false);
@@ -211,7 +229,7 @@ function ProfileView() {
     } catch (err: unknown) {
       setError(extractErrorMessage(err));
     }
-  }, [newProfileName, createProfile, navigate, setError]);
+  }, [createProfile, navigate, setError]);
 
   if (!id) {
     // No profile selected - redirect to first profile or show empty state
@@ -222,7 +240,7 @@ function ProfileView() {
       <div className={styles.viewPage}>
         <div className="empty-state">
           <p>No profiles yet</p>
-          <button className="btn btn-primary" onClick={() => { setNewProfileName(""); setShowCreateDialog(true); }}>
+          <button className="btn btn-primary" onClick={() => setShowCreateDialog(true)}>
             + New Profile
           </button>
         </div>
@@ -453,36 +471,12 @@ function ProfileView() {
       />
 
       {/* Create Profile Dialog */}
-      {showCreateDialog && (
-        <div className={styles.createDialogOverlay} onClick={() => setShowCreateDialog(false)}>
-          <div className={styles.createDialog} onClick={(e) => e.stopPropagation()}>
-            <h3 className={styles.createDialogTitle}>Create Profile</h3>
-            <div className="form-row">
-              <input
-                className="input"
-                placeholder="Profile name"
-                value={newProfileName}
-                onChange={(e) => setNewProfileName(e.target.value)}
-                onKeyDown={(e) => { if (e.key === "Enter") handleCreateProfile(); }}
-                autoFocus
-              />
-              <button
-                className="btn btn-primary"
-                onClick={handleCreateProfile}
-                disabled={!newProfileName.trim() || isLoading}
-              >
-                Create
-              </button>
-              <button
-                className="btn btn-ghost"
-                onClick={() => setShowCreateDialog(false)}
-              >
-                Cancel
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      <CreateProfileDialog
+        open={showCreateDialog}
+        onClose={() => setShowCreateDialog(false)}
+        onCreate={handleCreateProfile}
+        isLoading={isLoading}
+      />
     </div>
   );
 }

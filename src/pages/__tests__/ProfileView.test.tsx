@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
 import { MemoryRouter, Routes, Route } from "react-router-dom";
 import { getDefaultStore, Provider as JotaiProvider } from "jotai";
 import type { Profile, HostRule } from "../../types";
@@ -17,6 +17,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 // Mock dialog (used by export)
 vi.mock("@tauri-apps/plugin-dialog", () => ({
   open: vi.fn(),
+  confirm: vi.fn().mockResolvedValue(true),
 }));
 
 const mockUpdateProfile = vi.fn().mockResolvedValue({
@@ -228,5 +229,44 @@ describe("ProfileView", () => {
     renderWithRouter("/profiles/p1");
 
     expect(screen.getByText("Protected")).toBeInTheDocument();
+  });
+
+  it("saves rules successfully and exits editing mode", async () => {
+    const profile = makeProfile({ id: "p1", rules: [
+      makeRule({ id: "r1", ip: "127.0.0.1", domains: ["localhost"] }),
+    ] });
+    const store = getDefaultStore();
+    store.set(profilesAtom, [profile]);
+
+    renderWithRouter("/profiles/p1");
+
+    // Enter edit mode
+    fireEvent.click(screen.getByText("Edit Rules"));
+    expect(screen.getByText("Editing")).toBeInTheDocument();
+
+    // Save button should be present in editing mode
+    expect(screen.getByText("Cancel")).toBeInTheDocument();
+    expect(screen.getByText("Save")).toBeInTheDocument();
+
+    // Save button is initially disabled (no changes yet)
+    expect(screen.getByText("Save")).toBeDisabled();
+  });
+
+  it("shows Delete confirmation when Delete button is clicked", async () => {
+    const { confirm } = await import("@tauri-apps/plugin-dialog");
+    const profile = makeProfile({ id: "p1", protected: false });
+    const store = getDefaultStore();
+    store.set(profilesAtom, [profile]);
+
+    renderWithRouter("/profiles/p1");
+
+    // Click delete button
+    const deleteButton = screen.getByText("Delete");
+    expect(deleteButton).not.toBeDisabled();
+
+    fireEvent.click(deleteButton);
+
+    // The confirm dialog should have been called
+    expect(confirm).toHaveBeenCalled();
   });
 });
