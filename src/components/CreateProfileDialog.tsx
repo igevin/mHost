@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { createPortal } from "react-dom";
 import styles from "./CreateProfileDialog.module.css";
 
@@ -11,32 +11,38 @@ interface CreateProfileDialogProps {
 
 function CreateProfileDialog({ open, onClose, onCreate, isLoading }: CreateProfileDialogProps) {
   const [name, setName] = useState("");
-  const [mounted, setMounted] = useState(false);
   const [isCreating, setIsCreating] = useState(false);
+  const isCreatingRef = useRef(false);
+  const inputRef = useRef<HTMLInputElement>(null);
 
-  useEffect(() => {
-    setMounted(true);
-  }, []);
-
+  // Reset name and focus input when dialog opens
   useEffect(() => {
     if (open) {
       setName("");
       setIsCreating(false);
+      isCreatingRef.current = false;
+      // Focus after a tick to ensure the input is mounted
+      const timer = setTimeout(() => {
+        inputRef.current?.focus();
+      }, 0);
+      return () => clearTimeout(timer);
     }
   }, [open]);
 
   const handleCreate = useCallback(async () => {
     const trimmed = name.trim();
-    if (!trimmed || isCreating) return;
+    if (!trimmed || isCreatingRef.current) return;
+    isCreatingRef.current = true;
     setIsCreating(true);
     try {
       await onCreate(trimmed);
     } catch {
       // Error is handled by parent via setError
     } finally {
+      isCreatingRef.current = false;
       setIsCreating(false);
     }
-  }, [name, isCreating, onCreate]);
+  }, [name, onCreate]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -48,7 +54,7 @@ function CreateProfileDialog({ open, onClose, onCreate, isLoading }: CreateProfi
     [handleCreate],
   );
 
-  if (!open || !mounted) return null;
+  if (!open) return null;
 
   const disabled = !name.trim() || isLoading || isCreating;
 
@@ -58,12 +64,12 @@ function CreateProfileDialog({ open, onClose, onCreate, isLoading }: CreateProfi
         <h3 className={styles.title}>Create Profile</h3>
         <div className="form-row">
           <input
+            ref={inputRef}
             className="input"
             placeholder="Profile name"
             value={name}
             onChange={(e) => setName(e.target.value)}
             onKeyDown={handleKeyDown}
-            autoFocus
           />
           <button
             className="btn btn-primary"
