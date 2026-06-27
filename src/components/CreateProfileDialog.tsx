@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { createPortal } from "react-dom";
 import styles from "./CreateProfileDialog.module.css";
 
@@ -12,6 +12,7 @@ interface CreateProfileDialogProps {
 function CreateProfileDialog({ open, onClose, onCreate, isLoading }: CreateProfileDialogProps) {
   const [name, setName] = useState("");
   const [mounted, setMounted] = useState(false);
+  const [isCreating, setIsCreating] = useState(false);
 
   useEffect(() => {
     setMounted(true);
@@ -20,20 +21,36 @@ function CreateProfileDialog({ open, onClose, onCreate, isLoading }: CreateProfi
   useEffect(() => {
     if (open) {
       setName("");
+      setIsCreating(false);
     }
   }, [open]);
 
-  const handleCreate = async () => {
+  const handleCreate = useCallback(async () => {
     const trimmed = name.trim();
-    if (!trimmed) return;
-    await onCreate(trimmed);
-  };
+    if (!trimmed || isCreating) return;
+    setIsCreating(true);
+    try {
+      await onCreate(trimmed);
+    } catch {
+      // Error is handled by parent via setError
+    } finally {
+      setIsCreating(false);
+    }
+  }, [name, isCreating, onCreate]);
 
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === "Enter") handleCreate();
-  };
+  const handleKeyDown = useCallback(
+    (e: React.KeyboardEvent) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        handleCreate();
+      }
+    },
+    [handleCreate],
+  );
 
   if (!open || !mounted) return null;
+
+  const disabled = !name.trim() || isLoading || isCreating;
 
   return createPortal(
     <div className={styles.overlay} onClick={onClose}>
@@ -51,11 +68,11 @@ function CreateProfileDialog({ open, onClose, onCreate, isLoading }: CreateProfi
           <button
             className="btn btn-primary"
             onClick={handleCreate}
-            disabled={!name.trim() || isLoading}
+            disabled={disabled}
           >
-            Create
+            {isCreating ? "Creating..." : "Create"}
           </button>
-          <button className="btn btn-ghost" onClick={onClose}>
+          <button className="btn btn-ghost" onClick={onClose} disabled={isCreating}>
             Cancel
           </button>
         </div>
