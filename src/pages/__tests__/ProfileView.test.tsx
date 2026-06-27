@@ -264,7 +264,9 @@ describe("ProfileView", () => {
     const deleteButton = screen.getByText("Delete");
     expect(deleteButton).not.toBeDisabled();
 
-    fireEvent.click(deleteButton);
+    await act(async () => {
+      fireEvent.click(deleteButton);
+    });
 
     // The confirm dialog should have been called
     expect(confirm).toHaveBeenCalled();

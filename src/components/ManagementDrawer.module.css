@@ -248,30 +248,4 @@
 }
 
 /* ---- Create Profile Dialog ---- */
-
-.createDialogOverlay {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.3);
-  z-index: 400; /* Z_INDEX.DRAWER_CREATE_OVERLAY */
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.createDialog {
-  background: var(--color-surface);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-md);
-  padding: 16px 20px;
-  width: 360px;
-  box-shadow: var(--shadow-md);
-  z-index: 410; /* Z_INDEX.DRAWER_CREATE_CONTENT */
-}
-
-.createDialogTitle {
-  font-size: 14px;
-  font-weight: 600;
-  margin-bottom: 12px;
-  color: var(--color-text);
-}
+/* CreateProfileDialog component handles its own styles */
