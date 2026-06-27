@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import type { Profile, ParseErrorAtLine } from "../types";
+import type { HostRule, Profile, ParseErrorAtLine } from "../types";
 import { countRealRules } from "../lib/rules";
 import { validateHostsText, importProfile, importProfileFromFile } from "../lib/tauri";
 import { extractErrorMessage } from "../lib/error";
@@ -11,10 +11,13 @@ type ImportSource = "text" | "file-hosts" | "file-json";
 interface ImportDialogProps {
   open: boolean;
   onClose: () => void;
-  onImported: (profile: Profile) => void;
+  mode?: "create" | "replace";
+  onImported?: (profile: Profile) => void;
+  onRulesParsed?: (rules: HostRule[], tempProfileId?: string) => void;
 }
 
-function ImportDialog({ open, onClose, onImported }: ImportDialogProps) {
+function ImportDialog({ open, onClose, mode = "create", onImported, onRulesParsed }: ImportDialogProps) {
+  const isReplace = mode === "replace";
   const [name, setName] = useState("");
   const [source, setSource] = useState<ImportSource>("text");
   const [hostsText, setHostsText] = useState("");
@@ -114,32 +117,56 @@ function ImportDialog({ open, onClose, onImported }: ImportDialogProps) {
     };
   }, []);
 
-  const canImport =
-    name.trim().length > 0 &&
-    (source === "text"
+  const canImport = isReplace
+    ? source === "text"
       ? errors.length === 0 && ruleCount !== null
-      : filePath !== null);
+      : filePath !== null
+    : name.trim().length > 0 &&
+      (source === "text"
+        ? errors.length === 0 && ruleCount !== null
+        : filePath !== null);
 
   const handleImport = useCallback(async () => {
     if (!canImport) return;
     setIsImporting(true);
     setImportError(null);
     try {
-      let profile: Profile;
-      if (source === "text") {
-        profile = await importProfile(name.trim(), hostsText);
-      } else {
-        if (!filePath) return;
-        profile = await importProfileFromFile(name.trim(), filePath);
+      if (isReplace && onRulesParsed) {
+        // Replace mode: parse rules without creating a visible new profile
+        if (source === "text") {
+          const result = await validateHostsText(hostsText);
+          if (result.errors.length > 0) {
+            setErrors(result.errors);
+            setIsImporting(false);
+            return;
+          }
+          onRulesParsed(result.rules);
+        } else {
+          if (!filePath) return;
+          // Create a temporary profile to parse the file, then extract rules
+          const tempName = `__import_temp_${Date.now()}`;
+          const tempProfile = await importProfileFromFile(tempName, filePath);
+          onRulesParsed(tempProfile.rules, tempProfile.id);
+        }
+        onClose();
+      } else if (onImported) {
+        // Create mode: create a new profile
+        let profile: Profile;
+        if (source === "text") {
+          profile = await importProfile(name.trim(), hostsText);
+        } else {
+          if (!filePath) return;
+          profile = await importProfileFromFile(name.trim(), filePath);
+        }
+        onImported(profile);
+        onClose();
       }
-      onImported(profile);
-      onClose();
     } catch (err) {
       setImportError(extractErrorMessage(err));
     } finally {
       setIsImporting(false);
     }
-  }, [canImport, name, hostsText, filePath, source, onImported, onClose]);
+  }, [canImport, isReplace, source, hostsText, filePath, name, onRulesParsed, onImported, onClose]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -155,21 +182,25 @@ function ImportDialog({ open, onClose, onImported }: ImportDialogProps) {
   return (
     <div className={styles.overlay} onClick={onClose} onKeyDown={handleKeyDown}>
       <div className={styles.dialog} onClick={(e) => e.stopPropagation()}>
-        <h3 className={styles.title}>Import Profile</h3>
+        <h3 className={styles.title}>
+          {isReplace ? "Import Rules" : "Import Profile"}
+        </h3>
 
-        <div className={styles.formGroup}>
-          <label className="form-label" htmlFor="import-name">
-            Profile Name
-          </label>
-          <input
-            id="import-name"
-            className="input"
-            placeholder="Enter profile name"
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            autoFocus
-          />
-        </div>
+        {!isReplace && (
+          <div className={styles.formGroup}>
+            <label className="form-label" htmlFor="import-name">
+              Profile Name
+            </label>
+            <input
+              id="import-name"
+              className="input"
+              placeholder="Enter profile name"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              autoFocus
+            />
+          </div>
+        )}
 
         <div className={styles.formGroup}>
           <label className="form-label">Import Source</label>
@@ -262,7 +293,7 @@ function ImportDialog({ open, onClose, onImported }: ImportDialogProps) {
             onClick={handleImport}
             disabled={!canImport || isImporting}
           >
-            {isImporting ? "Importing..." : "Import"}
+            {isImporting ? "Importing..." : isReplace ? "Import & Replace" : "Import"}
           </button>
           <button className="btn btn-ghost" onClick={onClose}>
             Cancel

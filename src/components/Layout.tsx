@@ -1,5 +1,18 @@
-import { NavLink, Outlet } from "react-router-dom";
+import { useCallback, useState } from "react";
+import { NavLink, useNavigate, Outlet } from "react-router-dom";
+import { useAtomValue, useSetAtom } from "jotai";
+import {
+  profilesAtom,
+  selectedProfileIdAtom,
+  toggleProfileEnabledAtom,
+  createProfileAtom,
+  errorAtom,
+  isLoadingAtom,
+} from "../stores/profiles";
+import { extractErrorMessage } from "../lib/error";
 import StatusBar from "./StatusBar";
+import ManagementDrawer from "./ManagementDrawer";
+import CreateProfileDialog from "./CreateProfileDialog";
 import styles from "./Layout.module.css";
 
 interface NavItem {
@@ -10,130 +23,7 @@ interface NavItem {
   disabled?: boolean;
 }
 
-function Layout() {
-  const profileNavItems: NavItem[] = [
-    { to: "/profiles", label: "Profiles", icon: <ProfilesIcon /> },
-  ];
-
-  const toolNavItems: NavItem[] = [
-    {
-      to: "#adblock",
-      label: "Ad Block",
-      icon: <ShieldIcon />,
-      badge: 10,
-      disabled: true,
-    },
-    {
-      to: "#remote",
-      label: "Remote Rules",
-      icon: <GlobeIcon />,
-      badge: 3,
-      disabled: true,
-    },
-    {
-      to: "#backup",
-      label: "Backup",
-      icon: <BackupIcon />,
-      disabled: true,
-    },
-    { to: "/settings", label: "Settings", icon: <SettingsIcon /> },
-  ];
-
-  return (
-    <div className={styles.mhostLayout}>
-      <aside className={styles.sidebar}>
-        <div className={styles.sidebarHeader}>
-          <div className={styles.logo}>
-            <span className={styles.logoIcon}>m</span>
-            <span className={styles.logoText}>mHost</span>
-          </div>
-        </div>
-
-        {/* Profiles Section */}
-        <div className={styles.sidebarSection}>
-          <div className={styles.sidebarSectionTitle}>Profiles</div>
-          <nav className={styles.sidebarNav}>
-            {profileNavItems.map((item) => (
-              <NavLink
-                key={item.to}
-                to={item.to}
-                className={({ isActive }) =>
-                  `${styles.navLink} ${isActive ? styles.navLinkActive : ""}`
-                }
-                end={item.to === "/profiles"}
-              >
-                <span className={styles.navIcon}>{item.icon}</span>
-                <span>{item.label}</span>
-              </NavLink>
-            ))}
-          </nav>
-        </div>
-
-        {/* Tools Section */}
-        <div className={styles.sidebarSection}>
-          <div className={styles.sidebarSectionTitle}>Tools</div>
-          <nav className={styles.sidebarNav}>
-            {toolNavItems.map((item) =>
-              item.disabled ? (
-                <div
-                  key={item.to}
-                  className={`${styles.navLink} ${styles.navLinkDisabled}`}
-                  title="Coming soon"
-                >
-                  <span className={styles.navIcon}>{item.icon}</span>
-                  <span>{item.label}</span>
-                  {item.badge !== undefined && item.badge > 0 && (
-                    <span className={styles.navBadge}>{item.badge}</span>
-                  )}
-                  <span className={styles.comingSoonBadge}>Soon</span>
-                </div>
-              ) : (
-                <NavLink
-                  key={item.to}
-                  to={item.to}
-                  className={({ isActive }) =>
-                    `${styles.navLink} ${isActive ? styles.navLinkActive : ""}`
-                  }
-                >
-                  <span className={styles.navIcon}>{item.icon}</span>
-                  <span>{item.label}</span>
-                </NavLink>
-              ),
-            )}
-          </nav>
-        </div>
-
-        <div className={styles.sidebarSpacer} />
-
-        <StatusBar />
-      </aside>
-
-      <main className={styles.mhostMain}>
-        <Outlet />
-      </main>
-    </div>
-  );
-}
-
 /* ---- SVG Icons ---- */
-
-function ProfilesIcon() {
-  return (
-    <svg
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      width="18"
-      height="18"
-    >
-      <rect x="3" y="3" width="7" height="7" rx="1" />
-      <rect x="14" y="3" width="7" height="7" rx="1" />
-      <rect x="3" y="14" width="7" height="7" rx="1" />
-      <rect x="14" y="14" width="7" height="7" rx="1" />
-    </svg>
-  );
-}
 
 function ShieldIcon() {
   return (
@@ -197,6 +87,209 @@ function SettingsIcon() {
       <circle cx="12" cy="12" r="3" />
       <path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83 0 2 2 0 010-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z" />
     </svg>
+  );
+}
+
+/* ---- Static tool nav items (module-level constant, created once) ---- */
+
+const toolNavItems: NavItem[] = [
+  {
+    to: "#adblock",
+    label: "Ad Block",
+    icon: <ShieldIcon />,
+    badge: 10,
+    disabled: true,
+  },
+  {
+    to: "#remote",
+    label: "Remote Rules",
+    icon: <GlobeIcon />,
+    badge: 3,
+    disabled: true,
+  },
+  {
+    to: "#backup",
+    label: "Backup",
+    icon: <BackupIcon />,
+    disabled: true,
+  },
+  { to: "/settings", label: "Settings", icon: <SettingsIcon /> },
+];
+
+function Layout() {
+  const profiles = useAtomValue(profilesAtom);
+  const selectedProfileId = useAtomValue(selectedProfileIdAtom);
+  const toggleEnabled = useSetAtom(toggleProfileEnabledAtom);
+  const createProfile = useSetAtom(createProfileAtom);
+  const isLoading = useAtomValue(isLoadingAtom);
+
+  const navigate = useNavigate();
+  const setError = useSetAtom(errorAtom);
+  const [showManagement, setShowManagement] = useState(false);
+  const [showCreateDialog, setShowCreateDialog] = useState(false);
+
+  const handleProfileClick = useCallback(
+    (id: string) => {
+      navigate(`/profiles/${id}`);
+    },
+    [navigate],
+  );
+
+  const handleToggle = useCallback(
+    (e: React.MouseEvent, id: string) => {
+      e.stopPropagation();
+      e.preventDefault();
+      toggleEnabled(id).catch((err) => {
+        setError(extractErrorMessage(err));
+      });
+    },
+    [toggleEnabled, setError],
+  );
+
+  const handleNewProfile = useCallback(() => {
+    setShowCreateDialog(true);
+  }, []);
+
+  const handleCreateProfile = useCallback(async (name: string) => {
+    try {
+      const profile = await createProfile(name);
+      setShowCreateDialog(false);
+      navigate(`/profiles/${profile.id}`);
+    } catch (err) {
+      setError(extractErrorMessage(err));
+    }
+  }, [createProfile, navigate, setError]);
+
+  return (
+    <div className={styles.mhostLayout}>
+      <aside className={styles.sidebar}>
+        <div className={styles.sidebarHeader}>
+          <div className={styles.logo}>
+            <span className={styles.logoIcon}>m</span>
+            <span className={styles.logoText}>mHost</span>
+          </div>
+        </div>
+
+        {/* Profiles Section */}
+        <div className={styles.sidebarSection}>
+          <div className={styles.sidebarSectionTitleRow}>
+            <span className={styles.sidebarSectionTitle}>Profiles</span>
+            <button
+              className={styles.manageLink}
+              onClick={() => setShowManagement(true)}
+            >
+              Manage -&gt;
+            </button>
+          </div>
+          <div className={styles.profileList}>
+            {profiles.length === 0 && (
+              <div className={styles.profileEmpty}>No profiles yet</div>
+            )}
+            {profiles.map((profile) => (
+              <div
+                key={profile.id}
+                className={`${styles.profileItem} ${
+                  selectedProfileId === profile.id ? styles.profileItemActive : ""
+                }`}
+                onClick={() => handleProfileClick(profile.id)}
+                role="button"
+                tabIndex={0}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") handleProfileClick(profile.id);
+                }}
+              >
+                <div className={styles.profileItemContent}>
+                  <span
+                    className={`${styles.profileStatusDot} ${
+                      profile.enabled ? styles.profileStatusDotOn : styles.profileStatusDotOff
+                    }`}
+                  />
+                  <div className={styles.profileItemInfo}>
+                    <span className={styles.profileItemName}>{profile.name}</span>
+                    {profile.description && (
+                      <span className={styles.profileItemDesc}>
+                        {profile.description}
+                      </span>
+                    )}
+                  </div>
+                </div>
+                <label
+                  className={styles.toggle}
+                  onClick={(e) => handleToggle(e, profile.id)}
+                >
+                  <input
+                    type="checkbox"
+                    role="switch"
+                    checked={profile.enabled}
+                    readOnly
+                  />
+                  <span className={styles.toggleSlider} />
+                </label>
+              </div>
+            ))}
+          </div>
+          <button
+            className={styles.newProfileBtn}
+            onClick={handleNewProfile}
+          >
+            + New Profile
+          </button>
+          <CreateProfileDialog
+            open={showCreateDialog}
+            onClose={() => setShowCreateDialog(false)}
+            onCreate={handleCreateProfile}
+            isLoading={isLoading}
+          />
+        </div>
+
+        {/* Tools Section */}
+        <div className={styles.sidebarSection}>
+          <div className={styles.sidebarSectionTitle}>Tools</div>
+          <nav className={styles.sidebarNav}>
+            {toolNavItems.map((item) =>
+              item.disabled ? (
+                <div
+                  key={item.to}
+                  className={`${styles.navLink} ${styles.navLinkDisabled}`}
+                  title="Coming soon"
+                >
+                  <span className={styles.navIcon}>{item.icon}</span>
+                  <span>{item.label}</span>
+                  {item.badge !== undefined && item.badge > 0 && (
+                    <span className={styles.navBadge}>{item.badge}</span>
+                  )}
+                  <span className={styles.comingSoonBadge}>Soon</span>
+                </div>
+              ) : (
+                <NavLink
+                  key={item.to}
+                  to={item.to}
+                  className={({ isActive }) =>
+                    `${styles.navLink} ${isActive ? styles.navLinkActive : ""}`
+                  }
+                >
+                  <span className={styles.navIcon}>{item.icon}</span>
+                  <span>{item.label}</span>
+                </NavLink>
+              ),
+            )}
+          </nav>
+        </div>
+
+        <div className={styles.sidebarSpacer} />
+
+        <StatusBar />
+      </aside>
+
+      <main className={styles.mhostMain}>
+        <Outlet />
+      </main>
+
+      <ManagementDrawer
+        open={showManagement}
+        onClose={() => setShowManagement(false)}
+      />
+    </div>
   );
 }
 

@@ -8,7 +8,7 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  z-index: 100;
+  z-index: 100; /* Z_INDEX.DIALOG_OVERLAY */
   animation: fadeIn 0.15s ease;
 }
 
@@ -34,6 +34,7 @@
   overflow-y: auto;
   box-shadow: var(--shadow-md);
   animation: slideUp 0.2s ease;
+  z-index: 110; /* Z_INDEX.DIALOG_CONTENT */
 }
 
 @keyframes slideUp {

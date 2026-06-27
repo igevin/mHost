@@ -122,21 +122,33 @@ pub async fn update_profile(
     // Security fix (#18): Validate profile before saving
     validate_profile(&profile)?;
 
-    // Fix (#44): Always acquire apply_lock and re-apply after saving.
-    // This ensures that:
-    // 1. Rule changes in an enabled profile take effect immediately.
-    // 2. When a profile is disabled, the managed block is cleared.
-    // 3. No TOCTOU race between save_profile and apply.
+    // Always acquire lock first to prevent TOCTOU race
     let _guard = state.apply_lock.lock().await;
+
+    let needs_apply = match state.storage.list_profiles() {
+        Ok(profiles) => profiles
+            .into_iter()
+            .find(|p| p.id == profile.id)
+            .map(|old| {
+                let rules_or_enabled_changed =
+                    old.rules != profile.rules || old.enabled != profile.enabled;
+                rules_or_enabled_changed && profile.enabled
+            })
+            .unwrap_or(false),
+        Err(_) => false,
+    };
+
     state.storage.save_profile(&profile)?;
 
-    let writer = state.writer.clone();
-    let storage = state.storage.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        crate::commands::apply::apply_current_plan_logic(storage.as_ref(), &writer)
-    })
-    .await
-    .map_err(|e| MhostError::InvalidInput(e.to_string()))??;
+    if needs_apply {
+        let writer = state.writer.clone();
+        let storage = state.storage.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            crate::commands::apply::apply_current_plan_logic(storage.as_ref(), &writer)
+        })
+        .await
+        .map_err(|e| MhostError::InvalidInput(e.to_string()))??;
+    }
 
     #[cfg(target_os = "macos")]
     crate::tray::update_tray_menu(&app_handle);
