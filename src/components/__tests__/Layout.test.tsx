@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent } from "@testing-library/react";
 import { BrowserRouter } from "react-router-dom";
 import { getDefaultStore, Provider as JotaiProvider } from "jotai";
 import type { Profile } from "../../types";
@@ -198,7 +198,7 @@ describe("Layout", () => {
     const store = getDefaultStore();
     store.set(profilesAtom, profiles);
 
-    const router = renderWithProviders(<Layout />);
+    renderWithProviders(<Layout />);
 
     // Click on the "dev" profile item
     const devElements = screen.getAllByText("dev");

@@ -15,7 +15,7 @@ import {
 import { countRealRules } from "../lib/rules";
 import { exportProfileToFile, deleteProfile } from "../lib/tauri";
 import { extractErrorMessage } from "../lib/error";
-import type { HostRule, Profile } from "../types";
+import type { HostRule } from "../types";
 import RuleEditor from "../components/RuleEditor";
 import ImportDialog from "../components/ImportDialog";
 import CreateProfileDialog from "../components/CreateProfileDialog";
