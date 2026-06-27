@@ -122,21 +122,45 @@ pub async fn update_profile(
     // Security fix (#18): Validate profile before saving
     validate_profile(&profile)?;
 
-    // Fix (#44): Always acquire apply_lock and re-apply after saving.
-    // This ensures that:
-    // 1. Rule changes in an enabled profile take effect immediately.
-    // 2. When a profile is disabled, the managed block is cleared.
-    // 3. No TOCTOU race between save_profile and apply.
-    let _guard = state.apply_lock.lock().await;
-    state.storage.save_profile(&profile)?;
+    // Determine whether we need to apply (write /etc/hosts).
+    // Only apply when rules/enabled changed AND the profile is enabled.
+    // - Metadata-only changes (name, description, tags): never apply.
+    // - Rules changed on a disabled profile: save only, no admin prompt.
+    // - Rules changed on an enabled profile: save + apply.
+    // - Profile toggled to enabled: save + apply.
+    let needs_apply = match state.storage.list_profiles() {
+        Ok(profiles) => profiles
+            .into_iter()
+            .find(|p| p.id == profile.id)
+            .map(|old| {
+                let rules_or_enabled_changed =
+                    old.rules != profile.rules || old.enabled != profile.enabled;
+                rules_or_enabled_changed && profile.enabled
+            })
+            .unwrap_or(false), // new profile or not found, not enabled yet — no apply
+        Err(_) => false,
+    };
 
-    let writer = state.writer.clone();
-    let storage = state.storage.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        crate::commands::apply::apply_current_plan_logic(storage.as_ref(), &writer)
-    })
-    .await
-    .map_err(|e| MhostError::InvalidInput(e.to_string()))??;
+    if needs_apply {
+        // Fix (#44): Acquire apply_lock and re-apply after saving.
+        // This ensures that:
+        // 1. Rule changes in an enabled profile take effect immediately.
+        // 2. When a profile is disabled, the managed block is cleared.
+        // 3. No TOCTOU race between save_profile and apply.
+        let _guard = state.apply_lock.lock().await;
+        state.storage.save_profile(&profile)?;
+
+        let writer = state.writer.clone();
+        let storage = state.storage.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            crate::commands::apply::apply_current_plan_logic(storage.as_ref(), &writer)
+        })
+        .await
+        .map_err(|e| MhostError::InvalidInput(e.to_string()))??;
+    } else {
+        // Metadata-only change: no admin prompt needed.
+        state.storage.save_profile(&profile)?;
+    }
 
     #[cfg(target_os = "macos")]
     crate::tray::update_tray_menu(&app_handle);

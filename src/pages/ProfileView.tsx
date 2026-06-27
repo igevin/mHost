@@ -1,0 +1,490 @@
+import { useEffect, useState, useCallback } from "react";
+import { useParams, useNavigate, Navigate } from "react-router-dom";
+import { useAtomValue, useSetAtom } from "jotai";
+import { save, confirm } from "@tauri-apps/plugin-dialog";
+import {
+  profilesAtom,
+  selectedProfileIdAtom,
+  isLoadingAtom,
+  errorAtom,
+  updateProfileAtom,
+  createProfileAtom,
+  deleteProfileAtom,
+  fetchProfilesAtom,
+} from "../stores/profiles";
+import { countRealRules } from "../lib/rules";
+import { exportProfileToFile, deleteProfile } from "../lib/tauri";
+import { extractErrorMessage } from "../lib/error";
+import type { HostRule, Profile } from "../types";
+import RuleEditor from "../components/RuleEditor";
+import ImportDialog from "../components/ImportDialog";
+import styles from "./ProfileView.module.css";
+
+function ProfileView() {
+  const { id } = useParams<{ id: string }>();
+  const navigate = useNavigate();
+  const profiles = useAtomValue(profilesAtom);
+  const isLoading = useAtomValue(isLoadingAtom);
+  const error = useAtomValue(errorAtom);
+  const setSelectedId = useSetAtom(selectedProfileIdAtom);
+  const setError = useSetAtom(errorAtom);
+  const updateProfile = useSetAtom(updateProfileAtom);
+  const deleteProfileAction = useSetAtom(deleteProfileAtom);
+  const createProfile = useSetAtom(createProfileAtom);
+  const fetchProfiles = useSetAtom(fetchProfilesAtom);
+
+  const profile = profiles.find((p) => p.id === id);
+
+  // View state
+  const [isEditing, setIsEditing] = useState(false);
+  const [isInfoBarExpanded, setIsInfoBarExpanded] = useState(false);
+  const [isEditingInfo, setIsEditingInfo] = useState(false);
+  const [importDialogOpen, setImportDialogOpen] = useState(false);
+  const [showCreateDialog, setShowCreateDialog] = useState(false);
+  const [newProfileName, setNewProfileName] = useState("");
+
+  // Draft state for editing rules
+  const [draftRules, setDraftRules] = useState<HostRule[]>([]);
+  const [hasChanges, setHasChanges] = useState(false);
+  const [ruleErrors, setRuleErrors] = useState(false);
+
+  // Draft state for editing profile info (name, description, tags)
+  const [draftInfo, setDraftInfo] = useState<{ name: string; description: string; tags: string }>({
+    name: "",
+    description: "",
+    tags: "",
+  });
+  const [infoHasChanges, setInfoHasChanges] = useState(false);
+
+  useEffect(() => {
+    if (id) {
+      setSelectedId(id);
+    }
+  }, [id, setSelectedId]);
+
+  // Reset draft when profile changes (only when not editing)
+  useEffect(() => {
+    if (profile && !isEditing) {
+      setDraftRules([...profile.rules]);
+      setHasChanges(false);
+      setRuleErrors(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentionally depend on profile?.id only
+  }, [profile?.id]);
+
+  const ruleCount = countRealRules(profile?.rules ?? []);
+
+  const handleEditRules = useCallback(() => {
+    if (profile) {
+      setDraftRules([...profile.rules]);
+      setHasChanges(false);
+      setRuleErrors(false);
+      setIsEditing(true);
+    }
+  }, [profile]);
+
+  const handleCancelEdit = useCallback(() => {
+    setDraftRules([]);
+    setHasChanges(false);
+    setRuleErrors(false);
+    setIsEditing(false);
+  }, []);
+
+  const handleRulesChange = useCallback((rules: HostRule[]) => {
+    setDraftRules(rules);
+    setHasChanges(true);
+    setRuleErrors(false);
+  }, []);
+
+  const handleRulesErrorChange = useCallback((hasErrors: boolean) => {
+    setRuleErrors(hasErrors);
+  }, []);
+
+  const handleEditInfo = useCallback(() => {
+    if (profile) {
+      setDraftInfo({
+        name: profile.name,
+        description: profile.description ?? "",
+        tags: profile.tags.join(", "),
+      });
+      setInfoHasChanges(false);
+      setIsEditingInfo(true);
+      setIsInfoBarExpanded(true);
+    }
+  }, [profile]);
+
+  const handleCancelInfoEdit = useCallback(() => {
+    setIsEditingInfo(false);
+    setInfoHasChanges(false);
+  }, []);
+
+  const handleInfoChange = useCallback((field: string, value: string) => {
+    setDraftInfo((prev) => ({ ...prev, [field]: value }));
+    setInfoHasChanges(true);
+  }, []);
+
+  const handleSaveInfo = useCallback(async () => {
+    if (!profile || !infoHasChanges) return;
+    try {
+      const tags = draftInfo.tags
+        .split(",")
+        .map((t) => t.trim())
+        .filter((t) => t.length > 0);
+      const updated = {
+        ...profile,
+        name: draftInfo.name.trim() || profile.name,
+        description: draftInfo.description.trim() || null,
+        tags,
+      };
+      await updateProfile(updated);
+      setInfoHasChanges(false);
+      setIsEditingInfo(false);
+      setIsInfoBarExpanded(false);
+    } catch (err: unknown) {
+      setError(extractErrorMessage(err));
+    }
+  }, [profile, draftInfo, infoHasChanges, updateProfile, setError]);
+
+  const handleSave = useCallback(async () => {
+    if (!profile || ruleErrors) return;
+    try {
+      const updated = { ...profile, rules: draftRules };
+      await updateProfile(updated);
+      setHasChanges(false);
+      setIsEditing(false);
+    } catch (err: unknown) {
+      setError(extractErrorMessage(err));
+    }
+  }, [profile, draftRules, ruleErrors, updateProfile, setError]);
+
+  const handleDeleteProfile = useCallback(async () => {
+    if (!profile || !id || profile.protected) return;
+    const confirmed = await confirm(`Delete profile "${profile.name}"?`);
+    if (!confirmed) return;
+    try {
+      await deleteProfileAction(id);
+      navigate("/profiles");
+    } catch (err: unknown) {
+      setError(extractErrorMessage(err));
+    }
+  }, [profile, id, deleteProfileAction, navigate, setError]);
+
+  const handleExport = useCallback(async () => {
+    if (!profile || !id) return;
+    try {
+      const path = await save({
+        defaultPath: `${profile.name}.hosts`,
+        filters: [{ name: "Hosts", extensions: ["hosts", "txt"] }],
+      });
+      if (path) {
+        await exportProfileToFile(id, "hosts", path);
+      }
+    } catch (err: unknown) {
+      setError(extractErrorMessage(err));
+    }
+  }, [profile, id, setError]);
+
+  const handleRulesParsed = useCallback(async (rules: HostRule[], tempProfileId?: string) => {
+    setImportDialogOpen(false);
+    if (!profile) return;
+    try {
+      // Update current profile with imported rules
+      const updated = { ...profile, rules };
+      await updateProfile(updated);
+      // Clean up temporary profile if file import was used
+      if (tempProfileId) {
+        await deleteProfile(tempProfileId);
+      }
+      await fetchProfiles();
+    } catch (err: unknown) {
+      setError(extractErrorMessage(err));
+    }
+  }, [profile, updateProfile, setError, fetchProfiles]);
+
+  const handleCreateProfile = useCallback(async () => {
+    const name = newProfileName.trim();
+    if (!name) return;
+    try {
+      const profile = await createProfile(name);
+      setShowCreateDialog(false);
+      navigate(`/profiles/${profile.id}`);
+    } catch (err: unknown) {
+      setError(extractErrorMessage(err));
+    }
+  }, [newProfileName, createProfile, navigate, setError]);
+
+  if (!id) {
+    // No profile selected - redirect to first profile or show empty state
+    if (profiles.length > 0) {
+      return <Navigate to={`/profiles/${profiles[0].id}`} replace />;
+    }
+    return (
+      <div className={styles.viewPage}>
+        <div className="empty-state">
+          <p>No profiles yet</p>
+          <button className="btn btn-primary" onClick={() => { setNewProfileName(""); setShowCreateDialog(true); }}>
+            + New Profile
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (!profile) {
+    return (
+      <div className={styles.viewPage}>
+        <div className="empty-state">
+          <p>Profile not found.</p>
+          <button className="btn btn-primary" onClick={() => navigate("/profiles")}>
+            Back to Profiles
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className={styles.viewPage}>
+      {error && <div className="alert alert-error">{error}</div>}
+
+      {/* Info Bar */}
+      <div className={styles.infoBar}>
+        {!isInfoBarExpanded ? (
+          <div className={styles.infoBarCollapsed} onClick={() => setIsInfoBarExpanded(true)}>
+            <div className={styles.infoBarSummary}>
+              <span className={styles.infoBarName}>{profile.name}</span>
+              {profile.description && (
+                <span className={styles.infoBarDesc}>{profile.description}</span>
+              )}
+              {profile.tags.length > 0 && (
+                <div className={styles.infoBarTags}>
+                  {profile.tags.map((tag) => (
+                    <span key={tag} className={styles.infoBarTag}>{tag}</span>
+                  ))}
+                </div>
+              )}
+            </div>
+            <button
+              className={styles.infoBarEditLink}
+              onClick={(e) => {
+                e.stopPropagation();
+                handleEditInfo();
+              }}
+            >
+              Edit info -&gt;
+            </button>
+          </div>
+        ) : (
+          <div className={styles.infoBarExpanded}>
+            {isEditingInfo ? (
+              <>
+                <div className={styles.infoBarFields}>
+                  <div className="form-group">
+                    <label className="form-label">Name</label>
+                    <input
+                      className="input"
+                      value={draftInfo.name}
+                      onChange={(e) => handleInfoChange("name", e.target.value)}
+                    />
+                  </div>
+                  <div className="form-group">
+                    <label className="form-label">Description</label>
+                    <input
+                      className="input"
+                      value={draftInfo.description}
+                      onChange={(e) => handleInfoChange("description", e.target.value)}
+                      placeholder="Optional description"
+                    />
+                  </div>
+                  <div className="form-group">
+                    <label className="form-label">Tags (comma-separated)</label>
+                    <input
+                      className="input"
+                      value={draftInfo.tags}
+                      onChange={(e) => handleInfoChange("tags", e.target.value)}
+                      placeholder="e.g. dev, staging"
+                    />
+                  </div>
+                </div>
+                <div className={styles.infoBarActions}>
+                  <button
+                    className="btn btn-primary btn-sm"
+                    onClick={handleSaveInfo}
+                    disabled={!infoHasChanges || isLoading}
+                  >
+                    Save
+                  </button>
+                  <button
+                    className="btn btn-ghost btn-sm"
+                    onClick={handleCancelInfoEdit}
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </>
+            ) : (
+              <>
+                <div className={styles.infoBarFields}>
+                  <div className="form-group">
+                    <label className="form-label">Name</label>
+                    <input
+                      className="input"
+                      value={profile.name}
+                      readOnly
+                    />
+                  </div>
+                  <div className="form-group">
+                    <label className="form-label">Description</label>
+                    <input
+                      className="input"
+                      value={profile.description ?? ""}
+                      readOnly
+                    />
+                  </div>
+                  <div className="form-group">
+                    <label className="form-label">Tags</label>
+                    <input
+                      className="input"
+                      value={profile.tags.join(", ")}
+                      readOnly
+                    />
+                  </div>
+                </div>
+                <div className={styles.infoBarActions}>
+                  <button
+                    className="btn btn-ghost btn-sm"
+                    onClick={() => {
+                      setIsEditingInfo(false);
+                      setIsInfoBarExpanded(false);
+                    }}
+                  >
+                    Collapse
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* Header */}
+      <div className={styles.viewHeader}>
+        <div className={styles.viewHeaderLeft}>
+          <h1 className={styles.viewTitle}>{profile.name}</h1>
+          <div className={styles.viewBadges}>
+            {profile.enabled ? (
+              <span className={`${styles.badge} ${styles.badgeEnabled}`}>Enabled</span>
+            ) : (
+              <span className={`${styles.badge} ${styles.badgeDisabled}`}>Disabled</span>
+            )}
+            {profile.protected && (
+              <span className={`${styles.badge} ${styles.badgeProtected}`}>Protected</span>
+            )}
+            <span className={`${styles.badge} ${styles.badgeRules}`}>
+              {ruleCount} rule{ruleCount !== 1 ? "s" : ""}
+            </span>
+          </div>
+        </div>
+        <div className={styles.viewHeaderActions}>
+          {!isEditing ? (
+            <>
+              <button className="btn btn-ghost btn-sm" onClick={() => setImportDialogOpen(true)}>
+                Import
+              </button>
+              <button className="btn btn-ghost btn-sm" onClick={handleExport} disabled={isLoading}>
+                Export
+              </button>
+              <button className="btn btn-primary btn-sm" onClick={handleEditRules}>
+                Edit Rules
+              </button>
+              <button
+                className="btn btn-danger btn-sm"
+                onClick={handleDeleteProfile}
+                disabled={profile.protected || isLoading}
+              >
+                Delete
+              </button>
+            </>
+          ) : (
+            <>
+              <button className="btn btn-ghost btn-sm" onClick={handleCancelEdit}>
+                Cancel
+              </button>
+              <button
+                className="btn btn-primary btn-sm"
+                onClick={handleSave}
+                disabled={!hasChanges || isLoading || ruleErrors}
+              >
+                Save
+              </button>
+            </>
+          )}
+        </div>
+      </div>
+
+      {/* Rules Editor */}
+      <div className={styles.rulesSection}>
+        <div className={styles.rulesTitleBar}>
+          <div className={styles.rulesTitleLeft}>
+            <h3 className={styles.rulesTitle}>Rules</h3>
+            {!isEditing ? (
+              <span className={`${styles.badge} ${styles.badgeReadOnly}`}>Read-only</span>
+            ) : (
+              <span className={`${styles.badge} ${styles.badgeEditing}`}>Editing</span>
+            )}
+          </div>
+        </div>
+        <div className={`${styles.rulesContent} ${isEditing ? styles.rulesContentEditing : styles.rulesContentReadOnly}`}>
+          <RuleEditor
+            rules={isEditing ? draftRules : profile.rules}
+            onChange={handleRulesChange}
+            onErrorChange={handleRulesErrorChange}
+            readOnly={!isEditing}
+          />
+        </div>
+      </div>
+
+      {/* Import Dialog */}
+      <ImportDialog
+        open={importDialogOpen}
+        onClose={() => setImportDialogOpen(false)}
+        mode="replace"
+        onRulesParsed={handleRulesParsed}
+      />
+
+      {/* Create Profile Dialog */}
+      {showCreateDialog && (
+        <div className={styles.createDialogOverlay} onClick={() => setShowCreateDialog(false)}>
+          <div className={styles.createDialog} onClick={(e) => e.stopPropagation()}>
+            <h3 className={styles.createDialogTitle}>Create Profile</h3>
+            <div className="form-row">
+              <input
+                className="input"
+                placeholder="Profile name"
+                value={newProfileName}
+                onChange={(e) => setNewProfileName(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") handleCreateProfile(); }}
+                autoFocus
+              />
+              <button
+                className="btn btn-primary"
+                onClick={handleCreateProfile}
+                disabled={!newProfileName.trim() || isLoading}
+              >
+                Create
+              </button>
+              <button
+                className="btn btn-ghost"
+                onClick={() => setShowCreateDialog(false)}
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default ProfileView;
