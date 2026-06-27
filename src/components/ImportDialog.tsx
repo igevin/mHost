@@ -28,6 +28,7 @@ function ImportDialog({ open, onClose, mode = "create", onImported, onRulesParse
   const [isImporting, setIsImporting] = useState(false);
   const [importError, setImportError] = useState<string | null>(null);
   const validateTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const firedRef = useRef(false);
 
   // Reset state when dialog opens/closes
   useEffect(() => {
@@ -41,6 +42,7 @@ function ImportDialog({ open, onClose, mode = "create", onImported, onRulesParse
       setIsValidating(false);
       setIsImporting(false);
       setImportError(null);
+      firedRef.current = false;
     }
   }, [open]);
 
@@ -127,7 +129,9 @@ function ImportDialog({ open, onClose, mode = "create", onImported, onRulesParse
         : filePath !== null);
 
   const handleImport = useCallback(async () => {
+    if (firedRef.current) return;
     if (!canImport) return;
+    firedRef.current = true;
     setIsImporting(true);
     setImportError(null);
     try {
@@ -138,6 +142,7 @@ function ImportDialog({ open, onClose, mode = "create", onImported, onRulesParse
           if (result.errors.length > 0) {
             setErrors(result.errors);
             setIsImporting(false);
+            firedRef.current = false;
             return;
           }
           onRulesParsed(result.rules);
@@ -165,8 +170,20 @@ function ImportDialog({ open, onClose, mode = "create", onImported, onRulesParse
       setImportError(extractErrorMessage(err));
     } finally {
       setIsImporting(false);
+      setTimeout(() => {
+        firedRef.current = false;
+      }, 50);
     }
   }, [canImport, isReplace, source, hostsText, filePath, name, onRulesParsed, onImported, onClose]);
+
+  const handleCancel = useCallback(() => {
+    if (firedRef.current) return;
+    firedRef.current = true;
+    onClose();
+    setTimeout(() => {
+      firedRef.current = false;
+    }, 50);
+  }, [onClose]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -175,6 +192,16 @@ function ImportDialog({ open, onClose, mode = "create", onImported, onRulesParse
       }
     },
     [onClose],
+  );
+
+  // WebKit workaround: use pointerdown as fallback when click is swallowed
+  // after focus transfer from input to button.
+  const handlePointerDown = useCallback(
+    (handler: () => void) => (e: React.PointerEvent) => {
+      if (e.button !== 0) return;
+      handler();
+    },
+    [],
   );
 
   if (!open) return null;
@@ -208,18 +235,21 @@ function ImportDialog({ open, onClose, mode = "create", onImported, onRulesParse
             <button
               className={`btn btn-sm ${source === "text" ? "btn-primary" : "btn-ghost"}`}
               onClick={() => handleSourceChange("text")}
+              onPointerDown={(e) => { if (e.button === 0) handleSourceChange("text"); }}
             >
               Paste Text
             </button>
             <button
               className={`btn btn-sm ${source === "file-hosts" ? "btn-primary" : "btn-ghost"}`}
               onClick={() => handleSourceChange("file-hosts")}
+              onPointerDown={(e) => { if (e.button === 0) handleSourceChange("file-hosts"); }}
             >
               Hosts File
             </button>
             <button
               className={`btn btn-sm ${source === "file-json" ? "btn-primary" : "btn-ghost"}`}
               onClick={() => handleSourceChange("file-json")}
+              onPointerDown={(e) => { if (e.button === 0) handleSourceChange("file-json"); }}
             >
               JSON File
             </button>
@@ -250,6 +280,7 @@ function ImportDialog({ open, onClose, mode = "create", onImported, onRulesParse
               <button
                 className="btn btn-ghost btn-sm"
                 onClick={handleSelectFile}
+                onPointerDown={handlePointerDown(handleSelectFile)}
                 disabled={isImporting}
               >
                 Select File...
@@ -291,11 +322,16 @@ function ImportDialog({ open, onClose, mode = "create", onImported, onRulesParse
           <button
             className="btn btn-primary"
             onClick={handleImport}
+            onPointerDown={handlePointerDown(handleImport)}
             disabled={!canImport || isImporting}
           >
             {isImporting ? "Importing..." : isReplace ? "Import & Replace" : "Import"}
           </button>
-          <button className="btn btn-ghost" onClick={onClose}>
+          <button
+            className="btn btn-ghost"
+            onClick={handleCancel}
+            onPointerDown={handlePointerDown(handleCancel)}
+          >
             Cancel
           </button>
         </div>

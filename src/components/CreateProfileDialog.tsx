@@ -13,36 +13,48 @@ function CreateProfileDialog({ open, onClose, onCreate, isLoading }: CreateProfi
   const [name, setName] = useState("");
   const [isCreating, setIsCreating] = useState(false);
   const isCreatingRef = useRef(false);
-  const inputRef = useRef<HTMLInputElement>(null);
+  // Track whether the current pointer interaction has already fired,
+  // so we don't double-fire if click also comes through.
+  const firedRef = useRef(false);
 
-  // Reset name and focus input when dialog opens
   useEffect(() => {
     if (open) {
       setName("");
       setIsCreating(false);
       isCreatingRef.current = false;
-      // Focus after a tick to ensure the input is mounted
-      const timer = setTimeout(() => {
-        inputRef.current?.focus();
-      }, 0);
-      return () => clearTimeout(timer);
+      firedRef.current = false;
     }
   }, [open]);
 
   const handleCreate = useCallback(async () => {
+    if (firedRef.current) return;
     const trimmed = name.trim();
     if (!trimmed || isCreatingRef.current) return;
+    firedRef.current = true;
     isCreatingRef.current = true;
     setIsCreating(true);
     try {
       await onCreate(trimmed);
     } catch {
-      // Error is handled by parent via setError
+      // Error handled by parent
     } finally {
       isCreatingRef.current = false;
       setIsCreating(false);
+      // Reset firedRef after a tick so the button is usable again
+      setTimeout(() => {
+        firedRef.current = false;
+      }, 50);
     }
   }, [name, onCreate]);
+
+  const handleCancel = useCallback(() => {
+    if (firedRef.current || isCreatingRef.current) return;
+    firedRef.current = true;
+    onClose();
+    setTimeout(() => {
+      firedRef.current = false;
+    }, 50);
+  }, [onClose]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -52,6 +64,17 @@ function CreateProfileDialog({ open, onClose, onCreate, isLoading }: CreateProfi
       }
     },
     [handleCreate],
+  );
+
+  // WebKit workaround: use pointerdown instead of click, because WebKit
+  // swallows the first click after typing when focus moves from input to button.
+  const handlePointerDown = useCallback(
+    (handler: () => void) => (e: React.PointerEvent) => {
+      // Only handle primary button (left mouse button / single touch)
+      if (e.button !== 0) return;
+      handler();
+    },
+    [],
   );
 
   if (!open) return null;
@@ -64,7 +87,6 @@ function CreateProfileDialog({ open, onClose, onCreate, isLoading }: CreateProfi
         <h3 className={styles.title}>Create Profile</h3>
         <div className="form-row">
           <input
-            ref={inputRef}
             className="input"
             placeholder="Profile name"
             value={name}
@@ -74,11 +96,17 @@ function CreateProfileDialog({ open, onClose, onCreate, isLoading }: CreateProfi
           <button
             className="btn btn-primary"
             onClick={handleCreate}
+            onPointerDown={handlePointerDown(handleCreate)}
             disabled={disabled}
           >
             {isCreating ? "Creating..." : "Create"}
           </button>
-          <button className="btn btn-ghost" onClick={onClose} disabled={isCreating}>
+          <button
+            className="btn btn-ghost"
+            onClick={handleCancel}
+            onPointerDown={handlePointerDown(handleCancel)}
+            disabled={isCreating}
+          >
             Cancel
           </button>
         </div>
