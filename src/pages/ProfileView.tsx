@@ -244,6 +244,12 @@ function ProfileView() {
             + New Profile
           </button>
         </div>
+        <CreateProfileDialog
+          open={showCreateDialog}
+          onClose={() => setShowCreateDialog(false)}
+          onCreate={handleCreateProfile}
+          isLoading={isLoading}
+        />
       </div>
     );
   }
