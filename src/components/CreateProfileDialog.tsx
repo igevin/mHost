@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { createPortal } from "react-dom";
+import { useWebKitPointerDown } from "../hooks/useWebKitPointerDown";
 import styles from "./CreateProfileDialog.module.css";
 
 interface CreateProfileDialogProps {
@@ -13,24 +14,23 @@ function CreateProfileDialog({ open, onClose, onCreate, isLoading }: CreateProfi
   const [name, setName] = useState("");
   const [isCreating, setIsCreating] = useState(false);
   const isCreatingRef = useRef(false);
-  // Track whether the current pointer interaction has already fired,
-  // so we don't double-fire if click also comes through.
-  const firedRef = useRef(false);
+  const { fire, release, onPointerDown } = useWebKitPointerDown();
 
   useEffect(() => {
     if (open) {
       setName("");
       setIsCreating(false);
       isCreatingRef.current = false;
-      firedRef.current = false;
     }
   }, [open]);
 
   const handleCreate = useCallback(async () => {
-    if (firedRef.current) return;
+    if (!fire()) return;
     const trimmed = name.trim();
-    if (!trimmed || isCreatingRef.current) return;
-    firedRef.current = true;
+    if (!trimmed || isCreatingRef.current) {
+      release();
+      return;
+    }
     isCreatingRef.current = true;
     setIsCreating(true);
     try {
@@ -40,20 +40,13 @@ function CreateProfileDialog({ open, onClose, onCreate, isLoading }: CreateProfi
     } finally {
       isCreatingRef.current = false;
       setIsCreating(false);
-      // Reset firedRef after a tick so the button is usable again
-      setTimeout(() => {
-        firedRef.current = false;
-      }, 50);
+      release();
     }
-  }, [name, onCreate]);
+  }, [name, onCreate, fire, release]);
 
   const handleCancel = useCallback(() => {
-    if (firedRef.current || isCreatingRef.current) return;
-    firedRef.current = true;
+    if (isCreatingRef.current) return;
     onClose();
-    setTimeout(() => {
-      firedRef.current = false;
-    }, 50);
   }, [onClose]);
 
   const handleKeyDown = useCallback(
@@ -64,17 +57,6 @@ function CreateProfileDialog({ open, onClose, onCreate, isLoading }: CreateProfi
       }
     },
     [handleCreate],
-  );
-
-  // WebKit workaround: use pointerdown instead of click, because WebKit
-  // swallows the first click after typing when focus moves from input to button.
-  const handlePointerDown = useCallback(
-    (handler: () => void) => (e: React.PointerEvent) => {
-      // Only handle primary button (left mouse button / single touch)
-      if (e.button !== 0) return;
-      handler();
-    },
-    [],
   );
 
   if (!open) return null;
@@ -96,7 +78,7 @@ function CreateProfileDialog({ open, onClose, onCreate, isLoading }: CreateProfi
           <button
             className="btn btn-primary"
             onClick={handleCreate}
-            onPointerDown={handlePointerDown(handleCreate)}
+            onPointerDown={onPointerDown(handleCreate)}
             disabled={disabled}
           >
             {isCreating ? "Creating..." : "Create"}
@@ -104,7 +86,7 @@ function CreateProfileDialog({ open, onClose, onCreate, isLoading }: CreateProfi
           <button
             className="btn btn-ghost"
             onClick={handleCancel}
-            onPointerDown={handlePointerDown(handleCancel)}
+            onPointerDown={onPointerDown(handleCancel)}
             disabled={isCreating}
           >
             Cancel
