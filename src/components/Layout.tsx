@@ -127,6 +127,7 @@ function Layout() {
   const setError = useSetAtom(errorAtom);
   const [showManagement, setShowManagement] = useState(false);
   const [showCreateDialog, setShowCreateDialog] = useState(false);
+  const [togglingId, setTogglingId] = useState<string | null>(null);
 
   const handleProfileClick = useCallback(
     (id: string) => {
@@ -139,11 +140,17 @@ function Layout() {
     (e: React.MouseEvent, id: string) => {
       e.stopPropagation();
       e.preventDefault();
-      toggleEnabled(id).catch((err) => {
-        setError(extractErrorMessage(err));
-      });
+      if (togglingId) return;
+      setTogglingId(id);
+      toggleEnabled(id)
+        .catch((err) => {
+          setError(extractErrorMessage(err));
+        })
+        .finally(() => {
+          setTogglingId(null);
+        });
     },
-    [toggleEnabled, setError],
+    [toggleEnabled, setError, togglingId],
   );
 
   const handleNewProfile = useCallback(() => {

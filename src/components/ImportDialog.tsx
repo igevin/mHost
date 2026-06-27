@@ -1,9 +1,11 @@
 import { useState, useEffect, useCallback, useRef } from "react";
+import { createPortal } from "react-dom";
 import type { HostRule, Profile, ParseErrorAtLine } from "../types";
 import { countRealRules } from "../lib/rules";
 import { validateHostsText, importProfile, importProfileFromFile } from "../lib/tauri";
 import { extractErrorMessage } from "../lib/error";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
+import { useWebKitPointerDown } from "../hooks/useWebKitPointerDown";
 import styles from "./ImportDialog.module.css";
 
 type ImportSource = "text" | "file-hosts" | "file-json";
@@ -28,6 +30,7 @@ function ImportDialog({ open, onClose, mode = "create", onImported, onRulesParse
   const [isImporting, setIsImporting] = useState(false);
   const [importError, setImportError] = useState<string | null>(null);
   const validateTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const { fire, release, onPointerDown } = useWebKitPointerDown();
 
   // Reset state when dialog opens/closes
   useEffect(() => {
@@ -127,7 +130,11 @@ function ImportDialog({ open, onClose, mode = "create", onImported, onRulesParse
         : filePath !== null);
 
   const handleImport = useCallback(async () => {
-    if (!canImport) return;
+    if (!fire()) return;
+    if (!canImport) {
+      release();
+      return;
+    }
     setIsImporting(true);
     setImportError(null);
     try {
@@ -138,6 +145,7 @@ function ImportDialog({ open, onClose, mode = "create", onImported, onRulesParse
           if (result.errors.length > 0) {
             setErrors(result.errors);
             setIsImporting(false);
+            release();
             return;
           }
           onRulesParsed(result.rules);
@@ -165,8 +173,14 @@ function ImportDialog({ open, onClose, mode = "create", onImported, onRulesParse
       setImportError(extractErrorMessage(err));
     } finally {
       setIsImporting(false);
+      release();
     }
-  }, [canImport, isReplace, source, hostsText, filePath, name, onRulesParsed, onImported, onClose]);
+  }, [canImport, isReplace, source, hostsText, filePath, name, onRulesParsed, onImported, onClose, fire, release]);
+
+  const handleCancel = useCallback(() => {
+    if (isImporting) return;
+    onClose();
+  }, [isImporting, onClose]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -179,7 +193,7 @@ function ImportDialog({ open, onClose, mode = "create", onImported, onRulesParse
 
   if (!open) return null;
 
-  return (
+  return createPortal(
     <div className={styles.overlay} onClick={onClose} onKeyDown={handleKeyDown}>
       <div className={styles.dialog} onClick={(e) => e.stopPropagation()}>
         <h3 className={styles.title}>
@@ -208,18 +222,21 @@ function ImportDialog({ open, onClose, mode = "create", onImported, onRulesParse
             <button
               className={`btn btn-sm ${source === "text" ? "btn-primary" : "btn-ghost"}`}
               onClick={() => handleSourceChange("text")}
+              onPointerDown={(e) => { if (e.button === 0) handleSourceChange("text"); }}
             >
               Paste Text
             </button>
             <button
               className={`btn btn-sm ${source === "file-hosts" ? "btn-primary" : "btn-ghost"}`}
               onClick={() => handleSourceChange("file-hosts")}
+              onPointerDown={(e) => { if (e.button === 0) handleSourceChange("file-hosts"); }}
             >
               Hosts File
             </button>
             <button
               className={`btn btn-sm ${source === "file-json" ? "btn-primary" : "btn-ghost"}`}
               onClick={() => handleSourceChange("file-json")}
+              onPointerDown={(e) => { if (e.button === 0) handleSourceChange("file-json"); }}
             >
               JSON File
             </button>
@@ -250,6 +267,7 @@ function ImportDialog({ open, onClose, mode = "create", onImported, onRulesParse
               <button
                 className="btn btn-ghost btn-sm"
                 onClick={handleSelectFile}
+                onPointerDown={onPointerDown(handleSelectFile)}
                 disabled={isImporting}
               >
                 Select File...
@@ -291,16 +309,23 @@ function ImportDialog({ open, onClose, mode = "create", onImported, onRulesParse
           <button
             className="btn btn-primary"
             onClick={handleImport}
+            onPointerDown={onPointerDown(handleImport)}
             disabled={!canImport || isImporting}
           >
             {isImporting ? "Importing..." : isReplace ? "Import & Replace" : "Import"}
           </button>
-          <button className="btn btn-ghost" onClick={onClose}>
+          <button
+            className="btn btn-ghost"
+            onClick={handleCancel}
+            onPointerDown={onPointerDown(handleCancel)}
+            disabled={isImporting}
+          >
             Cancel
           </button>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
 

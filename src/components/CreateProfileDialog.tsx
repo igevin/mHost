@@ -1,5 +1,6 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { createPortal } from "react-dom";
+import { useWebKitPointerDown } from "../hooks/useWebKitPointerDown";
 import styles from "./CreateProfileDialog.module.css";
 
 interface CreateProfileDialogProps {
@@ -11,29 +12,56 @@ interface CreateProfileDialogProps {
 
 function CreateProfileDialog({ open, onClose, onCreate, isLoading }: CreateProfileDialogProps) {
   const [name, setName] = useState("");
-  const [mounted, setMounted] = useState(false);
-
-  useEffect(() => {
-    setMounted(true);
-  }, []);
+  const [isCreating, setIsCreating] = useState(false);
+  const isCreatingRef = useRef(false);
+  const { fire, release, onPointerDown } = useWebKitPointerDown();
 
   useEffect(() => {
     if (open) {
       setName("");
+      setIsCreating(false);
+      isCreatingRef.current = false;
     }
   }, [open]);
 
-  const handleCreate = async () => {
+  const handleCreate = useCallback(async () => {
+    if (!fire()) return;
     const trimmed = name.trim();
-    if (!trimmed) return;
-    await onCreate(trimmed);
-  };
+    if (!trimmed || isCreatingRef.current) {
+      release();
+      return;
+    }
+    isCreatingRef.current = true;
+    setIsCreating(true);
+    try {
+      await onCreate(trimmed);
+    } catch {
+      // Error handled by parent
+    } finally {
+      isCreatingRef.current = false;
+      setIsCreating(false);
+      release();
+    }
+  }, [name, onCreate, fire, release]);
 
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === "Enter") handleCreate();
-  };
+  const handleCancel = useCallback(() => {
+    if (isCreatingRef.current) return;
+    onClose();
+  }, [onClose]);
 
-  if (!open || !mounted) return null;
+  const handleKeyDown = useCallback(
+    (e: React.KeyboardEvent) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        handleCreate();
+      }
+    },
+    [handleCreate],
+  );
+
+  if (!open) return null;
+
+  const disabled = !name.trim() || isLoading || isCreating;
 
   return createPortal(
     <div className={styles.overlay} onClick={onClose}>
@@ -46,16 +74,21 @@ function CreateProfileDialog({ open, onClose, onCreate, isLoading }: CreateProfi
             value={name}
             onChange={(e) => setName(e.target.value)}
             onKeyDown={handleKeyDown}
-            autoFocus
           />
           <button
             className="btn btn-primary"
             onClick={handleCreate}
-            disabled={!name.trim() || isLoading}
+            onPointerDown={onPointerDown(handleCreate)}
+            disabled={disabled}
           >
-            Create
+            {isCreating ? "Creating..." : "Create"}
           </button>
-          <button className="btn btn-ghost" onClick={onClose}>
+          <button
+            className="btn btn-ghost"
+            onClick={handleCancel}
+            onPointerDown={onPointerDown(handleCancel)}
+            disabled={isCreating}
+          >
             Cancel
           </button>
         </div>
