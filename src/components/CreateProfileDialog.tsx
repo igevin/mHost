@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { createPortal } from "react-dom";
 import styles from "./CreateProfileDialog.module.css";
 
 interface CreateProfileDialogProps {
@@ -10,6 +11,11 @@ interface CreateProfileDialogProps {
 
 function CreateProfileDialog({ open, onClose, onCreate, isLoading }: CreateProfileDialogProps) {
   const [name, setName] = useState("");
+  const [mounted, setMounted] = useState(false);
+
+  useEffect(() => {
+    setMounted(true);
+  }, []);
 
   useEffect(() => {
     if (open) {
@@ -27,9 +33,9 @@ function CreateProfileDialog({ open, onClose, onCreate, isLoading }: CreateProfi
     if (e.key === "Enter") handleCreate();
   };
 
-  if (!open) return null;
+  if (!open || !mounted) return null;
 
-  return (
+  return createPortal(
     <div className={styles.overlay} onClick={onClose}>
       <div className={styles.dialog} onClick={(e) => e.stopPropagation()}>
         <h3 className={styles.title}>Create Profile</h3>
@@ -54,7 +60,8 @@ function CreateProfileDialog({ open, onClose, onCreate, isLoading }: CreateProfi
           </button>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
 
