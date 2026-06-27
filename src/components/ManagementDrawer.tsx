@@ -40,6 +40,8 @@ function ManagementDrawer({ open, onClose }: ManagementDrawerProps) {
 
   // Loading state for toggle operations to prevent duplicate clicks
   const [togglingId, setTogglingId] = useState<string | null>(null);
+  const [duplicatingId, setDuplicatingId] = useState<string | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
 
   // Create profile dialog state
   const [showCreateDialog, setShowCreateDialog] = useState(false);
@@ -109,14 +111,18 @@ function ManagementDrawer({ open, onClose }: ManagementDrawerProps) {
 
   const handleDuplicate = useCallback(
     async (profile: Profile) => {
+      if (duplicatingId) return;
+      setDuplicatingId(profile.id);
       try {
         await duplicateProfile(profile.id, `${profile.name} (copy)`);
         await fetchProfiles();
       } catch (err: unknown) {
         setError(extractErrorMessage(err));
+      } finally {
+        setDuplicatingId(null);
       }
     },
-    [setError, fetchProfiles],
+    [duplicatingId, setError, fetchProfiles],
   );
 
   const handleExport = useCallback(
@@ -141,15 +147,19 @@ function ManagementDrawer({ open, onClose }: ManagementDrawerProps) {
 
   const handleDelete = useCallback(
     async (id: string) => {
+      if (deletingId) return;
       const confirmed = await confirm("Delete this profile?");
       if (!confirmed) return;
+      setDeletingId(id);
       try {
         await deleteProfile(id);
       } catch (err: unknown) {
         setError(extractErrorMessage(err));
+      } finally {
+        setDeletingId(null);
       }
     },
-    [deleteProfile, setError],
+    [deletingId, deleteProfile, setError],
   );
 
   const handleToggle = useCallback(
@@ -297,8 +307,9 @@ function ManagementDrawer({ open, onClose }: ManagementDrawerProps) {
                   <button
                     className="btn btn-ghost btn-sm"
                     onClick={() => handleDuplicate(profile)}
+                    disabled={duplicatingId === profile.id}
                   >
-                    Duplicate
+                    {duplicatingId === profile.id ? "Duplicating..." : "Duplicate"}
                   </button>
                   <button
                     className="btn btn-ghost btn-sm"
@@ -309,9 +320,9 @@ function ManagementDrawer({ open, onClose }: ManagementDrawerProps) {
                   <button
                     className="btn btn-danger btn-sm"
                     onClick={() => handleDelete(profile.id)}
-                    disabled={profile.protected}
+                    disabled={profile.protected || deletingId === profile.id}
                   >
-                    Delete
+                    {deletingId === profile.id ? "Deleting..." : "Delete"}
                   </button>
                 </div>
               </div>

@@ -40,6 +40,8 @@ function ProfileView() {
   const [isEditing, setIsEditing] = useState(false);
   const [isInfoBarExpanded, setIsInfoBarExpanded] = useState(false);
   const [isEditingInfo, setIsEditingInfo] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  const [isSavingInfo, setIsSavingInfo] = useState(false);
   const [importDialogOpen, setImportDialogOpen] = useState(false);
   const [showCreateDialog, setShowCreateDialog] = useState(false);
 
@@ -140,7 +142,8 @@ function ProfileView() {
   }, []);
 
   const handleSaveInfo = useCallback(async () => {
-    if (!profile || !infoHasChanges) return;
+    if (!profile || !infoHasChanges || isSavingInfo) return;
+    setIsSavingInfo(true);
     try {
       const tags = draftInfo.tags
         .split(",")
@@ -158,11 +161,14 @@ function ProfileView() {
       setIsInfoBarExpanded(false);
     } catch (err: unknown) {
       setError(extractErrorMessage(err));
+    } finally {
+      setIsSavingInfo(false);
     }
-  }, [profile, draftInfo, infoHasChanges, updateProfile, setError]);
+  }, [profile, draftInfo, infoHasChanges, isSavingInfo, updateProfile, setError]);
 
   const handleSave = useCallback(async () => {
-    if (!profile || ruleErrors) return;
+    if (!profile || ruleErrors || isSaving) return;
+    setIsSaving(true);
     try {
       const updated = { ...profile, rules: draftRules };
       await updateProfile(updated);
@@ -171,8 +177,10 @@ function ProfileView() {
       isEditingRef.current = false;
     } catch (err: unknown) {
       setError(extractErrorMessage(err));
+    } finally {
+      setIsSaving(false);
     }
-  }, [profile, draftRules, ruleErrors, updateProfile, setError]);
+  }, [profile, draftRules, ruleErrors, isSaving, updateProfile, setError]);
 
   const handleDeleteProfile = useCallback(async () => {
     if (!profile || !id || profile.protected) return;
@@ -334,9 +342,9 @@ function ProfileView() {
                   <button
                     className="btn btn-primary btn-sm"
                     onClick={handleSaveInfo}
-                    disabled={!infoHasChanges || isLoading}
+                    disabled={!infoHasChanges || isLoading || isSavingInfo}
                   >
-                    Save
+                    {isSavingInfo ? "Saving..." : "Save"}
                   </button>
                   <button
                     className="btn btn-ghost btn-sm"
@@ -437,9 +445,9 @@ function ProfileView() {
               <button
                 className="btn btn-primary btn-sm"
                 onClick={handleSave}
-                disabled={!hasChanges || isLoading || ruleErrors}
+                disabled={!hasChanges || isLoading || ruleErrors || isSaving}
               >
-                Save
+                {isSaving ? "Saving..." : "Save"}
               </button>
             </>
           )}
