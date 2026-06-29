@@ -24,6 +24,60 @@ pub async fn generate_apply_plan(state: State<'_, AppState>) -> Result<ApplyPlan
     }).await.map_err(|e| MhostError::InvalidInput(e.to_string()))?
 }
 
+/// Generate a preview plan for enabling/disabling a profile without modifying storage.
+///
+/// Testable without Tauri `State`.
+pub fn generate_preview_plan_logic(
+    id: &ProfileId,
+    enabled: bool,
+    storage: &(dyn Storage + Send + Sync),
+    writer: &HostsWriter,
+) -> Result<ApplyPlan, MhostError> {
+    let mut profiles = storage.list_profiles()?;
+
+    let mut found = false;
+    for profile in &mut profiles {
+        if profile.id == *id {
+            profile.enabled = enabled;
+            found = true;
+        } else if enabled {
+            // Single-profile exclusive mode: disable others when enabling target
+            profile.enabled = false;
+        }
+    }
+
+    if !found {
+        return Err(MhostError::InvalidInput(format!("profile not found: {}", id)));
+    }
+
+    let current_hosts = match std::fs::read_to_string(writer.hosts_path()) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(e.into());
+        }
+    };
+
+    generate_plan(&profiles, &current_hosts).map_err(Into::into)
+}
+
+/// Preview the apply plan for enabling/disabling a profile without modifying storage.
+///
+/// This is a pure query command: no storage state is mutated and no hosts file is written.
+#[tauri::command]
+pub async fn generate_preview_plan(
+    id: String,
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> Result<ApplyPlan, MhostError> {
+    let storage = state.storage.clone();
+    let writer = state.writer.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let profile_id = std::str::FromStr::from_str(&id)?;
+        generate_preview_plan_logic(&profile_id, enabled, storage.as_ref(), &writer)
+    }).await.map_err(|e| MhostError::InvalidInput(e.to_string()))?
+}
+
 /// Reject an empty plan (no enabled profiles with rules).
 ///
 /// Extracted as a pure function so it can be tested without Tauri `State`.
@@ -520,6 +574,82 @@ mod tests {
             "original content should be preserved: {}",
             hosts_after
         );
+    }
+
+    #[test]
+    fn test_generate_preview_plan_enable_shows_target_rules() {
+        let (_temp, storage, writer) = create_test_storage_and_writer();
+
+        // Create two profiles, enable the first one
+        let mut profile_a = create_profile_with_rules(
+            &storage,
+            "dev",
+            vec![("127.0.0.1", "example.com")],
+        );
+        profile_a.enabled = true;
+        storage.save_profile(&profile_a).unwrap();
+
+        let profile_b = create_profile_with_rules(
+            &storage,
+            "test",
+            vec![("192.168.1.1", "test.local")],
+        );
+
+        // Preview enabling profile_b (should disable profile_a)
+        let plan = generate_preview_plan_logic(
+            &profile_b.id,
+            true,
+            storage.as_ref(),
+            &writer,
+        ).unwrap();
+
+        // Verify plan contains profile_b's rules
+        assert!(
+            plan.rules.iter().any(|r| r.ip.to_string() == "192.168.1.1" && r.domain == "test.local"),
+            "plan should contain profile_b rules: {:?}",
+            plan.rules
+        );
+        // Verify plan does NOT contain profile_a's rules
+        assert!(
+            !plan.rules.iter().any(|r| r.ip.to_string() == "127.0.0.1" && r.domain == "example.com"),
+            "plan should NOT contain profile_a rules: {:?}",
+            plan.rules
+        );
+
+        // Verify storage state was NOT modified
+        let loaded_a = storage.load_profile(&profile_a.id).unwrap();
+        assert!(loaded_a.enabled, "profile_a should still be enabled in storage");
+        let loaded_b = storage.load_profile(&profile_b.id).unwrap();
+        assert!(!loaded_b.enabled, "profile_b should still be disabled in storage");
+    }
+
+    #[test]
+    fn test_generate_preview_plan_disable_shows_empty_plan() {
+        let (_temp, storage, writer) = create_test_storage_and_writer();
+
+        // Create and enable a profile
+        let mut profile = create_profile_with_rules(
+            &storage,
+            "dev",
+            vec![("127.0.0.1", "example.com")],
+        );
+        profile.enabled = true;
+        storage.save_profile(&profile).unwrap();
+
+        // Preview disabling the profile
+        let plan = generate_preview_plan_logic(
+            &profile.id,
+            false,
+            storage.as_ref(),
+            &writer,
+        ).unwrap();
+
+        // Verify plan is empty
+        assert!(plan.rules.is_empty(), "plan should be empty when disabling the only enabled profile: {:?}", plan.rules);
+
+        // Verify storage state was NOT modified
+        let loaded = storage.load_profile(&profile.id).unwrap();
+        assert!(loaded.enabled, "profile should still be enabled in storage");
     }
 }
 

@@ -29,12 +29,15 @@
 
 /* ---- Diff Preview ---- */
 
+.diffSection {
+  margin-bottom: 16px;
+}
+
 .diffPreview {
   background: var(--color-bg);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-sm);
   padding: 12px;
-  margin-bottom: 16px;
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   font-size: 12px;
   line-height: 1.8;
@@ -55,11 +58,31 @@
 
 .diffUnchanged {
   color: var(--color-text-muted);
+  background: var(--color-bg);
 }
 
 .diffLine {
   padding: 1px 4px;
   white-space: pre;
+}
+
+.diffUnchangedCollapsed {
+  display: block;
+  width: 100%;
+  padding: 4px;
+  text-align: center;
+  color: var(--color-text-muted);
+  background: none;
+  border: none;
+  font-size: 12px;
+  cursor: pointer;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.diffUnchangedCollapsed:hover {
+  color: var(--color-text-secondary);
+  background: var(--color-border-secondary);
+  border-radius: var(--radius-sm);
 }
 
 .diffEmpty {
@@ -75,6 +98,23 @@
   margin-bottom: 16px;
 }
 
+.conflictWarning {
+  padding: 8px 12px;
+  background: var(--yellow-light);
+  color: var(--yellow);
+  border: 1px solid var(--yellow);
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+.conflictList {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
 .conflictItem {
   display: flex;
   align-items: center;
@@ -85,7 +125,6 @@
   border-radius: var(--radius-sm);
   font-size: 13px;
   color: var(--color-danger);
-  margin-bottom: 6px;
 }
 
 .conflictItem:last-child {
@@ -95,6 +134,14 @@
 .conflictDomain {
   font-weight: 600;
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+/* ---- Backup Notice ---- */
+
+.backupNotice {
+  font-size: 13px;
+  color: var(--color-text-secondary);
+  margin-bottom: 16px;
 }
 
 /* ---- Progress ---- */

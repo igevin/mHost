@@ -94,3 +94,7 @@ export async function getManagedBlockContent(): Promise<string | null> {
 export async function getLastApplied(): Promise<string | null> {
   return invoke("get_last_applied");
 }
+
+export async function generatePreviewPlan(id: string, enabled: boolean): Promise<ApplyPlan> {
+  return invoke("generate_preview_plan", { id, enabled });
+}
