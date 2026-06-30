@@ -133,3 +133,22 @@
   border-radius: var(--radius-sm);
   padding: 4px 8px;
 }
+
+/* ---- Search Match Highlights ---- */
+
+.searchMatch,
+.searchMatchActive {
+  padding: 0;
+  margin: 0;
+  font-family: inherit;
+  font-size: inherit;
+  line-height: inherit;
+}
+
+.searchMatch {
+  background: rgba(255, 215, 0, 0.4);
+}
+
+.searchMatchActive {
+  background: rgba(255, 140, 0, 0.5);
+}

@@ -242,4 +242,208 @@ describe("RuleEditor", () => {
 
     expect(screen.queryByText(/冗余|冲突/)).not.toBeInTheDocument();
   });
+
+  describe("Search & Replace", () => {
+    it("opens search bar on Cmd+F", () => {
+      render(<RuleEditor rules={sampleRules} onChange={vi.fn()} />);
+      expect(screen.queryByTestId("search-input")).not.toBeInTheDocument();
+
+      fireEvent.keyDown(document, { key: "f", metaKey: true });
+      expect(screen.getByTestId("search-input")).toBeInTheDocument();
+    });
+
+    it("opens search bar on Ctrl+F", () => {
+      render(<RuleEditor rules={sampleRules} onChange={vi.fn()} />);
+      fireEvent.keyDown(document, { key: "f", ctrlKey: true });
+      expect(screen.getByTestId("search-input")).toBeInTheDocument();
+    });
+
+    it("closes search bar on Esc when focus is outside search bar", () => {
+      render(<RuleEditor rules={sampleRules} onChange={vi.fn()} />);
+      fireEvent.keyDown(document, { key: "f", metaKey: true });
+      expect(screen.getByTestId("search-input")).toBeInTheDocument();
+
+      // Focus the textarea and press Esc
+      const textarea = document.querySelector("textarea")!;
+      textarea.focus();
+      fireEvent.keyDown(document, { key: "Escape" });
+      expect(screen.queryByTestId("search-input")).not.toBeInTheDocument();
+    });
+
+    it("highlights search matches in the highlight layer", () => {
+      render(<RuleEditor rules={sampleRules} onChange={vi.fn()} />);
+      fireEvent.keyDown(document, { key: "f", metaKey: true });
+
+      const searchInput = screen.getByTestId("search-input");
+      fireEvent.change(searchInput, { target: { value: "localhost" } });
+
+      const highlightLayer = document.querySelector("[aria-hidden='true']");
+      expect(highlightLayer).toBeInTheDocument();
+      expect(highlightLayer!.innerHTML).toMatch(/searchMatch/);
+    });
+
+    it("shows active match with distinct style", () => {
+      const rules = [
+        makeRule({ id: "r1", ip: "127.0.0.1", domains: ["localhost", "localhost"] }),
+      ];
+      render(<RuleEditor rules={rules} onChange={vi.fn()} />);
+      fireEvent.keyDown(document, { key: "f", metaKey: true });
+
+      const searchInput = screen.getByTestId("search-input");
+      fireEvent.change(searchInput, { target: { value: "localhost" } });
+
+      const highlightLayer = document.querySelector("[aria-hidden='true']");
+      expect(highlightLayer!.innerHTML).toMatch(/searchMatchActive/);
+    });
+
+    it("shows 0/0 when no matches", () => {
+      render(<RuleEditor rules={sampleRules} onChange={vi.fn()} />);
+      fireEvent.keyDown(document, { key: "f", metaKey: true });
+
+      const searchInput = screen.getByTestId("search-input");
+      fireEvent.change(searchInput, { target: { value: "nonexistent" } });
+
+      expect(screen.getByText("0/0")).toBeInTheDocument();
+    });
+
+    it("navigates between matches with prev/next buttons", () => {
+      const rules = [
+        makeRule({ id: "r1", ip: "127.0.0.1", domains: ["localhost", "localhost", "localhost"] }),
+      ];
+      render(<RuleEditor rules={rules} onChange={vi.fn()} />);
+      fireEvent.keyDown(document, { key: "f", metaKey: true });
+
+      const searchInput = screen.getByTestId("search-input");
+      fireEvent.change(searchInput, { target: { value: "localhost" } });
+
+      // Should show 1/3
+      expect(screen.getByText("1/3")).toBeInTheDocument();
+
+      // Click next -> 2/3
+      fireEvent.click(screen.getByTestId("next-button"));
+      expect(screen.getByText("2/3")).toBeInTheDocument();
+
+      // Click next -> 3/3
+      fireEvent.click(screen.getByTestId("next-button"));
+      expect(screen.getByText("3/3")).toBeInTheDocument();
+
+      // Click next -> cycles to 1/3
+      fireEvent.click(screen.getByTestId("next-button"));
+      expect(screen.getByText("1/3")).toBeInTheDocument();
+
+      // Click prev -> cycles to 3/3
+      fireEvent.click(screen.getByTestId("prev-button"));
+      expect(screen.getByText("3/3")).toBeInTheDocument();
+    });
+
+    it("navigates matches with Enter and Shift+Enter", () => {
+      const rules = [
+        makeRule({ id: "r1", ip: "127.0.0.1", domains: ["localhost", "localhost"] }),
+      ];
+      render(<RuleEditor rules={rules} onChange={vi.fn()} />);
+      fireEvent.keyDown(document, { key: "f", metaKey: true });
+
+      const searchInput = screen.getByTestId("search-input");
+      fireEvent.change(searchInput, { target: { value: "localhost" } });
+
+      expect(screen.getByText("1/2")).toBeInTheDocument();
+
+      fireEvent.keyDown(searchInput, { key: "Enter", shiftKey: false });
+      expect(screen.getByText("2/2")).toBeInTheDocument();
+
+      fireEvent.keyDown(searchInput, { key: "Enter", shiftKey: true });
+      expect(screen.getByText("1/2")).toBeInTheDocument();
+    });
+
+    it("handles search query with regex special characters", () => {
+      const rules = [
+        makeRule({ id: "r1", ip: "127.0.0.1", domains: ["test.com"] }),
+      ];
+      render(<RuleEditor rules={rules} onChange={vi.fn()} />);
+      fireEvent.keyDown(document, { key: "f", metaKey: true });
+
+      const searchInput = screen.getByTestId("search-input");
+      // Searching for a literal dot should match the IP, not act as regex wildcard
+      fireEvent.change(searchInput, { target: { value: "127.0.0" } });
+
+      expect(screen.getByText("1/1")).toBeInTheDocument();
+    });
+
+    it("replaces current match", () => {
+      mockValidateHostsText.mockResolvedValue({
+        rules: [],
+        errors: [],
+        duplicates: [],
+      });
+
+      const rules = [
+        makeRule({ id: "r1", ip: "127.0.0.1", domains: ["localhost", "localhost"] }),
+      ];
+      render(<RuleEditor rules={rules} onChange={vi.fn()} />);
+      fireEvent.keyDown(document, { key: "f", metaKey: true });
+
+      const searchInput = screen.getByTestId("search-input");
+      fireEvent.change(searchInput, { target: { value: "localhost" } });
+
+      fireEvent.click(screen.getByTestId("toggle-replace"));
+      fireEvent.change(screen.getByTestId("replace-input"), { target: { value: "newhost" } });
+      fireEvent.click(screen.getByTestId("replace-button"));
+
+      const textarea = document.querySelector("textarea")!;
+      expect(textarea).toHaveValue("127.0.0.1 newhost localhost");
+    });
+
+    it("replaces all matches", () => {
+      mockValidateHostsText.mockResolvedValue({
+        rules: [],
+        errors: [],
+        duplicates: [],
+      });
+
+      const rules = [
+        makeRule({ id: "r1", ip: "127.0.0.1", domains: ["localhost", "localhost", "localhost"] }),
+      ];
+      render(<RuleEditor rules={rules} onChange={vi.fn()} />);
+      fireEvent.keyDown(document, { key: "f", metaKey: true });
+
+      const searchInput = screen.getByTestId("search-input");
+      fireEvent.change(searchInput, { target: { value: "localhost" } });
+
+      fireEvent.click(screen.getByTestId("toggle-replace"));
+      fireEvent.change(screen.getByTestId("replace-input"), { target: { value: "newhost" } });
+      fireEvent.click(screen.getByTestId("replace-all-button"));
+
+      const textarea = document.querySelector("textarea")!;
+      expect(textarea).toHaveValue("127.0.0.1 newhost newhost newhost");
+    });
+
+    it("hides replace functionality in readOnly mode", () => {
+      render(<RuleEditor rules={sampleRules} onChange={vi.fn()} readOnly />);
+      fireEvent.keyDown(document, { key: "f", metaKey: true });
+
+      expect(screen.getByTestId("search-input")).toBeInTheDocument();
+      expect(screen.queryByTestId("toggle-replace")).not.toBeInTheDocument();
+    });
+
+    it("clears search highlights when search bar is closed", () => {
+      render(<RuleEditor rules={sampleRules} onChange={vi.fn()} />);
+      fireEvent.keyDown(document, { key: "f", metaKey: true });
+
+      const searchInput = screen.getByTestId("search-input");
+      fireEvent.change(searchInput, { target: { value: "localhost" } });
+
+      let highlightLayer = document.querySelector("[aria-hidden='true']");
+      expect(highlightLayer!.innerHTML).toMatch(/searchMatch/);
+
+      // Close search bar via Escape inside search input
+      fireEvent.keyDown(searchInput, { key: "Escape" });
+
+      // Search bar should be gone
+      expect(screen.queryByTestId("search-input")).not.toBeInTheDocument();
+
+      // Highlights should be cleared (no searchMatch in highlight layer)
+      highlightLayer = document.querySelector("[aria-hidden='true']");
+      expect(highlightLayer!.innerHTML).not.toMatch(/searchMatch/);
+    });
+  });
 });
