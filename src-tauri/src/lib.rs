@@ -35,6 +35,8 @@ pub fn run() {
             generate_apply_plan,
             apply_hosts,
             rollback_hosts,
+            list_backups,
+            rollback_to_backup,
             read_system_hosts,
             validate_hosts_text,
             validate_hosts_errors,

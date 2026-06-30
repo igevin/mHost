@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Profile, ApplyPlan, ValidateResult, ExportFormat } from "../types";
+import type { Profile, ApplyPlan, ValidateResult, ExportFormat, BackupInfo } from "../types";
 
 // ---- Profile commands ----
 
@@ -97,4 +97,14 @@ export async function getLastApplied(): Promise<string | null> {
 
 export async function generatePreviewPlan(id: string, enabled: boolean): Promise<ApplyPlan> {
   return invoke("generate_preview_plan", { id, enabled });
+}
+
+// ---- Backup commands ----
+
+export async function listBackups(): Promise<BackupInfo[]> {
+  return invoke("list_backups");
+}
+
+export async function rollbackToBackup(id: string): Promise<void> {
+  return invoke("rollback_to_backup", { id });
 }

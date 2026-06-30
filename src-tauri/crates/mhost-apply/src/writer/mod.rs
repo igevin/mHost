@@ -59,6 +59,11 @@ impl HostsWriter {
         &self.hosts_path
     }
 
+    /// Return the path to the backup directory.
+    pub fn backup_dir(&self) -> &Path {
+        &self.backup_dir
+    }
+
     /// Create a new `HostsWriter` with custom paths (for testing).
     pub fn with_paths(hosts_path: impl Into<PathBuf>, backup_dir: impl Into<PathBuf>) -> Self {
         let hosts_path = hosts_path.into();
@@ -186,6 +191,44 @@ impl HostsWriter {
         let latest_path = latest.path();
 
         let backup_content = fs::read_to_string(&latest_path)?;
+        self.atomic_write(&backup_content)?;
+
+        // Verify rollback succeeded
+        let rolled_back = fs::read_to_string(&self.hosts_path)?;
+        if rolled_back != backup_content {
+            return Err(ApplyError::BackupFailed("rollback content mismatch".to_string()).into());
+        }
+
+        Ok(())
+    }
+
+    /// Rollback to a specific backup file.
+    ///
+    /// Reads the specified backup and writes it to the hosts path.
+    /// After rollback, verifies the file content matches the backup.
+    pub fn rollback_to_backup(&self, backup_path: &Path) -> Result<(), MhostError> {
+        // Security fix (#19): Verify hosts_path is a regular file before rollback
+        ensure_regular_file(&self.hosts_path)?;
+
+        // Security: validate backup_path is within backup_dir to prevent path traversal
+        let canonical_backup = backup_path.canonicalize().map_err(|_| {
+            ApplyError::BackupFailed(format!("invalid backup path: {}", backup_path.display()))
+        })?;
+        let canonical_dir = self.backup_dir.canonicalize().map_err(|_| {
+            ApplyError::BackupFailed("invalid backup directory".to_string())
+        })?;
+        if !canonical_backup.starts_with(&canonical_dir) {
+            return Err(ApplyError::BackupFailed("invalid backup path".to_string()).into());
+        }
+
+        if !backup_path.exists() {
+            return Err(ApplyError::BackupFailed(
+                format!("backup not found: {}", backup_path.display()),
+            )
+            .into());
+        }
+
+        let backup_content = fs::read_to_string(backup_path)?;
         self.atomic_write(&backup_content)?;
 
         // Verify rollback succeeded

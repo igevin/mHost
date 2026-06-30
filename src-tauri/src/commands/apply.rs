@@ -1,6 +1,6 @@
 use mhost_apply::{ApplyPlan, generate_plan};
-use mhost_apply::writer::HostsWriter;
-use mhost_core::{MhostError, ProfileId};
+use mhost_apply::writer::{HostsWriter, backup};
+use mhost_core::{BackupInfo, MhostError, ProfileId};
 use mhost_storage::storage::Storage;
 use tauri::{AppHandle, State};
 
@@ -225,6 +225,27 @@ pub async fn rollback_hosts(state: State<'_, AppState>) -> Result<(), MhostError
     let writer = state.writer.clone();
     tauri::async_runtime::spawn_blocking(move || {
         writer.rollback().map_err(Into::into)
+    }).await.map_err(|e| MhostError::InvalidInput(e.to_string()))?
+}
+
+#[tauri::command]
+pub async fn list_backups(state: State<'_, AppState>) -> Result<Vec<BackupInfo>, MhostError> {
+    let backup_dir = state.writer.backup_dir().to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || {
+        backup::list_backups(&backup_dir).map_err(Into::into)
+    }).await.map_err(|e| MhostError::InvalidInput(e.to_string()))?
+}
+
+#[tauri::command]
+pub async fn rollback_to_backup(
+    id: String,
+    state: State<'_, AppState>,
+) -> Result<(), MhostError> {
+    let _guard = state.apply_lock.lock().await;
+    let writer = state.writer.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let backup_path = writer.backup_dir().join(&id);
+        writer.rollback_to_backup(&backup_path).map_err(Into::into)
     }).await.map_err(|e| MhostError::InvalidInput(e.to_string()))?
 }
 

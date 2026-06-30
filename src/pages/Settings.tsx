@@ -3,7 +3,7 @@ import { useSetAtom } from "jotai";
 import { readSystemHosts } from "../lib/tauri";
 import { extractErrorMessage } from "../lib/error";
 import { rollbackHostsActionAtom } from "../stores/profiles";
-import RollbackButton from "../components/RollbackButton";
+import BackupPanel from "../components/BackupPanel";
 import styles from "./Settings.module.css";
 
 function Settings() {
@@ -58,13 +58,13 @@ function Settings() {
           </div>
         </div>
 
-        {/* Hosts Management Card */}
+        {/* Backup Management Card */}
         <div className="card">
-          <h3 className="card-title">Hosts Management</h3>
+          <h3 className="card-title">Backup Management</h3>
           <p className={styles.sectionDesc}>
-            Rollback the system hosts file to the last backed-up version.
+            View and restore previous versions of your hosts file.
           </p>
-          <RollbackButton onRollback={rollback} />
+          <BackupPanel onRollback={rollback} />
         </div>
 
         {/* System Hosts Preview */}

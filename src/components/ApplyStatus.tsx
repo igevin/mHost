@@ -1,16 +1,19 @@
 import { useEffect, useState } from "react";
-import { useAtomValue } from "jotai";
+import { useAtomValue, useSetAtom } from "jotai";
 import { enabledProfileAtom } from "../stores/profiles";
+import { rollbackHostsActionAtom } from "../stores/profiles";
 import {
   getManagedBlockContent,
   getLastApplied,
   generateApplyPlan,
 } from "../lib/tauri";
 import type { ApplyPlan } from "../types";
+import RollbackButton from "./RollbackButton";
 import styles from "./ApplyStatus.module.css";
 
 function ApplyStatus() {
   const enabledProfile = useAtomValue(enabledProfileAtom);
+  const rollback = useSetAtom(rollbackHostsActionAtom);
   const [managedContent, setManagedContent] = useState<string | null>(null);
   const [lastApplied, setLastApplied] = useState<string | null>(null);
   const [applyPlan, setApplyPlan] = useState<ApplyPlan | null>(null);
@@ -111,6 +114,13 @@ function ApplyStatus() {
               ? new Date(lastApplied).toLocaleString()
               : "Never"}
           </span>
+          <RollbackButton
+            onRollback={async () => {
+              await rollback();
+              setLastApplied(null);
+            }}
+            size="small"
+          />
         </div>
 
         {/* Pending Changes */}

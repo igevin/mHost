@@ -5,6 +5,19 @@ use std::net::IpAddr;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
+// BackupInfo
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupInfo {
+    pub id: String,
+    pub filename: String,
+    pub timestamp: String,
+    pub size: u64,
+    pub path: String,
+}
+
+// ---------------------------------------------------------------------------
 // ID types
 // ---------------------------------------------------------------------------
 

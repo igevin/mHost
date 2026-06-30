@@ -1,19 +1,25 @@
 import { useState } from "react";
 import { extractErrorMessage } from "../lib/error";
+import { useWebKitPointerDown } from "../hooks/useWebKitPointerDown";
 import styles from "./RollbackButton.module.css";
 
 interface RollbackButtonProps {
   onRollback: () => Promise<void>;
+  size?: "default" | "small";
 }
 
-function RollbackButton({ onRollback }: RollbackButtonProps) {
+function RollbackButton({ onRollback, size = "default" }: RollbackButtonProps) {
   const [showConfirm, setShowConfirm] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [isRollingBack, setIsRollingBack] = useState(false);
+  const { onPointerDown } = useWebKitPointerDown();
+  const dialogGuard = useWebKitPointerDown();
 
   const handleRollbackClick = () => {
+    if (!dialogGuard.fire()) return;
     setShowConfirm(true);
     setError(null);
+    setTimeout(dialogGuard.release, 50);
   };
 
   const handleConfirm = async () => {
@@ -30,15 +36,20 @@ function RollbackButton({ onRollback }: RollbackButtonProps) {
   };
 
   const handleCancel = () => {
+    if (!dialogGuard.fire()) return;
     setShowConfirm(false);
     setError(null);
+    setTimeout(dialogGuard.release, 50);
   };
+
+  const btnClass = size === "small" ? "btn btn-sm btn-danger" : "btn btn-danger";
 
   return (
     <>
       <button
-        className="btn btn-danger"
+        className={btnClass}
         onClick={handleRollbackClick}
+        onPointerDown={onPointerDown(handleRollbackClick)}
         disabled={isRollingBack}
       >
         Rollback
@@ -61,6 +72,7 @@ function RollbackButton({ onRollback }: RollbackButtonProps) {
               <button
                 className="btn btn-ghost"
                 onClick={handleCancel}
+                onPointerDown={onPointerDown(handleCancel)}
                 disabled={isRollingBack}
               >
                 Cancel
@@ -68,6 +80,7 @@ function RollbackButton({ onRollback }: RollbackButtonProps) {
               <button
                 className="btn btn-danger"
                 onClick={handleConfirm}
+                onPointerDown={onPointerDown(handleConfirm)}
                 disabled={isRollingBack}
               >
                 {isRollingBack ? "Rolling back..." : "Confirm"}

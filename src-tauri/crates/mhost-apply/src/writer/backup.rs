@@ -4,7 +4,7 @@
 //! old backups when the count exceeds the configured maximum.
 
 use chrono::Utc;
-use mhost_core::MhostError;
+use mhost_core::{BackupInfo, MhostError};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -82,6 +82,45 @@ pub fn prune_old_backups(backup_dir: &Path) -> Result<(), MhostError> {
     }
 
     Ok(())
+}
+
+/// List all backup files in the given directory.
+///
+/// Returns backup metadata sorted by timestamp descending (newest first).
+/// Filters files matching `hosts-*.bak`.
+pub fn list_backups(backup_dir: &Path) -> Result<Vec<BackupInfo>, MhostError> {
+    let mut backups: Vec<BackupInfo> = Vec::new();
+
+    let entries = match fs::read_dir(backup_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(backups),
+        Err(e) => return Err(e.into()),
+    };
+
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with("hosts-") || !name.ends_with(".bak") {
+            continue;
+        }
+
+        let metadata = entry.metadata()?;
+        let modified = metadata.modified()?;
+        let timestamp = chrono::DateTime::<chrono::Utc>::from(modified).to_rfc3339();
+
+        backups.push(BackupInfo {
+            id: name.clone(),
+            filename: name,
+            timestamp,
+            size: metadata.len(),
+            path: entry.path().to_string_lossy().to_string(),
+        });
+    }
+
+    // Sort by timestamp descending (newest first)
+    backups.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+
+    Ok(backups)
 }
 
 #[cfg(test)]
@@ -203,5 +242,88 @@ mod tests {
             names.contains(&"hosts-20240111_120000.bak".to_string()),
             "newest backup should be retained"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // list_backups tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_list_backups_empty_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let backups = list_backups(dir.path()).unwrap();
+        assert!(backups.is_empty(), "should return empty vec for empty dir");
+    }
+
+    #[test]
+    fn test_list_backups_filters_non_backup_files() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create backup files
+        fs::write(dir.path().join("hosts-20240101_120000.bak"), "backup1").unwrap();
+        fs::write(dir.path().join("hosts-20240102_120000.bak"), "backup2").unwrap();
+
+        // Create non-backup files
+        fs::write(dir.path().join("random.txt"), "random").unwrap();
+        fs::write(dir.path().join("hosts-20240103.txt"), "not a backup").unwrap();
+        fs::write(dir.path().join("other-20240102_120000.bak"), "other").unwrap();
+
+        let backups = list_backups(dir.path()).unwrap();
+        assert_eq!(backups.len(), 2, "should only include hosts-*.bak files");
+    }
+
+    #[test]
+    fn test_list_backups_sorted_descending() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create backups with distinct modification times
+        let path1 = dir.path().join("hosts-20240101_120000.bak");
+        let path2 = dir.path().join("hosts-20240102_120000.bak");
+        let path3 = dir.path().join("hosts-20240103_120000.bak");
+
+        fs::write(&path1, "backup1").unwrap();
+        let mtime1 = filetime::FileTime::from_unix_time(1000, 0);
+        filetime::set_file_mtime(&path1, mtime1).unwrap();
+
+        fs::write(&path2, "backup2").unwrap();
+        let mtime2 = filetime::FileTime::from_unix_time(2000, 0);
+        filetime::set_file_mtime(&path2, mtime2).unwrap();
+
+        fs::write(&path3, "backup3").unwrap();
+        let mtime3 = filetime::FileTime::from_unix_time(3000, 0);
+        filetime::set_file_mtime(&path3, mtime3).unwrap();
+
+        let backups = list_backups(dir.path()).unwrap();
+        assert_eq!(backups.len(), 3);
+        assert_eq!(
+            backups[0].filename, "hosts-20240103_120000.bak",
+            "newest backup should be first"
+        );
+        assert_eq!(
+            backups[1].filename, "hosts-20240102_120000.bak",
+            "middle backup should be second"
+        );
+        assert_eq!(
+            backups[2].filename, "hosts-20240101_120000.bak",
+            "oldest backup should be last"
+        );
+    }
+
+    #[test]
+    fn test_list_backups_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hosts-20240101_120000.bak");
+        let content = "test backup content";
+        fs::write(&path, content).unwrap();
+
+        let backups = list_backups(dir.path()).unwrap();
+        assert_eq!(backups.len(), 1);
+
+        let info = &backups[0];
+        assert_eq!(info.id, "hosts-20240101_120000.bak");
+        assert_eq!(info.filename, "hosts-20240101_120000.bak");
+        assert_eq!(info.size, content.len() as u64);
+        assert!(info.path.contains("hosts-20240101_120000.bak"));
+        assert!(!info.timestamp.is_empty());
     }
 }

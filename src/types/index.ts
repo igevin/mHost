@@ -74,3 +74,11 @@ export interface ValidateResult {
 }
 
 export type ExportFormat = "hosts" | "json";
+
+export interface BackupInfo {
+  id: string;
+  filename: string;
+  timestamp: string; // ISO 8601
+  size: number;
+  path: string;
+}

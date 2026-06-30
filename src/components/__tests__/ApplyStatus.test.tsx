@@ -253,6 +253,35 @@ describe("ApplyStatus", () => {
     });
   });
 
+  it("renders RollbackButton in Apply History card", async () => {
+    const profile = makeProfile();
+    const store = getDefaultStore();
+    store.set(profilesAtom, [profile]);
+
+    mockInvoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "get_managed_block_content") return "127.0.0.1 localhost\n";
+      if (cmd === "get_last_applied") return "2024-06-15T10:30:00Z";
+      if (cmd === "generate_apply_plan") return makePlan();
+      return null;
+    });
+
+    render(
+      <Wrapper>
+        <ApplyStatus />
+      </Wrapper>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("Apply History")).toBeInTheDocument();
+    });
+
+    const applyHistoryCard = screen.getByText("Apply History").closest(".card");
+    expect(applyHistoryCard).toBeTruthy();
+    const rollbackBtn = applyHistoryCard!.querySelector("button");
+    expect(rollbackBtn).toBeTruthy();
+    expect(rollbackBtn!.textContent).toMatch(/rollback/i);
+  });
+
   it("hides pending changes when plan fails", async () => {
     const profile = makeProfile();
     const store = getDefaultStore();
