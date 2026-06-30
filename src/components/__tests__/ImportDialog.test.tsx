@@ -46,6 +46,7 @@ describe("ImportDialog", () => {
     mockValidateHostsText.mockResolvedValue({
       rules: [{ id: "r1", ip: "127.0.0.1", domains: ["localhost"], enabled: true, comment: null, source: { type: "Manual" } }],
       errors: [],
+      duplicates: [],
     } as ValidateResult);
 
     render(<ImportDialog {...defaultProps} />);
@@ -80,6 +81,7 @@ describe("ImportDialog", () => {
     mockValidateHostsText.mockResolvedValue({
       rules: [],
       errors: [{ line_number: 1, error: "invalid format" }],
+      duplicates: [],
     } as ValidateResult);
 
     render(<ImportDialog {...defaultProps} />);
@@ -110,6 +112,7 @@ describe("ImportDialog", () => {
     mockValidateHostsText.mockResolvedValue({
       rules: [{ id: "r1", ip: "10.0.0.1", domains: ["test.com"], enabled: true, comment: null, source: { type: "Manual" } }],
       errors: [],
+      duplicates: [],
     } as ValidateResult);
     mockImportProfile.mockResolvedValue(importedProfile);
 

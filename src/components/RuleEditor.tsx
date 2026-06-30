@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback, useMemo, useDeferredValue } from "react";
-import type { HostRule, ParseErrorAtLine } from "../types";
+import type { HostRule, ValidateResult } from "../types";
 import { validateHostsText } from "../lib/tauri";
 import { extractErrorMessage } from "../lib/error";
 import styles from "./RuleEditor.module.css";
@@ -144,7 +144,8 @@ function useDebouncedCallback<T extends (...args: Parameters<T>) => void>(
 
 function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEditorProps) {
   const [text, setText] = useState(() => rulesToText(rules));
-  const [errors, setErrors] = useState<ParseErrorAtLine[]>([]);
+  const [validateResult, setValidateResult] = useState<ValidateResult | null>(null);
+  const errors = validateResult?.errors ?? [];
   const [isValidating, setIsValidating] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const highlightRef = useRef<HTMLDivElement>(null);
@@ -186,7 +187,7 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEd
       );
     if (rulesChanged) {
       setText(newText);
-      setErrors([]);
+      setValidateResult(null);
       prevRulesRef.current = rules;
     }
   }, [rules]);
@@ -196,13 +197,18 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEd
       setIsValidating(true);
       try {
         const result = await validateHostsText(value);
-        setErrors(result.errors);
-        onErrorChange?.(result.errors.length > 0);
+        setValidateResult(result);
+        const hasBlockingIssues = result.errors.length > 0 || result.duplicates.some((d) => d.kind === "different_ip");
+        onErrorChange?.(hasBlockingIssues);
         if (result.errors.length === 0) {
           onChange(result.rules);
         }
       } catch (err) {
-        setErrors([{ line_number: 0, error: "Validation failed: " + extractErrorMessage(err) }]);
+        setValidateResult({
+          rules: [],
+          errors: [{ line_number: 0, error: "Validation failed: " + extractErrorMessage(err) }],
+          duplicates: [],
+        });
       } finally {
         setIsValidating(false);
       }
@@ -261,11 +267,25 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEd
       {isValidating && (
         <div className={styles.validating}>Validating...</div>
       )}
-      {errors.length > 0 && (
+      {(errors.length > 0 || (validateResult?.duplicates?.length ?? 0) > 0) && (
         <div className={styles.errorList}>
           {errors.map((err) => (
             <div key={err.line_number} className={styles.errorItem}>
               Line {err.line_number}: {typeof err.error === "string" ? err.error : JSON.stringify(err.error)}
+            </div>
+          ))}
+          {validateResult?.duplicates?.map((dup) => (
+            <div
+              key={`dup-${dup.domain}`}
+              className={
+                dup.kind === "different_ip"
+                  ? styles.errorItem
+                  : styles.warningItem
+              }
+            >
+              {dup.kind === "different_ip"
+                ? `冲突: 域名 "${dup.domain}" 映射到不同 IP (行 ${dup.lines.join(", ")})`
+                : `冗余: 域名 "${dup.domain}" 重复出现 (行 ${dup.lines.join(", ")})`}
             </div>
           ))}
         </div>

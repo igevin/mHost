@@ -29,6 +29,7 @@ pub struct ParseErrorAtLine {
 pub struct ValidateResult {
     pub rules: Vec<HostRule>,
     pub errors: Vec<ParseErrorAtLine>,
+    pub duplicates: Vec<mhost_core::DuplicateRule>,
 }
 
 /// Hosts file parser
@@ -59,7 +60,10 @@ impl Parser {
 
         for (idx, line) in text.lines().enumerate() {
             match Self::parse_line(line) {
-                Ok(Some(rule)) => rules.push(rule),
+                Ok(Some(mut rule)) => {
+                    rule.line_number = Some(idx + 1);
+                    rules.push(rule);
+                }
                 Ok(None) => {}
                 Err(error) => errors.push(ParseErrorAtLine {
                     line_number: idx + 1,
@@ -68,7 +72,8 @@ impl Parser {
             }
         }
 
-        ValidateResult { rules, errors }
+        let duplicates = validator::check_duplicates(&rules);
+        ValidateResult { rules, errors, duplicates }
     }
 
     /// Parse hosts text and collect only errors with their line numbers.
@@ -636,5 +641,56 @@ mod tests {
         let json = serde_json::to_string(&result).unwrap();
         let parsed: ValidateResult = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.rules.len(), result.rules.len());
+    }
+
+    // -----------------------------------------------------------------------
+    // Duplicate detection tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_no_duplicates_for_unique_domains() {
+        let input = "127.0.0.1 a.com\n127.0.0.1 b.com";
+        let result = Parser::parse_with_lines(input);
+        assert!(result.duplicates.is_empty());
+    }
+
+    #[test]
+    fn test_same_ip_duplicates_detected() {
+        let input = "127.0.0.1 a.com\n127.0.0.1 a.com";
+        let result = Parser::parse_with_lines(input);
+        assert_eq!(result.duplicates.len(), 1);
+        assert_eq!(result.duplicates[0].domain, "a.com");
+        assert_eq!(result.duplicates[0].lines, vec![1, 2]);
+        assert!(matches!(result.duplicates[0].kind, mhost_core::DuplicateKind::SameIp));
+    }
+
+    #[test]
+    fn test_different_ip_duplicates_detected() {
+        let input = "127.0.0.1 a.com\n192.168.1.1 a.com";
+        let result = Parser::parse_with_lines(input);
+        assert_eq!(result.duplicates.len(), 1);
+        assert!(matches!(result.duplicates[0].kind, mhost_core::DuplicateKind::DifferentIp));
+    }
+
+    #[test]
+    fn test_disabled_rules_not_checked() {
+        let input = "127.0.0.1 a.com\n# 127.0.0.1 a.com";
+        let result = Parser::parse_with_lines(input);
+        assert!(result.duplicates.is_empty());
+    }
+
+    #[test]
+    fn test_comment_only_lines_not_checked() {
+        let input = "127.0.0.1 a.com\n# just a comment";
+        let result = Parser::parse_with_lines(input);
+        assert!(result.duplicates.is_empty());
+    }
+
+    #[test]
+    fn test_duplicate_across_multiple_rules() {
+        let input = "127.0.0.1 a.com b.com\n127.0.0.1 a.com";
+        let result = Parser::parse_with_lines(input);
+        assert_eq!(result.duplicates.len(), 1);
+        assert_eq!(result.duplicates[0].domain, "a.com");
     }
 }

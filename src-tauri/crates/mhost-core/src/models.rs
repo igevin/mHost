@@ -81,6 +81,25 @@ impl Profile {
 }
 
 // ---------------------------------------------------------------------------
+// DuplicateRule / DuplicateKind
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DuplicateRule {
+    pub domain: String,
+    pub lines: Vec<usize>,
+    pub kind: DuplicateKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DuplicateKind {
+    #[serde(rename = "same_ip")]
+    SameIp,
+    #[serde(rename = "different_ip")]
+    DifferentIp,
+}
+
+// ---------------------------------------------------------------------------
 // HostRule
 // ---------------------------------------------------------------------------
 
@@ -97,6 +116,9 @@ pub struct HostRule {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
     pub source: RuleSource,
+    /// 1-based line number in the original hosts text (set by `parse_with_lines`).
+    #[serde(skip)]
+    pub line_number: Option<usize>,
 }
 
 impl HostRule {
@@ -108,6 +130,7 @@ impl HostRule {
             enabled: true,
             comment: None,
             source: RuleSource::Manual,
+            line_number: None,
         }
     }
 
@@ -120,6 +143,7 @@ impl HostRule {
             enabled: false,
             comment: Some(text.into()),
             source: RuleSource::Manual,
+            line_number: None,
         }
     }
 
