@@ -29,3 +29,9 @@ export const applyPlanAtom = atom<import("../../types").ApplyPlan | null>(null);
 export const applyResultAtom = atom<"success" | "error" | null>(null);
 export const applyErrorAtom = atom<string | null>(null);
 export const applyTargetAtom = atom<{ id: string; enabled: boolean } | null>(null);
+
+// ---- Snapshot atoms ----
+
+export const snapshotsAtom = atom<import("../../types").SnapshotMeta[]>([]);
+export const isLoadingSnapshotsAtom = atom(false);
+export const snapshotErrorAtom = atom<string | null>(null);

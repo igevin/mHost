@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Profile, ApplyPlan, ValidateResult, ExportFormat } from "../types";
+import type { Profile, ApplyPlan, ValidateResult, ExportFormat, SnapshotMeta } from "../types";
 
 // ---- Profile commands ----
 
@@ -97,4 +97,22 @@ export async function getLastApplied(): Promise<string | null> {
 
 export async function generatePreviewPlan(id: string, enabled: boolean): Promise<ApplyPlan> {
   return invoke("generate_preview_plan", { id, enabled });
+}
+
+// ---- Snapshot commands ----
+
+export async function saveSnapshot(name: string, description?: string): Promise<SnapshotMeta> {
+  return invoke<SnapshotMeta>("save_snapshot", { name, description });
+}
+
+export async function listSnapshots(): Promise<SnapshotMeta[]> {
+  return invoke<SnapshotMeta[]>("list_snapshots");
+}
+
+export async function loadSnapshot(id: string): Promise<void> {
+  return invoke<void>("load_snapshot", { id });
+}
+
+export async function deleteSnapshot(id: string): Promise<void> {
+  return invoke<void>("delete_snapshot", { id });
 }

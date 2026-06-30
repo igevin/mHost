@@ -71,7 +71,7 @@ describe("Layout", () => {
     renderWithProviders(<Layout />);
     expect(screen.getByText("Ad Block")).toBeInTheDocument();
     expect(screen.getByText("Remote Rules")).toBeInTheDocument();
-    expect(screen.getByText("Backup")).toBeInTheDocument();
+    expect(screen.getByText("Snapshots")).toBeInTheDocument();
     expect(screen.getByText("Settings")).toBeInTheDocument();
   });
 
@@ -187,7 +187,7 @@ describe("Layout", () => {
 
   it("renders disabled tool items with 'Soon' badge", () => {
     renderWithProviders(<Layout />);
-    expect(screen.getAllByText("Soon").length).toBeGreaterThanOrEqual(3);
+    expect(screen.getAllByText("Soon").length).toBeGreaterThanOrEqual(2);
   });
 
   it("navigates to profile page when profile item is clicked", async () => {

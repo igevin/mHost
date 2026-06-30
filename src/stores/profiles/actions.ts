@@ -9,6 +9,10 @@ import {
   enableAndApply,
   rollbackHosts,
   generatePreviewPlan,
+  saveSnapshot,
+  listSnapshots,
+  loadSnapshot,
+  deleteSnapshot,
 } from "../../lib/tauri";
 import { extractErrorMessage } from "../../lib/error";
 import {
@@ -22,6 +26,9 @@ import {
   applyResultAtom,
   applyErrorAtom,
   applyTargetAtom,
+  snapshotsAtom,
+  isLoadingSnapshotsAtom,
+  snapshotErrorAtom,
 } from "./state";
 
 // ---- Async action atoms ----
@@ -167,4 +174,54 @@ export const closeApplyConfirmAtom = atom(null, (_get, set) => {
   set(applyResultAtom, null);
   set(applyErrorAtom, null);
   set(applyTargetAtom, null);
+});
+
+// ---- Snapshot action atoms ----
+
+export const fetchSnapshotsAtom = atom(null, async (_get, set) => {
+  set(isLoadingSnapshotsAtom, true);
+  set(snapshotErrorAtom, null);
+  try {
+    const snapshots = await listSnapshots();
+    set(snapshotsAtom, snapshots);
+  } catch (err) {
+    set(snapshotErrorAtom, extractErrorMessage(err));
+  } finally {
+    set(isLoadingSnapshotsAtom, false);
+  }
+});
+
+export const saveSnapshotAtom = atom(null, async (get, set, { name, description }: { name: string; description?: string }) => {
+  set(snapshotErrorAtom, null);
+  try {
+    const meta = await saveSnapshot(name, description);
+    set(snapshotsAtom, [meta, ...get(snapshotsAtom)]);
+  } catch (err) {
+    set(snapshotErrorAtom, extractErrorMessage(err));
+    throw err;
+  }
+});
+
+export const loadSnapshotAtom = atom(null, async (_get, set, id: string) => {
+  set(snapshotErrorAtom, null);
+  try {
+    await loadSnapshot(id);
+    // Refresh profiles after rollback
+    const profiles = await listProfiles();
+    set(profilesAtom, profiles);
+  } catch (err) {
+    set(snapshotErrorAtom, extractErrorMessage(err));
+    throw err;
+  }
+});
+
+export const deleteSnapshotAtom = atom(null, async (get, set, id: string) => {
+  set(snapshotErrorAtom, null);
+  try {
+    await deleteSnapshot(id);
+    set(snapshotsAtom, get(snapshotsAtom).filter((s) => s.id !== id));
+  } catch (err) {
+    set(snapshotErrorAtom, extractErrorMessage(err));
+    throw err;
+  }
 });

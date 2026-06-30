@@ -5,7 +5,7 @@ pub mod state;
 pub mod tray;
 pub mod tray_logic;
 
-use commands::{apply::*, profile::*, profile_io::*, validate::*};
+use commands::{apply::*, profile::*, profile_io::*, snapshot::*, validate::*};
 use state::AppState;
 use tauri::Manager;
 
@@ -45,6 +45,10 @@ pub fn run() {
             duplicate_profile,
             export_profile_to_file,
             import_profile_from_file,
+            save_snapshot,
+            list_snapshots,
+            load_snapshot,
+            delete_snapshot,
         ])
         .setup(|app| {
             #[cfg(target_os = "macos")]
