@@ -74,3 +74,19 @@ export interface ValidateResult {
 }
 
 export type ExportFormat = "hosts" | "json";
+
+export interface Snapshot {
+  id: string;
+  name: string;
+  description?: string;
+  profiles: Profile[];
+  created_at: string;
+}
+
+export interface SnapshotMeta {
+  id: string;
+  name: string;
+  description?: string;
+  profile_count: number;
+  created_at: string;
+}

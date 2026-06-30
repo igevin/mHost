@@ -118,10 +118,10 @@ const toolNavItems: NavItem[] = [
     disabled: true,
   },
   {
-    to: "#backup",
-    label: "Backup",
+    to: "/snapshot",
+    label: "Snapshots",
     icon: <BackupIcon />,
-    disabled: true,
+    disabled: false,
   },
   { to: "/settings", label: "Settings", icon: <SettingsIcon /> },
 ];

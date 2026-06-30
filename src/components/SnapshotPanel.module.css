@@ -1,0 +1,139 @@
+/* ---- Panel ---- */
+
+.panel {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* ---- Empty State ---- */
+
+.emptyState {
+  text-align: center;
+  padding: 48px 24px;
+  color: var(--color-text-secondary);
+}
+
+.emptyState p {
+  margin: 0;
+}
+
+.emptyHint {
+  font-size: 13px;
+  color: var(--color-text-muted);
+  margin-top: 8px;
+}
+
+/* ---- Snapshot List ---- */
+
+.snapshotList {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* ---- Snapshot Card ---- */
+
+.snapshotCard {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  padding: 16px;
+  transition: all var(--transition-normal);
+}
+
+.snapshotCard:hover {
+  box-shadow: var(--shadow-sm);
+}
+
+.snapshotCardHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.snapshotName {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--color-text);
+  margin: 0;
+}
+
+.snapshotBadge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  background: var(--color-bg);
+  color: var(--color-text-secondary);
+  border: 1px solid var(--color-border);
+  white-space: nowrap;
+}
+
+.snapshotDesc {
+  margin: 8px 0 0;
+  font-size: 13px;
+  color: var(--color-text-secondary);
+  line-height: 1.5;
+}
+
+.snapshotMeta {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--color-text-muted);
+}
+
+.snapshotActions {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--color-border);
+}
+
+/* ---- Create Snapshot Dialog ---- */
+
+.dialogOverlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.3);
+  z-index: 400;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.dialog {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  padding: 20px 24px;
+  width: 420px;
+  max-width: 90vw;
+  box-shadow: var(--shadow-md);
+  z-index: 410;
+}
+
+.dialogTitle {
+  font-size: 15px;
+  font-weight: 600;
+  margin: 0 0 16px;
+  color: var(--color-text);
+}
+
+.dialogBody {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.dialogActions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
