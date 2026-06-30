@@ -123,6 +123,9 @@ pub async fn apply_hosts(state: State<'_, AppState>) -> Result<(), MhostError> {
         // Write last_applied timestamp only on success
         write_last_applied(&storage.root())?;
 
+        // Auto-snapshot after successful apply
+        let _ = crate::commands::snapshot::auto_snapshot_logic(storage.as_ref());
+
         Ok(())
     }).await.map_err(|e| MhostError::InvalidInput(e.to_string()))?
 }
@@ -212,7 +215,12 @@ pub async fn enable_and_apply(
     let storage = state.storage.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let profile_id = std::str::FromStr::from_str(&id)?;
-        enable_and_apply_logic(&profile_id, enabled, storage.as_ref(), &writer)
+        enable_and_apply_logic(&profile_id, enabled, storage.as_ref(), &writer)?;
+
+        // Auto-snapshot after successful apply
+        let _ = crate::commands::snapshot::auto_snapshot_logic(storage.as_ref());
+
+        Ok::<(), MhostError>(())
     }).await.map_err(|e| MhostError::InvalidInput(e.to_string()))??;
     #[cfg(target_os = "macos")]
     crate::tray::update_tray_menu(&app_handle);

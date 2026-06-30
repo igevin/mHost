@@ -206,6 +206,43 @@ pub async fn delete_snapshot(
 }
 
 // ---------------------------------------------------------------------------
+// Auto snapshot
+// ---------------------------------------------------------------------------
+
+const AUTO_SNAPSHOT_INTERVAL_DAYS: i64 = 3;
+
+/// Automatically create a snapshot after apply if conditions are met:
+/// - If no snapshots exist, create one.
+/// - If the latest snapshot is older than 3 days, create a new one.
+/// - Otherwise, do nothing.
+pub fn auto_snapshot_logic(
+    storage: &(dyn Storage + Send + Sync),
+) -> Result<Option<SnapshotMeta>, MhostError> {
+    let snapshots = list_snapshots_logic(storage)?;
+
+    let should_create = if snapshots.is_empty() {
+        true
+    } else {
+        let latest = &snapshots[0]; // list_snapshots_logic returns descending order
+        let now = Utc::now();
+        let diff = now.signed_duration_since(latest.created_at);
+        diff.num_days() >= AUTO_SNAPSHOT_INTERVAL_DAYS
+    };
+
+    if should_create {
+        let name = format!("Auto-snapshot {}", Utc::now().format("%Y-%m-%d %H:%M"));
+        let meta = save_snapshot_logic(
+            storage,
+            name,
+            Some("Automatically created on apply".to_string()),
+        )?;
+        Ok(Some(meta))
+    } else {
+        Ok(None)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -378,5 +415,65 @@ mod tests {
 
         let result = load_snapshot_logic(storage.as_ref(), &writer, &meta.id);
         assert!(result.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Auto snapshot tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_auto_snapshot_creates_when_empty() {
+        let (_temp, storage, _writer) = create_test_storage_and_writer();
+        create_profile_with_rules(&storage, "dev", vec![("127.0.0.1", "example.com")]);
+
+        let result = auto_snapshot_logic(storage.as_ref()).unwrap();
+        assert!(result.is_some(), "should create snapshot when list is empty");
+
+        let snapshots = list_snapshots_logic(storage.as_ref()).unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert!(snapshots[0].name.starts_with("Auto-snapshot"));
+    }
+
+    #[test]
+    fn test_auto_snapshot_skips_when_recent() {
+        let (_temp, storage, _writer) = create_test_storage_and_writer();
+        create_profile_with_rules(&storage, "dev", vec![("127.0.0.1", "example.com")]);
+
+        // Create a snapshot with current time
+        save_snapshot_logic(storage.as_ref(), "recent".to_string(), None).unwrap();
+
+        let result = auto_snapshot_logic(storage.as_ref()).unwrap();
+        assert!(result.is_none(), "should NOT create snapshot when recent one exists");
+
+        let snapshots = list_snapshots_logic(storage.as_ref()).unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].name, "recent");
+    }
+
+    #[test]
+    fn test_auto_snapshot_creates_when_old() {
+        let (_temp, storage, _writer) = create_test_storage_and_writer();
+        create_profile_with_rules(&storage, "dev", vec![("127.0.0.1", "example.com")]);
+
+        // Create an old snapshot by writing file directly with backdated created_at
+        let old_snapshot = mhost_core::Snapshot {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "old".to_string(),
+            description: None,
+            profiles: storage.list_profiles().unwrap(),
+            created_at: Utc::now() - chrono::Duration::days(4),
+        };
+        let snapshots_dir = storage.root().join("snapshots");
+        std::fs::create_dir_all(&snapshots_dir).unwrap();
+        let path = snapshots_dir.join(format!("{}.json", old_snapshot.id));
+        let json = serde_json::to_string_pretty(&old_snapshot).unwrap();
+        std::fs::write(&path, json).unwrap();
+
+        let result = auto_snapshot_logic(storage.as_ref()).unwrap();
+        assert!(result.is_some(), "should create snapshot when latest is older than 3 days");
+
+        let snapshots = list_snapshots_logic(storage.as_ref()).unwrap();
+        assert_eq!(snapshots.len(), 2);
+        assert!(snapshots[0].name.starts_with("Auto-snapshot")); // newest first
     }
 }
