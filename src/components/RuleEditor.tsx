@@ -127,7 +127,6 @@ function findMatches(text: string, query: string): MatchInfo[] {
 /** Parse text into HTML with syntax highlighting and search marks */
 function highlightText(
   text: string,
-  searchQuery: string,
   matches: MatchInfo[],
   activeMatchIndex: number,
 ): string {
@@ -148,7 +147,7 @@ function highlightText(
         .map((m, idx) => ({ ...m, matchIndex: idx }))
         .filter((m) => m.start < lineEnd && m.end > lineStart);
 
-      if (!searchQuery || lineMatches.length === 0) {
+      if (lineMatches.length === 0) {
         return highlightLine(line);
       }
 
@@ -419,8 +418,8 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEd
   // Generate highlighted content — Perf fix (#30): use deferred value to avoid blocking on every keystroke
   const deferredText = useDeferredValue(text);
   const highlightedHtml = useMemo(
-    () => highlightText(deferredText, searchQuery, matches, currentMatchIndex),
-    [deferredText, searchQuery, matches, currentMatchIndex],
+    () => highlightText(deferredText, matches, currentMatchIndex),
+    [deferredText, matches, currentMatchIndex],
   );
   const editorHasBlockingIssues = errors.length > 0 || (validateResult?.duplicates?.some((d) => d.kind === "different_ip") ?? false);
 

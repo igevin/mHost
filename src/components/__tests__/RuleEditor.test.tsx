@@ -355,7 +355,21 @@ describe("RuleEditor", () => {
       expect(screen.getByText("1/2")).toBeInTheDocument();
     });
 
-    it("replaces current match", async () => {
+    it("handles search query with regex special characters", () => {
+      const rules = [
+        makeRule({ id: "r1", ip: "127.0.0.1", domains: ["test.com"] }),
+      ];
+      render(<RuleEditor rules={rules} onChange={vi.fn()} />);
+      fireEvent.keyDown(document, { key: "f", metaKey: true });
+
+      const searchInput = screen.getByTestId("search-input");
+      // Searching for a literal dot should match the IP, not act as regex wildcard
+      fireEvent.change(searchInput, { target: { value: "127.0.0" } });
+
+      expect(screen.getByText("1/1")).toBeInTheDocument();
+    });
+
+    it("replaces current match", () => {
       mockValidateHostsText.mockResolvedValue({
         rules: [],
         errors: [],
@@ -379,7 +393,7 @@ describe("RuleEditor", () => {
       expect(textarea).toHaveValue("127.0.0.1 newhost localhost");
     });
 
-    it("replaces all matches", async () => {
+    it("replaces all matches", () => {
       mockValidateHostsText.mockResolvedValue({
         rules: [],
         errors: [],
