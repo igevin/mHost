@@ -64,6 +64,7 @@ function ImportDialog({ open, onClose, mode = "create", onImported, onRulesParse
       setRuleCount(!hasBlocking ? countRealRules(result.rules) : null);
     } catch (_err) {
       setErrors([{ line_number: 0, error: "Validation failed" }]);
+      setDuplicates([]);
       setRuleCount(null);
     } finally {
       setIsValidating(false);
