@@ -21,3 +21,11 @@ export const enabledProfileAtom = atom((get) => {
   const profiles = get(profilesAtom);
   return profiles.find((p) => p.enabled) ?? null;
 });
+
+// ---- Apply confirm dialog atoms ----
+
+export const applyConfirmOpenAtom = atom(false);
+export const applyPlanAtom = atom<import("../../types").ApplyPlan | null>(null);
+export const applyResultAtom = atom<"success" | "error" | null>(null);
+export const applyErrorAtom = atom<string | null>(null);
+export const applyTargetAtom = atom<{ id: string; enabled: boolean } | null>(null);

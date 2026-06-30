@@ -5,19 +5,29 @@ import { useAtomValue, useSetAtom } from "jotai";
 import {
   profilesAtom,
   deleteProfileAtom,
-  toggleProfileEnabledAtom,
   errorAtom,
   createProfileAtom,
   isLoadingAtom,
   fetchProfilesAtom,
+  applyConfirmOpenAtom,
+  applyPlanAtom,
+  applyResultAtom,
+  applyErrorAtom,
+  isApplyingAtom,
+  previewApplyAtom,
+  executeApplyAtom,
+  closeApplyConfirmAtom,
+  rollbackHostsActionAtom,
 } from "../stores/profiles";
 import { countRealRules } from "../lib/rules";
 import { exportProfileToFile, duplicateProfile } from "../lib/tauri";
 import { extractErrorMessage } from "../lib/error";
+import { useWebKitPointerDown } from "../hooks/useWebKitPointerDown";
 import { save, confirm } from "@tauri-apps/plugin-dialog";
 import type { Profile, ExportFormat } from "../types";
 import ImportDialog from "./ImportDialog";
 import CreateProfileDialog from "./CreateProfileDialog";
+import ApplyConfirmDialog from "./ApplyConfirmDialog";
 import styles from "./ManagementDrawer.module.css";
 
 interface ManagementDrawerProps {
@@ -30,16 +40,25 @@ function ManagementDrawer({ open, onClose }: ManagementDrawerProps) {
   const profiles = useAtomValue(profilesAtom);
   const setError = useSetAtom(errorAtom);
   const deleteProfile = useSetAtom(deleteProfileAtom);
-  const toggleEnabled = useSetAtom(toggleProfileEnabledAtom);
   const createProfile = useSetAtom(createProfileAtom);
   const fetchProfiles = useSetAtom(fetchProfilesAtom);
   const isLoading = useAtomValue(isLoadingAtom);
 
+  const previewApply = useSetAtom(previewApplyAtom);
+  const executeApply = useSetAtom(executeApplyAtom);
+  const closeApplyConfirm = useSetAtom(closeApplyConfirmAtom);
+  const rollbackHostsAction = useSetAtom(rollbackHostsActionAtom);
+  const applyConfirmOpen = useAtomValue(applyConfirmOpenAtom);
+  const applyPlan = useAtomValue(applyPlanAtom);
+  const applyResult = useAtomValue(applyResultAtom);
+  const applyError = useAtomValue(applyErrorAtom);
+  const isApplying = useAtomValue(isApplyingAtom);
+  const { onPointerDown } = useWebKitPointerDown();
+
   // Import dialog state -- hooks must be called unconditionally before any early return
   const [showImport, setShowImport] = useState(false);
 
-  // Loading state for toggle operations to prevent duplicate clicks
-  const [togglingId, setTogglingId] = useState<string | null>(null);
+  // Loading state for operations to prevent duplicate clicks
   const [duplicatingId, setDuplicatingId] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
 
@@ -163,18 +182,10 @@ function ManagementDrawer({ open, onClose }: ManagementDrawerProps) {
   );
 
   const handleToggle = useCallback(
-    async (id: string) => {
-      if (togglingId) return; // prevent duplicate clicks
-      setTogglingId(id);
-      try {
-        await toggleEnabled(id);
-      } catch (err: unknown) {
-        setError(extractErrorMessage(err));
-      } finally {
-        setTogglingId(null);
-      }
+    (id: string, enabled: boolean) => {
+      previewApply({ id, enabled: !enabled });
     },
-    [toggleEnabled, setError, togglingId],
+    [previewApply],
   );
 
   const handleImported = useCallback(async (profile: Profile) => {
@@ -297,12 +308,13 @@ function ManagementDrawer({ open, onClose }: ManagementDrawerProps) {
                   </button>
                   <button
                     className="btn btn-ghost btn-sm"
-                    onClick={() => handleToggle(profile.id)}
-                    disabled={togglingId === profile.id}
+                    onClick={() => handleToggle(profile.id, profile.enabled)}
+                    onPointerDown={onPointerDown(() => {
+                      handleToggle(profile.id, profile.enabled);
+                    })}
+                    disabled={isApplying}
                   >
-                    {togglingId === profile.id
-                      ? (profile.enabled ? "Disabling..." : "Enabling...")
-                      : (profile.enabled ? "Disable" : "Enable")}
+                    {profile.enabled ? "Disable" : "Enable"}
                   </button>
                   <button
                     className="btn btn-ghost btn-sm"
@@ -353,6 +365,17 @@ function ManagementDrawer({ open, onClose }: ManagementDrawerProps) {
         onClose={() => setShowCreateDialog(false)}
         onCreate={handleCreateProfile}
         isLoading={isLoading}
+      />
+
+      <ApplyConfirmDialog
+        open={applyConfirmOpen}
+        plan={applyPlan}
+        onConfirm={() => executeApply()}
+        onCancel={() => closeApplyConfirm()}
+        isApplying={isApplying}
+        applyResult={applyResult}
+        applyError={applyError}
+        onRollback={() => rollbackHostsAction()}
       />
     </>,
     document.body,

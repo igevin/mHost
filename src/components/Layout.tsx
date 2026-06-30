@@ -4,15 +4,25 @@ import { useAtomValue, useSetAtom } from "jotai";
 import {
   profilesAtom,
   selectedProfileIdAtom,
-  toggleProfileEnabledAtom,
   createProfileAtom,
   errorAtom,
   isLoadingAtom,
+  applyConfirmOpenAtom,
+  applyPlanAtom,
+  applyResultAtom,
+  applyErrorAtom,
+  isApplyingAtom,
+  previewApplyAtom,
+  executeApplyAtom,
+  closeApplyConfirmAtom,
+  rollbackHostsActionAtom,
 } from "../stores/profiles";
 import { extractErrorMessage } from "../lib/error";
+import { useWebKitPointerDown } from "../hooks/useWebKitPointerDown";
 import StatusBar from "./StatusBar";
 import ManagementDrawer from "./ManagementDrawer";
 import CreateProfileDialog from "./CreateProfileDialog";
+import ApplyConfirmDialog from "./ApplyConfirmDialog";
 import styles from "./Layout.module.css";
 
 interface NavItem {
@@ -119,7 +129,6 @@ const toolNavItems: NavItem[] = [
 function Layout() {
   const profiles = useAtomValue(profilesAtom);
   const selectedProfileId = useAtomValue(selectedProfileIdAtom);
-  const toggleEnabled = useSetAtom(toggleProfileEnabledAtom);
   const createProfile = useSetAtom(createProfileAtom);
   const isLoading = useAtomValue(isLoadingAtom);
 
@@ -127,7 +136,18 @@ function Layout() {
   const setError = useSetAtom(errorAtom);
   const [showManagement, setShowManagement] = useState(false);
   const [showCreateDialog, setShowCreateDialog] = useState(false);
-  const [togglingId, setTogglingId] = useState<string | null>(null);
+
+  const applyConfirmOpen = useAtomValue(applyConfirmOpenAtom);
+  const applyPlan = useAtomValue(applyPlanAtom);
+  const applyResult = useAtomValue(applyResultAtom);
+  const applyError = useAtomValue(applyErrorAtom);
+  const isApplying = useAtomValue(isApplyingAtom);
+  const previewApply = useSetAtom(previewApplyAtom);
+  const executeApply = useSetAtom(executeApplyAtom);
+  const closeApplyConfirm = useSetAtom(closeApplyConfirmAtom);
+  const rollbackHostsAction = useSetAtom(rollbackHostsActionAtom);
+  const setApplyError = useSetAtom(applyErrorAtom);
+  const { onPointerDown } = useWebKitPointerDown();
 
   const handleProfileClick = useCallback(
     (id: string) => {
@@ -137,20 +157,11 @@ function Layout() {
   );
 
   const handleToggle = useCallback(
-    (e: React.MouseEvent, id: string) => {
-      e.stopPropagation();
-      e.preventDefault();
-      if (togglingId) return;
-      setTogglingId(id);
-      toggleEnabled(id)
-        .catch((err) => {
-          setError(extractErrorMessage(err));
-        })
-        .finally(() => {
-          setTogglingId(null);
-        });
+    (id: string, enabled: boolean) => {
+      setApplyError(null);
+      previewApply({ id, enabled: !enabled });
     },
-    [toggleEnabled, setError, togglingId],
+    [previewApply, setApplyError],
   );
 
   const handleNewProfile = useCallback(() => {
@@ -222,7 +233,14 @@ function Layout() {
                 </div>
                 <label
                   className={styles.toggle}
-                  onClick={(e) => handleToggle(e, profile.id)}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    e.preventDefault();
+                    handleToggle(profile.id, profile.enabled);
+                  }}
+                  onPointerDown={onPointerDown(() => {
+                    handleToggle(profile.id, profile.enabled);
+                  })}
                 >
                   <input
                     type="checkbox"
@@ -289,12 +307,35 @@ function Layout() {
       </aside>
 
       <main className={styles.mhostMain}>
+        {applyError && !applyConfirmOpen && (
+          <div className="alert alert-error">
+            {applyError}
+            <button
+              className="btn btn-ghost btn-sm"
+              onClick={() => setApplyError(null)}
+              style={{ marginLeft: 8 }}
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
         <Outlet />
       </main>
 
       <ManagementDrawer
         open={showManagement}
         onClose={() => setShowManagement(false)}
+      />
+
+      <ApplyConfirmDialog
+        open={applyConfirmOpen}
+        plan={applyPlan}
+        onConfirm={() => executeApply()}
+        onCancel={() => closeApplyConfirm()}
+        isApplying={isApplying}
+        applyResult={applyResult}
+        applyError={applyError}
+        onRollback={() => rollbackHostsAction()}
       />
     </div>
   );

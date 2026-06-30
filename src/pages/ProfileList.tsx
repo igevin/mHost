@@ -9,7 +9,15 @@ import {
   fetchProfilesAtom,
   createProfileAtom,
   deleteProfileAtom,
-  toggleProfileEnabledAtom,
+  applyConfirmOpenAtom,
+  applyPlanAtom,
+  applyResultAtom,
+  applyErrorAtom,
+  isApplyingAtom,
+  previewApplyAtom,
+  executeApplyAtom,
+  closeApplyConfirmAtom,
+  rollbackHostsActionAtom,
 } from "../stores/profiles";
 import { extractErrorMessage } from "../lib/error";
 import { countRealRules } from "../lib/rules";
@@ -19,6 +27,7 @@ import { save, confirm } from "@tauri-apps/plugin-dialog";
 import ProfileCard from "../components/ProfileCard";
 import CreateProfileForm from "../components/CreateProfileForm";
 import ImportDialog from "../components/ImportDialog";
+import ApplyConfirmDialog from "../components/ApplyConfirmDialog";
 import styles from "./ProfileList.module.css";
 
 function ProfileList() {
@@ -32,7 +41,16 @@ function ProfileList() {
   const fetchProfiles = useSetAtom(fetchProfilesAtom);
   const createProfile = useSetAtom(createProfileAtom);
   const deleteProfile = useSetAtom(deleteProfileAtom);
-  const toggleEnabled = useSetAtom(toggleProfileEnabledAtom);
+  const previewApply = useSetAtom(previewApplyAtom);
+  const executeApply = useSetAtom(executeApplyAtom);
+  const closeApplyConfirm = useSetAtom(closeApplyConfirmAtom);
+  const rollbackHostsAction = useSetAtom(rollbackHostsActionAtom);
+
+  const applyConfirmOpen = useAtomValue(applyConfirmOpenAtom);
+  const applyPlan = useAtomValue(applyPlanAtom);
+  const applyResult = useAtomValue(applyResultAtom);
+  const applyError = useAtomValue(applyErrorAtom);
+  const isApplying = useAtomValue(isApplyingAtom);
 
   const [showCreate, setShowCreate] = useState(false);
   const [showImport, setShowImport] = useState(false);
@@ -72,14 +90,12 @@ function ProfileList() {
   );
 
   const handleToggle = useCallback(
-    async (id: string) => {
-      try {
-        await toggleEnabled(id);
-      } catch (err: unknown) {
-        setError(extractErrorMessage(err));
-      }
+    (id: string) => {
+      const profile = profiles.find((p) => p.id === id);
+      if (!profile) return;
+      previewApply({ id, enabled: !profile.enabled });
     },
-    [toggleEnabled, setError],
+    [profiles, previewApply],
   );
 
   const handleEdit = useCallback(
@@ -293,6 +309,17 @@ function ProfileList() {
           </div>
         </div>
       )}
+
+      <ApplyConfirmDialog
+        open={applyConfirmOpen}
+        plan={applyPlan}
+        onConfirm={() => executeApply()}
+        onCancel={() => closeApplyConfirm()}
+        isApplying={isApplying}
+        applyResult={applyResult}
+        applyError={applyError}
+        onRollback={() => rollbackHostsAction()}
+      />
     </div>
   );
 }

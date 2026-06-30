@@ -7,6 +7,11 @@ export {
   isLoadingAtom,
   selectedProfileAtom,
   enabledProfileAtom,
+  applyConfirmOpenAtom,
+  applyPlanAtom,
+  applyResultAtom,
+  applyErrorAtom,
+  applyTargetAtom,
 } from "./state";
 
 // ---- Async action atoms ----
@@ -16,6 +21,8 @@ export {
   createProfileAtom,
   updateProfileAtom,
   deleteProfileAtom,
-  toggleProfileEnabledAtom,
   rollbackHostsActionAtom,
+  previewApplyAtom,
+  executeApplyAtom,
+  closeApplyConfirmAtom,
 } from "./actions";

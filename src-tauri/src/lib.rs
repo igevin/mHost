@@ -31,6 +31,7 @@ pub fn run() {
             delete_profile,
             set_profile_enabled,
             enable_and_apply,
+            generate_preview_plan,
             generate_apply_plan,
             apply_hosts,
             rollback_hosts,

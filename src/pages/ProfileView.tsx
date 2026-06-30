@@ -7,14 +7,18 @@ import {
   selectedProfileIdAtom,
   isLoadingAtom,
   errorAtom,
+  isApplyingAtom,
+  applyErrorAtom,
   updateProfileAtom,
   createProfileAtom,
   deleteProfileAtom,
   fetchProfilesAtom,
+  previewApplyAtom,
 } from "../stores/profiles";
 import { countRealRules } from "../lib/rules";
 import { exportProfileToFile, deleteProfile } from "../lib/tauri";
 import { extractErrorMessage } from "../lib/error";
+import { useWebKitPointerDown } from "../hooks/useWebKitPointerDown";
 import type { HostRule } from "../types";
 import RuleEditor from "../components/RuleEditor";
 import ImportDialog from "../components/ImportDialog";
@@ -27,12 +31,16 @@ function ProfileView() {
   const profiles = useAtomValue(profilesAtom);
   const isLoading = useAtomValue(isLoadingAtom);
   const error = useAtomValue(errorAtom);
+  const isApplying = useAtomValue(isApplyingAtom);
   const setSelectedId = useSetAtom(selectedProfileIdAtom);
   const setError = useSetAtom(errorAtom);
   const updateProfile = useSetAtom(updateProfileAtom);
   const deleteProfileAction = useSetAtom(deleteProfileAtom);
   const createProfile = useSetAtom(createProfileAtom);
   const fetchProfiles = useSetAtom(fetchProfilesAtom);
+  const previewApply = useSetAtom(previewApplyAtom);
+  const setApplyError = useSetAtom(applyErrorAtom);
+  const { onPointerDown } = useWebKitPointerDown();
 
   const profile = profiles.find((p) => p.id === id);
 
@@ -409,6 +417,24 @@ function ProfileView() {
             ) : (
               <span className={`${styles.badge} ${styles.badgeDisabled}`}>Disabled</span>
             )}
+            <button
+              className={`btn btn-sm ${profile.enabled ? "btn-ghost" : "btn-primary"}`}
+              onClick={() => {
+                if (id) {
+                  setApplyError(null);
+                  previewApply({ id, enabled: !profile.enabled });
+                }
+              }}
+              onPointerDown={onPointerDown(() => {
+                if (id) {
+                  setApplyError(null);
+                  previewApply({ id, enabled: !profile.enabled });
+                }
+              })}
+              disabled={isApplying || isLoading}
+            >
+              {profile.enabled ? "Disable" : "Enable"}
+            </button>
             {profile.protected && (
               <span className={`${styles.badge} ${styles.badgeProtected}`}>Protected</span>
             )}
