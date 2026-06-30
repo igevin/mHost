@@ -71,6 +71,7 @@ describe("Layout", () => {
     renderWithProviders(<Layout />);
     expect(screen.getByText("Ad Block")).toBeInTheDocument();
     expect(screen.getByText("Remote Rules")).toBeInTheDocument();
+    expect(screen.getByText("Backup")).toBeInTheDocument();
     expect(screen.getByText("Settings")).toBeInTheDocument();
   });
 
