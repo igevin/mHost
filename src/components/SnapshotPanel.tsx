@@ -7,12 +7,10 @@ import {
   isLoadingSnapshotsAtom,
   snapshotErrorAtom,
   fetchSnapshotsAtom,
-  saveSnapshotAtom,
   loadSnapshotAtom,
   deleteSnapshotAtom,
 } from "../stores/profiles";
 import { useWebKitPointerDown } from "../hooks/useWebKitPointerDown";
-import { extractErrorMessage } from "../lib/error";
 import type { SnapshotMeta } from "../types";
 import styles from "./SnapshotPanel.module.css";
 

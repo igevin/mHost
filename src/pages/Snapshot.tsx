@@ -3,7 +3,6 @@ import { useSetAtom } from "jotai";
 import { saveSnapshotAtom } from "../stores/profiles";
 import { useWebKitPointerDown } from "../hooks/useWebKitPointerDown";
 import SnapshotPanel from "../components/SnapshotPanel";
-import styles from "./Snapshot.module.css";
 
 function SnapshotPage() {
   const [showCreateDialog, setShowCreateDialog] = useState(false);
