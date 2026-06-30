@@ -124,3 +124,12 @@
   border-radius: var(--radius-sm);
   padding: 4px 8px;
 }
+
+.warningItem {
+  font-size: 12px;
+  color: var(--color-warning);
+  background: var(--color-warning-bg);
+  border: 1px solid var(--color-warning-border);
+  border-radius: var(--radius-sm);
+  padding: 4px 8px;
+}

@@ -54,6 +54,7 @@ describe("RuleEditor", () => {
     mockValidateHostsText.mockResolvedValue({
       rules: [],
       errors: [{ line_number: 2, error: "invalid IP address" }],
+      duplicates: [],
     });
 
     const onChange = vi.fn();
@@ -80,6 +81,7 @@ describe("RuleEditor", () => {
     mockValidateHostsText.mockResolvedValue({
       rules: newRules,
       errors: [],
+      duplicates: [],
     });
 
     const onChange = vi.fn();
@@ -103,6 +105,7 @@ describe("RuleEditor", () => {
     mockValidateHostsText.mockResolvedValue({
       rules: [],
       errors: [{ line_number: 1, error: "parse error" }],
+      duplicates: [],
     });
 
     const onChange = vi.fn();
@@ -127,6 +130,7 @@ describe("RuleEditor", () => {
     mockValidateHostsText.mockResolvedValue({
       rules: [],
       errors: [],
+      duplicates: [],
     });
 
     const onChange = vi.fn();
@@ -152,5 +156,90 @@ describe("RuleEditor", () => {
 
     const textarea = screen.getByRole("textbox");
     expect(textarea).toHaveAttribute("readonly");
+  });
+
+  it("shows warning for duplicate domain with same IP", async () => {
+    mockValidateHostsText.mockResolvedValue({
+      rules: [],
+      errors: [],
+      duplicates: [
+        { domain: "example.com", lines: [1, 3], kind: "same_ip" },
+      ],
+    });
+
+    const onChange = vi.fn();
+    const onErrorChange = vi.fn();
+    render(<RuleEditor rules={[]} onChange={onChange} onErrorChange={onErrorChange} />);
+
+    const textarea = screen.getByRole("textbox");
+    fireEvent.change(textarea, { target: { value: "127.0.0.1 example.com\n\n127.0.0.1 example.com" } });
+
+    act(() => {
+      vi.advanceTimersByTime(350);
+    });
+
+    await act(async () => {
+      await vi.runAllTimersAsync();
+    });
+
+    const warningEl = screen.getByText(/冗余.*example.com/);
+    expect(warningEl).toBeInTheDocument();
+    expect(warningEl.className).toMatch(/warningItem/);
+    expect(onErrorChange).toHaveBeenCalledWith(false);
+  });
+
+  it("shows error for duplicate domain with different IP", async () => {
+    mockValidateHostsText.mockResolvedValue({
+      rules: [],
+      errors: [],
+      duplicates: [
+        { domain: "example.com", lines: [1, 2], kind: "different_ip" },
+      ],
+    });
+
+    const onChange = vi.fn();
+    const onErrorChange = vi.fn();
+    render(<RuleEditor rules={[]} onChange={onChange} onErrorChange={onErrorChange} />);
+
+    const textarea = screen.getByRole("textbox");
+    fireEvent.change(textarea, { target: { value: "127.0.0.1 example.com\n192.168.1.1 example.com" } });
+
+    act(() => {
+      vi.advanceTimersByTime(350);
+    });
+
+    await act(async () => {
+      await vi.runAllTimersAsync();
+    });
+
+    const errorEl = screen.getByText(/冲突.*example.com/);
+    expect(errorEl).toBeInTheDocument();
+    expect(errorEl.className).toMatch(/errorItem/);
+    expect(onErrorChange).toHaveBeenCalledWith(true);
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
+  it("does not show duplicate hint when no duplicates", async () => {
+    mockValidateHostsText.mockResolvedValue({
+      rules: [],
+      errors: [],
+      duplicates: [],
+    });
+
+    const onChange = vi.fn();
+    render(<RuleEditor rules={[]} onChange={onChange} />);
+
+    const textarea = screen.getByRole("textbox");
+    fireEvent.change(textarea, { target: { value: "127.0.0.1 example.com" } });
+
+    act(() => {
+      vi.advanceTimersByTime(350);
+    });
+
+    await act(async () => {
+      await vi.runAllTimersAsync();
+    });
+
+    expect(screen.queryByText(/冗余|冲突/)).not.toBeInTheDocument();
   });
 });

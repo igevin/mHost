@@ -1,5 +1,8 @@
 //! Hosts syntax validator
 
+use mhost_core::{DuplicateKind, DuplicateRule, HostRule};
+use std::collections::BTreeMap;
+
 /// Validates a domain string according to the following rules:
 /// - must not be empty
 /// - only letters, digits, hyphens, and dots are allowed
@@ -61,6 +64,55 @@ pub fn looks_like_ip(token: &str) -> bool {
         && token.chars().any(|c| c.is_ascii_digit())
         && !token.starts_with('.')
         && !token.ends_with('.')
+}
+
+/// Check for duplicate domains across enabled rules.
+/// Returns a list of domains that appear on more than one line,
+/// annotated with the line numbers and whether the IPs match.
+pub fn check_duplicates(rules: &[HostRule]) -> Vec<DuplicateRule> {
+    let mut domain_map: BTreeMap<String, Vec<(usize, String)>> = BTreeMap::new();
+
+    for rule in rules {
+        if !rule.enabled || rule.ip.is_none() {
+            continue;
+        }
+        let line_number = match rule.line_number {
+            Some(n) => n,
+            None => continue,
+        };
+        let ip_str = rule.ip.as_ref().unwrap().to_string();
+        for domain in &rule.domains {
+            domain_map
+                .entry(domain.clone())
+                .or_default()
+                .push((line_number, ip_str.clone()));
+        }
+    }
+
+    let mut duplicates = Vec::new();
+    for (domain, entries) in domain_map {
+        if entries.len() < 2 {
+            continue;
+        }
+        let lines: Vec<usize> = entries
+            .iter()
+            .map(|(line, _)| *line)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let ips: Vec<String> = entries.iter().map(|(_, ip)| ip.clone()).collect();
+        let all_same_ip = ips.iter().all(|ip| ip == &ips[0]);
+
+        let kind = if all_same_ip {
+            DuplicateKind::SameIp
+        } else {
+            DuplicateKind::DifferentIp
+        };
+
+        duplicates.push(DuplicateRule { domain, lines, kind });
+    }
+
+    duplicates
 }
 
 // ---------------------------------------------------------------------------

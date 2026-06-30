@@ -61,9 +61,16 @@ export interface ParseErrorAtLine {
   error: string | Record<string, string>;
 }
 
+export interface DuplicateRule {
+  domain: string;
+  lines: number[];
+  kind: "same_ip" | "different_ip";
+}
+
 export interface ValidateResult {
   rules: HostRule[];
   errors: ParseErrorAtLine[];
+  duplicates: DuplicateRule[];
 }
 
 export type ExportFormat = "hosts" | "json";

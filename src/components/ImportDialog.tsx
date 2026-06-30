@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { createPortal } from "react-dom";
-import type { HostRule, Profile, ParseErrorAtLine } from "../types";
+import type { HostRule, Profile, ParseErrorAtLine, DuplicateRule } from "../types";
 import { countRealRules } from "../lib/rules";
 import { validateHostsText, importProfile, importProfileFromFile } from "../lib/tauri";
 import { extractErrorMessage } from "../lib/error";
@@ -25,6 +25,7 @@ function ImportDialog({ open, onClose, mode = "create", onImported, onRulesParse
   const [hostsText, setHostsText] = useState("");
   const [filePath, setFilePath] = useState<string | null>(null);
   const [errors, setErrors] = useState<ParseErrorAtLine[]>([]);
+  const [duplicates, setDuplicates] = useState<DuplicateRule[]>([]);
   const [ruleCount, setRuleCount] = useState<number | null>(null);
   const [isValidating, setIsValidating] = useState(false);
   const [isImporting, setIsImporting] = useState(false);
@@ -40,6 +41,7 @@ function ImportDialog({ open, onClose, mode = "create", onImported, onRulesParse
       setHostsText("");
       setFilePath(null);
       setErrors([]);
+      setDuplicates([]);
       setRuleCount(null);
       setIsValidating(false);
       setIsImporting(false);
@@ -57,9 +59,12 @@ function ImportDialog({ open, onClose, mode = "create", onImported, onRulesParse
     try {
       const result = await validateHostsText(text);
       setErrors(result.errors);
-      setRuleCount(result.errors.length === 0 ? countRealRules(result.rules) : null);
+      setDuplicates(result.duplicates);
+      const hasBlocking = result.errors.length > 0 || result.duplicates.some((d) => d.kind === "different_ip");
+      setRuleCount(!hasBlocking ? countRealRules(result.rules) : null);
     } catch (_err) {
       setErrors([{ line_number: 0, error: "Validation failed" }]);
+      setDuplicates([]);
       setRuleCount(null);
     } finally {
       setIsValidating(false);
@@ -88,6 +93,7 @@ function ImportDialog({ open, onClose, mode = "create", onImported, onRulesParse
     setFilePath(null);
     setHostsText("");
     setErrors([]);
+    setDuplicates([]);
     setRuleCount(null);
     setImportError(null);
   }, []);
@@ -105,6 +111,7 @@ function ImportDialog({ open, onClose, mode = "create", onImported, onRulesParse
         // Validation will happen on import; clear any stale state
         setRuleCount(null);
         setErrors([]);
+        setDuplicates([]);
       }
     } catch (err) {
       setImportError(extractErrorMessage(err));
@@ -120,13 +127,14 @@ function ImportDialog({ open, onClose, mode = "create", onImported, onRulesParse
     };
   }, []);
 
+  const hasTextBlocking = errors.length > 0 || duplicates.some((d) => d.kind === "different_ip");
   const canImport = isReplace
     ? source === "text"
-      ? errors.length === 0 && ruleCount !== null
+      ? !hasTextBlocking && ruleCount !== null
       : filePath !== null
     : name.trim().length > 0 &&
       (source === "text"
-        ? errors.length === 0 && ruleCount !== null
+        ? !hasTextBlocking && ruleCount !== null
         : filePath !== null);
 
   const handleImport = useCallback(async () => {
@@ -142,8 +150,9 @@ function ImportDialog({ open, onClose, mode = "create", onImported, onRulesParse
         // Replace mode: parse rules without creating a visible new profile
         if (source === "text") {
           const result = await validateHostsText(hostsText);
-          if (result.errors.length > 0) {
+          if (result.errors.length > 0 || result.duplicates.some((d) => d.kind === "different_ip")) {
             setErrors(result.errors);
+            setDuplicates(result.duplicates);
             setIsImporting(false);
             release();
             return;
@@ -250,7 +259,7 @@ function ImportDialog({ open, onClose, mode = "create", onImported, onRulesParse
             </label>
             <textarea
               id="import-text"
-              className={`hosts-textarea ${errors.length > 0 ? styles.hasErrors : ""}`}
+              className={`hosts-textarea ${hasTextBlocking ? styles.hasErrors : ""}`}
               placeholder="Paste hosts file content here..."
               value={hostsText}
               onChange={handleTextChange}
@@ -296,6 +305,21 @@ function ImportDialog({ open, onClose, mode = "create", onImported, onRulesParse
             {errors.map((err) => (
               <div key={err.line_number} className={styles.errorItem}>
                 Line {err.line_number}: {typeof err.error === "string" ? err.error : JSON.stringify(err.error)}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {duplicates.length > 0 && (
+          <div className={styles.errorList}>
+            {duplicates.map((dup) => (
+              <div
+                key={`dup-${dup.domain}`}
+                className={dup.kind === "different_ip" ? styles.errorItem : styles.warningItem}
+              >
+                {dup.kind === "different_ip"
+                  ? `冲突: 域名 "${dup.domain}" 映射到不同 IP (行 ${dup.lines.join(", ")})`
+                  : `冗余: 域名 "${dup.domain}" 重复出现 (行 ${dup.lines.join(", ")})`}
               </div>
             ))}
           </div>
