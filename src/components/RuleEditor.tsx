@@ -200,7 +200,7 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEd
         setValidateResult(result);
         const hasBlockingIssues = result.errors.length > 0 || result.duplicates.some((d) => d.kind === "different_ip");
         onErrorChange?.(hasBlockingIssues);
-        if (result.errors.length === 0) {
+        if (!hasBlockingIssues) {
           onChange(result.rules);
         }
       } catch (err) {
@@ -239,10 +239,11 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEd
   // Generate highlighted content — Perf fix (#30): use deferred value to avoid blocking on every keystroke
   const deferredText = useDeferredValue(text);
   const highlightedHtml = useMemo(() => highlightText(deferredText), [deferredText]);
+  const editorHasBlockingIssues = errors.length > 0 || (validateResult?.duplicates?.some((d) => d.kind === "different_ip") ?? false);
 
   return (
     <div className={styles.container}>
-      <div className={`${styles.editorWrapper} ${errors.length > 0 ? styles.editorWrapperHasErrors : ""}`}>
+      <div className={`${styles.editorWrapper} ${editorHasBlockingIssues ? styles.editorWrapperHasErrors : ""}`}>
         {/* Highlight Layer */}
         <div
           ref={highlightRef}

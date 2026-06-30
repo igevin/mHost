@@ -168,7 +168,8 @@ describe("RuleEditor", () => {
     });
 
     const onChange = vi.fn();
-    render(<RuleEditor rules={[]} onChange={onChange} />);
+    const onErrorChange = vi.fn();
+    render(<RuleEditor rules={[]} onChange={onChange} onErrorChange={onErrorChange} />);
 
     const textarea = screen.getByRole("textbox");
     fireEvent.change(textarea, { target: { value: "127.0.0.1 example.com\n\n127.0.0.1 example.com" } });
@@ -181,7 +182,10 @@ describe("RuleEditor", () => {
       await vi.runAllTimersAsync();
     });
 
-    expect(screen.getByText(/冗余.*example.com/)).toBeInTheDocument();
+    const warningEl = screen.getByText(/冗余.*example.com/);
+    expect(warningEl).toBeInTheDocument();
+    expect(warningEl.className).toMatch(/warningItem/);
+    expect(onErrorChange).toHaveBeenCalledWith(false);
   });
 
   it("shows error for duplicate domain with different IP", async () => {
@@ -194,7 +198,8 @@ describe("RuleEditor", () => {
     });
 
     const onChange = vi.fn();
-    render(<RuleEditor rules={[]} onChange={onChange} />);
+    const onErrorChange = vi.fn();
+    render(<RuleEditor rules={[]} onChange={onChange} onErrorChange={onErrorChange} />);
 
     const textarea = screen.getByRole("textbox");
     fireEvent.change(textarea, { target: { value: "127.0.0.1 example.com\n192.168.1.1 example.com" } });
@@ -207,7 +212,11 @@ describe("RuleEditor", () => {
       await vi.runAllTimersAsync();
     });
 
-    expect(screen.getByText(/冲突.*example.com/)).toBeInTheDocument();
+    const errorEl = screen.getByText(/冲突.*example.com/);
+    expect(errorEl).toBeInTheDocument();
+    expect(errorEl.className).toMatch(/errorItem/);
+    expect(onErrorChange).toHaveBeenCalledWith(true);
+    expect(onChange).not.toHaveBeenCalled();
   });
 
   it("does not show duplicate hint when no duplicates", async () => {
