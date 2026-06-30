@@ -8,27 +8,21 @@ import {
   isLoadingAtom,
   errorAtom,
   isApplyingAtom,
-  applyConfirmOpenAtom,
-  applyPlanAtom,
-  applyResultAtom,
   applyErrorAtom,
   updateProfileAtom,
   createProfileAtom,
   deleteProfileAtom,
   fetchProfilesAtom,
   previewApplyAtom,
-  executeApplyAtom,
-  closeApplyConfirmAtom,
-  rollbackHostsActionAtom,
 } from "../stores/profiles";
 import { countRealRules } from "../lib/rules";
 import { exportProfileToFile, deleteProfile } from "../lib/tauri";
 import { extractErrorMessage } from "../lib/error";
+import { useWebKitPointerDown } from "../hooks/useWebKitPointerDown";
 import type { HostRule } from "../types";
 import RuleEditor from "../components/RuleEditor";
 import ImportDialog from "../components/ImportDialog";
 import CreateProfileDialog from "../components/CreateProfileDialog";
-import ApplyConfirmDialog from "../components/ApplyConfirmDialog";
 import styles from "./ProfileView.module.css";
 
 function ProfileView() {
@@ -38,10 +32,6 @@ function ProfileView() {
   const isLoading = useAtomValue(isLoadingAtom);
   const error = useAtomValue(errorAtom);
   const isApplying = useAtomValue(isApplyingAtom);
-  const applyConfirmOpen = useAtomValue(applyConfirmOpenAtom);
-  const applyPlan = useAtomValue(applyPlanAtom);
-  const applyResult = useAtomValue(applyResultAtom);
-  const applyError = useAtomValue(applyErrorAtom);
   const setSelectedId = useSetAtom(selectedProfileIdAtom);
   const setError = useSetAtom(errorAtom);
   const updateProfile = useSetAtom(updateProfileAtom);
@@ -49,9 +39,8 @@ function ProfileView() {
   const createProfile = useSetAtom(createProfileAtom);
   const fetchProfiles = useSetAtom(fetchProfilesAtom);
   const previewApply = useSetAtom(previewApplyAtom);
-  const executeApply = useSetAtom(executeApplyAtom);
-  const closeApplyConfirm = useSetAtom(closeApplyConfirmAtom);
-  const rollbackHostsAction = useSetAtom(rollbackHostsActionAtom);
+  const setApplyError = useSetAtom(applyErrorAtom);
+  const { onPointerDown } = useWebKitPointerDown();
 
   const profile = profiles.find((p) => p.id === id);
 
@@ -432,9 +421,16 @@ function ProfileView() {
               className={`btn btn-sm ${profile.enabled ? "btn-ghost" : "btn-primary"}`}
               onClick={() => {
                 if (id) {
+                  setApplyError(null);
                   previewApply({ id, enabled: !profile.enabled });
                 }
               }}
+              onPointerDown={onPointerDown(() => {
+                if (id) {
+                  setApplyError(null);
+                  previewApply({ id, enabled: !profile.enabled });
+                }
+              })}
               disabled={isApplying || isLoading}
             >
               {profile.enabled ? "Disable" : "Enable"}
@@ -520,18 +516,6 @@ function ProfileView() {
         onClose={() => setShowCreateDialog(false)}
         onCreate={handleCreateProfile}
         isLoading={isLoading}
-      />
-
-      {/* Apply Confirm Dialog */}
-      <ApplyConfirmDialog
-        open={applyConfirmOpen}
-        plan={applyPlan}
-        onConfirm={() => executeApply()}
-        onCancel={() => closeApplyConfirm()}
-        isApplying={isApplying}
-        applyResult={applyResult}
-        applyError={applyError}
-        onRollback={() => rollbackHostsAction()}
       />
     </div>
   );
