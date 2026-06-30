@@ -350,6 +350,7 @@ function ProfileView() {
                   <button
                     className="btn btn-primary btn-sm"
                     onClick={handleSaveInfo}
+                    onPointerDown={onPointerDown(handleSaveInfo)}
                     disabled={!infoHasChanges || isLoading || isSavingInfo}
                   >
                     {isSavingInfo ? "Saving..." : "Save"}
@@ -357,6 +358,7 @@ function ProfileView() {
                   <button
                     className="btn btn-ghost btn-sm"
                     onClick={handleCancelInfoEdit}
+                    onPointerDown={onPointerDown(handleCancelInfoEdit)}
                   >
                     Cancel
                   </button>
@@ -465,12 +467,17 @@ function ProfileView() {
             </>
           ) : (
             <>
-              <button className="btn btn-ghost btn-sm" onClick={handleCancelEdit}>
+              <button
+                className="btn btn-ghost btn-sm"
+                onClick={handleCancelEdit}
+                onPointerDown={onPointerDown(handleCancelEdit)}
+              >
                 Cancel
               </button>
               <button
                 className="btn btn-primary btn-sm"
                 onClick={handleSave}
+                onPointerDown={onPointerDown(handleSave)}
                 disabled={!hasChanges || isLoading || ruleErrors || isSaving}
               >
                 {isSaving ? "Saving..." : "Save"}
