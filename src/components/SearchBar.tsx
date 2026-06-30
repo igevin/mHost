@@ -36,6 +36,8 @@ function SearchBar({
   const [replaceExpanded, setReplaceExpanded] = useState(false);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const { onPointerDown } = useWebKitPointerDown();
+  // Separate guard for toggle to prevent double-fire from onClick + onPointerDown
+  const toggleGuard = useWebKitPointerDown();
 
   useEffect(() => {
     if (visible) {
@@ -61,8 +63,10 @@ function SearchBar({
   );
 
   const handleToggleReplace = useCallback(() => {
+    if (!toggleGuard.fire()) return;
     setReplaceExpanded((prev) => !prev);
-  }, []);
+    setTimeout(toggleGuard.release, 50);
+  }, [toggleGuard]);
 
   const matchDisplay = matchCount > 0 ? `${currentMatchIndex + 1}/${matchCount}` : "0/0";
 

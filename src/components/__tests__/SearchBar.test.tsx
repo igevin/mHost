@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, act } from "@testing-library/react";
 import SearchBar from "../SearchBar";
 
 function renderSearchBar(props: Partial<Parameters<typeof SearchBar>[0]> = {}) {
@@ -66,11 +66,15 @@ describe("SearchBar", () => {
     expect(onClose).toHaveBeenCalled();
   });
 
-  it("toggles replace row when Replace button clicked", () => {
+  it("toggles replace row when Replace button clicked", async () => {
     renderSearchBar();
     expect(screen.queryByTestId("replace-input")).not.toBeInTheDocument();
     fireEvent.click(screen.getByTestId("toggle-replace"));
     expect(screen.getByTestId("replace-input")).toBeInTheDocument();
+    // Wait for toggle guard to release before second click
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 100));
+    });
     fireEvent.click(screen.getByTestId("toggle-replace"));
     expect(screen.queryByTestId("replace-input")).not.toBeInTheDocument();
   });
