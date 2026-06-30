@@ -118,10 +118,9 @@ const toolNavItems: NavItem[] = [
     disabled: true,
   },
   {
-    to: "#backup",
+    to: "/backup",
     label: "Backup",
     icon: <BackupIcon />,
-    disabled: true,
   },
   { to: "/settings", label: "Settings", icon: <SettingsIcon /> },
 ];
@@ -274,7 +273,7 @@ function Layout() {
             {toolNavItems.map((item) =>
               item.disabled ? (
                 <div
-                  key={item.to}
+                  key={item.label}
                   className={`${styles.navLink} ${styles.navLinkDisabled}`}
                   title="Coming soon"
                 >
@@ -287,7 +286,7 @@ function Layout() {
                 </div>
               ) : (
                 <NavLink
-                  key={item.to}
+                  key={item.label}
                   to={item.to}
                   className={({ isActive }) =>
                     `${styles.navLink} ${isActive ? styles.navLinkActive : ""}`

@@ -5,6 +5,7 @@ import { useSetAtom } from "jotai";
 import Layout from "./components/Layout";
 import ProfileView from "./pages/ProfileView";
 import Settings from "./pages/Settings";
+import Backup from "./pages/Backup";
 import { fetchProfilesAtom } from "./stores/profiles";
 
 function App() {
@@ -30,6 +31,7 @@ function App() {
         <Route path="/" element={<Navigate to="/profiles" replace />} />
         <Route path="/profiles" element={<ProfileView />} />
         <Route path="/profiles/:id" element={<ProfileView />} />
+        <Route path="/backup" element={<Backup />} />
         <Route path="/settings" element={<Settings />} />
       </Route>
     </Routes>
