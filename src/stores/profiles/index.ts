@@ -21,7 +21,6 @@ export {
   createProfileAtom,
   updateProfileAtom,
   deleteProfileAtom,
-  toggleProfileEnabledAtom,
   rollbackHostsActionAtom,
   previewApplyAtom,
   executeApplyAtom,
