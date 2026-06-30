@@ -124,7 +124,9 @@ pub async fn apply_hosts(state: State<'_, AppState>) -> Result<(), MhostError> {
         write_last_applied(&storage.root())?;
 
         // Auto-snapshot after successful apply
-        let _ = crate::commands::snapshot::auto_snapshot_logic(storage.as_ref());
+        if let Err(e) = crate::commands::snapshot::auto_snapshot_logic(storage.as_ref()) {
+            eprintln!("[mHost] Auto-snapshot failed: {}", e);
+        }
 
         Ok(())
     }).await.map_err(|e| MhostError::InvalidInput(e.to_string()))?
@@ -218,7 +220,9 @@ pub async fn enable_and_apply(
         enable_and_apply_logic(&profile_id, enabled, storage.as_ref(), &writer)?;
 
         // Auto-snapshot after successful apply
-        let _ = crate::commands::snapshot::auto_snapshot_logic(storage.as_ref());
+        if let Err(e) = crate::commands::snapshot::auto_snapshot_logic(storage.as_ref()) {
+            eprintln!("[mHost] Auto-snapshot failed: {}", e);
+        }
 
         Ok::<(), MhostError>(())
     }).await.map_err(|e| MhostError::InvalidInput(e.to_string()))??;

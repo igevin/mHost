@@ -130,9 +130,14 @@ function SnapshotPanel({
       if (e.key === "Enter") {
         e.preventDefault();
         handleSave();
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        if (!isSaving) {
+          onCloseCreateDialog();
+        }
       }
     },
-    [handleSave],
+    [handleSave, isSaving, onCloseCreateDialog],
   );
 
   return (
@@ -202,7 +207,7 @@ function SnapshotPanel({
         createPortal(
           <div
             className={styles.dialogOverlay}
-            onClick={onCloseCreateDialog}
+            onClick={isSaving ? undefined : onCloseCreateDialog}
           >
             <div
               className={styles.dialog}

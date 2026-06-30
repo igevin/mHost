@@ -27,6 +27,8 @@ pub struct AppState {
     pub storage: Arc<dyn Storage + Send + Sync>,
     pub writer: Arc<HostsWriter>,
     pub apply_lock: ApplyLock,
+    /// N2: Serialize snapshot save/delete operations to prevent races.
+    pub snapshot_lock: ApplyLock,
     /// Perf fix (#29): Track last rendered profile IDs to avoid unnecessary menu rebuilds.
     pub last_profile_ids: Mutex<Vec<String>>,
 }
@@ -39,6 +41,7 @@ impl AppState {
             storage,
             writer,
             apply_lock: ApplyLock(tokio::sync::Mutex::new(())),
+            snapshot_lock: ApplyLock(tokio::sync::Mutex::new(())),
             last_profile_ids: Mutex::new(Vec::new()),
         })
     }

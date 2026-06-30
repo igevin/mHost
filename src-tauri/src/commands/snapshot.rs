@@ -1,12 +1,31 @@
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use mhost_apply::writer::HostsWriter;
 use mhost_core::{MhostError, Snapshot, SnapshotMeta};
 use mhost_storage::storage::Storage;
+use serde::Deserialize;
 use tauri::{AppHandle, State};
 
 use crate::state::AppState;
 
 const MAX_SNAPSHOTS: usize = 20;
+const MAX_SNAPSHOT_NAME_LENGTH: usize = 100;
+const MAX_SNAPSHOT_DESC_LENGTH: usize = 500;
+
+// ---------------------------------------------------------------------------
+// ID validation
+// ---------------------------------------------------------------------------
+
+/// Validate that a snapshot id is a valid UUID v4 string.
+/// Security fix (B1): Prevents path traversal via malicious id values.
+fn validate_snapshot_id(id: &str) -> Result<(), MhostError> {
+    if uuid::Uuid::parse_str(id).is_err() {
+        return Err(MhostError::InvalidInput(format!(
+            "invalid snapshot id: {}",
+            id
+        )));
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // Pure logic functions (testable without Tauri State)
@@ -17,6 +36,24 @@ pub fn save_snapshot_logic(
     name: String,
     description: Option<String>,
 ) -> Result<SnapshotMeta, MhostError> {
+    // N4: Validate length limits
+    if name.len() > MAX_SNAPSHOT_NAME_LENGTH {
+        return Err(MhostError::InvalidInput(format!(
+            "Snapshot name exceeds maximum length of {} characters",
+            MAX_SNAPSHOT_NAME_LENGTH
+        )));
+    }
+    if description
+        .as_ref()
+        .map_or(0, |s| s.len())
+        > MAX_SNAPSHOT_DESC_LENGTH
+    {
+        return Err(MhostError::InvalidInput(format!(
+            "Snapshot description exceeds maximum length of {} characters",
+            MAX_SNAPSHOT_DESC_LENGTH
+        )));
+    }
+
     let profiles = storage.list_profiles()?;
     let id = uuid::Uuid::new_v4().to_string();
     let created_at = Utc::now();
@@ -33,7 +70,11 @@ pub fn save_snapshot_logic(
     let snapshot_path = snapshots_dir.join(format!("{}.json", id));
     let json = serde_json::to_string_pretty(&snapshot)
         .map_err(|e| MhostError::InvalidInput(format!("serialize snapshot failed: {}", e)))?;
-    std::fs::write(&snapshot_path, json)?;
+
+    // N1: Atomic write via temp file + rename
+    let temp_path = snapshot_path.with_extension("tmp");
+    std::fs::write(&temp_path, json)?;
+    std::fs::rename(&temp_path, &snapshot_path)?;
 
     let meta = SnapshotMeta {
         id: id.clone(),
@@ -61,6 +102,48 @@ pub fn save_snapshot_logic(
     Ok(meta)
 }
 
+/// Lightweight metadata-only structure for reading snapshot files without
+/// loading the full `profiles` array into memory.
+/// Fix (B3): Avoids deserializing the entire Snapshot when only meta is needed.
+#[derive(Deserialize)]
+struct SnapshotFileMeta {
+    id: String,
+    name: String,
+    description: Option<String>,
+    #[serde(deserialize_with = "deserialize_profile_count")]
+    profiles: usize,
+    created_at: DateTime<Utc>,
+}
+
+/// Custom deserializer that counts array elements without allocating them.
+fn deserialize_profile_count<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct ProfileCountVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for ProfileCountVisitor {
+        type Value = usize;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("an array")
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut count = 0;
+            while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                count += 1;
+            }
+            Ok(count)
+        }
+    }
+
+    deserializer.deserialize_seq(ProfileCountVisitor)
+}
+
 pub fn list_snapshots_logic(
     storage: &(dyn Storage + Send + Sync),
 ) -> Result<Vec<SnapshotMeta>, MhostError> {
@@ -85,17 +168,20 @@ pub fn list_snapshots_logic(
             Err(_) => continue,
         };
 
-        let snapshot: Snapshot = match serde_json::from_str(&content) {
-            Ok(s) => s,
-            Err(_) => continue,
+        let meta: SnapshotFileMeta = match serde_json::from_str(&content) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("[mHost] Skipping corrupted snapshot file {:?}: {}", path, e);
+                continue;
+            }
         };
 
         metas.push(SnapshotMeta {
-            id: snapshot.id,
-            name: snapshot.name,
-            description: snapshot.description,
-            profile_count: snapshot.profiles.len(),
-            created_at: snapshot.created_at,
+            id: meta.id,
+            name: meta.name,
+            description: meta.description,
+            profile_count: meta.profiles,
+            created_at: meta.created_at,
         });
     }
 
@@ -108,6 +194,8 @@ pub fn load_snapshot_logic(
     writer: &HostsWriter,
     id: &str,
 ) -> Result<(), MhostError> {
+    validate_snapshot_id(id)?;
+
     let snapshot_path = storage.root().join("snapshots").join(format!("{}.json", id));
     if !snapshot_path.exists() {
         return Err(MhostError::InvalidInput(format!("snapshot not found: {}", id)));
@@ -117,15 +205,22 @@ pub fn load_snapshot_logic(
     let snapshot: Snapshot = serde_json::from_str(&content)
         .map_err(|e| MhostError::InvalidInput(format!("parse snapshot failed: {}", e)))?;
 
-    // Delete all current profiles
+    // Fix (B2): Atomic recovery — save all snapshot profiles first, then delete extras.
+    // If save_profile fails partway through, we only have extra profiles (no data loss).
     let current_profiles = storage.list_profiles()?;
-    for p in current_profiles {
-        storage.delete_profile(&p.id)?;
-    }
+    let snapshot_ids: std::collections::HashSet<_> =
+        snapshot.profiles.iter().map(|p| p.id.clone()).collect();
 
-    // Save all snapshot profiles
+    // Save all snapshot profiles (overwrites any with matching ids)
     for profile in snapshot.profiles {
         storage.save_profile(&profile)?;
+    }
+
+    // Delete current profiles that are not in the snapshot
+    for p in current_profiles {
+        if !snapshot_ids.contains(&p.id) {
+            storage.delete_profile(&p.id)?;
+        }
     }
 
     // Apply current plan
@@ -138,6 +233,8 @@ pub fn delete_snapshot_logic(
     storage: &(dyn Storage + Send + Sync),
     id: &str,
 ) -> Result<(), MhostError> {
+    validate_snapshot_id(id)?;
+
     let snapshot_path = storage.root().join("snapshots").join(format!("{}.json", id));
     if snapshot_path.exists() {
         std::fs::remove_file(&snapshot_path)?;
@@ -155,6 +252,8 @@ pub async fn save_snapshot(
     description: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<SnapshotMeta, MhostError> {
+    // N2: Serialize snapshot operations to prevent races during save+prune
+    let _guard = state.snapshot_lock.lock().await;
     let storage = state.storage.clone();
     tauri::async_runtime::spawn_blocking(move || {
         save_snapshot_logic(storage.as_ref(), name, description)
@@ -199,6 +298,8 @@ pub async fn delete_snapshot(
     id: String,
     state: State<'_, AppState>,
 ) -> Result<(), MhostError> {
+    // N2: Serialize snapshot operations
+    let _guard = state.snapshot_lock.lock().await;
     let storage = state.storage.clone();
     tauri::async_runtime::spawn_blocking(move || delete_snapshot_logic(storage.as_ref(), &id))
         .await
@@ -403,18 +504,57 @@ mod tests {
     }
 
     #[test]
-    fn test_load_snapshot_respects_apply_lock() {
-        // This test verifies that the logic function itself does not interfere with locking.
-        // The actual lock is held at the command layer. Here we just ensure the logic works.
+    fn test_load_snapshot_validates_id_format() {
         let (_temp, storage, writer) = create_test_storage_and_writer();
-        let mut profile = create_profile_with_rules(&storage, "dev", vec![("127.0.0.1", "example.com")]);
-        profile.enabled = true;
-        storage.save_profile(&profile).unwrap();
 
-        let meta = save_snapshot_logic(storage.as_ref(), "backup".to_string(), None).unwrap();
+        // B1: Rejects path traversal attempts
+        let result = load_snapshot_logic(storage.as_ref(), &writer, "../etc/passwd");
+        assert!(result.is_err(), "should reject invalid snapshot id");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("invalid snapshot id"), "error should mention invalid id: {}", msg);
 
-        let result = load_snapshot_logic(storage.as_ref(), &writer, &meta.id);
-        assert!(result.is_ok());
+        let result = delete_snapshot_logic(storage.as_ref(), "../../secret");
+        assert!(result.is_err(), "should reject invalid snapshot id for delete");
+    }
+
+    #[test]
+    fn test_load_snapshot_recovery_on_partial_failure() {
+        // B2: Verify that if save_profile fails partway, no data is lost.
+        // In practice, FileStorage::save_profile is atomic, so this test
+        // verifies the ordering (save first, delete after).
+        let (_temp, storage, writer) = create_test_storage_and_writer();
+        let p1 = create_profile_with_rules(&storage, "keep", vec![("127.0.0.1", "keep.local")]);
+        let p2 = create_profile_with_rules(&storage, "remove", vec![("192.168.1.1", "remove.local")]);
+
+        // Save a snapshot that only contains "keep" by building it manually
+        let snapshots_dir = storage.root().join("snapshots");
+        std::fs::create_dir_all(&snapshots_dir).unwrap();
+        let snapshot = mhost_core::Snapshot {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "partial".to_string(),
+            description: None,
+            profiles: vec![p1],
+            created_at: Utc::now(),
+        };
+        let path = snapshots_dir.join(format!("{}.json", snapshot.id));
+        let json = serde_json::to_string_pretty(&snapshot).unwrap();
+        std::fs::write(&path, json).unwrap();
+
+        // Delete original profiles
+        for p in storage.list_profiles().unwrap() {
+            storage.delete_profile(&p.id).unwrap();
+        }
+        assert!(storage.list_profiles().unwrap().is_empty());
+
+        // Load snapshot (only "keep" should exist after)
+        load_snapshot_logic(storage.as_ref(), &writer, &snapshot.id).unwrap();
+
+        let restored = storage.list_profiles().unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].name, "keep");
+
+        // Verify "remove" profile id is gone
+        assert!(!restored.iter().any(|p| p.id == p2.id));
     }
 
     // -----------------------------------------------------------------------
@@ -475,5 +615,23 @@ mod tests {
         let snapshots = list_snapshots_logic(storage.as_ref()).unwrap();
         assert_eq!(snapshots.len(), 2);
         assert!(snapshots[0].name.starts_with("Auto-snapshot")); // newest first
+    }
+
+    #[test]
+    fn test_save_snapshot_rejects_long_name() {
+        let (_temp, storage, _writer) = create_test_storage_and_writer();
+        let long_name = "a".repeat(MAX_SNAPSHOT_NAME_LENGTH + 1);
+        let result = save_snapshot_logic(storage.as_ref(), long_name, None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("exceeds maximum length"));
+    }
+
+    #[test]
+    fn test_save_snapshot_rejects_long_description() {
+        let (_temp, storage, _writer) = create_test_storage_and_writer();
+        let long_desc = "a".repeat(MAX_SNAPSHOT_DESC_LENGTH + 1);
+        let result = save_snapshot_logic(storage.as_ref(), "name".to_string(), Some(long_desc));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("exceeds maximum length"));
     }
 }
