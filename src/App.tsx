@@ -6,6 +6,7 @@ import Layout from "./components/Layout";
 import ProfileView from "./pages/ProfileView";
 import Settings from "./pages/Settings";
 import SnapshotPage from "./pages/Snapshot";
+import SystemHosts from "./pages/SystemHosts";
 import { fetchProfilesAtom } from "./stores/profiles";
 
 function App() {
@@ -33,6 +34,7 @@ function App() {
         <Route path="/profiles/:id" element={<ProfileView />} />
         <Route path="/settings" element={<Settings />} />
         <Route path="/snapshot" element={<SnapshotPage />} />
+        <Route path="/hosts" element={<SystemHosts />} />
       </Route>
     </Routes>
   );

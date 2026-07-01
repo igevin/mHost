@@ -1,18 +1,6 @@
-import { useState, useEffect } from "react";
-import { readSystemHosts } from "../lib/tauri";
-import { extractErrorMessage } from "../lib/error";
 import styles from "./Settings.module.css";
 
 function Settings() {
-  const [hostsContent, setHostsContent] = useState<string | null>(null);
-  const [hostsError, setHostsError] = useState<string | null>(null);
-
-  useEffect(() => {
-    readSystemHosts()
-      .then((content) => setHostsContent(content))
-      .catch((err) => setHostsError(extractErrorMessage(err)));
-  }, []);
-
   return (
     <div className="mhost-page">
       <header className="mhost-page-header">
@@ -52,18 +40,6 @@ function Settings() {
             <span className={styles.infoLabel}>Backups</span>
             <span className={styles.infoValue}>backups/</span>
           </div>
-        </div>
-
-        {/* System Hosts Preview */}
-        <div className={`card ${styles.previewCard}`}>
-          <h3 className="card-title">System Hosts Preview</h3>
-          {hostsError ? (
-            <div className="alert alert-error">{hostsError}</div>
-          ) : hostsContent === null ? (
-            <div className="loading">Loading...</div>
-          ) : (
-            <pre className={styles.hostsPreview}>{hostsContent}</pre>
-          )}
         </div>
       </div>
     </div>
