@@ -3,7 +3,10 @@
 .settingsGrid {
   display: grid;
   grid-template-columns: 1fr 1fr;
+  grid-template-rows: auto 1fr;
   gap: 16px;
+  flex: 1;
+  min-height: 0;
 }
 
 @media (max-width: 768px) {
@@ -124,10 +127,19 @@
   font-size: 12px;
   line-height: 1.6;
   overflow: auto;
-  max-height: 400px;
+  flex: 1;
+  min-height: 0;
   white-space: pre-wrap;
   word-break: break-word;
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.previewCard {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  margin-bottom: 0;
 }
 
 /* ---- About Card ---- */
