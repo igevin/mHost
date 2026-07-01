@@ -8,9 +8,17 @@ function SystemHosts() {
   const [hostsError, setHostsError] = useState<string | null>(null);
 
   useEffect(() => {
+    let mounted = true;
     readSystemHosts()
-      .then((content) => setHostsContent(content))
-      .catch((err) => setHostsError(extractErrorMessage(err)));
+      .then((content) => {
+        if (mounted) setHostsContent(content);
+      })
+      .catch((err) => {
+        if (mounted) setHostsError(extractErrorMessage(err));
+      });
+    return () => {
+      mounted = false;
+    };
   }, []);
 
   return (
