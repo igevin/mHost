@@ -21,10 +21,35 @@
 
 /* ---- Highlight Layer (underneath textarea) ---- */
 
-.highlightLayer {
+.lineNumbers {
   position: absolute;
   top: 0;
   left: 0;
+  bottom: 0;
+  width: 44px;
+  padding: 10px 6px 10px 0;
+  background: var(--color-readonly-bg);
+  border-right: 1px solid var(--color-border);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--color-text-muted);
+  text-align: right;
+  overflow: hidden;
+  z-index: 3;
+  user-select: none;
+}
+
+.lineNumber {
+  min-height: 20.8px;
+}
+
+/* ---- Highlight Layer (underneath textarea) ---- */
+
+.highlightLayer {
+  position: absolute;
+  top: 0;
+  left: 44px;
   right: 0;
   bottom: 0;
   padding: 10px 12px;
@@ -46,7 +71,7 @@
 .textarea {
   position: absolute;
   top: 0;
-  left: 0;
+  left: 44px;
   right: 0;
   bottom: 0;
   width: 100%;

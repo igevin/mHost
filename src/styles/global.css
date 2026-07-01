@@ -108,6 +108,10 @@ body {
 /* ---- Page ---- */
 .mhost-page {
   max-width: 960px;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
 
 .mhost-page-header {

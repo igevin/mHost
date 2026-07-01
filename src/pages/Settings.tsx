@@ -1,22 +1,6 @@
-import { useState, useEffect } from "react";
-import { useSetAtom } from "jotai";
-import { readSystemHosts } from "../lib/tauri";
-import { extractErrorMessage } from "../lib/error";
-import { rollbackHostsActionAtom } from "../stores/profiles";
-import RollbackButton from "../components/RollbackButton";
 import styles from "./Settings.module.css";
 
 function Settings() {
-  const [hostsContent, setHostsContent] = useState<string | null>(null);
-  const [hostsError, setHostsError] = useState<string | null>(null);
-  const rollback = useSetAtom(rollbackHostsActionAtom);
-
-  useEffect(() => {
-    readSystemHosts()
-      .then((content) => setHostsContent(content))
-      .catch((err) => setHostsError(extractErrorMessage(err)));
-  }, []);
-
   return (
     <div className="mhost-page">
       <header className="mhost-page-header">
@@ -56,27 +40,6 @@ function Settings() {
             <span className={styles.infoLabel}>Backups</span>
             <span className={styles.infoValue}>backups/</span>
           </div>
-        </div>
-
-        {/* Hosts Management Card */}
-        <div className="card">
-          <h3 className="card-title">Hosts Management</h3>
-          <p className={styles.sectionDesc}>
-            Rollback the system hosts file to the last backed-up version.
-          </p>
-          <RollbackButton onRollback={rollback} />
-        </div>
-
-        {/* System Hosts Preview */}
-        <div className="card card-full">
-          <h3 className="card-title">System Hosts Preview</h3>
-          {hostsError ? (
-            <div className="alert alert-error">{hostsError}</div>
-          ) : hostsContent === null ? (
-            <div className="loading">Loading...</div>
-          ) : (
-            <pre className={styles.hostsPreview}>{hostsContent}</pre>
-          )}
         </div>
       </div>
     </div>

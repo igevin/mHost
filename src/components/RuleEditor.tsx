@@ -238,6 +238,7 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEd
   const [isValidating, setIsValidating] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const highlightRef = useRef<HTMLDivElement>(null);
+  const lineNumbersRef = useRef<HTMLDivElement>(null);
 
   // Track whether the user is actively editing — prevents external rule sync
   // from overwriting the textarea while the user is typing.
@@ -334,11 +335,12 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEd
     [debouncedValidate],
   );
 
-  // Sync scroll between textarea and highlight layer
+  // Sync scroll between textarea, highlight layer, and line numbers
   const handleScroll = useCallback(() => {
-    if (textareaRef.current && highlightRef.current) {
+    if (textareaRef.current && highlightRef.current && lineNumbersRef.current) {
       highlightRef.current.scrollTop = textareaRef.current.scrollTop;
       highlightRef.current.scrollLeft = textareaRef.current.scrollLeft;
+      lineNumbersRef.current.scrollTop = textareaRef.current.scrollTop;
     }
   }, []);
 
@@ -423,6 +425,11 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEd
   );
   const editorHasBlockingIssues = errors.length > 0 || (validateResult?.duplicates?.some((d) => d.kind === "different_ip") ?? false);
 
+  const lineNumbers = useMemo(() => {
+    const count = text.split("\n").length;
+    return Array.from({ length: count }, (_, i) => i + 1);
+  }, [text]);
+
   return (
     <div className={styles.container}>
       <SearchBar
@@ -445,6 +452,13 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEd
         readOnly={readOnly}
       />
       <div className={`${styles.editorWrapper} ${editorHasBlockingIssues ? styles.editorWrapperHasErrors : ""}`}>
+        {/* Line Numbers */}
+        <div ref={lineNumbersRef} className={styles.lineNumbers}>
+          {lineNumbers.map((num) => (
+            <div key={num} className={styles.lineNumber}>{num}</div>
+          ))}
+        </div>
+
         {/* Highlight Layer */}
         <div
           ref={highlightRef}
