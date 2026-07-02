@@ -46,6 +46,18 @@ impl fmt::Display for SourceId {
 }
 
 // ---------------------------------------------------------------------------
+// ProfileMode
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ProfileMode {
+    #[default]
+    Hosts,
+    Dns,
+}
+
+// ---------------------------------------------------------------------------
 // Profile
 // ---------------------------------------------------------------------------
 
@@ -59,6 +71,8 @@ pub struct Profile {
     pub protected: bool,
     pub tags: Vec<String>,
     pub rules: Vec<HostRule>,
+    #[serde(default)]
+    pub mode: ProfileMode,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -74,6 +88,7 @@ impl Profile {
             protected: false,
             tags: Vec::new(),
             rules: Vec::new(),
+            mode: ProfileMode::Hosts,
             created_at: now,
             updated_at: now,
         }
@@ -263,6 +278,7 @@ mod tests {
         assert!(p.tags.is_empty());
         assert!(p.rules.is_empty());
         assert!(p.description.is_none());
+        assert_eq!(p.mode, ProfileMode::Hosts);
     }
 
     #[test]
@@ -292,6 +308,7 @@ mod tests {
             assert_eq!(profile.protected, restored.protected, "case: {}", name);
             assert_eq!(profile.tags, restored.tags, "case: {}", name);
             assert_eq!(profile.rules, restored.rules, "case: {}", name);
+            assert_eq!(profile.mode, restored.mode, "case: {}", name);
             assert_eq!(profile.created_at, restored.created_at, "case: {}", name);
             assert_eq!(profile.updated_at, restored.updated_at, "case: {}", name);
         }
@@ -305,6 +322,56 @@ mod tests {
         assert!(json.contains("\"id\""));
         assert!(json.contains("\"name\""));
         assert!(json.contains("\"enabled\""));
+    }
+
+    #[test]
+    fn test_profile_mode_backward_compatibility() {
+        // 模拟旧版本序列化的 Profile JSON（不含 mode 字段）
+        let old_json = r#"{
+            "id": "550e8400-e29b-41d4-a716-446655440000",
+            "name": "legacy",
+            "enabled": false,
+            "protected": false,
+            "tags": [],
+            "rules": [],
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:00:00Z"
+        }"#;
+
+        let profile: Profile = serde_json::from_str(old_json).unwrap();
+        assert_eq!(profile.mode, ProfileMode::Hosts, "旧数据反序列化时 mode 应默认为 Hosts");
+    }
+
+    #[test]
+    fn test_profile_mode_serde_roundtrip() {
+        let cases = vec![
+            ("hosts", ProfileMode::Hosts),
+            ("dns", ProfileMode::Dns),
+        ];
+
+        for (name, mode) in cases {
+            let json = serde_json::to_string(&mode).unwrap();
+            let restored: ProfileMode = serde_json::from_str(&json).unwrap();
+            assert_eq!(mode, restored, "case: {}", name);
+        }
+    }
+
+    #[test]
+    fn test_profile_mode_json_format() {
+        assert_eq!(serde_json::to_string(&ProfileMode::Hosts).unwrap(), "\"hosts\"");
+        assert_eq!(serde_json::to_string(&ProfileMode::Dns).unwrap(), "\"dns\"");
+    }
+
+    #[test]
+    fn test_profile_dns_mode_serialization() {
+        let mut profile = Profile::new("dns_profile");
+        profile.mode = ProfileMode::Dns;
+
+        let json = serde_json::to_string(&profile).unwrap();
+        assert!(json.contains("\"mode\":\"dns\""));
+
+        let restored: Profile = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.mode, ProfileMode::Dns);
     }
 
     // -----------------------------------------------------------------------
