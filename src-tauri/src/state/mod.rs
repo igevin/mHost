@@ -1,4 +1,5 @@
 use std::sync::{Arc, Mutex};
+use mhost_storage::migration::migrate_v1_to_v2;
 use mhost_storage::storage::{FileStorage, Storage};
 use mhost_apply::writer::HostsWriter;
 use mhost_core::MhostError;
@@ -35,7 +36,22 @@ pub struct AppState {
 
 impl AppState {
     pub fn new() -> Result<Self, MhostError> {
-        let storage = Arc::new(FileStorage::default()?);
+        let file_storage = FileStorage::default()?;
+
+        // v1 → v2 数据迁移：失败记录错误日志，不阻断应用启动
+        if let Ok(fs) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            migrate_v1_to_v2(&file_storage)
+        })) {
+            match fs {
+                Ok(true) => eprintln!("[mHost] v1 → v2 data migration completed successfully."),
+                Ok(false) => {}
+                Err(e) => eprintln!("[mHost] v1 → v2 data migration failed: {}", e),
+            }
+        } else {
+            eprintln!("[mHost] v1 → v2 data migration panicked, continuing startup.");
+        }
+
+        let storage = Arc::new(file_storage);
         let writer = Arc::new(HostsWriter::new());
         Ok(Self {
             storage,
