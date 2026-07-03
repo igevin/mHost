@@ -5,13 +5,13 @@ pub mod state;
 pub mod tray;
 pub mod tray_logic;
 
-use commands::{apply::*, profile::*, profile_io::*, snapshot::*, validate::*};
+use commands::{apply::*, dns::*, profile::*, profile_io::*, snapshot::*, validate::*};
 use state::AppState;
 use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let app_state = match AppState::new() {
+    let app_state = match tauri::async_runtime::block_on(AppState::new()) {
         Ok(state) => state,
         Err(e) => {
             eprintln!("[mHost] Failed to initialize AppState: {}", e);
@@ -49,10 +49,15 @@ pub fn run() {
             list_snapshots,
             load_snapshot,
             delete_snapshot,
+            set_dns_mode,
+            get_dns_mode,
+            reload_dns_rules,
+            get_dns_status,
+            list_dns_profiles,
         ])
         .setup(|app| {
             #[cfg(target_os = "macos")]
-            if let Err(e) = crate::tray::build_tray(&app.handle()) {
+            if let Err(e) = crate::tray::build_tray(app.handle()) {
                 eprintln!("[mHost] Failed to build tray: {}", e);
             }
 

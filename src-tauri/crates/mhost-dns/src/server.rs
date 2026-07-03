@@ -151,23 +151,29 @@ impl DnsServer {
 
     /// 优雅停止 DNS 服务。
     pub async fn stop(&self) -> Result<(), DnsError> {
-        if let Some(tx) = match self.shutdown_tx.lock() {
-            Ok(mut guard) => guard.take(),
-            Err(poisoned) => {
-                let mut guard = poisoned.into_inner();
-                guard.take()
+        let tx = {
+            match self.shutdown_tx.lock() {
+                Ok(mut guard) => guard.take(),
+                Err(poisoned) => {
+                    let mut guard = poisoned.into_inner();
+                    guard.take()
+                }
             }
-        } {
+        };
+        if let Some(tx) = tx {
             let _ = tx.send(()).await;
         }
 
-        if let Some(handle) = match self.server_handle.lock() {
-            Ok(mut guard) => guard.take(),
-            Err(poisoned) => {
-                let mut guard = poisoned.into_inner();
-                guard.take()
+        let handle = {
+            match self.server_handle.lock() {
+                Ok(mut guard) => guard.take(),
+                Err(poisoned) => {
+                    let mut guard = poisoned.into_inner();
+                    guard.take()
+                }
             }
-        } {
+        };
+        if let Some(handle) = handle {
             match handle.await {
                 Ok(result) => result?,
                 Err(e) if e.is_cancelled() => (),
@@ -187,6 +193,26 @@ impl DnsServer {
     /// 是否正在运行。
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::SeqCst)
+    }
+
+    /// 返回监听端口。
+    pub fn port(&self) -> u16 {
+        self.config.port
+    }
+
+    /// 返回上游 DNS 服务器列表。
+    pub fn upstream(&self) -> &[String] {
+        &self.config.upstream
+    }
+
+    /// 返回缓存容量（配置值）。
+    pub fn cache_capacity(&self) -> usize {
+        self.config.cache_size
+    }
+
+    /// 返回当前规则数量。
+    pub fn rule_count(&self) -> usize {
+        self.rule_engine.rule_count()
     }
 }
 
