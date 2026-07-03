@@ -26,8 +26,26 @@ pub async fn set_dns_mode(enabled: bool, state: State<'_, AppState>) -> Result<(
             }
         }
 
-        // 2. 创建 DnsConfig 和 DnsServer
-        let config = mhost_dns::DnsConfig::default();
+        // 2. 创建 DnsConfig 和 DnsServer（macOS 上使用非特权端口）
+        // upstream 使用系统原始 DNS 作为兜底，确保无规则匹配时行为不变
+        let upstream = {
+            let system_dns = mhost_dns::platform::get_system_dns()
+                .unwrap_or_default();
+            if system_dns.is_empty() {
+                vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()]
+            } else {
+                system_dns
+            }
+        };
+        let config = mhost_dns::DnsConfig {
+            #[cfg(target_os = "macos")]
+            port: 1053,
+            #[cfg(not(target_os = "macos"))]
+            port: 53,
+            upstream,
+            ..Default::default()
+        };
+        let dns_port = config.port;
         let server = mhost_dns::DnsServer::new(config);
 
         // 3. 加载所有 enabled 的 DNS 模式 Profile，reload_rules
@@ -44,11 +62,11 @@ pub async fn set_dns_mode(enabled: bool, state: State<'_, AppState>) -> Result<(
             .await
             .map_err(|e| MhostError::InvalidInput(format!("dns server start failed: {}", e)))?;
 
-        // 5. 设置系统 DNS 为 127.0.0.1
-        if let Err(e) = mhost_dns::platform::set_local_dns() {
+        // 5. 设置系统 DNS 和端口转发（macOS 上需要管理员权限）
+        if let Err(e) = mhost_dns::platform::enable_dns_mode(dns_port) {
             let _ = server.stop().await;
             return Err(MhostError::InvalidInput(format!(
-                "Failed to set local DNS: {}",
+                "Failed to enable DNS mode: {}",
                 e
             )));
         }
@@ -70,15 +88,15 @@ pub async fn set_dns_mode(enabled: bool, state: State<'_, AppState>) -> Result<(
         // 8. 设置 dns_enabled = true
         state.dns_enabled.store(true, Ordering::Relaxed);
     } else {
-        // 1. 恢复系统 DNS
+        // 1. 恢复系统 DNS 和移除端口转发
         let original = {
             match state.original_dns.lock() {
                 Ok(guard) => guard.clone(),
                 Err(poisoned) => poisoned.into_inner().clone(),
             }
         };
-        mhost_dns::platform::restore_system_dns(&original)
-            .map_err(|e| MhostError::InvalidInput(format!("restore system dns failed: {}", e)))?;
+        mhost_dns::platform::disable_dns_mode(&original)
+            .map_err(|e| MhostError::InvalidInput(format!("disable dns mode failed: {}", e)))?;
 
         // 2. 停止 DnsServer
         let server_opt = {

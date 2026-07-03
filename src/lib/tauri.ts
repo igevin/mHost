@@ -16,7 +16,12 @@ export async function createProfile(name: string, mode?: ProfileMode): Promise<P
 }
 
 export async function updateProfile(profile: Profile): Promise<Profile> {
-  return invoke("update_profile", { profile });
+  return invoke("update_profile", {
+    id: profile.id,
+    name: profile.name,
+    description: profile.description,
+    rules: profile.rules,
+  });
 }
 
 export async function deleteProfile(id: string): Promise<void> {

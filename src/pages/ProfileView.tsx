@@ -499,6 +499,11 @@ function ProfileView({ mode = "hosts" }: ProfileViewProps) {
         <div className={styles.viewHeaderLeft}>
           <h1 className={styles.viewTitle}>{profile.name}</h1>
           <div className={styles.viewBadges}>
+            <span
+              className={`${styles.badge} ${profile.mode === "dns" ? styles.badgeModeDns : styles.badgeModeHosts}`}
+            >
+              {profile.mode === "dns" ? "DNS" : "Hosts"}
+            </span>
             {profile.enabled ? (
               <span className={`${styles.badge} ${styles.badgeEnabled}`}>Enabled</span>
             ) : (
@@ -523,18 +528,32 @@ function ProfileView({ mode = "hosts" }: ProfileViewProps) {
         <div className={styles.viewHeaderActions}>
           {!isEditing ? (
             <>
-              <button className="btn btn-ghost btn-sm" onClick={() => setImportDialogOpen(true)}>
+              <button
+                className="btn btn-ghost btn-sm"
+                onClick={() => setImportDialogOpen(true)}
+                onPointerDown={onPointerDown(() => setImportDialogOpen(true))}
+              >
                 Import
               </button>
-              <button className="btn btn-ghost btn-sm" onClick={handleExport} disabled={isLoading}>
+              <button
+                className="btn btn-ghost btn-sm"
+                onClick={handleExport}
+                onPointerDown={onPointerDown(handleExport)}
+                disabled={isLoading}
+              >
                 Export
               </button>
-              <button className="btn btn-primary btn-sm" onClick={handleEditRules}>
+              <button
+                className="btn btn-primary btn-sm"
+                onClick={handleEditRules}
+                onPointerDown={onPointerDown(handleEditRules)}
+              >
                 Edit Rules
               </button>
               <button
                 className="btn btn-danger btn-sm"
                 onClick={handleDeleteProfile}
+                onPointerDown={onPointerDown(handleDeleteProfile)}
                 disabled={profile.protected || isLoading}
               >
                 Delete

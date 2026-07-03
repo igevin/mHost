@@ -2151,6 +2151,7 @@ dependencies = [
  "chrono",
  "hickory-proto",
  "hickory-resolver",
+ "libc",
  "mhost-core",
  "serde",
  "serde_json",

@@ -1,5 +1,6 @@
 pub mod config;
 pub mod platform;
+pub mod proxy;
 pub mod resolver;
 pub mod server;
 

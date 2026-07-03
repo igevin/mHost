@@ -1,5 +1,8 @@
 use std::process::Command;
 
+/// DNS proxy PID 文件路径。
+const PROXY_PID_FILE: &str = "/tmp/mhost-dns-proxy.pid";
+
 /// 平台操作错误。
 #[derive(Debug, thiserror::Error)]
 pub enum PlatformError {
@@ -30,61 +33,117 @@ pub fn get_system_dns() -> Result<Vec<String>, PlatformError> {
     parse_dns_servers(&stdout)
 }
 
+/// 使用 osascript 提权执行 shell 命令。
+fn run_with_privileges(cmd: &str) -> Result<std::process::Output, String> {
+    let escaped = cmd.replace("\"", "\\\"");
+    let script = format!("do shell script \"{}\" with administrator privileges", escaped);
+    std::process::Command::new("osascript")
+        .args(["-e", &script])
+        .output()
+        .map_err(|e| format!("osascript failed: {}", e))
+}
+
+/// 在 macOS 上启用 DNS 模式：启动 dns-proxy + 设置系统 DNS。
+/// dns-proxy 以 root 权限运行，绑定 53 端口并转发到 target_port。
+/// 合并为单次 osascript 提权调用，用户只需输入一次密码。
+pub fn enable_dns_mode(dns_port: u16) -> Result<(), PlatformError> {
+    let interface = get_active_network_interface()?;
+
+    // 构建 dns-proxy 二进制路径（与 mhost 同目录）
+    let proxy_path = std::env::current_exe()
+        .ok()
+        .and_then(|p| {
+            p.parent()
+                .map(|dir| dir.join("mhost-dns-proxy").to_string_lossy().to_string())
+        })
+        .unwrap_or_else(|| "mhost-dns-proxy".to_string());
+
+    // 启动 dns-proxy 后台进程 + 设置系统 DNS，单次提权
+    let combined = format!(
+        "\"{proxy}\" --listen 53 --target {dns_port} & echo $! > {pid_file} && disown && networksetup -setdnsservers {interface} 127.0.0.1",
+        proxy = proxy_path,
+        dns_port = dns_port,
+        pid_file = PROXY_PID_FILE,
+        interface = interface,
+    );
+    let output = run_with_privileges(&combined)
+        .map_err(|e| PlatformError::SetDns(format!("enable dns mode failed: {}", e)))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(PlatformError::SetDns(format!("command failed: {}", stderr)));
+    }
+    Ok(())
+}
+
+/// 在 macOS 上禁用 DNS 模式：恢复系统 DNS + 停止 dns-proxy。
+/// 合并为单次 osascript 提权调用，用户只需输入一次密码。
+pub fn disable_dns_mode(servers: &[String]) -> Result<(), PlatformError> {
+    let interface = get_active_network_interface()?;
+    let ns_cmd = if servers.is_empty() {
+        format!("networksetup -setdnsservers {} Empty", interface)
+    } else {
+        let servers_str = servers.join(" ");
+        format!("networksetup -setdnsservers {} {}", interface, servers_str)
+    };
+    // 恢复 DNS + kill dns-proxy，用 || true 忽略 kill 失败（进程可能已退出）
+    let combined = format!(
+        "{}; (kill $(cat {pid_file} 2>/dev/null) || true); rm -f {pid_file}",
+        ns_cmd,
+        pid_file = PROXY_PID_FILE,
+    );
+    let output = run_with_privileges(&combined)
+        .map_err(|e| PlatformError::RestoreDns(format!("disable dns mode failed: {}", e)))?;
+    let _ = output;
+    Ok(())
+}
+
+/// 清理残留的 dns-proxy 进程（应用启动时调用）。
+pub fn cleanup_stale_proxy() {
+    if let Ok(pid_str) = std::fs::read_to_string(PROXY_PID_FILE) {
+        if let Ok(pid) = pid_str.trim().parse::<u32>() {
+            // 检查进程是否还在运行
+            unsafe {
+                if libc::kill(pid as libc::pid_t, 0) == 0 {
+                    // 进程存在，尝试 kill
+                    unsafe {
+                        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                    }
+                    eprintln!("[mHost] Killed stale dns-proxy process (pid {})", pid);
+                }
+            }
+        }
+        let _ = std::fs::remove_file(PROXY_PID_FILE);
+    }
+}
+
 /// 设置系统 DNS 为本地服务（127.0.0.1）。
 pub fn set_local_dns() -> Result<(), PlatformError> {
     let interface = get_active_network_interface()?;
-    let output = Command::new("networksetup")
-        .args(["-setdnsservers", &interface, "127.0.0.1"])
-        .output()
-        .map_err(|e| PlatformError::SetDns(format!("command failed: {}", e)))?;
-
+    let cmd = format!("networksetup -setdnsservers {} 127.0.0.1", interface);
+    let output = run_with_privileges(&cmd)
+        .map_err(|e| PlatformError::SetDns(e))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(PlatformError::SetDns(format!("networksetup failed: {}", stderr)));
     }
-
     Ok(())
 }
 
 /// 恢复系统 DNS 为指定列表。
 pub fn restore_system_dns(servers: &[String]) -> Result<(), PlatformError> {
     let interface = get_active_network_interface()?;
-
-    if servers.is_empty() {
-        // 空列表表示恢复为 DHCP 自动获取
-        let output = Command::new("networksetup")
-            .args(["-setdnsservers", &interface, "Empty"])
-            .output()
-            .map_err(|e| PlatformError::RestoreDns(format!("command failed: {}", e)))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(PlatformError::RestoreDns(format!(
-                "networksetup failed: {}",
-                stderr
-            )));
-        }
-        return Ok(());
-    }
-
-    let mut args = vec!["-setdnsservers", &interface];
-    for s in servers {
-        args.push(s.as_str());
-    }
-
-    let output = Command::new("networksetup")
-        .args(&args)
-        .output()
-        .map_err(|e| PlatformError::RestoreDns(format!("command failed: {}", e)))?;
-
+    let cmd = if servers.is_empty() {
+        format!("networksetup -setdnsservers {} Empty", interface)
+    } else {
+        let servers_str = servers.join(" ");
+        format!("networksetup -setdnsservers {} {}", interface, servers_str)
+    };
+    let output = run_with_privileges(&cmd)
+        .map_err(|e| PlatformError::RestoreDns(e))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(PlatformError::RestoreDns(format!(
-            "networksetup failed: {}",
-            stderr
-        )));
+        return Err(PlatformError::RestoreDns(format!("networksetup failed: {}", stderr)));
     }
-
     Ok(())
 }
 

@@ -40,7 +40,7 @@ pub struct DnsServer {
 
 impl DnsServer {
     pub fn new(config: DnsConfig) -> Self {
-        let resolver = build_resolver(&config.upstream).unwrap_or_else(|e| {
+        let resolver = build_resolver(&config.upstream, config.timeout_ms).unwrap_or_else(|e| {
             tracing::warn!(
                 "Failed to build upstream resolver: {}, falling back to system config",
                 e
@@ -337,7 +337,7 @@ async fn resolve_upstream(domain: &str, resolver: &TokioAsyncResolver) -> Result
         .ok_or_else(|| DnsError::Upstream("no records found".into()))
 }
 
-fn build_resolver(upstream: &[String]) -> Result<TokioAsyncResolver, DnsError> {
+fn build_resolver(upstream: &[String], timeout_ms: u64) -> Result<TokioAsyncResolver, DnsError> {
     if upstream.is_empty() {
         TokioAsyncResolver::tokio_from_system_conf()
             .map_err(|e| DnsError::Upstream(e.to_string()))
@@ -355,7 +355,9 @@ fn build_resolver(upstream: &[String]) -> Result<TokioAsyncResolver, DnsError> {
             };
             config.add_name_server(NameServerConfig::new(socket_addr, Protocol::Udp));
         }
-        Ok(TokioAsyncResolver::tokio(config, ResolverOpts::default()))
+        let mut opts = ResolverOpts::default();
+        opts.timeout = std::time::Duration::from_millis(timeout_ms);
+        Ok(TokioAsyncResolver::tokio(config, opts))
     }
 }
 
@@ -500,9 +502,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_dns_server_not_found() {
+        // 使用本地不可达端口作为 upstream，短超时确保测试快速失败
         let config = DnsConfig {
             port: 1055,
-            upstream: vec![],
+            upstream: vec!["127.0.0.1:1".to_string()],
+            timeout_ms: 500,
             ..Default::default()
         };
         let server = Arc::new(DnsServer::new(config));
@@ -537,7 +541,7 @@ mod tests {
 
         let response = Message::from_bytes(&buf[..len]).unwrap();
         assert_eq!(response.id(), 5678);
-        // 无规则且无上上游时应返回 ServFail
+        // 无规则匹配时 upstream 查询失败应返回 ServFail
         assert_eq!(response.response_code(), ResponseCode::ServFail);
 
         server.stop().await.unwrap();

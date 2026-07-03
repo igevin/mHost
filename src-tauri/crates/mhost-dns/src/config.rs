@@ -9,6 +9,8 @@ pub struct DnsConfig {
     pub upstream: Vec<String>,
     /// 缓存大小（默认 1000）。
     pub cache_size: usize,
+    /// 上游查询超时毫秒数（默认 3000）。
+    pub timeout_ms: u64,
 }
 
 impl Default for DnsConfig {
@@ -17,6 +19,7 @@ impl Default for DnsConfig {
             port: 53,
             upstream: vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()],
             cache_size: 1000,
+            timeout_ms: 3000,
         }
     }
 }
@@ -46,6 +49,7 @@ mod tests {
                     port: 1053,
                     upstream: vec!["9.9.9.9".to_string()],
                     cache_size: 500,
+                    timeout_ms: 3000,
                 },
             ),
             (
@@ -54,6 +58,7 @@ mod tests {
                     port: 53,
                     upstream: vec![],
                     cache_size: 0,
+                    timeout_ms: 3000,
                 },
             ),
         ];
