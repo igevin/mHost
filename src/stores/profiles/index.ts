@@ -42,4 +42,7 @@ export {
   fetchDnsProfilesAtom,
   createDnsProfileAtom,
   reloadDnsRulesAtom,
+  updateDnsProfileAtom,
+  deleteDnsProfileAtom,
+  toggleDnsProfileEnabledAtom,
 } from "./actions";

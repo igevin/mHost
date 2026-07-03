@@ -1,6 +1,18 @@
+import { useAtomValue, useSetAtom } from "jotai";
+import {
+  dnsEnabledAtom,
+  dnsStatusAtom,
+  isDnsLoadingAtom,
+  toggleDnsModeAtom,
+} from "../stores/profiles";
 import styles from "./Settings.module.css";
 
 function Settings() {
+  const dnsEnabled = useAtomValue(dnsEnabledAtom);
+  const dnsStatus = useAtomValue(dnsStatusAtom);
+  const isDnsLoading = useAtomValue(isDnsLoadingAtom);
+  const toggleDnsMode = useSetAtom(toggleDnsModeAtom);
+
   return (
     <div className="mhost-page">
       <header className="mhost-page-header">
@@ -40,6 +52,47 @@ function Settings() {
             <span className={styles.infoLabel}>Backups</span>
             <span className={styles.infoValue}>backups/</span>
           </div>
+        </div>
+
+        {/* DNS Mode Card */}
+        <div className="card">
+          <h3 className="card-title">DNS Mode</h3>
+          <div className={styles.dnsStatusRow}>
+            <span className={styles.dnsStatusLabel}>Status:</span>
+            <span className={dnsEnabled ? styles.dnsStatusOn : styles.dnsStatusOff}>
+              {dnsEnabled ? "Running" : "Stopped"}
+            </span>
+            {dnsEnabled && dnsStatus && (
+              <span className={styles.dnsStatusDetail}>
+                {dnsStatus.rule_count} rules &middot; Port {dnsStatus.port}
+              </span>
+            )}
+          </div>
+          <div className={styles.dnsActions}>
+            {dnsEnabled ? (
+              <button
+                className="btn btn-danger"
+                onClick={() => toggleDnsMode(false)}
+                disabled={isDnsLoading}
+              >
+                {isDnsLoading ? "Disabling..." : "Disable DNS Mode"}
+              </button>
+            ) : (
+              <button
+                className="btn btn-primary"
+                onClick={() => toggleDnsMode(true)}
+                disabled={isDnsLoading}
+              >
+                {isDnsLoading ? "Enabling..." : "Enable DNS Mode"}
+              </button>
+            )}
+          </div>
+          {dnsEnabled && dnsStatus && (
+            <div className={styles.dnsDetails}>
+              <div>Upstream: {dnsStatus.upstream.join(", ") || "System default"}</div>
+              <div>Cache capacity: {dnsStatus.cache_capacity}</div>
+            </div>
+          )}
         </div>
       </div>
     </div>

@@ -114,6 +114,52 @@
   line-height: 1.5;
 }
 
+/* ---- DNS Mode Card ---- */
+
+.dnsStatusRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.dnsStatusLabel {
+  font-size: 13px;
+  color: var(--color-text-secondary);
+}
+
+.dnsStatusOn {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-success);
+}
+
+.dnsStatusOff {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-text-muted);
+}
+
+.dnsStatusDetail {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  margin-left: 8px;
+}
+
+.dnsActions {
+  margin-bottom: 12px;
+}
+
+.dnsDetails {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  padding-top: 12px;
+  border-top: 1px solid var(--color-border);
+}
+
 /* ---- About Card ---- */
 
 .aboutCard {
