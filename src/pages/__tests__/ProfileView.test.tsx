@@ -3,7 +3,7 @@ import { render, screen, fireEvent, act } from "@testing-library/react";
 import { MemoryRouter, Routes, Route } from "react-router-dom";
 import { getDefaultStore, Provider as JotaiProvider } from "jotai";
 import type { Profile, HostRule } from "../../types";
-import { profilesAtom, selectedProfileIdAtom } from "../../stores/profiles";
+import { profilesAtom, selectedProfileIdAtom, dnsProfilesAtom } from "../../stores/profiles";
 
 // Mock tauri
 vi.mock("@tauri-apps/api/core", () => ({
@@ -18,6 +18,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 vi.mock("@tauri-apps/plugin-dialog", () => ({
   open: vi.fn(),
   confirm: vi.fn().mockResolvedValue(true),
+  save: vi.fn().mockResolvedValue("/test/path"),
 }));
 
 const mockUpdateProfile = vi.fn().mockResolvedValue({
@@ -32,12 +33,21 @@ const mockUpdateProfile = vi.fn().mockResolvedValue({
   updated_at: "2024-01-01T00:00:00Z",
 });
 
-vi.mock("../../lib/tauri", () => ({
-  validateHostsText: vi.fn().mockResolvedValue({ rules: [], errors: [] }),
-  exportProfileToFile: vi.fn().mockResolvedValue(undefined),
-  updateProfile: (...args: unknown[]) => mockUpdateProfile(...args),
-  exportProfile: vi.fn().mockResolvedValue(""),
-}));
+const mockSetProfileEnabled = vi.fn().mockResolvedValue(undefined);
+const mockListDnsProfiles = vi.fn().mockResolvedValue([]);
+
+vi.mock("../../lib/tauri", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../lib/tauri")>();
+  return {
+    ...actual,
+    validateHostsText: vi.fn().mockResolvedValue({ rules: [], errors: [] }),
+    exportProfileToFile: vi.fn().mockResolvedValue(undefined),
+    updateProfile: (...args: unknown[]) => mockUpdateProfile(...args),
+    exportProfile: vi.fn().mockResolvedValue(""),
+    setProfileEnabled: (...args: unknown[]) => mockSetProfileEnabled(...args),
+    listDnsProfiles: (...args: unknown[]) => mockListDnsProfiles(...args),
+  };
+});
 
 import ProfileView from "../ProfileView";
 
@@ -77,7 +87,10 @@ function renderWithRouter(initialEntry: string) {
     <JotaiProvider store={getDefaultStore()}>
       <MemoryRouter initialEntries={[initialEntry]}>
         <Routes>
+          <Route path="/profiles" element={<ProfileView />} />
           <Route path="/profiles/:id" element={<ProfileView />} />
+          <Route path="/dns-profiles" element={<ProfileView mode="dns" />} />
+          <Route path="/dns-profiles/:id" element={<ProfileView mode="dns" />} />
         </Routes>
       </MemoryRouter>
     </JotaiProvider>,
@@ -90,6 +103,7 @@ describe("ProfileView", () => {
     const store = getDefaultStore();
     store.set(profilesAtom, []);
     store.set(selectedProfileIdAtom, null);
+    store.set(dnsProfilesAtom, []);
   });
 
   it("renders profile name and rule count", () => {
@@ -271,5 +285,83 @@ describe("ProfileView", () => {
 
     // The confirm dialog should have been called
     expect(confirm).toHaveBeenCalled();
+  });
+
+  // ---- DNS mode tests ----
+
+  it("renders empty state for DNS mode when no profiles", () => {
+    const store = getDefaultStore();
+    store.set(dnsProfilesAtom, []);
+
+    renderWithRouter("/dns-profiles");
+
+    expect(screen.getByText("No DNS profiles yet")).toBeInTheDocument();
+    expect(screen.getByText("+ New DNS Profile")).toBeInTheDocument();
+  });
+
+  it("renders DNS profile name and rule count", () => {
+    const profile = makeProfile({ id: "d1", name: "dns-profile", mode: "dns" });
+    const store = getDefaultStore();
+    store.set(dnsProfilesAtom, [profile]);
+
+    renderWithRouter("/dns-profiles/d1");
+
+    const nameElements = screen.getAllByText("dns-profile");
+    expect(nameElements.length).toBeGreaterThanOrEqual(2);
+    expect(screen.getByText(/2 rules/i)).toBeInTheDocument();
+  });
+
+  it("shows Enabled badge when DNS profile is enabled", () => {
+    const profile = makeProfile({ id: "d1", enabled: true, mode: "dns" });
+    const store = getDefaultStore();
+    store.set(dnsProfilesAtom, [profile]);
+
+    renderWithRouter("/dns-profiles/d1");
+
+    expect(screen.getByText("Enabled")).toBeInTheDocument();
+  });
+
+  it("shows Disabled badge when DNS profile is disabled", () => {
+    const profile = makeProfile({ id: "d1", enabled: false, mode: "dns" });
+    const store = getDefaultStore();
+    store.set(dnsProfilesAtom, [profile]);
+
+    renderWithRouter("/dns-profiles/d1");
+
+    expect(screen.getByText("Disabled")).toBeInTheDocument();
+  });
+
+  it("shows Disable button for enabled DNS profile and triggers toggle", async () => {
+    const profile = makeProfile({ id: "d1", enabled: true, mode: "dns" });
+    const store = getDefaultStore();
+    store.set(dnsProfilesAtom, [profile]);
+
+    renderWithRouter("/dns-profiles/d1");
+
+    const toggleButton = screen.getByText("Disable");
+    expect(toggleButton).toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.click(toggleButton);
+    });
+
+    expect(mockSetProfileEnabled).toHaveBeenCalledWith("d1", false);
+  });
+
+  it("shows Enable button for disabled DNS profile and triggers toggle", async () => {
+    const profile = makeProfile({ id: "d1", enabled: false, mode: "dns" });
+    const store = getDefaultStore();
+    store.set(dnsProfilesAtom, [profile]);
+
+    renderWithRouter("/dns-profiles/d1");
+
+    const toggleButton = screen.getByText("Enable");
+    expect(toggleButton).toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.click(toggleButton);
+    });
+
+    expect(mockSetProfileEnabled).toHaveBeenCalledWith("d1", true);
   });
 });

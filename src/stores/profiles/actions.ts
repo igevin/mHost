@@ -6,6 +6,7 @@ import {
   createProfile,
   updateProfile,
   deleteProfile,
+  setProfileEnabled,
   enableAndApply,
   rollbackHosts,
   generatePreviewPlan,
@@ -248,6 +249,7 @@ export const fetchDnsModeAtom = atom(null, async (_get, set) => {
     set(dnsStatusAtom, status);
   } catch (err) {
     set(dnsErrorAtom, extractErrorMessage(err));
+    set(dnsStatusAtom, null);
   } finally {
     set(isDnsLoadingAtom, false);
   }
@@ -263,6 +265,7 @@ export const toggleDnsModeAtom = atom(null, async (_get, set, enabled: boolean) 
     set(dnsStatusAtom, status);
   } catch (err) {
     set(dnsErrorAtom, extractErrorMessage(err));
+    set(dnsStatusAtom, null);
     throw err;
   } finally {
     set(isDnsLoadingAtom, false);
@@ -306,8 +309,66 @@ export const reloadDnsRulesAtom = atom(null, async (_get, set) => {
     set(dnsStatusAtom, status);
   } catch (err) {
     set(dnsErrorAtom, extractErrorMessage(err));
+    set(dnsStatusAtom, null);
     throw err;
   } finally {
     set(isDnsLoadingAtom, false);
   }
 });
+
+export const updateDnsProfileAtom = atom(
+  null,
+  async (_get, set, profile: Profile) => {
+    set(isDnsLoadingAtom, true);
+    set(dnsErrorAtom, null);
+    try {
+      const updated = await updateProfile(profile);
+      set(dnsProfilesAtom, (prev) =>
+        prev.map((p) => (p.id === updated.id ? updated : p)),
+      );
+      return updated;
+    } catch (err) {
+      set(dnsErrorAtom, extractErrorMessage(err));
+      throw err;
+    } finally {
+      set(isDnsLoadingAtom, false);
+    }
+  },
+);
+
+export const deleteDnsProfileAtom = atom(
+  null,
+  async (_get, set, id: string) => {
+    set(isDnsLoadingAtom, true);
+    set(dnsErrorAtom, null);
+    try {
+      await deleteProfile(id);
+      set(dnsProfilesAtom, (prev) => prev.filter((p) => p.id !== id));
+    } catch (err) {
+      set(dnsErrorAtom, extractErrorMessage(err));
+      throw err;
+    } finally {
+      set(isDnsLoadingAtom, false);
+    }
+  },
+);
+
+export const toggleDnsProfileEnabledAtom = atom(
+  null,
+  async (_get, set, { id, enabled }: { id: string; enabled: boolean }) => {
+    set(isDnsLoadingAtom, true);
+    set(dnsErrorAtom, null);
+    try {
+      await setProfileEnabled(id, enabled);
+      const profiles = await listDnsProfiles();
+      set(dnsProfilesAtom, profiles);
+      const status = await getDnsStatus();
+      set(dnsStatusAtom, status);
+    } catch (err) {
+      set(dnsErrorAtom, extractErrorMessage(err));
+      throw err;
+    } finally {
+      set(isDnsLoadingAtom, false);
+    }
+  },
+);
