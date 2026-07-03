@@ -1,5 +1,5 @@
 import { atom } from "jotai";
-import type { Profile } from "../../types";
+import type { Profile, DnsStatus } from "../../types";
 
 // ---- Base atoms ----
 
@@ -8,6 +8,14 @@ export const selectedProfileIdAtom = atom<string | null>(null);
 export const isApplyingAtom = atom(false);
 export const errorAtom = atom<string | null>(null);
 export const isLoadingAtom = atom(false);
+
+// ---- DNS related atoms ----
+
+export const dnsProfilesAtom = atom<Profile[]>([]);
+export const dnsEnabledAtom = atom(false);
+export const dnsStatusAtom = atom<DnsStatus | null>(null);
+export const isDnsLoadingAtom = atom(false);
+export const dnsErrorAtom = atom<string | null>(null);
 
 // ---- Derived atoms ----
 
