@@ -1,6 +1,8 @@
+use std::str::FromStr;
+
 use mhost_apply::{ApplyPlan, generate_plan};
 use mhost_apply::writer::HostsWriter;
-use mhost_core::{MhostError, ProfileId};
+use mhost_core::{MhostError, ProfileId, ProfileMode};
 use mhost_storage::storage::Storage;
 use tauri::{AppHandle, State};
 
@@ -12,7 +14,7 @@ pub async fn generate_apply_plan(state: State<'_, AppState>) -> Result<ApplyPlan
     let storage = state.storage.clone();
     let writer = state.writer.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let profiles = storage.list_profiles()?;
+        let profiles = storage.list_profiles_by_mode(ProfileMode::Hosts)?;
         let current_hosts = match std::fs::read_to_string(writer.hosts_path()) {
             Ok(content) => content,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -33,7 +35,22 @@ pub fn generate_preview_plan_logic(
     storage: &(dyn Storage + Send + Sync),
     writer: &HostsWriter,
 ) -> Result<ApplyPlan, MhostError> {
-    let mut profiles = storage.list_profiles()?;
+    // DNS 模式 Profile 不写入 hosts，预览返回空 plan
+    let target_profile = storage.load_profile(id)?;
+    if target_profile.mode == ProfileMode::Dns {
+        return Ok(ApplyPlan {
+            rules: vec![],
+            conflicts: vec![],
+            diff: mhost_core::HostsDiff {
+                added: vec![],
+                removed: vec![],
+                unchanged: vec![],
+            },
+            backup_required: false,
+        });
+    }
+
+    let mut profiles = storage.list_profiles_by_mode(ProfileMode::Hosts)?;
 
     let mut found = false;
     for profile in &mut profiles {
@@ -105,7 +122,7 @@ pub async fn apply_hosts(state: State<'_, AppState>) -> Result<(), MhostError> {
     let storage = state.storage.clone();
     tauri::async_runtime::spawn_blocking(move || {
         eprintln!("[mHost] Waiting for user authorization (if needed)...");
-        let profiles = storage.list_profiles()?;
+        let profiles = storage.list_profiles_by_mode(ProfileMode::Hosts)?;
         let current_hosts = match std::fs::read_to_string(writer.hosts_path()) {
             Ok(content) => content,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -141,7 +158,7 @@ pub fn apply_current_plan_logic(
     storage: &(dyn Storage + Send + Sync),
     writer: &HostsWriter,
 ) -> Result<(), MhostError> {
-    let profiles = storage.list_profiles()?;
+    let profiles = storage.list_profiles_by_mode(ProfileMode::Hosts)?;
     let current_hosts = match std::fs::read_to_string(writer.hosts_path()) {
         Ok(content) => content,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -165,9 +182,10 @@ pub fn apply_current_plan_logic(
     Ok(())
 }
 
-/// Core logic: enable a profile and immediately apply its rules to the system hosts file.
+/// Core logic: enable a hosts-mode profile and immediately apply its rules to the system hosts file.
 ///
 /// Testable without Tauri `State`.
+/// Only for hosts mode profiles. DNS mode profiles should use DNS reload instead.
 pub fn enable_and_apply_logic(
     id: &ProfileId,
     enabled: bool,
@@ -183,26 +201,16 @@ pub fn enable_and_apply_logic(
     profile.updated_at = chrono::Utc::now();
     storage.save_profile(&profile)?;
 
-    // 2. Apply current plan
+    // 2. Apply current plan (hosts mode only)
     apply_current_plan_logic(storage, writer)?;
 
     Ok(())
 }
 
-/// Enable a profile and immediately apply its rules to the system hosts file.
+/// Enable a profile and immediately apply its rules.
 ///
-/// This is the primary user-facing command: toggling a profile on/off should
-/// instantly update `/etc/hosts` (with a macOS authorization prompt).
-///
-/// Flow:
-/// 1. Set the target profile as enabled (disable all others — phase 0 constraint).
-/// 2. Reload all profiles from storage.
-/// 3. Generate an apply plan from the newly-enabled profiles.
-/// 4. Write the plan to `/etc/hosts` (triggers macOS auth prompt).
-/// 5. Record last-applied timestamp.
-///
-/// If `enabled` is `false`, the managed block is removed from hosts (all profiles
-/// disabled → empty plan → managed block cleared).
+/// For hosts mode: toggles the profile and applies to /etc/hosts.
+/// For dns mode: toggles the profile and reloads DNS rules if DNS mode is enabled.
 /// Security fix (#16): Uses apply_lock to prevent concurrent writes.
 /// Perf fix (#26): Async with spawn_blocking to avoid blocking executor.
 #[tauri::command]
@@ -212,20 +220,54 @@ pub async fn enable_and_apply(
     state: State<'_, AppState>,
     app_handle: AppHandle,
 ) -> Result<(), MhostError> {
-    let _guard = state.apply_lock.lock().await;
-    let writer = state.writer.clone();
-    let storage = state.storage.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let profile_id = std::str::FromStr::from_str(&id)?;
-        enable_and_apply_logic(&profile_id, enabled, storage.as_ref(), &writer)?;
+    let profile_id = ProfileId::from_str(&id)?;
+    let profile = state.storage.load_profile(&profile_id)?;
 
-        // Auto-snapshot after successful apply
-        if let Err(e) = crate::commands::snapshot::auto_snapshot_logic(storage.as_ref()) {
-            eprintln!("[mHost] Auto-snapshot failed: {}", e);
+    if profile.mode == ProfileMode::Hosts {
+        let _guard = state.apply_lock.lock().await;
+        let writer = state.writer.clone();
+        let storage = state.storage.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            enable_and_apply_logic(&profile_id, enabled, storage.as_ref(), &writer)?;
+
+            // Auto-snapshot after successful apply
+            if let Err(e) = crate::commands::snapshot::auto_snapshot_logic(storage.as_ref()) {
+                eprintln!("[mHost] Auto-snapshot failed: {}", e);
+            }
+
+            Ok::<(), MhostError>(())
+        })
+        .await
+        .map_err(|e| MhostError::InvalidInput(e.to_string()))??;
+    } else {
+        // DNS 模式：直接启用/禁用，然后热重载规则
+        let mut profile = profile;
+        profile.enabled = enabled;
+        profile.updated_at = chrono::Utc::now();
+        state.storage.save_profile(&profile)?;
+
+        if enabled && state.dns_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+            let profiles = state
+                .storage
+                .list_profiles_by_mode(ProfileMode::Dns)?;
+            let enabled_profiles: Vec<_> = profiles.into_iter().filter(|p| p.enabled).collect();
+
+            match state.dns_server.lock() {
+                Ok(guard) => {
+                    if let Some(server) = guard.as_ref() {
+                        server.reload_rules(&enabled_profiles);
+                    }
+                }
+                Err(poisoned) => {
+                    let guard = poisoned.into_inner();
+                    if let Some(server) = guard.as_ref() {
+                        server.reload_rules(&enabled_profiles);
+                    }
+                }
+            }
         }
+    }
 
-        Ok::<(), MhostError>(())
-    }).await.map_err(|e| MhostError::InvalidInput(e.to_string()))??;
     #[cfg(target_os = "macos")]
     crate::tray::update_tray_menu(&app_handle);
     Ok(())
@@ -662,6 +704,72 @@ mod tests {
         // Verify storage state was NOT modified
         let loaded = storage.load_profile(&profile.id).unwrap();
         assert!(loaded.enabled, "profile should still be enabled in storage");
+    }
+
+    #[test]
+    fn test_apply_current_plan_logic_ignores_dns_profiles() {
+        let (_temp, storage, writer) = create_test_storage_and_writer();
+
+        // Create a hosts profile with rules and enable it
+        let mut hosts_profile = create_profile_with_rules(
+            &storage,
+            "hosts_dev",
+            vec![("127.0.0.1", "hosts.example.com")],
+        );
+        hosts_profile.enabled = true;
+        storage.save_profile(&hosts_profile).unwrap();
+
+        // Create a DNS profile with rules and enable it
+        let mut dns_profile = create_profile_with_rules(
+            &storage,
+            "dns_dev",
+            vec![("192.168.1.1", "dns.example.com")],
+        );
+        dns_profile.mode = ProfileMode::Dns;
+        dns_profile.enabled = true;
+        storage.save_profile(&dns_profile).unwrap();
+
+        // Apply current plan
+        let result = apply_current_plan_logic(storage.as_ref(), &writer);
+        assert!(result.is_ok(), "apply should succeed: {:?}", result.err());
+
+        // Verify hosts file only contains hosts profile rules
+        let hosts_content = std::fs::read_to_string(writer.hosts_path()).unwrap();
+        assert!(
+            hosts_content.contains("127.0.0.1 hosts.example.com"),
+            "hosts should contain hosts profile rules: {}",
+            hosts_content
+        );
+        assert!(
+            !hosts_content.contains("192.168.1.1 dns.example.com"),
+            "hosts should NOT contain dns profile rules: {}",
+            hosts_content
+        );
+    }
+
+    #[test]
+    fn test_generate_preview_plan_ignores_dns_profiles() {
+        let (_temp, storage, writer) = create_test_storage_and_writer();
+
+        // Create and enable a DNS profile (set mode before first save)
+        let mut dns_profile = Profile::new("dns_dev");
+        dns_profile.mode = ProfileMode::Dns;
+        dns_profile.rules.push(HostRule::new(
+            "192.168.1.1".parse().unwrap(),
+            vec!["dns.example.com".to_string()],
+        ));
+        dns_profile.enabled = true;
+        storage.save_profile(&dns_profile).unwrap();
+
+        // Preview plan should be empty (DNS profile does not affect hosts)
+        let plan = generate_preview_plan_logic(
+            &dns_profile.id,
+            true,
+            storage.as_ref(),
+            &writer,
+        ).unwrap();
+
+        assert!(plan.rules.is_empty(), "plan should be empty when target is dns profile: {:?}", plan.rules);
     }
 }
 

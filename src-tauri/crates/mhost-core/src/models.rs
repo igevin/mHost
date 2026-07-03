@@ -259,6 +259,19 @@ pub struct SnapshotMeta {
 }
 
 // ---------------------------------------------------------------------------
+// DnsStatus
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DnsStatus {
+    pub running: bool,
+    pub port: u16,
+    pub upstream: Vec<String>,
+    pub rule_count: usize,
+    pub cache_capacity: usize,
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
