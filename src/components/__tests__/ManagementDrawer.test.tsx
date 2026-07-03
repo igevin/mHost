@@ -34,6 +34,7 @@ function makeProfile(overrides: Partial<Profile> = {}): Profile {
       { id: "r1", ip: "127.0.0.1", domains: ["localhost"], enabled: true, comment: null, source: { type: "Manual" } },
       { id: "r2", ip: "::1", domains: ["localhost6"], enabled: true, comment: null, source: { type: "Manual" } },
     ],
+    mode: "hosts",
     created_at: "2024-01-01T00:00:00Z",
     updated_at: "2024-06-15T10:30:00Z",
     ...overrides,

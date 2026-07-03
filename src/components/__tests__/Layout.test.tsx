@@ -29,6 +29,7 @@ function makeProfile(overrides: Partial<Profile> = {}): Profile {
     protected: false,
     tags: [],
     rules: [],
+    mode: "hosts",
     created_at: "2024-01-01T00:00:00Z",
     updated_at: "2024-01-01T00:00:00Z",
     ...overrides,

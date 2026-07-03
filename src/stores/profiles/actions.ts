@@ -13,6 +13,11 @@ import {
   listSnapshots,
   loadSnapshot,
   deleteSnapshot,
+  getDnsMode,
+  getDnsStatus,
+  setDnsMode,
+  reloadDnsRules,
+  listDnsProfiles,
 } from "../../lib/tauri";
 import { extractErrorMessage } from "../../lib/error";
 import {
@@ -29,6 +34,11 @@ import {
   snapshotsAtom,
   isLoadingSnapshotsAtom,
   snapshotErrorAtom,
+  dnsProfilesAtom,
+  dnsEnabledAtom,
+  dnsStatusAtom,
+  isDnsLoadingAtom,
+  dnsErrorAtom,
 } from "./state";
 
 // ---- Async action atoms ----
@@ -223,5 +233,81 @@ export const deleteSnapshotAtom = atom(null, async (get, set, id: string) => {
   } catch (err) {
     set(snapshotErrorAtom, extractErrorMessage(err));
     throw err;
+  }
+});
+
+// ---- DNS action atoms ----
+
+export const fetchDnsModeAtom = atom(null, async (_get, set) => {
+  set(isDnsLoadingAtom, true);
+  set(dnsErrorAtom, null);
+  try {
+    const enabled = await getDnsMode();
+    set(dnsEnabledAtom, enabled);
+    const status = await getDnsStatus();
+    set(dnsStatusAtom, status);
+  } catch (err) {
+    set(dnsErrorAtom, extractErrorMessage(err));
+  } finally {
+    set(isDnsLoadingAtom, false);
+  }
+});
+
+export const toggleDnsModeAtom = atom(null, async (_get, set, enabled: boolean) => {
+  set(isDnsLoadingAtom, true);
+  set(dnsErrorAtom, null);
+  try {
+    await setDnsMode(enabled);
+    set(dnsEnabledAtom, enabled);
+    const status = await getDnsStatus();
+    set(dnsStatusAtom, status);
+  } catch (err) {
+    set(dnsErrorAtom, extractErrorMessage(err));
+    throw err;
+  } finally {
+    set(isDnsLoadingAtom, false);
+  }
+});
+
+export const fetchDnsProfilesAtom = atom(null, async (_get, set) => {
+  set(isDnsLoadingAtom, true);
+  set(dnsErrorAtom, null);
+  try {
+    const profiles = await listDnsProfiles();
+    set(dnsProfilesAtom, profiles);
+  } catch (err) {
+    set(dnsErrorAtom, extractErrorMessage(err));
+  } finally {
+    set(isDnsLoadingAtom, false);
+  }
+});
+
+export const createDnsProfileAtom = atom(null, async (_get, set, name: string) => {
+  set(isDnsLoadingAtom, true);
+  set(dnsErrorAtom, null);
+  try {
+    const profile = await createProfile(name, "dns");
+    set(dnsProfilesAtom, (prev) => [...prev, profile]);
+    return profile;
+  } catch (err) {
+    set(dnsErrorAtom, extractErrorMessage(err));
+    throw err;
+  } finally {
+    set(isDnsLoadingAtom, false);
+  }
+});
+
+export const reloadDnsRulesAtom = atom(null, async (_get, set) => {
+  set(isDnsLoadingAtom, true);
+  set(dnsErrorAtom, null);
+  try {
+    await reloadDnsRules();
+    const status = await getDnsStatus();
+    set(dnsStatusAtom, status);
+  } catch (err) {
+    set(dnsErrorAtom, extractErrorMessage(err));
+    throw err;
+  } finally {
+    set(isDnsLoadingAtom, false);
   }
 });

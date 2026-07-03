@@ -10,6 +10,7 @@ describe("TypeScript types validation", () => {
       protected: false,
       tags: ["work", "dev"],
       rules: [],
+      mode: "hosts" as const,
       created_at: "2024-01-01T00:00:00Z",
       updated_at: "2024-01-01T00:00:00Z",
     };

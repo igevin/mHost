@@ -1,3 +1,5 @@
+export type ProfileMode = "hosts" | "dns";
+
 export interface Profile {
   id: string;
   name: string;
@@ -6,8 +8,17 @@ export interface Profile {
   protected: boolean;
   tags: string[];
   rules: HostRule[];
+  mode: ProfileMode;
   created_at: string; // ISO 8601
   updated_at: string;
+}
+
+export interface DnsStatus {
+  running: boolean;
+  port: number;
+  upstream: string[];
+  rule_count: number;
+  cache_capacity: number;
 }
 
 export interface HostRule {

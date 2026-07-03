@@ -1,18 +1,18 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Profile, ApplyPlan, ValidateResult, ExportFormat, SnapshotMeta } from "../types";
+import type { Profile, ApplyPlan, ValidateResult, ExportFormat, SnapshotMeta, DnsStatus, ProfileMode } from "../types";
 
 // ---- Profile commands ----
 
-export async function listProfiles(): Promise<Profile[]> {
-  return invoke("list_profiles");
+export async function listProfiles(mode?: ProfileMode): Promise<Profile[]> {
+  return invoke("list_profiles", { mode });
 }
 
 export async function getProfile(id: string): Promise<Profile> {
   return invoke("get_profile", { id });
 }
 
-export async function createProfile(name: string): Promise<Profile> {
-  return invoke("create_profile", { name });
+export async function createProfile(name: string, mode?: ProfileMode): Promise<Profile> {
+  return invoke("create_profile", { name, mode });
 }
 
 export async function updateProfile(profile: Profile): Promise<Profile> {
@@ -115,4 +115,26 @@ export async function loadSnapshot(id: string): Promise<void> {
 
 export async function deleteSnapshot(id: string): Promise<void> {
   return invoke<void>("delete_snapshot", { id });
+}
+
+// ---- DNS commands ----
+
+export async function setDnsMode(enabled: boolean): Promise<void> {
+  return invoke("set_dns_mode", { enabled });
+}
+
+export async function getDnsMode(): Promise<boolean> {
+  return invoke("get_dns_mode");
+}
+
+export async function reloadDnsRules(): Promise<void> {
+  return invoke("reload_dns_rules");
+}
+
+export async function getDnsStatus(): Promise<DnsStatus> {
+  return invoke("get_dns_status");
+}
+
+export async function listDnsProfiles(): Promise<Profile[]> {
+  return invoke("list_dns_profiles");
 }
