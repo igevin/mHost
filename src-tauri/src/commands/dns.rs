@@ -272,6 +272,60 @@ pub async fn reload_dns_rules(state: State<'_, AppState>) -> Result<(), MhostErr
     Ok(())
 }
 
+/// App 退出时的 DNS 清理（fix: 用户反馈"退出后 DNS 出问题"）。
+///
+/// 由 `lib.rs::run()` 在 `RunEvent::ExitRequested` 钩子里调用，确保
+/// 用户从 tray 退出 / Cmd-Q / 主动 Quit 时系统 DNS 恢复到 original。
+///
+/// 不持 Tauri `State<'_, AppState>` 的原因：`RunEvent::ExitRequested`
+/// 回调运行在 Tauri 2 内部 task 上下文，没有命令调用栈，
+/// `State<'_, AppState>` 这种借用参数无法构造。直接用 `&AppState`。
+///
+/// 失败处理：清理失败时返回 Err 由调用方记录日志，但**不阻止退出**。
+/// App 进程必须在清理失败时也能退出，否则用户就被卡死。
+pub async fn cleanup_dns_on_exit(state: &AppState) -> Result<(), MhostError> {
+    if !state.dns_enabled.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    set_dns_mode_disable(state).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::ApplyLock;
+    use mhost_apply::writer::HostsWriter;
+    use mhost_storage::storage::FileStorage;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
+    use tempfile::TempDir;
+
+    /// 单元测试：DNS 模式未启用时，cleanup_dns_on_exit 直接返回 Ok，
+    /// 不做 disable 副作用（不调 networksetup）。
+    ///
+    /// 这个测试覆盖「DNS 模式没启用就退出」的情况 —— 退出不该抛错。
+    #[tokio::test]
+    async fn test_cleanup_dns_on_exit_noop_when_dns_disabled() {
+        let temp = TempDir::new().unwrap();
+        let storage = Arc::new(FileStorage::new(temp.path()))
+            as Arc<dyn mhost_storage::storage::Storage + Send + Sync>;
+        let state = AppState {
+            storage,
+            writer: Arc::new(HostsWriter::new()),
+            apply_lock: ApplyLock::new(),
+            snapshot_lock: ApplyLock::new(),
+            last_profile_ids: Mutex::new(Vec::new()),
+            dns_server: Arc::new(Mutex::new(None)),
+            dns_enabled: AtomicBool::new(false),
+            original_dns: Mutex::new(Vec::new()),
+            dns_lock: ApplyLock::new(),
+        };
+        // dns_enabled = false → cleanup 应直接返回 Ok
+        let result = cleanup_dns_on_exit(&state).await;
+        assert!(result.is_ok(), "DNS disabled → cleanup should be a no-op");
+    }
+}
+
 /// 获取 DNS 服务运行状态。
 #[tauri::command]
 pub async fn get_dns_status(

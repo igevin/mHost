@@ -7,7 +7,7 @@ pub mod tray_logic;
 
 use commands::{apply::*, dns::*, profile::*, profile_io::*, snapshot::*, validate::*};
 use state::AppState;
-use tauri::Manager;
+use tauri::{Manager, RunEvent};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -19,7 +19,7 @@ pub fn run() {
         }
     };
 
-    if let Err(e) = tauri::Builder::default()
+    let app = match tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(app_state)
@@ -78,9 +78,37 @@ pub fn run() {
 
             Ok(())
         })
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
     {
-        eprintln!("[mHost] Tauri application error: {}", e);
-        std::process::exit(1);
-    }
+        Ok(app) => app,
+        Err(e) => {
+            eprintln!("[mHost] Tauri application build error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // fix: 用户反馈"退出后 DNS 出问题"
+    //
+    // Tauri 2 提供 `RunEvent::ExitRequested` 在退出前回调，调用
+    // `api.prevent_exit()` 可以阻止退出、做 async 清理、然后 `app.exit()`
+    // 放行。窗口关闭（WindowEvent::CloseRequested）已被拦截为 hide，
+    // 所以这个钩子只在用户真正退出时触发（tray "退出"、Cmd-Q、
+    // OS 关机等）。
+    //
+    // 关键：清理失败也必须放行退出，否则用户被卡死。
+    app.run(|app_handle, event| {
+        if let RunEvent::ExitRequested { api, .. } = event {
+            api.prevent_exit();
+            let handle = app_handle.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Some(state) = handle.try_state::<AppState>() {
+                    // AppState 是 'static（通过 .manage() 注入），inner() 返回 &AppState
+                    if let Err(e) = commands::dns::cleanup_dns_on_exit(state.inner()).await {
+                        eprintln!("[mHost] DNS cleanup on exit failed: {}", e);
+                    }
+                }
+                handle.exit(0);
+            });
+        }
+    });
 }
