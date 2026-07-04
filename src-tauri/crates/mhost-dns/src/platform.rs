@@ -178,9 +178,13 @@ pub fn disable_dns_mode(servers: &[String]) -> Result<(), PlatformError> {
         let servers_str = servers.join(" ");
         format!("networksetup -setdnsservers {interface} {servers_str}")
     };
-    // 写脚本到临时文件（用 || true 容忍 kill 失败）
+    // 写脚本到临时文件。
+    // 关键：必须加 `set -e`，否则最后一行 `rm -f` 永远成功，掩盖了
+    // 上面 networksetup 命令的真实退出码。`kill ... || true` 容忍
+    // PID 文件不存在（用户已经手动 kill 过 proxy）。
     let script_body = format!(
         r#"#!/bin/sh
+set -e
 {ns_cmd}
 kill $(cat {pid_file} 2>/dev/null) || true
 rm -f {pid_file}
@@ -606,6 +610,87 @@ networksetup -setdnsservers Wi-Fi 127.0.0.1
                 .contains(r#"echo "$! /usr/local/bin/mhost-dns-proxy" > /tmp/mhost-dns-proxy.pid"#),
             "PID 文件写入应包含 binary 路径，脚本:\n{}",
             script
+        );
+    }
+
+    /// 回归测试（fix: code review B1）：disable_dns_mode 脚本必须有 `set -e`，
+    /// 否则最后一行 `rm -f` 永远成功，掩盖 networksetup 失败的退出码。
+    ///
+    /// 通过 shell 真实执行来验证。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_disable_script_propagates_networksetup_failure() {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::process::Command;
+
+        // 模拟「networksetup 失败」+ 「kill 找不到 PID」+ 「rm 不存在的文件」
+        // 三个命令链的 disable 脚本。
+        let script_body = r#"#!/bin/sh
+set -e
+/bin/false
+kill 99999 2>/dev/null || true
+rm -f /tmp/mhost-dns-nonexistent.pid
+"#;
+        let path = std::env::temp_dir().join(format!(
+            "mhost-dns-disable-test-{}-{}.sh",
+            std::process::id(),
+            1
+        ));
+        let _ = std::fs::remove_file(&path);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o700)
+            .open(&path)
+            .unwrap();
+        std::fs::write(&path, script_body).unwrap();
+
+        let output = Command::new(&path).output().unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        // 有 set -e：/bin/false 失败让脚本立即退出（exit code 1）
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "set -e + /bin/false should make script exit 1; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// 反向验证：没有 set -e 时 disable 脚本会错误地退出 0（掩盖 networksetup 失败）
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_disable_script_without_set_e_hides_failure() {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::process::Command;
+
+        let script_body = r#"#!/bin/sh
+/bin/false
+kill 99999 2>/dev/null || true
+rm -f /tmp/mhost-dns-nonexistent.pid
+"#;
+        let path = std::env::temp_dir().join(format!(
+            "mhost-dns-disable-test-{}-{}.sh",
+            std::process::id(),
+            2
+        ));
+        let _ = std::fs::remove_file(&path);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o700)
+            .open(&path)
+            .unwrap();
+        std::fs::write(&path, script_body).unwrap();
+
+        let output = Command::new(&path).output().unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        // 没有 set -e：最后一行 rm 成功，脚本退出 0，掩盖 /bin/false 的失败
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "without set -e, the last `rm -f` masks the /bin/false failure"
         );
     }
 

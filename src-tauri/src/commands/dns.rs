@@ -143,19 +143,49 @@ async fn set_dns_mode_enable(state: &AppState) -> Result<(), MhostError> {
 /// 与启用对称：先持久化 manifest，再做实际 stop + restore 副作用。
 async fn set_dns_mode_disable(state: &AppState) -> Result<(), MhostError> {
     // 1. 读取 in-memory original_dns（由 enable 路径写入）
-    let original = match state.original_dns.lock() {
+    let mut original = match state.original_dns.lock() {
         Ok(guard) => guard.clone(),
         Err(poisoned) => poisoned.into_inner().clone(),
     };
 
-    // 安全保护：如果 original 是空（说明 enable 路径从未成功持久化或被
-    // 外部状态破坏），不允许继续——否则会把系统 DNS 写成 "Empty" 断网。
+    // 保护（fix: code review B3）：如果 state.original_dns 是空（v2.0
+    // legacy 升级后被 try_recover_dns 主动跳过；或 Pi-hole / dnsmasq /
+    // systemd-resolved 用户的真实 DNS 恰好含 127.0.0.1），不能简单拒绝。
+    // 先尝试读当前系统 DNS 作为恢复值：
+    //   - 如果非空且不含 127.0.0.1 / ::1 → 视为「用户在升级后修改过 DNS」，
+    //     用它作为恢复值（保守合理：用户已主动改过）
+    //   - 否则仍拒绝，避免把 127.0.0.1 永久写到 manifest
     if original.is_empty() {
-        return Err(MhostError::InvalidInput(
-            "refusing to disable DNS: original_dns snapshot is empty; \
-             re-enable DNS mode once to refresh the snapshot"
-                .to_string(),
-        ));
+        match mhost_dns::platform::get_system_dns() {
+            Ok(current) if !current.is_empty() => {
+                let looks_like_residue = current.iter().any(|s| s == "127.0.0.1" || s == "::1");
+                if !looks_like_residue {
+                    eprintln!(
+                        "[mHost] state.original_dns was empty; falling back to current \
+                         system DNS for disable: {:?}",
+                        current
+                    );
+                    original = current;
+                } else {
+                    return Err(MhostError::InvalidInput(
+                        "refusing to disable DNS: state.original_dns snapshot is empty \
+                         and current system DNS contains 127.0.0.1/::1 (likely mhost's \
+                         own proxy). Manually run `sudo networksetup -setdnsservers \
+                         <interface> Empty` to restore, then re-enable mhost DNS mode \
+                         once to refresh the snapshot."
+                            .to_string(),
+                    ));
+                }
+            }
+            Ok(_) | Err(_) => {
+                return Err(MhostError::InvalidInput(
+                    "refusing to disable DNS: state.original_dns snapshot is empty \
+                     and could not query system DNS. Re-enable DNS mode once to \
+                     refresh the snapshot."
+                        .to_string(),
+                ));
+            }
+        }
     }
 
     // 2. **PERSIST MANIFEST FIRST** —— 把 dns_enabled 标 false，让
