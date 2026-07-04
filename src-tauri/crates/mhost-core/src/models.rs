@@ -352,15 +352,16 @@ mod tests {
         }"#;
 
         let profile: Profile = serde_json::from_str(old_json).unwrap();
-        assert_eq!(profile.mode, ProfileMode::Hosts, "旧数据反序列化时 mode 应默认为 Hosts");
+        assert_eq!(
+            profile.mode,
+            ProfileMode::Hosts,
+            "旧数据反序列化时 mode 应默认为 Hosts"
+        );
     }
 
     #[test]
     fn test_profile_mode_serde_roundtrip() {
-        let cases = vec![
-            ("hosts", ProfileMode::Hosts),
-            ("dns", ProfileMode::Dns),
-        ];
+        let cases = vec![("hosts", ProfileMode::Hosts), ("dns", ProfileMode::Dns)];
 
         for (name, mode) in cases {
             let json = serde_json::to_string(&mode).unwrap();
@@ -371,7 +372,10 @@ mod tests {
 
     #[test]
     fn test_profile_mode_json_format() {
-        assert_eq!(serde_json::to_string(&ProfileMode::Hosts).unwrap(), "\"hosts\"");
+        assert_eq!(
+            serde_json::to_string(&ProfileMode::Hosts).unwrap(),
+            "\"hosts\""
+        );
         assert_eq!(serde_json::to_string(&ProfileMode::Dns).unwrap(), "\"dns\"");
     }
 

@@ -3,8 +3,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use hickory_proto::op::{Header, Message, MessageType, OpCode, ResponseCode};
-use hickory_proto::rr::{Name, RData, Record, RecordType};
 use hickory_proto::rr::rdata::A;
+use hickory_proto::rr::{Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
 use hickory_resolver::config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts};
 use hickory_resolver::TokioAsyncResolver;
@@ -339,17 +339,16 @@ async fn resolve_upstream(domain: &str, resolver: &TokioAsyncResolver) -> Result
 
 fn build_resolver(upstream: &[String], timeout_ms: u64) -> Result<TokioAsyncResolver, DnsError> {
     if upstream.is_empty() {
-        TokioAsyncResolver::tokio_from_system_conf()
-            .map_err(|e| DnsError::Upstream(e.to_string()))
+        TokioAsyncResolver::tokio_from_system_conf().map_err(|e| DnsError::Upstream(e.to_string()))
     } else {
         let mut config = ResolverConfig::new();
         for server in upstream {
             let socket_addr = match server.parse::<SocketAddr>() {
                 Ok(addr) => addr,
                 Err(_) => {
-                    let ip = server
-                        .parse::<IpAddr>()
-                        .map_err(|e| DnsError::Upstream(format!("invalid server '{}': {}", server, e)))?;
+                    let ip = server.parse::<IpAddr>().map_err(|e| {
+                        DnsError::Upstream(format!("invalid server '{}': {}", server, e))
+                    })?;
                     SocketAddr::from((ip, 53))
                 }
             };
@@ -400,14 +399,11 @@ mod tests {
     }
 
     async fn wait_for_server_running(server: &DnsServer, timeout_ms: u64) {
-        tokio::time::timeout(
-            Duration::from_millis(timeout_ms),
-            async {
-                while !server.is_running() {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            },
-        )
+        tokio::time::timeout(Duration::from_millis(timeout_ms), async {
+            while !server.is_running() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
         .await
         .expect("server should start within timeout");
     }
@@ -441,11 +437,7 @@ mod tests {
             "dns_test",
             ProfileMode::Dns,
             true,
-            vec![make_rule(
-                Some("127.0.0.1"),
-                vec!["test.example.com"],
-                true,
-            )],
+            vec![make_rule(Some("127.0.0.1"), vec!["test.example.com"], true)],
         );
 
         let config = DnsConfig {

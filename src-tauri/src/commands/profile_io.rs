@@ -18,9 +18,8 @@ const MAX_FILE_READ_SIZE: usize = 1_048_576; // 1MB
 /// Security fix (#17): Prevents arbitrary file read/write via IPC.
 fn validate_user_path(path: &str, must_exist: bool) -> Result<std::path::PathBuf, MhostError> {
     let p = std::path::Path::new(path);
-    let home = dirs::home_dir().ok_or_else(|| {
-        MhostError::InvalidInput("Cannot determine home directory".to_string())
-    })?;
+    let home = dirs::home_dir()
+        .ok_or_else(|| MhostError::InvalidInput("Cannot determine home directory".to_string()))?;
 
     if must_exist {
         // Import: file must exist, canonicalize full path
@@ -41,9 +40,9 @@ fn validate_user_path(path: &str, must_exist: bool) -> Result<std::path::PathBuf
         let parent = p.parent().ok_or_else(|| {
             MhostError::InvalidInput(format!("Path '{}' has no parent directory", path))
         })?;
-        let canonical_parent = parent
-            .canonicalize()
-            .map_err(|e| MhostError::InvalidInput(format!("Invalid parent path '{}': {}", path, e)))?;
+        let canonical_parent = parent.canonicalize().map_err(|e| {
+            MhostError::InvalidInput(format!("Invalid parent path '{}': {}", path, e))
+        })?;
         if !canonical_parent.starts_with(&home) {
             return Err(MhostError::InvalidInput(format!(
                 "Path '{}' is outside home directory",
@@ -51,9 +50,9 @@ fn validate_user_path(path: &str, must_exist: bool) -> Result<std::path::PathBuf
             )));
         }
         // Reconstruct path using canonicalized parent + original filename
-        let file_name = p.file_name().ok_or_else(|| {
-            MhostError::InvalidInput(format!("Path '{}' has no file name", path))
-        })?;
+        let file_name = p
+            .file_name()
+            .ok_or_else(|| MhostError::InvalidInput(format!("Path '{}' has no file name", path)))?;
         Ok(canonical_parent.join(file_name))
     }
 }
@@ -204,7 +203,9 @@ pub async fn export_profile_to_file(
     let content = export_profile_logic(&id, format, state.storage.as_ref())?;
     tauri::async_runtime::spawn_blocking(move || {
         std::fs::write(&validated, &content).map_err(Into::into)
-    }).await.map_err(|e| MhostError::InvalidInput(e.to_string()))?
+    })
+    .await
+    .map_err(|e| MhostError::InvalidInput(e.to_string()))?
 }
 
 /// Import a profile from a file.
@@ -238,13 +239,15 @@ pub async fn import_profile_from_file(
         let is_json = canonical
             .extension()
             .and_then(|ext| ext.to_str())
-            .map_or(false, |ext| ext.eq_ignore_ascii_case("json"));
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"));
         if is_json {
             import_profile_from_json(name, &content, storage.as_ref())
         } else {
             import_profile_logic(name, &content, storage.as_ref())
         }
-    }).await.map_err(|e| MhostError::InvalidInput(e.to_string()))?
+    })
+    .await
+    .map_err(|e| MhostError::InvalidInput(e.to_string()))?
 }
 
 /// Import a profile from JSON content.
@@ -345,12 +348,8 @@ mod tests {
         ];
 
         for (name, hosts_text, expected_rules) in cases {
-            let profile = import_profile_logic(
-                format!("import_{}", name),
-                hosts_text,
-                &storage,
-            )
-            .unwrap();
+            let profile =
+                import_profile_logic(format!("import_{}", name), hosts_text, &storage).unwrap();
             assert_eq!(
                 profile.rules.len(),
                 expected_rules,
@@ -358,7 +357,11 @@ mod tests {
                 name,
                 expected_rules
             );
-            assert!(!profile.enabled, "case: {} — imported profile should be disabled", name);
+            assert!(
+                !profile.enabled,
+                "case: {} — imported profile should be disabled",
+                name
+            );
         }
     }
 
@@ -370,7 +373,11 @@ mod tests {
         let result = import_profile_logic("bad".to_string(), "999.999.999.999 x.com", &storage);
         assert!(result.is_err(), "invalid IP should be rejected");
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("parse error"), "error should mention parse errors: {}", msg);
+        assert!(
+            msg.contains("parse error"),
+            "error should mention parse errors: {}",
+            msg
+        );
 
         // Invalid domain
         let result = import_profile_logic("bad2".to_string(), "127.0.0.1 -bad.com", &storage);
@@ -393,11 +400,7 @@ mod tests {
         let (_temp, storage) = create_test_storage();
 
         // Create an existing profile named "dev"
-        create_profile_with_rules(
-            &storage,
-            "dev",
-            vec![],
-        );
+        create_profile_with_rules(&storage, "dev", vec![]);
 
         // Import with same name → should auto-append suffix
         let profile = import_profile_logic("dev".to_string(), "127.0.0.1 a.com", &storage).unwrap();
@@ -413,7 +416,8 @@ mod tests {
     fn test_import_persisted() {
         let (_temp, storage) = create_test_storage();
 
-        let profile = import_profile_logic("persisted".to_string(), "127.0.0.1 a.com", &storage).unwrap();
+        let profile =
+            import_profile_logic("persisted".to_string(), "127.0.0.1 a.com", &storage).unwrap();
 
         // Verify it can be loaded back
         let loaded = storage.load_profile(&profile.id).unwrap();
@@ -422,7 +426,10 @@ mod tests {
 
         // Verify it appears in list
         let all = storage.list_profiles().unwrap();
-        assert!(all.iter().any(|p| p.id == profile.id), "imported profile should be in list");
+        assert!(
+            all.iter().any(|p| p.id == profile.id),
+            "imported profile should be in list"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -441,15 +448,17 @@ mod tests {
             ],
         );
 
-        let output = export_profile_logic(
-            &profile.id.to_string(),
-            ExportFormat::Hosts,
-            &storage,
-        )
-        .unwrap();
+        let output =
+            export_profile_logic(&profile.id.to_string(), ExportFormat::Hosts, &storage).unwrap();
 
-        assert!(output.contains("127.0.0.1 a.com"), "hosts output should contain first rule");
-        assert!(output.contains("::1 localhost"), "hosts output should contain second rule");
+        assert!(
+            output.contains("127.0.0.1 a.com"),
+            "hosts output should contain first rule"
+        );
+        assert!(
+            output.contains("::1 localhost"),
+            "hosts output should contain second rule"
+        );
     }
 
     #[test]
@@ -461,12 +470,8 @@ mod tests {
             vec![("127.0.0.1".parse().unwrap(), vec!["a.com".to_string()])],
         );
 
-        let output = export_profile_logic(
-            &profile.id.to_string(),
-            ExportFormat::Json,
-            &storage,
-        )
-        .unwrap();
+        let output =
+            export_profile_logic(&profile.id.to_string(), ExportFormat::Json, &storage).unwrap();
 
         // Verify it's valid JSON
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
@@ -480,7 +485,10 @@ mod tests {
         let fake_id = uuid::Uuid::new_v4().to_string();
 
         let result = export_profile_logic(&fake_id, ExportFormat::Hosts, &storage);
-        assert!(result.is_err(), "exporting non-existent profile should fail");
+        assert!(
+            result.is_err(),
+            "exporting non-existent profile should fail"
+        );
     }
 
     #[test]
@@ -496,18 +504,19 @@ mod tests {
         .unwrap();
 
         // Export as hosts
-        let hosts_text = export_profile_logic(
-            &original.id.to_string(),
-            ExportFormat::Hosts,
-            &storage,
-        )
-        .unwrap();
+        let hosts_text =
+            export_profile_logic(&original.id.to_string(), ExportFormat::Hosts, &storage).unwrap();
 
         // Import back
-        let imported = import_profile_logic("roundtrip_import".to_string(), &hosts_text, &storage).unwrap();
+        let imported =
+            import_profile_logic("roundtrip_import".to_string(), &hosts_text, &storage).unwrap();
 
         // Verify rules match (same count, same IPs and domains)
-        assert_eq!(original.rules.len(), imported.rules.len(), "rule count should match after roundtrip");
+        assert_eq!(
+            original.rules.len(),
+            imported.rules.len(),
+            "rule count should match after roundtrip"
+        );
         for (orig, imp) in original.rules.iter().zip(imported.rules.iter()) {
             assert_eq!(orig.ip, imp.ip, "IP should match");
             assert_eq!(orig.domains, imp.domains, "domains should match");
@@ -527,12 +536,8 @@ mod tests {
             vec![("127.0.0.1".parse().unwrap(), vec!["a.com".to_string()])],
         );
 
-        let dup = duplicate_profile_logic(
-            &source.id.to_string(),
-            "copy".to_string(),
-            &storage,
-        )
-        .unwrap();
+        let dup =
+            duplicate_profile_logic(&source.id.to_string(), "copy".to_string(), &storage).unwrap();
 
         // New ID
         assert_ne!(dup.id, source.id, "duplicate should have a different ID");
@@ -551,11 +556,7 @@ mod tests {
     #[test]
     fn test_duplicate_empty_name() {
         let (_temp, storage) = create_test_storage();
-        let source = create_profile_with_rules(
-            &storage,
-            "source",
-            vec![],
-        );
+        let source = create_profile_with_rules(&storage, "source", vec![]);
 
         let result = duplicate_profile_logic(&source.id.to_string(), "".to_string(), &storage);
         assert!(result.is_err(), "empty name should be rejected");
@@ -567,22 +568,14 @@ mod tests {
     #[test]
     fn test_duplicate_name_conflict() {
         let (_temp, storage) = create_test_storage();
-        let source = create_profile_with_rules(
-            &storage,
-            "source",
-            vec![],
-        );
+        let source = create_profile_with_rules(&storage, "source", vec![]);
 
         // Create an existing profile named "existing"
         create_profile_with_rules(&storage, "existing", vec![]);
 
         // Duplicate with conflicting name
-        let dup = duplicate_profile_logic(
-            &source.id.to_string(),
-            "existing".to_string(),
-            &storage,
-        )
-        .unwrap();
+        let dup = duplicate_profile_logic(&source.id.to_string(), "existing".to_string(), &storage)
+            .unwrap();
         assert_eq!(dup.name, "existing (2)");
     }
 
@@ -592,7 +585,10 @@ mod tests {
         let fake_id = uuid::Uuid::new_v4().to_string();
 
         let result = duplicate_profile_logic(&fake_id, "copy".to_string(), &storage);
-        assert!(result.is_err(), "duplicating non-existent profile should fail");
+        assert!(
+            result.is_err(),
+            "duplicating non-existent profile should fail"
+        );
     }
 
     #[test]
@@ -607,12 +603,8 @@ mod tests {
         ));
         storage.save_profile(&source).unwrap();
 
-        let dup = duplicate_profile_logic(
-            &source.id.to_string(),
-            "copy".to_string(),
-            &storage,
-        )
-        .unwrap();
+        let dup =
+            duplicate_profile_logic(&source.id.to_string(), "copy".to_string(), &storage).unwrap();
 
         assert_eq!(dup.description, Some("test desc".to_string()));
         assert_eq!(dup.tags, vec!["tag1".to_string(), "tag2".to_string()]);

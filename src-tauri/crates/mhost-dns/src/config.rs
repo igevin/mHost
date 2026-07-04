@@ -39,10 +39,7 @@ mod tests {
     #[test]
     fn test_dns_config_serde_roundtrip() {
         let cases = vec![
-            (
-                "default",
-                DnsConfig::default(),
-            ),
+            ("default", DnsConfig::default()),
             (
                 "custom",
                 DnsConfig {

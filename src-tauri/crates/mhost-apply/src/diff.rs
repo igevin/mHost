@@ -27,11 +27,20 @@ pub fn calculate_diff(current_hosts: &str, resolved_rules: &[ResolvedRule]) -> H
     let existing_set: BTreeSet<&str> = existing_lines.iter().map(|s| s.as_str()).collect();
     let target_set: BTreeSet<&str> = target_lines.iter().map(|s| s.as_str()).collect();
 
-    let added: Vec<String> = target_set.difference(&existing_set).map(|&s| s.to_string()).collect();
+    let added: Vec<String> = target_set
+        .difference(&existing_set)
+        .map(|&s| s.to_string())
+        .collect();
 
-    let removed: Vec<String> = existing_set.difference(&target_set).map(|&s| s.to_string()).collect();
+    let removed: Vec<String> = existing_set
+        .difference(&target_set)
+        .map(|&s| s.to_string())
+        .collect();
 
-    let unchanged: Vec<String> = existing_set.intersection(&target_set).map(|&s| s.to_string()).collect();
+    let unchanged: Vec<String> = existing_set
+        .intersection(&target_set)
+        .map(|&s| s.to_string())
+        .collect();
 
     HostsDiff {
         added,

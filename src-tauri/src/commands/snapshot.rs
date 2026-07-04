@@ -43,11 +43,7 @@ pub fn save_snapshot_logic(
             MAX_SNAPSHOT_NAME_LENGTH
         )));
     }
-    if description
-        .as_ref()
-        .map_or(0, |s| s.len())
-        > MAX_SNAPSHOT_DESC_LENGTH
-    {
+    if description.as_ref().map_or(0, |s| s.len()) > MAX_SNAPSHOT_DESC_LENGTH {
         return Err(MhostError::InvalidInput(format!(
             "Snapshot description exceeds maximum length of {} characters",
             MAX_SNAPSHOT_DESC_LENGTH
@@ -196,9 +192,15 @@ pub fn load_snapshot_logic(
 ) -> Result<(), MhostError> {
     validate_snapshot_id(id)?;
 
-    let snapshot_path = storage.root().join("snapshots").join(format!("{}.json", id));
+    let snapshot_path = storage
+        .root()
+        .join("snapshots")
+        .join(format!("{}.json", id));
     if !snapshot_path.exists() {
-        return Err(MhostError::InvalidInput(format!("snapshot not found: {}", id)));
+        return Err(MhostError::InvalidInput(format!(
+            "snapshot not found: {}",
+            id
+        )));
     }
 
     let content = std::fs::read_to_string(&snapshot_path)?;
@@ -235,7 +237,10 @@ pub fn delete_snapshot_logic(
 ) -> Result<(), MhostError> {
     validate_snapshot_id(id)?;
 
-    let snapshot_path = storage.root().join("snapshots").join(format!("{}.json", id));
+    let snapshot_path = storage
+        .root()
+        .join("snapshots")
+        .join(format!("{}.json", id));
     if snapshot_path.exists() {
         std::fs::remove_file(&snapshot_path)?;
     }
@@ -263,9 +268,7 @@ pub async fn save_snapshot(
 }
 
 #[tauri::command]
-pub async fn list_snapshots(
-    state: State<'_, AppState>,
-) -> Result<Vec<SnapshotMeta>, MhostError> {
+pub async fn list_snapshots(state: State<'_, AppState>) -> Result<Vec<SnapshotMeta>, MhostError> {
     let storage = state.storage.clone();
     tauri::async_runtime::spawn_blocking(move || list_snapshots_logic(storage.as_ref()))
         .await
@@ -317,10 +320,7 @@ pub async fn load_snapshot(
 }
 
 #[tauri::command]
-pub async fn delete_snapshot(
-    id: String,
-    state: State<'_, AppState>,
-) -> Result<(), MhostError> {
+pub async fn delete_snapshot(id: String, state: State<'_, AppState>) -> Result<(), MhostError> {
     // N2: Serialize snapshot operations
     let _guard = state.snapshot_lock.lock().await;
     let storage = state.storage.clone();
@@ -397,7 +397,9 @@ mod tests {
     ) -> Profile {
         let mut profile = Profile::new(name);
         for (ip, domain) in rules {
-            profile.rules.push(HostRule::new(ip.parse().unwrap(), vec![domain.to_string()]));
+            profile
+                .rules
+                .push(HostRule::new(ip.parse().unwrap(), vec![domain.to_string()]));
         }
         storage.save_profile(&profile).unwrap();
         profile
@@ -413,7 +415,10 @@ mod tests {
         assert_eq!(meta.profile_count, 1);
         assert!(meta.description.is_none());
 
-        let snapshot_path = storage.root().join("snapshots").join(format!("{}.json", meta.id));
+        let snapshot_path = storage
+            .root()
+            .join("snapshots")
+            .join(format!("{}.json", meta.id));
         assert!(snapshot_path.exists());
     }
 
@@ -492,7 +497,8 @@ mod tests {
     fn test_load_snapshot_applies_hosts() {
         let (_temp, storage, writer) = create_test_storage_and_writer();
 
-        let mut profile = create_profile_with_rules(&storage, "dev", vec![("127.0.0.1", "example.com")]);
+        let mut profile =
+            create_profile_with_rules(&storage, "dev", vec![("127.0.0.1", "example.com")]);
         profile.enabled = true;
         storage.save_profile(&profile).unwrap();
 
@@ -519,7 +525,10 @@ mod tests {
         create_profile_with_rules(&storage, "dev", vec![("127.0.0.1", "example.com")]);
 
         let meta = save_snapshot_logic(storage.as_ref(), "to-delete".to_string(), None).unwrap();
-        let snapshot_path = storage.root().join("snapshots").join(format!("{}.json", meta.id));
+        let snapshot_path = storage
+            .root()
+            .join("snapshots")
+            .join(format!("{}.json", meta.id));
         assert!(snapshot_path.exists());
 
         delete_snapshot_logic(storage.as_ref(), &meta.id).unwrap();
@@ -534,10 +543,17 @@ mod tests {
         let result = load_snapshot_logic(storage.as_ref(), &writer, "../etc/passwd");
         assert!(result.is_err(), "should reject invalid snapshot id");
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("invalid snapshot id"), "error should mention invalid id: {}", msg);
+        assert!(
+            msg.contains("invalid snapshot id"),
+            "error should mention invalid id: {}",
+            msg
+        );
 
         let result = delete_snapshot_logic(storage.as_ref(), "../../secret");
-        assert!(result.is_err(), "should reject invalid snapshot id for delete");
+        assert!(
+            result.is_err(),
+            "should reject invalid snapshot id for delete"
+        );
     }
 
     #[test]
@@ -547,7 +563,8 @@ mod tests {
         // verifies the ordering (save first, delete after).
         let (_temp, storage, writer) = create_test_storage_and_writer();
         let p1 = create_profile_with_rules(&storage, "keep", vec![("127.0.0.1", "keep.local")]);
-        let p2 = create_profile_with_rules(&storage, "remove", vec![("192.168.1.1", "remove.local")]);
+        let p2 =
+            create_profile_with_rules(&storage, "remove", vec![("192.168.1.1", "remove.local")]);
 
         // Save a snapshot that only contains "keep" by building it manually
         let snapshots_dir = storage.root().join("snapshots");
@@ -590,7 +607,10 @@ mod tests {
         create_profile_with_rules(&storage, "dev", vec![("127.0.0.1", "example.com")]);
 
         let result = auto_snapshot_logic(storage.as_ref()).unwrap();
-        assert!(result.is_some(), "should create snapshot when list is empty");
+        assert!(
+            result.is_some(),
+            "should create snapshot when list is empty"
+        );
 
         let snapshots = list_snapshots_logic(storage.as_ref()).unwrap();
         assert_eq!(snapshots.len(), 1);
@@ -606,7 +626,10 @@ mod tests {
         save_snapshot_logic(storage.as_ref(), "recent".to_string(), None).unwrap();
 
         let result = auto_snapshot_logic(storage.as_ref()).unwrap();
-        assert!(result.is_none(), "should NOT create snapshot when recent one exists");
+        assert!(
+            result.is_none(),
+            "should NOT create snapshot when recent one exists"
+        );
 
         let snapshots = list_snapshots_logic(storage.as_ref()).unwrap();
         assert_eq!(snapshots.len(), 1);
@@ -633,7 +656,10 @@ mod tests {
         std::fs::write(&path, json).unwrap();
 
         let result = auto_snapshot_logic(storage.as_ref()).unwrap();
-        assert!(result.is_some(), "should create snapshot when latest is older than 3 days");
+        assert!(
+            result.is_some(),
+            "should create snapshot when latest is older than 3 days"
+        );
 
         let snapshots = list_snapshots_logic(storage.as_ref()).unwrap();
         assert_eq!(snapshots.len(), 2);
@@ -646,7 +672,10 @@ mod tests {
         let long_name = "a".repeat(MAX_SNAPSHOT_NAME_LENGTH + 1);
         let result = save_snapshot_logic(storage.as_ref(), long_name, None);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("exceeds maximum length"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds maximum length"));
     }
 
     #[test]
@@ -655,7 +684,10 @@ mod tests {
         let long_desc = "a".repeat(MAX_SNAPSHOT_DESC_LENGTH + 1);
         let result = save_snapshot_logic(storage.as_ref(), "name".to_string(), Some(long_desc));
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("exceeds maximum length"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds maximum length"));
     }
 
     #[test]
@@ -682,7 +714,8 @@ mod tests {
         storage.save_profile(&dns_profile).unwrap();
 
         // Save snapshot — should include both hosts and DNS profiles
-        let snapshot_meta = save_snapshot_logic(storage.as_ref(), "cross_mode".to_string(), None).unwrap();
+        let snapshot_meta =
+            save_snapshot_logic(storage.as_ref(), "cross_mode".to_string(), None).unwrap();
         let snapshot_id = snapshot_meta.id;
         assert!(!snapshot_id.is_empty());
 
@@ -691,8 +724,15 @@ mod tests {
         let snapshot_path = snapshots_dir.join(format!("{}.json", snapshot_id));
         let snapshot_json = std::fs::read_to_string(&snapshot_path).unwrap();
         let snapshot: Snapshot = serde_json::from_str(&snapshot_json).unwrap();
-        assert_eq!(snapshot.profiles.len(), 2, "snapshot should contain both hosts and dns profiles");
-        assert!(snapshot.profiles.iter().any(|p| p.mode == ProfileMode::Hosts));
+        assert_eq!(
+            snapshot.profiles.len(),
+            2,
+            "snapshot should contain both hosts and dns profiles"
+        );
+        assert!(snapshot
+            .profiles
+            .iter()
+            .any(|p| p.mode == ProfileMode::Hosts));
         assert!(snapshot.profiles.iter().any(|p| p.mode == ProfileMode::Dns));
 
         // Delete all profiles
@@ -706,7 +746,11 @@ mod tests {
 
         let restored = storage.list_all_profiles().unwrap();
         assert_eq!(restored.len(), 2, "both profiles should be restored");
-        assert!(restored.iter().any(|p| p.mode == ProfileMode::Hosts && p.name == "hosts_dev"));
-        assert!(restored.iter().any(|p| p.mode == ProfileMode::Dns && p.name == "dns_dev"));
+        assert!(restored
+            .iter()
+            .any(|p| p.mode == ProfileMode::Hosts && p.name == "hosts_dev"));
+        assert!(restored
+            .iter()
+            .any(|p| p.mode == ProfileMode::Dns && p.name == "dns_dev"));
     }
 }

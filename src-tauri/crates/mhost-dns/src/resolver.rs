@@ -316,6 +316,9 @@ mod tests {
         engine.rebuild(&[p2]);
         assert_eq!(engine.rule_count(), 1);
         assert_eq!(engine.resolve("a.com"), None);
-        assert_eq!(engine.resolve("b.com"), Some("192.168.1.1".parse().unwrap()));
+        assert_eq!(
+            engine.resolve("b.com"),
+            Some("192.168.1.1".parse().unwrap())
+        );
     }
 }

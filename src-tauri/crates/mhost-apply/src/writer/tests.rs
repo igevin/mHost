@@ -46,7 +46,8 @@ fn test_build_content_first_write_appends_block() {
 
 #[test]
 fn test_build_content_update_replaces_block() {
-    let current = "# before\n# ---- mHost start ----\n127.0.0.1 old.com\n# ---- mHost end ----\n# after\n";
+    let current =
+        "# before\n# ---- mHost start ----\n127.0.0.1 old.com\n# ---- mHost end ----\n# after\n";
     let plan = plan_with_rules(vec![resolved_rule("127.0.0.1", "new.com", "p1")]);
     let content = content::build_hosts_content(current, &plan);
 
