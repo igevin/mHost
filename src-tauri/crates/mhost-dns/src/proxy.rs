@@ -232,19 +232,14 @@ mod tests {
         let addr = socket.local_addr().unwrap();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 4096];
-            loop {
-                match socket.recv_from(&mut buf).await {
-                    Ok((len, src)) => {
-                        let query = &buf[..len];
-                        // 找匹配的 response
-                        for (q, r) in &responses {
-                            if q.as_slice() == query {
-                                let _ = socket.send_to(r, src).await;
-                                break;
-                            }
-                        }
+            while let Ok((len, src)) = socket.recv_from(&mut buf).await {
+                let query = &buf[..len];
+                // 找匹配的 response
+                for (q, r) in &responses {
+                    if q.as_slice() == query {
+                        let _ = socket.send_to(r, src).await;
+                        break;
                     }
-                    Err(_) => break,
                 }
             }
         });
