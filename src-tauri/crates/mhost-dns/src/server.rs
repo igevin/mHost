@@ -265,13 +265,15 @@ async fn handle_dns_request(
     response.add_query(query.clone());
 
     match record_type {
-        RecordType::A => {
-            match handle_a_query(name_str, query.name(), rule_engine, resolver).await {
+        RecordType::A | RecordType::AAAA => {
+            match handle_address_query(name_str, query.name(), record_type, rule_engine, resolver)
+                .await
+            {
                 QueryResult::Answer(record) => {
                     response.add_answer(*record);
                 }
                 QueryResult::NoError => {
-                    // 返回空答案
+                    // 已知 qtype 但本地/上游都没有匹配记录
                 }
                 QueryResult::ServFail => {
                     let mut h = *response.header();
@@ -302,47 +304,70 @@ enum QueryResult {
     ServFail,
 }
 
-async fn handle_a_query(
+/// 处理 A 或 AAAA 查询。本地规则用 `LOCAL_RULE_TTL`，上游响应透传 TTL。
+async fn handle_address_query(
     name_str: &str,
     name: &Name,
+    qtype: RecordType,
     rule_engine: &RuleEngine,
     resolver: &TokioAsyncResolver,
 ) -> QueryResult {
-    // 优先匹配本地规则
+    // 1. 优先匹配本地规则
     if let Some(ip) = rule_engine.resolve(name_str) {
-        if let IpAddr::V4(ipv4) = ip {
-            let rdata = RData::A(A(ipv4));
-            let record = Record::from_rdata(name.clone(), 300, rdata);
-            return QueryResult::Answer(Box::new(record));
-        }
-        return QueryResult::NoError;
+        let record = match (qtype, ip) {
+            (RecordType::A, IpAddr::V4(v4)) => {
+                Some(Record::from_rdata(name.clone(), LOCAL_RULE_TTL, RData::A(A(v4))))
+            }
+            (RecordType::AAAA, IpAddr::V6(v6)) => {
+                use hickory_proto::rr::rdata::AAAA;
+                Some(Record::from_rdata(
+                    name.clone(),
+                    LOCAL_RULE_TTL,
+                    RData::AAAA(AAAA(v6)),
+                ))
+            }
+            // qtype 与规则 IP family 不匹配：视为 NoError（不算错）
+            _ => None,
+        };
+        return match record {
+            Some(r) => QueryResult::Answer(Box::new(r)),
+            None => QueryResult::NoError,
+        };
     }
 
-    // 未命中，转发上游
-    match resolve_upstream(name_str, resolver).await {
-        Ok(IpAddr::V4(ipv4)) => {
-            let rdata = RData::A(A(ipv4));
-            let record = Record::from_rdata(name.clone(), 300, rdata);
-            QueryResult::Answer(Box::new(record))
-        }
-        Ok(IpAddr::V6(_)) => QueryResult::NoError,
-        Err(e) => {
+    // 2. 未命中，转发上游
+    match resolve_upstream_typed(name_str, qtype, resolver).await {
+        Ok((record, _ttl)) => QueryResult::Answer(Box::new(record)),
+        Err(QueryError::NoMatch) => QueryResult::NoError,
+        Err(QueryError::ServFail(e)) => {
             tracing::warn!("Upstream resolution failed for {}: {}", name_str, e);
             QueryResult::ServFail
         }
     }
 }
 
-async fn resolve_upstream(domain: &str, resolver: &TokioAsyncResolver) -> Result<IpAddr, DnsError> {
-    let response = resolver
-        .lookup_ip(domain)
-        .await
-        .map_err(|e| DnsError::Upstream(e.to_string()))?;
+enum QueryError {
+    NoMatch,
+    ServFail(String),
+}
 
-    response
-        .iter()
+/// 上游转发（按 qtype 区分）：拿类型匹配的 Record + 透传 TTL。
+async fn resolve_upstream_typed(
+    domain: &str,
+    qtype: RecordType,
+    resolver: &TokioAsyncResolver,
+) -> Result<(Record, u32), QueryError> {
+    let lookup = resolver
+        .lookup(domain, qtype)
+        .await
+        .map_err(|e| QueryError::ServFail(e.to_string()))?;
+    let record = lookup
+        .record_iter()
         .next()
-        .ok_or_else(|| DnsError::Upstream("no records found".into()))
+        .cloned()
+        .ok_or(QueryError::NoMatch)?;
+    let ttl = record.ttl();
+    Ok((record, ttl))
 }
 
 fn build_resolver(upstream: &[String], timeout_ms: u64) -> Result<TokioAsyncResolver, DnsError> {
@@ -543,6 +568,181 @@ mod tests {
         assert_eq!(response.id(), 5678);
         // 无规则匹配时 upstream 查询失败应返回 ServFail
         assert_eq!(response.response_code(), ResponseCode::ServFail);
+
+        server.stop().await.unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // AAAA / TTL 透传测试（fix #80）
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_dns_server_aaaa_query_local_rule() {
+        // 本地规则 IPv6 + AAAA 查询：期望返回 AAAA 记录
+        let profile = make_profile(
+            "dns_test_aaaa",
+            ProfileMode::Dns,
+            true,
+            vec![make_rule(
+                Some("::1"),
+                vec!["v6.example.com"],
+                true,
+            )],
+        );
+
+        let config = DnsConfig {
+            port: 1056,
+            ..Default::default()
+        };
+        let server = Arc::new(DnsServer::new(config).unwrap());
+        server.reload_rules(&[profile]);
+
+        let server_clone = server.clone();
+        let _handle = tokio::spawn(async move {
+            server_clone.start().await.unwrap();
+        });
+        wait_for_server_running(&server, 1000).await;
+
+        // 构造 AAAA 查询
+        let query_name = Name::from_utf8("v6.example.com.").unwrap();
+        let query = hickory_proto::op::Query::query(query_name, RecordType::AAAA);
+        let mut request = Message::new();
+        request.set_id(2000);
+        request.set_recursion_desired(true);
+        request.add_query(query);
+        let request_bytes = request.to_bytes().unwrap();
+
+        let client = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        client
+            .send_to(&request_bytes, "127.0.0.1:1056")
+            .await
+            .unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let (len, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let response = Message::from_bytes(&buf[..len]).unwrap();
+        assert_eq!(response.id(), 2000);
+        assert_eq!(response.response_code(), ResponseCode::NoError);
+        assert_eq!(response.answers().len(), 1, "应返回 1 条 AAAA 记录");
+
+        let answer = &response.answers()[0];
+        assert_eq!(answer.record_type(), RecordType::AAAA, "记录类型应为 AAAA");
+        if let Some(RData::AAAA(aaaa)) = answer.data() {
+            assert_eq!(aaaa.0, std::net::Ipv6Addr::LOCALHOST, "应为 ::1");
+        } else {
+            panic!("期望 AAAA 记录，实际 {:?}", answer.data());
+        }
+        // 本地规则 TTL = LOCAL_RULE_TTL
+        assert_eq!(answer.ttl(), LOCAL_RULE_TTL, "本地规则应使用 LOCAL_RULE_TTL");
+
+        server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_dns_server_aaaa_query_mismatched_family() {
+        // 本地规则是 IPv4 + AAAA 查询：qtype 与 IP family 不匹配 → NoError
+        let profile = make_profile(
+            "dns_test_family_mismatch",
+            ProfileMode::Dns,
+            true,
+            vec![make_rule(
+                Some("127.0.0.1"),
+                vec!["v4.example.com"],
+                true,
+            )],
+        );
+
+        let config = DnsConfig {
+            port: 1057,
+            ..Default::default()
+        };
+        let server = Arc::new(DnsServer::new(config).unwrap());
+        server.reload_rules(&[profile]);
+
+        let server_clone = server.clone();
+        let _handle = tokio::spawn(async move {
+            server_clone.start().await.unwrap();
+        });
+        wait_for_server_running(&server, 1000).await;
+
+        // 查 AAAA 但规则只有 v4 → NoError
+        let query_name = Name::from_utf8("v4.example.com.").unwrap();
+        let query = hickory_proto::op::Query::query(query_name, RecordType::AAAA);
+        let mut request = Message::new();
+        request.set_id(2001);
+        request.set_recursion_desired(true);
+        request.add_query(query);
+        let request_bytes = request.to_bytes().unwrap();
+
+        let client = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        client
+            .send_to(&request_bytes, "127.0.0.1:1057")
+            .await
+            .unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let (len, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let response = Message::from_bytes(&buf[..len]).unwrap();
+        assert_eq!(response.response_code(), ResponseCode::NoError);
+        assert_eq!(response.answers().len(), 0, "family 不匹配应返回空答案");
+
+        server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_dns_server_ttl_uses_local_rule_constant() {
+        // 验证本地规则响应的 TTL 来自 LOCAL_RULE_TTL 常量（不是 magic 300）
+        let profile = make_profile(
+            "dns_test_ttl",
+            ProfileMode::Dns,
+            true,
+            vec![make_rule(
+                Some("127.0.0.1"),
+                vec!["ttl.example.com"],
+                true,
+            )],
+        );
+
+        let config = DnsConfig {
+            port: 1058,
+            ..Default::default()
+        };
+        let server = Arc::new(DnsServer::new(config).unwrap());
+        server.reload_rules(&[profile]);
+
+        let server_clone = server.clone();
+        let _handle = tokio::spawn(async move {
+            server_clone.start().await.unwrap();
+        });
+        wait_for_server_running(&server, 1000).await;
+
+        let query_name = Name::from_utf8("ttl.example.com.").unwrap();
+        let query = hickory_proto::op::Query::query(query_name, RecordType::A);
+        let mut request = Message::new();
+        request.set_id(2002);
+        request.add_query(query);
+        let request_bytes = request.to_bytes().unwrap();
+
+        let client = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        client
+            .send_to(&request_bytes, "127.0.0.1:1058")
+            .await
+            .unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let (len, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let response = Message::from_bytes(&buf[..len]).unwrap();
+        let answer = &response.answers()[0];
+        assert_eq!(answer.ttl(), LOCAL_RULE_TTL);
 
         server.stop().await.unwrap();
     }
