@@ -63,13 +63,28 @@ impl RuleEngine {
     }
 
     /// 查询域名对应的 IP。
+    ///
+    /// **支持 suffix 匹配（fix #79）**：从完整域名开始，逐级向上找父域，
+    /// 第一个匹配胜出。
+    /// 例如：注册 `example.com → 0.0.0.0` 后，
+    /// `ad.example.com` / `tracker.example.com` / `example.com` 都会命中。
+    /// `something.com` 不会命中（除非显式注册 `com`）。
     pub fn resolve(&self, domain: &str) -> Option<IpAddr> {
-        match self.rules.read() {
-            Ok(guard) => guard.get(domain).copied(),
-            Err(poisoned) => {
-                let guard = poisoned.into_inner();
-                guard.get(domain).copied()
+        let lookup = |map: &HashMap<String, IpAddr>| -> Option<IpAddr> {
+            let mut current = domain;
+            loop {
+                if let Some(ip) = map.get(current) {
+                    return Some(*ip);
+                }
+                match current.find('.') {
+                    Some(pos) => current = &current[pos + 1..],
+                    None => return None,
+                }
             }
+        };
+        match self.rules.read() {
+            Ok(guard) => lookup(&guard),
+            Err(poisoned) => lookup(&poisoned.into_inner()),
         }
     }
 
@@ -319,6 +334,129 @@ mod tests {
         assert_eq!(
             engine.resolve("b.com"),
             Some("192.168.1.1".parse().unwrap())
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Suffix 匹配测试（fix #79）
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_suffix_match_basic() {
+        // 注册 example.com → 0.0.0.0，ad.example.com 应该通过 suffix 匹配命中
+        let engine = RuleEngine::new();
+        let profile = make_profile(
+            "p1",
+            ProfileMode::Dns,
+            true,
+            vec![make_rule(Some("0.0.0.0"), vec!["example.com"], true)],
+        );
+        engine.rebuild(&[profile]);
+
+        // 完整域名本身命中
+        assert_eq!(
+            engine.resolve("example.com"),
+            Some("0.0.0.0".parse().unwrap())
+        );
+        // 一级子域名命中
+        assert_eq!(
+            engine.resolve("ad.example.com"),
+            Some("0.0.0.0".parse().unwrap())
+        );
+        // 多级子域名命中
+        assert_eq!(
+            engine.resolve("a.b.c.example.com"),
+            Some("0.0.0.0".parse().unwrap())
+        );
+        // 兄弟域名（共享后缀但不是子域名）不命中
+        assert_eq!(engine.resolve("notexample.com"), None);
+        assert_eq!(engine.resolve("example.org"), None);
+        // 完全不同域名不命中
+        assert_eq!(engine.resolve("google.com"), None);
+    }
+
+    #[test]
+    fn test_resolve_specificity_more_specific_wins() {
+        // 同时注册 example.com 和 sub.example.com，a.sub.example.com
+        // 应优先匹配 sub.example.com（更具体的）
+        let engine = RuleEngine::new();
+        let profile = make_profile(
+            "p1",
+            ProfileMode::Dns,
+            true,
+            vec![
+                make_rule(Some("0.0.0.0"), vec!["example.com"], true),
+                make_rule(Some("127.0.0.1"), vec!["sub.example.com"], true),
+            ],
+        );
+        engine.rebuild(&[profile]);
+
+        // a.sub.example.com → 127.0.0.1（sub.example.com 更具体）
+        assert_eq!(
+            engine.resolve("a.sub.example.com"),
+            Some("127.0.0.1".parse().unwrap())
+        );
+        // b.example.com → 0.0.0.0（只有 example.com 匹配）
+        assert_eq!(
+            engine.resolve("b.example.com"),
+            Some("0.0.0.0".parse().unwrap())
+        );
+        // example.com 本身 → 0.0.0.0
+        assert_eq!(
+            engine.resolve("example.com"),
+            Some("0.0.0.0".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn test_resolve_no_match_unrelated_tld() {
+        // 注册 example.com 后查 com.example.org —— 后缀链找不到共同祖先，不命中
+        let engine = RuleEngine::new();
+        let profile = make_profile(
+            "p1",
+            ProfileMode::Dns,
+            true,
+            vec![make_rule(Some("0.0.0.0"), vec!["example.com"], true)],
+        );
+        engine.rebuild(&[profile]);
+
+        assert_eq!(engine.resolve("com.example.org"), None);
+        assert_eq!(engine.resolve("example.org"), None);
+        // 只有 example.com 链下的才命中
+        assert_eq!(
+            engine.resolve("sub.example.com"),
+            Some("0.0.0.0".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn test_resolve_tld_alone_requires_explicit_rule() {
+        // TLD 单独（如 com）必须显式注册才会命中
+        // 注册 example.com 不会让 com 单独命中
+        let engine = RuleEngine::new();
+        let profile = make_profile(
+            "p1",
+            ProfileMode::Dns,
+            true,
+            vec![make_rule(Some("0.0.0.0"), vec!["example.com"], true)],
+        );
+        engine.rebuild(&[profile]);
+
+        // com 单独不命中（避免误伤所有 .com 域名）
+        assert_eq!(engine.resolve("com"), None);
+        // 除非显式注册 com
+        let profile2 = make_profile(
+            "p2",
+            ProfileMode::Dns,
+            true,
+            vec![make_rule(Some("0.0.0.0"), vec!["com"], true)],
+        );
+        engine.rebuild(&[profile2]);
+        // 显式注册 com 后才匹配
+        assert_eq!(engine.resolve("com"), Some("0.0.0.0".parse().unwrap()));
+        assert_eq!(
+            engine.resolve("anything.com"),
+            Some("0.0.0.0".parse().unwrap())
         );
     }
 }

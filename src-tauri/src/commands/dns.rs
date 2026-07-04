@@ -40,15 +40,13 @@ pub async fn set_dns_mode(enabled: bool, state: State<'_, AppState>) -> Result<(
             }
         };
         let config = mhost_dns::DnsConfig {
-            #[cfg(target_os = "macos")]
-            port: 1053,
-            #[cfg(not(target_os = "macos"))]
-            port: 53,
+            port: mhost_dns::MHOST_DNS_PORT,
             upstream,
             ..Default::default()
         };
         let dns_port = config.port;
-        let server = mhost_dns::DnsServer::new(config);
+        let server = mhost_dns::DnsServer::new(config)
+            .map_err(|e| MhostError::InvalidInput(format!("dns server init failed: {}", e)))?;
 
         // 3. 加载所有 enabled 的 DNS 模式 Profile，reload_rules
         let profiles = state

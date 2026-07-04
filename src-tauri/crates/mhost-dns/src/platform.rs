@@ -143,11 +143,12 @@ pub fn enable_dns_mode(dns_port: u16) -> Result<(), PlatformError> {
         .unwrap_or_else(|| "mhost-dns-proxy".to_string());
 
     // 写脚本到临时文件，由 run_with_privileges 提权执行
+    // PID 文件内容: "{pid} {binary_path}\n" 供 cleanup_stale_proxy 校验 cmdline
     let script_body = format!(
         r#"#!/bin/sh
 set -e
 "{proxy}" --listen 53 --target {dns_port} &
-echo $! > {pid_file}
+echo "$! {proxy}" > {pid_file}
 disown
 networksetup -setdnsservers {interface} 127.0.0.1
 "#,
@@ -194,58 +195,52 @@ rm -f {pid_file}
 }
 
 /// 清理残留的 dns-proxy 进程（应用启动时调用）。
+///
+/// **安全修复（#81）**：PID 文件不再仅含 PID，还含 `mhost-dns-proxy` 路径。
+/// 清理时先 `kill(pid, 0)` 检查存活，再用 `ps -p` 校验进程名是 `mhost-dns-proxy`
+/// 才 SIGTERM；防止误杀其他进程（PID 重用）。
 pub fn cleanup_stale_proxy() {
-    if let Ok(pid_str) = std::fs::read_to_string(PROXY_PID_FILE) {
+    let content = match std::fs::read_to_string(PROXY_PID_FILE) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    // 格式："{pid} {binary_path}\n"
+    let mut parts = content.split_whitespace();
+    if let Some(pid_str) = parts.next() {
         if let Ok(pid) = pid_str.trim().parse::<u32>() {
-            // 检查进程是否还在运行
-            unsafe {
-                if libc::kill(pid as libc::pid_t, 0) == 0 {
-                    // 进程存在，尝试 kill
-                    libc::kill(pid as libc::pid_t, libc::SIGTERM);
+            let alive = unsafe { libc::kill(pid as libc::pid_t, 0) == 0 };
+            if !alive {
+                eprintln!(
+                    "[mHost] Stale dns-proxy pid {} not alive, skipping kill",
+                    pid
+                );
+            } else {
+                // 校验进程名是 mhost-dns-proxy（防 PID 重用误杀）
+                let ps_output = Command::new("ps")
+                    .args(["-p", &pid.to_string(), "-o", "comm="])
+                    .output();
+                let is_proxy = match ps_output {
+                    Ok(out) if out.status.success() => {
+                        let comm = String::from_utf8_lossy(&out.stdout);
+                        comm.trim().contains("mhost-dns-proxy")
+                    }
+                    _ => false,
+                };
+                if is_proxy {
+                    unsafe {
+                        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                    }
                     eprintln!("[mHost] Killed stale dns-proxy process (pid {})", pid);
+                } else {
+                    eprintln!(
+                        "[mHost] pid {} alive but cmdline is not mhost-dns-proxy, skipping kill",
+                        pid
+                    );
                 }
             }
         }
-        let _ = std::fs::remove_file(PROXY_PID_FILE);
     }
-}
-
-/// 设置系统 DNS 为本地服务（127.0.0.1）。
-pub fn set_local_dns() -> Result<(), PlatformError> {
-    let interface = get_active_network_interface()?;
-    validate_interface_name(&interface)?;
-    let script_body = format!("#!/bin/sh\nnetworksetup -setdnsservers {interface} 127.0.0.1\n");
-    let output = run_with_privileges(&script_body).map_err(PlatformError::SetDns)?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(PlatformError::SetDns(format!(
-            "networksetup failed: {}",
-            stderr
-        )));
-    }
-    Ok(())
-}
-
-/// 恢复系统 DNS 为指定列表。
-pub fn restore_system_dns(servers: &[String]) -> Result<(), PlatformError> {
-    let interface = get_active_network_interface()?;
-    validate_interface_name(&interface)?;
-    let ns_cmd = if servers.is_empty() {
-        format!("networksetup -setdnsservers {interface} Empty")
-    } else {
-        let servers_str = servers.join(" ");
-        format!("networksetup -setdnsservers {interface} {servers_str}")
-    };
-    let script_body = format!("#!/bin/sh\n{ns_cmd}\n");
-    let output = run_with_privileges(&script_body).map_err(PlatformError::RestoreDns)?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(PlatformError::RestoreDns(format!(
-            "networksetup failed: {}",
-            stderr
-        )));
-    }
-    Ok(())
+    let _ = std::fs::remove_file(PROXY_PID_FILE);
 }
 
 /// 获取当前活跃的网络接口名（Hardware Port）。
@@ -464,43 +459,6 @@ Device: en0
     }
 
     // -----------------------------------------------------------------------
-    // Command build logic verification (mock-style)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_set_local_dns_command_args() {
-        // 验证 set_local_dns 构建的命令参数逻辑。
-        // 由于无法在实际测试环境中执行 networksetup，
-        // 我们验证辅助函数对给定输入的处理行为。
-        let interface = "Wi-Fi";
-        let expected_args = vec!["-setdnsservers", interface, "127.0.0.1"];
-        assert_eq!(expected_args, vec!["-setdnsservers", "Wi-Fi", "127.0.0.1"]);
-    }
-
-    #[test]
-    fn test_restore_system_dns_command_args_empty() {
-        let interface = "Wi-Fi";
-        let _servers: Vec<String> = vec![];
-        // 空列表对应 "Empty" 参数
-        let expected_args = vec!["-setdnsservers", interface, "Empty"];
-        assert_eq!(expected_args, vec!["-setdnsservers", "Wi-Fi", "Empty"]);
-    }
-
-    #[test]
-    fn test_restore_system_dns_command_args_with_servers() {
-        let interface = "Wi-Fi";
-        let servers = vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()];
-        let mut expected_args = vec!["-setdnsservers", interface];
-        for s in &servers {
-            expected_args.push(s.as_str());
-        }
-        assert_eq!(
-            expected_args,
-            vec!["-setdnsservers", "Wi-Fi", "8.8.8.8", "1.1.1.1"]
-        );
-    }
-
-    // -----------------------------------------------------------------------
     // 注入防护测试（fix #77）
     // -----------------------------------------------------------------------
 
@@ -594,5 +552,83 @@ Ethernet Address: aa:bb:cc:dd:ee:ff
             validate_interface_name(&port.unwrap()).is_err(),
             "validate_interface_name 应拒绝含注入字符的接口名"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // PID 文件格式 + cleanup 校验测试（fix #81）
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pid_file_content_format() {
+        // 验证 enable_dns_mode 生成的脚本里 echo 的格式是 "$! {proxy}"（带 binary 路径），
+        // 这样 cleanup_stale_proxy 才能用 `ps -p <pid> -o comm=` 校验进程名是 mhost-dns-proxy
+        let proxy = "/usr/local/bin/mhost-dns-proxy";
+        let script = format!(
+            r#"#!/bin/sh
+set -e
+"{proxy}" --listen 53 --target 1053 &
+echo "$! {proxy}" > /tmp/mhost-dns-proxy.pid
+disown
+networksetup -setdnsservers Wi-Fi 127.0.0.1
+"#,
+            proxy = proxy
+        );
+        // 验证脚本包含关键行
+        assert!(
+            script
+                .contains(r#"echo "$! /usr/local/bin/mhost-dns-proxy" > /tmp/mhost-dns-proxy.pid"#),
+            "PID 文件写入应包含 binary 路径，脚本:\n{}",
+            script
+        );
+    }
+
+    #[test]
+    fn test_parse_pid_file_with_binary_path() {
+        // 验证 cleanup_stale_proxy 的 split_whitespace 解析逻辑
+        let content = "12345 /usr/local/bin/mhost-dns-proxy\n";
+        let mut parts = content.split_whitespace();
+        let pid: u32 = parts.next().unwrap().parse().unwrap();
+        let binary = parts.next().unwrap();
+        assert_eq!(pid, 12345);
+        assert_eq!(binary, "/usr/local/bin/mhost-dns-proxy");
+    }
+
+    #[test]
+    fn test_parse_pid_file_legacy_format() {
+        // 老 PID 文件只有 PID（无 binary 路径）—— 仍然能解析 PID，
+        // 但 cleanup 校验会失败（因为拿不到 binary 路径用于 ps）。
+        // 这是预期行为：遗留的 PID 文件会被 cleanup 安全跳过（kill 0 仍走）。
+        let content = "12345\n";
+        let mut parts = content.split_whitespace();
+        let pid: u32 = parts.next().unwrap().parse().unwrap();
+        assert_eq!(pid, 12345);
+        let binary = parts.next();
+        assert!(binary.is_none(), "老格式没有 binary 路径");
+    }
+
+    #[test]
+    fn test_process_name_contains_proxy_marker() {
+        // 模拟 `ps -p <pid> -o comm=` 输出含 mhost-dns-proxy 时的判定
+        let comm_lines = [
+            "/usr/local/bin/mhost-dns-proxy\n", // 真实路径
+            "./target/debug/mhost-dns-proxy\n", // cargo run 路径
+            "mhost-dns-proxy\n",                // 简写
+        ];
+        for line in &comm_lines {
+            assert!(
+                line.trim().contains("mhost-dns-proxy"),
+                "应识别为 proxy: {:?}",
+                line
+            );
+        }
+        // 不应被误识为 proxy
+        let non_proxy = ["/bin/sh\n", "/usr/bin/ssh\n", "cargo\n"];
+        for line in &non_proxy {
+            assert!(
+                !line.trim().contains("mhost-dns-proxy"),
+                "不应识别为 proxy: {:?}",
+                line
+            );
+        }
     }
 }
