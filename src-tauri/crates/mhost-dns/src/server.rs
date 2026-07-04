@@ -25,7 +25,15 @@ pub enum DnsError {
     Upstream(String),
     #[error("DNS message codec error: {0}")]
     Codec(String),
+    #[error("failed to build resolver: {0}")]
+    Resolver(String),
 }
+
+/// 本地规则响应默认 TTL（秒）。上游响应 TTL 会透传。
+pub(crate) const LOCAL_RULE_TTL: u32 = 300;
+
+/// UDP 缓冲区大小（EDNS(0) 协商后的最大响应长度）。
+const UDP_BUF_SIZE: usize = 4096;
 
 /// DNS 服务核心。
 /// TODO: TCP 监听支持计划在后续迭代中添加。
@@ -39,7 +47,7 @@ pub struct DnsServer {
 }
 
 impl DnsServer {
-    pub fn new(config: DnsConfig) -> Self {
+    pub fn new(config: DnsConfig) -> Result<Self, DnsError> {
         let resolver = build_resolver(&config.upstream, config.timeout_ms).unwrap_or_else(|e| {
             tracing::warn!(
                 "Failed to build upstream resolver: {}, falling back to system config",
@@ -48,14 +56,14 @@ impl DnsServer {
             TokioAsyncResolver::tokio_from_system_conf()
                 .expect("system resolver config must be valid")
         });
-        Self {
+        Ok(Self {
             config,
             rule_engine: Arc::new(RuleEngine::new()),
             running: AtomicBool::new(false),
             shutdown_tx: Mutex::new(None),
             server_handle: Mutex::new(None),
             resolver: std::sync::Mutex::new(resolver),
-        }
+        })
     }
 
     /// 启动 DNS 服务（异步，在后台运行）。
@@ -86,7 +94,7 @@ impl DnsServer {
         };
 
         let handle = tokio::spawn(async move {
-            let mut buf = vec![0u8; 512];
+            let mut buf = vec![0u8; UDP_BUF_SIZE];
 
             loop {
                 tokio::select! {
@@ -414,7 +422,7 @@ mod tests {
             port: 1053,
             ..Default::default()
         };
-        let server = Arc::new(DnsServer::new(config));
+        let server = Arc::new(DnsServer::new(config).unwrap());
 
         assert!(!server.is_running());
 
@@ -444,7 +452,7 @@ mod tests {
             port: 1054,
             ..Default::default()
         };
-        let server = Arc::new(DnsServer::new(config));
+        let server = Arc::new(DnsServer::new(config).unwrap());
         server.reload_rules(&[profile]);
 
         let server_clone = server.clone();
@@ -501,7 +509,7 @@ mod tests {
             timeout_ms: 500,
             ..Default::default()
         };
-        let server = Arc::new(DnsServer::new(config));
+        let server = Arc::new(DnsServer::new(config).unwrap());
 
         let server_clone = server.clone();
         let _handle = tokio::spawn(async move {

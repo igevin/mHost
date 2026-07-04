@@ -333,7 +333,7 @@ mod test_6_2_dns_mode_logic {
             port: 1056,
             ..Default::default()
         };
-        let server = Arc::new(mhost_dns::DnsServer::new(config));
+        let server = Arc::new(mhost_dns::DnsServer::new(config).unwrap());
 
         assert!(!server.is_running());
 
@@ -377,7 +377,7 @@ mod test_6_2_dns_mode_logic {
             port: 1057,
             ..Default::default()
         };
-        let server = Arc::new(mhost_dns::DnsServer::new(config));
+        let server = Arc::new(mhost_dns::DnsServer::new(config).unwrap());
         server.reload_rules(&[profile]);
 
         let server_clone = server.clone();
