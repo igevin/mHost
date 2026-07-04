@@ -274,15 +274,19 @@ pub async fn reload_dns_rules(state: State<'_, AppState>) -> Result<(), MhostErr
 
 /// App 退出时的 DNS 清理（fix: 用户反馈"退出后 DNS 出问题"）。
 ///
-/// 由 `lib.rs::run()` 在 `RunEvent::ExitRequested` 钩子里调用，确保
-/// 用户从 tray 退出 / Cmd-Q / 主动 Quit 时系统 DNS 恢复到 original。
+/// 由 `lib.rs::run()` 在两处调用：
+///   1) Tauri `RunEvent::ExitRequested` 钩子（tray 退出 / Cmd-Q）
+///   2) setup() 里 spawn 的 tokio signal handler（SIGINT/SIGTERM，
+///      覆盖 Ctrl+C / kill / OS 关机）
 ///
-/// 不持 Tauri `State<'_, AppState>` 的原因：`RunEvent::ExitRequested`
-/// 回调运行在 Tauri 2 内部 task 上下文，没有命令调用栈，
-/// `State<'_, AppState>` 这种借用参数无法构造。直接用 `&AppState`。
+/// 不持 Tauri `State<'_, AppState>` 的原因：RunEvent 回调运行在
+/// Tauri 2 内部 task 上下文，没有命令调用栈，`State<'_, AppState>`
+/// 这种借用参数无法构造。直接用 `&AppState`。
+///
+/// 幂等：dns_enabled=false 时直接 no-op，两个钩子同时触发也不会
+/// 重复清理。
 ///
 /// 失败处理：清理失败时返回 Err 由调用方记录日志，但**不阻止退出**。
-/// App 进程必须在清理失败时也能退出，否则用户就被卡死。
 pub async fn cleanup_dns_on_exit(state: &AppState) -> Result<(), MhostError> {
     if !state.dns_enabled.load(Ordering::Relaxed) {
         return Ok(());

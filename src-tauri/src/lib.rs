@@ -61,6 +61,52 @@ pub fn run() {
                 eprintln!("[mHost] Failed to build tray: {}", e);
             }
 
+            // 独立 signal handler —— 覆盖 Ctrl+C / kill / OS 关机等
+            // 硬退出场景（Tauri 2 RunEvent::ExitRequested 在这些场景
+            // 下经常不触发）。在 Tauri 自己的 tokio runtime 里 spawn，
+            // 与 RunEvent 钩子互不干扰，cleanup_dns_on_exit 内部幂等。
+            let sig_app_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                #[cfg(unix)]
+                {
+                    use tokio::signal::unix::{signal, SignalKind};
+                    let mut sigterm = match signal(SignalKind::terminate()) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("[mHost] SIGTERM handler install failed: {}", e);
+                            return;
+                        }
+                    };
+                    let mut sigint = match signal(SignalKind::interrupt()) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("[mHost] SIGINT handler install failed: {}", e);
+                            return;
+                        }
+                    };
+                    tokio::select! {
+                        _ = sigterm.recv() => {
+                            eprintln!("[mHost] exit: SIGTERM received, cleaning up DNS");
+                        }
+                        _ = sigint.recv() => {
+                            eprintln!("[mHost] exit: SIGINT received, cleaning up DNS");
+                        }
+                    }
+                    if let Some(state) = sig_app_handle.try_state::<AppState>() {
+                        if let Err(e) = commands::dns::cleanup_dns_on_exit(state.inner()).await {
+                            eprintln!("[mHost] DNS cleanup on signal failed: {}", e);
+                        }
+                    }
+                    sig_app_handle.exit(0);
+                }
+                #[cfg(not(unix))]
+                {
+                    // 非 Unix 平台（理论上用不到，mhost 是 macOS-only），
+                    // 仅作占位。
+                    let _ = sig_app_handle;
+                }
+            });
+
             // Intercept window close to hide instead of exit
             if let Some(window) = app.get_webview_window("main") {
                 let handle = app.handle().clone();
@@ -89,22 +135,24 @@ pub fn run() {
 
     // fix: 用户反馈"退出后 DNS 出问题"
     //
-    // Tauri 2 提供 `RunEvent::ExitRequested` 在退出前回调，调用
-    // `api.prevent_exit()` 可以阻止退出、做 async 清理、然后 `app.exit()`
-    // 放行。窗口关闭（WindowEvent::CloseRequested）已被拦截为 hide，
-    // 所以这个钩子只在用户真正退出时触发（tray "退出"、Cmd-Q、
-    // OS 关机等）。
+    // 双保险退出清理：
+    //   A) Tauri 2 `RunEvent::ExitRequested` 钩子 —— 覆盖 tray 退出 /
+    //      Cmd-Q 等正常退出（窗口关闭已被 prevent_close 拦截为 hide）
+    //   B) setup() 里 spawn 的 tokio signal handler（SIGINT/SIGTERM）——
+    //      覆盖 Ctrl+C、kill、OS 关机等硬退出。Tauri 2 在这些场景下
+    //      RunEvent::ExitRequested 经常不触发。
     //
-    // 关键：清理失败也必须放行退出，否则用户被卡死。
+    // 两条路径 cleanup_dns_on_exit 内部幂等（dns_enabled=false 是
+    // no-op），重复触发不会出问题。
     app.run(|app_handle, event| {
         if let RunEvent::ExitRequested { api, .. } = event {
+            eprintln!("[mHost] exit: Tauri ExitRequested, cleaning up DNS");
             api.prevent_exit();
             let handle = app_handle.clone();
             tauri::async_runtime::spawn(async move {
                 if let Some(state) = handle.try_state::<AppState>() {
-                    // AppState 是 'static（通过 .manage() 注入），inner() 返回 &AppState
                     if let Err(e) = commands::dns::cleanup_dns_on_exit(state.inner()).await {
-                        eprintln!("[mHost] DNS cleanup on exit failed: {}", e);
+                        eprintln!("[mHost] DNS cleanup on Tauri exit failed: {}", e);
                     }
                 }
                 handle.exit(0);

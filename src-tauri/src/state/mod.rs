@@ -138,7 +138,7 @@ impl AppState {
         //    此时已经是 127.0.0.1，问到的也是错的）。若 manifest 没保存则
         //    fallback 到 get_system_dns。
         let manifest = storage.load_manifest()?;
-        let original: Vec<String> = if let Some(saved) = &manifest.original_dns {
+        let mut original: Vec<String> = if let Some(saved) = &manifest.original_dns {
             saved.clone()
         } else {
             // legacy 路径：v2.0 没把 original_dns 持久化到 manifest。
@@ -151,7 +151,13 @@ impl AppState {
         // 1.1 保护性回写：只把「不像 v2.0 残留」的 original 回写。
         //   - 如果 original 为空（用户在 v2.0 后没配过系统 DNS）→ 写空 vec
         //   - 如果 original 含 127.0.0.1（v2.0 留下来的伪 original）→
-        //     不回写，避免永久污染 manifest
+        //     之前是直接跳过；但这样 state.original_dns 是空、退出时
+        //     cleanup 路径无法恢复（Pi-hole fallback 会拒绝）→ 用户
+        //     永远卡在 127.0.0.1。
+        //     修复：用 vec!["Empty"] 作为兜底（DHCP default），
+        //     这样退出时 networksetup -setdnsservers <iface> Empty 能
+        //     恢复 DHCP，Pi-hole 用户（少数场景）会丢失 Pi-hole 但
+        //     至少能用互联网。
         let mut manifest = manifest;
         if manifest.original_dns.is_none() {
             let looks_like_v2_residue = original.iter().any(|s| s == "127.0.0.1" || s == "::1");
@@ -165,14 +171,24 @@ impl AppState {
                 }
             } else {
                 eprintln!(
-                    "[mHost] Skipped persisting original_dns after recovery: \
-                     system DNS contains 127.0.0.1, likely v2.0 residue"
+                    "[mHost] Detected v2.0 residue (system DNS has 127.0.0.1); \
+                     using DHCP default as fallback original for safe cleanup"
                 );
+                // 兜底：把 ["Empty"] 持久化，作为退出恢复目标。
+                original = vec!["Empty".to_string()];
+                manifest.original_dns = Some(original.clone());
+                if let Err(e) = storage.save_manifest(&manifest) {
+                    eprintln!("[mHost] Failed to persist fallback original_dns: {}", e);
+                }
             }
         }
 
         // 2. 创建 DnsConfig 和 DnsServer（upstream 使用系统原始 DNS 兜底）
-        let upstream = if original.is_empty() {
+        //
+        // 注意：original 可能等于 vec!["Empty"]（v2.0 残留兜底），
+        // 这是个「恢复目标」placeholder，不能作为 upstream DNS。
+        // 所以这里对 upstream 单独 fallback。
+        let upstream = if original.is_empty() || original == vec!["Empty".to_string()] {
             vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()]
         } else {
             original.clone()
