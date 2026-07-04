@@ -38,6 +38,7 @@ mhost-core = { path = "crates/mhost-core" }
 mhost-hosts = { path = "crates/mhost-hosts" }
 mhost-storage = { path = "crates/mhost-storage" }
 mhost-apply = { path = "crates/mhost-apply" }
+mhost-dns = { path = "crates/mhost-dns" }
 dirs = "5"
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -48,6 +49,7 @@ objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSRunningApplic
 tempfile = { workspace = true }
 uuid = { workspace = true }
 filetime = "0.2"
+hickory-proto = "0.24"
 
 [profile.release]
 codegen-units = 1

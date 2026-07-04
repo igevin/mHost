@@ -5,7 +5,7 @@ use std::io;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use mhost_core::{Profile, ProfileId, StorageError};
+use mhost_core::{Profile, ProfileId, ProfileMode, StorageError};
 
 use crate::manifest::Manifest;
 
@@ -21,10 +21,14 @@ pub trait Storage {
     fn save_profile(&self, profile: &Profile) -> Result<(), StorageError>;
     /// 删除 Profile。
     fn delete_profile(&self, id: &ProfileId) -> Result<(), StorageError>;
-    /// 列出所有 Profile（损坏的文件会被静默跳过）。
+    /// 列出所有 Profile（向后兼容，默认返回 hosts 模式）。
     fn list_profiles(&self) -> Result<Vec<Profile>, StorageError>;
     /// 列出所有 Profile，同时返回解析过程中遇到的错误。
     fn list_profiles_with_errors(&self) -> Result<(Vec<Profile>, Vec<StorageError>), StorageError>;
+    /// 按模式列出 Profile。
+    fn list_profiles_by_mode(&self, mode: ProfileMode) -> Result<Vec<Profile>, StorageError>;
+    /// 列出所有 Profile（跨模式）。
+    fn list_all_profiles(&self) -> Result<Vec<Profile>, StorageError>;
     /// 加载 Manifest。
     fn load_manifest(&self) -> Result<Manifest, StorageError>;
     /// 保存 Manifest。
@@ -39,12 +43,15 @@ pub trait Storage {
 
 /// 基于本地文件系统的存储实现。
 ///
-/// 存储结构：
+/// 存储结构（v2）：
 /// ```text
 /// {root}/
 ///   manifest.json
 ///   profiles/
-///     {profile_id}.json
+///     hosts/
+///       {profile_id}.json
+///     dns/
+///       {profile_id}.json
 ///   backups/
 ///   settings.json
 /// ```
@@ -74,14 +81,29 @@ impl FileStorage {
         &self.root
     }
 
-    /// 返回 profiles 目录路径。
-    fn profiles_dir(&self) -> PathBuf {
-        self.root.join("profiles")
+    /// 返回指定模式对应的 profiles 子目录路径。
+    fn profiles_dir_for_mode(&self, mode: ProfileMode) -> PathBuf {
+        match mode {
+            ProfileMode::Hosts => self.root.join("profiles").join("hosts"),
+            ProfileMode::Dns => self.root.join("profiles").join("dns"),
+        }
     }
 
-    /// 返回指定 Profile ID 对应的文件路径。
-    fn profile_path(&self, id: &ProfileId) -> PathBuf {
-        self.profiles_dir().join(format!("{}.json", id))
+    /// 返回指定 Profile ID 和模式对应的文件路径。
+    fn profile_path_for_mode(&self, id: &ProfileId, mode: ProfileMode) -> PathBuf {
+        self.profiles_dir_for_mode(mode)
+            .join(format!("{}.json", id))
+    }
+
+    /// 遍历 hosts 和 dns 子目录，查找指定 ID 的 Profile 文件路径。
+    fn find_profile_path(&self, id: &ProfileId) -> Option<PathBuf> {
+        for mode in [ProfileMode::Hosts, ProfileMode::Dns] {
+            let path = self.profile_path_for_mode(id, mode);
+            if path.exists() {
+                return Some(path);
+            }
+        }
+        None
     }
 
     /// 返回 manifest 文件路径。
@@ -97,56 +119,19 @@ impl FileStorage {
         }
         Ok(())
     }
-}
 
-impl Storage for FileStorage {
-    fn load_profile(&self, id: &ProfileId) -> Result<Profile, StorageError> {
-        let path = self.profile_path(id);
-        if !path.exists() {
-            return Err(StorageError::ProfileNotFound(id.clone()));
-        }
-        let content = fs::read_to_string(&path)
-            .map_err(|e| StorageError::Io(format!("读取 Profile 失败: {}", e)))?;
-        let profile: Profile = serde_json::from_str(&content).map_err(|e| {
-            StorageError::ManifestCorrupted(format!("解析 Profile JSON 失败: {}", e))
-        })?;
-        Ok(profile)
-    }
-
-    fn save_profile(&self, profile: &Profile) -> Result<(), StorageError> {
-        self.ensure_dir(&self.profiles_dir())?;
-        let path = self.profile_path(&profile.id);
-        let json = serde_json::to_string_pretty(profile)
-            .map_err(|e| StorageError::ManifestCorrupted(format!("序列化 Profile 失败: {}", e)))?;
-        atomic_write(&path, json.as_bytes())
-            .map_err(|e| StorageError::Io(format!("写入 Profile 失败: {}", e)))?;
-        Ok(())
-    }
-
-    fn delete_profile(&self, id: &ProfileId) -> Result<(), StorageError> {
-        let path = self.profile_path(id);
-        if !path.exists() {
-            return Err(StorageError::ProfileNotFound(id.clone()));
-        }
-        fs::remove_file(&path)
-            .map_err(|e| StorageError::Io(format!("删除 Profile 失败: {}", e)))?;
-        Ok(())
-    }
-
-    fn list_profiles(&self) -> Result<Vec<Profile>, StorageError> {
-        let (profiles, _errors) = self.list_profiles_with_errors()?;
-        Ok(profiles)
-    }
-
-    fn list_profiles_with_errors(&self) -> Result<(Vec<Profile>, Vec<StorageError>), StorageError> {
-        let dir = self.profiles_dir();
+    /// 读取指定目录下的所有 Profile 文件，返回 (profiles, errors)。
+    fn read_profiles_from_dir(
+        &self,
+        dir: &Path,
+    ) -> Result<(Vec<Profile>, Vec<StorageError>), StorageError> {
         if !dir.exists() {
             return Ok((Vec::new(), Vec::new()));
         }
         let mut profiles = Vec::new();
         let mut errors = Vec::new();
-        for entry in fs::read_dir(&dir)
-            .map_err(|e| StorageError::Io(format!("读取 profiles 目录失败: {}", e)))?
+        for entry in fs::read_dir(dir)
+            .map_err(|e| StorageError::Io(format!("读取目录失败 [{}]: {}", dir.display(), e)))?
         {
             let entry = match entry {
                 Ok(e) => e,
@@ -183,6 +168,66 @@ impl Storage for FileStorage {
             }
         }
         Ok((profiles, errors))
+    }
+}
+
+impl Storage for FileStorage {
+    fn load_profile(&self, id: &ProfileId) -> Result<Profile, StorageError> {
+        let path = self
+            .find_profile_path(id)
+            .ok_or_else(|| StorageError::ProfileNotFound(id.clone()))?;
+        let content = fs::read_to_string(&path)
+            .map_err(|e| StorageError::Io(format!("读取 Profile 失败: {}", e)))?;
+        let profile: Profile = serde_json::from_str(&content).map_err(|e| {
+            StorageError::ManifestCorrupted(format!("解析 Profile JSON 失败: {}", e))
+        })?;
+        Ok(profile)
+    }
+
+    fn save_profile(&self, profile: &Profile) -> Result<(), StorageError> {
+        let dir = self.profiles_dir_for_mode(profile.mode);
+        self.ensure_dir(&dir)?;
+        let path = self.profile_path_for_mode(&profile.id, profile.mode);
+        let json = serde_json::to_string_pretty(profile)
+            .map_err(|e| StorageError::ManifestCorrupted(format!("序列化 Profile 失败: {}", e)))?;
+        atomic_write(&path, json.as_bytes())
+            .map_err(|e| StorageError::Io(format!("写入 Profile 失败: {}", e)))?;
+        Ok(())
+    }
+
+    fn delete_profile(&self, id: &ProfileId) -> Result<(), StorageError> {
+        let path = self
+            .find_profile_path(id)
+            .ok_or_else(|| StorageError::ProfileNotFound(id.clone()))?;
+        fs::remove_file(&path)
+            .map_err(|e| StorageError::Io(format!("删除 Profile 失败: {}", e)))?;
+        Ok(())
+    }
+
+    fn list_profiles(&self) -> Result<Vec<Profile>, StorageError> {
+        // 向后兼容：默认返回 hosts 模式
+        self.list_profiles_by_mode(ProfileMode::Hosts)
+    }
+
+    fn list_profiles_with_errors(&self) -> Result<(Vec<Profile>, Vec<StorageError>), StorageError> {
+        // 向后兼容：默认返回 hosts 模式
+        let dir = self.profiles_dir_for_mode(ProfileMode::Hosts);
+        self.read_profiles_from_dir(&dir)
+    }
+
+    fn list_profiles_by_mode(&self, mode: ProfileMode) -> Result<Vec<Profile>, StorageError> {
+        let dir = self.profiles_dir_for_mode(mode);
+        let (profiles, _errors) = self.read_profiles_from_dir(&dir)?;
+        Ok(profiles)
+    }
+
+    fn list_all_profiles(&self) -> Result<Vec<Profile>, StorageError> {
+        let mut all_profiles = Vec::new();
+        for mode in [ProfileMode::Hosts, ProfileMode::Dns] {
+            let profiles = self.list_profiles_by_mode(mode)?;
+            all_profiles.extend(profiles);
+        }
+        Ok(all_profiles)
     }
 
     fn load_manifest(&self) -> Result<Manifest, StorageError> {
@@ -454,8 +499,9 @@ mod tests {
         storage.save_manifest(&manifest).unwrap();
         let loaded = storage.load_manifest().unwrap();
 
-        assert_eq!(loaded.version, 1);
+        assert_eq!(loaded.version, 2);
         assert_eq!(loaded.app_version, "0.1.0");
+        assert_eq!(loaded.dns_enabled, Some(false));
         assert_eq!(manifest.updated_at, loaded.updated_at);
     }
 
@@ -480,8 +526,9 @@ mod tests {
         // 用新的 FileStorage 实例读取，验证持久化
         let storage2 = FileStorage::new(temp_dir.path());
         let loaded = storage2.load_manifest().unwrap();
-        assert_eq!(loaded.version, 1);
+        assert_eq!(loaded.version, 2);
         assert_eq!(loaded.app_version, "0.2.0");
+        assert_eq!(loaded.dns_enabled, Some(false));
     }
 
     // -----------------------------------------------------------------------
@@ -496,9 +543,9 @@ mod tests {
 
         storage.save_profile(&profile).unwrap();
 
-        let profiles_dir = temp_dir.path().join("profiles");
-        assert!(profiles_dir.exists());
-        assert!(profiles_dir.is_dir());
+        let hosts_dir = temp_dir.path().join("profiles").join("hosts");
+        assert!(hosts_dir.exists());
+        assert!(hosts_dir.is_dir());
     }
 
     #[test]
@@ -512,7 +559,120 @@ mod tests {
         let expected_path = temp_dir
             .path()
             .join("profiles")
+            .join("hosts")
             .join(format!("{}.json", profile.id));
         assert!(expected_path.exists());
+    }
+
+    // -----------------------------------------------------------------------
+    // Profile mode separation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_save_and_load_dns_profile() {
+        let (_temp, storage) = create_test_storage();
+        let mut profile = Profile::new("dns_test");
+        profile.mode = ProfileMode::Dns;
+
+        storage.save_profile(&profile).unwrap();
+        let loaded = storage.load_profile(&profile.id).unwrap();
+
+        assert_eq!(profile, loaded);
+        assert_eq!(loaded.mode, ProfileMode::Dns);
+    }
+
+    #[test]
+    fn test_list_profiles_by_mode() {
+        let (_temp, storage) = create_test_storage();
+        let mut dns_profile = Profile::new("dns_profile");
+        dns_profile.mode = ProfileMode::Dns;
+        let hosts_profile = Profile::new("hosts_profile");
+
+        storage.save_profile(&dns_profile).unwrap();
+        storage.save_profile(&hosts_profile).unwrap();
+
+        let hosts_listed = storage.list_profiles_by_mode(ProfileMode::Hosts).unwrap();
+        assert_eq!(hosts_listed.len(), 1);
+        assert_eq!(hosts_listed[0].id, hosts_profile.id);
+
+        let dns_listed = storage.list_profiles_by_mode(ProfileMode::Dns).unwrap();
+        assert_eq!(dns_listed.len(), 1);
+        assert_eq!(dns_listed[0].id, dns_profile.id);
+    }
+
+    #[test]
+    fn test_list_all_profiles() {
+        let (_temp, storage) = create_test_storage();
+        let mut dns_profile = Profile::new("dns_profile");
+        dns_profile.mode = ProfileMode::Dns;
+        let hosts_profile = Profile::new("hosts_profile");
+
+        storage.save_profile(&dns_profile).unwrap();
+        storage.save_profile(&hosts_profile).unwrap();
+
+        let all = storage.list_all_profiles().unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().any(|p| p.id == hosts_profile.id));
+        assert!(all.iter().any(|p| p.id == dns_profile.id));
+    }
+
+    #[test]
+    fn test_list_profiles_default_hosts() {
+        let (_temp, storage) = create_test_storage();
+        let mut dns_profile = Profile::new("dns_profile");
+        dns_profile.mode = ProfileMode::Dns;
+        let hosts_profile = Profile::new("hosts_profile");
+
+        storage.save_profile(&dns_profile).unwrap();
+        storage.save_profile(&hosts_profile).unwrap();
+
+        // list_profiles 默认返回 hosts 模式（向后兼容）
+        let listed = storage.list_profiles().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, hosts_profile.id);
+    }
+
+    #[test]
+    fn test_delete_dns_profile() {
+        let (_temp, storage) = create_test_storage();
+        let mut profile = Profile::new("to_delete_dns");
+        profile.mode = ProfileMode::Dns;
+
+        storage.save_profile(&profile).unwrap();
+        let loaded = storage.load_profile(&profile.id).unwrap();
+        assert_eq!(profile.id, loaded.id);
+
+        storage.delete_profile(&profile.id).unwrap();
+        let result = storage.load_profile(&profile.id);
+        assert!(
+            matches!(result, Err(StorageError::ProfileNotFound(_))),
+            "删除 DNS Profile 后应返回 ProfileNotFound"
+        );
+    }
+
+    #[test]
+    fn test_load_profile_cross_mode() {
+        let (_temp, storage) = create_test_storage();
+        let mut dns_profile = Profile::new("dns_cross");
+        dns_profile.mode = ProfileMode::Dns;
+
+        storage.save_profile(&dns_profile).unwrap();
+
+        // 不指定模式也能从 dns 目录加载
+        let loaded = storage.load_profile(&dns_profile.id).unwrap();
+        assert_eq!(loaded.mode, ProfileMode::Dns);
+    }
+
+    #[test]
+    fn test_list_profiles_empty_mode_dirs() {
+        let (_temp, storage) = create_test_storage();
+
+        let hosts = storage.list_profiles_by_mode(ProfileMode::Hosts).unwrap();
+        let dns = storage.list_profiles_by_mode(ProfileMode::Dns).unwrap();
+        let all = storage.list_all_profiles().unwrap();
+
+        assert!(hosts.is_empty());
+        assert!(dns.is_empty());
+        assert!(all.is_empty());
     }
 }

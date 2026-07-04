@@ -1,176 +1,151 @@
 use std::str::FromStr;
 
-use mhost_core::{MhostError, Profile, ProfileId};
-use mhost_hosts::parser::Parser;
+use mhost_core::{MhostError, Profile, ProfileId, ProfileMode};
 use mhost_storage::storage::Storage;
 use tauri::{AppHandle, State};
 
 use crate::state::AppState;
 
-const MAX_NAME_LENGTH: usize = 200;
-const MAX_DESCRIPTION_LENGTH: usize = 2000;
-
-/// Validate profile fields before saving.
-/// Security fix (#18): Prevents injection of control characters, excessive length, and invalid rules.
-fn validate_profile(profile: &Profile) -> Result<(), MhostError> {
-    // 1. Length limits
-    if profile.name.len() > MAX_NAME_LENGTH {
-        return Err(MhostError::InvalidInput(format!(
-            "Profile name exceeds maximum length of {} characters",
-            MAX_NAME_LENGTH
-        )));
-    }
-    if profile
-        .description
-        .as_ref()
-        .map_or(0, |s| s.len())
-        > MAX_DESCRIPTION_LENGTH
-    {
-        return Err(MhostError::InvalidInput(format!(
-            "Profile description exceeds maximum length of {} characters",
-            MAX_DESCRIPTION_LENGTH
-        )));
-    }
-
-    // 2. Reject control characters in name
-    if profile.name.chars().any(|c| c.is_control()) {
+// Security fix (#18): Prevent malicious profile data from being written to /etc/hosts.
+// Validate profile names, description, and all rules.
+pub fn validate_profile(profile: &Profile) -> Result<(), MhostError> {
+    // Name: non-empty, max 255 chars, no newlines or nulls
+    if profile.name.is_empty() {
         return Err(MhostError::InvalidInput(
-            "Profile name contains control characters".to_string(),
+            "Profile name cannot be empty".to_string(),
+        ));
+    }
+    if profile.name.len() > 255 {
+        return Err(MhostError::InvalidInput(
+            "Profile name exceeds 255 characters".to_string(),
+        ));
+    }
+    if profile.name.contains('\n') || profile.name.contains('\0') {
+        return Err(MhostError::InvalidInput(
+            "Profile name contains invalid characters".to_string(),
         ));
     }
 
-    // 3. Re-validate all rules through the parser
-    for rule in &profile.rules {
-        // Comment-only rules: skip IP/domain validation, but still validate the comment
-        if rule.is_comment_only() {
-            if let Some(c) = &rule.comment {
-                if c.chars().any(|ch| ch.is_control()) {
-                    return Err(MhostError::InvalidInput(format!(
-                        "Comment-only rule contains control characters: {:?}",
-                        c
-                    )));
-                }
-            }
-            continue;
+    // Description: optional, max 4096 chars, no nulls
+    if let Some(desc) = &profile.description {
+        if desc.len() > 4096 {
+            return Err(MhostError::InvalidInput(
+                "Profile description exceeds 4096 characters".to_string(),
+            ));
         }
-        let ip = rule.ip.expect("non-comment-only rule must have an ip");
-        let domains_str = rule.domains.join(" ");
-        let line = format!("{} {}", ip, domains_str);
-        let result = Parser::parse(&line);
-        if !result.errors.is_empty() {
+        if desc.contains('\0') {
+            return Err(MhostError::InvalidInput(
+                "Profile description contains invalid characters".to_string(),
+            ));
+        }
+    }
+
+    // Validate each rule entry
+    for rule in &profile.rules {
+        // IP must be present and valid (already IpAddr by type)
+        if rule.ip.is_none() {
             return Err(MhostError::InvalidInput(format!(
-                "Invalid rule in profile: {} {}",
-                ip, domains_str
+                "Missing IP address in profile '{}'",
+                profile.name
             )));
         }
-        // Reject control characters in comments (they would be written to /etc/hosts)
-        if let Some(c) = &rule.comment {
-            if c.chars().any(|ch| ch.is_control()) {
+
+        // Domains must not be empty
+        if rule.domains.is_empty() {
+            return Err(MhostError::InvalidInput(format!(
+                "Empty domains list in profile '{}'",
+                profile.name
+            )));
+        }
+        for domain in &rule.domains {
+            if domain.is_empty() {
                 return Err(MhostError::InvalidInput(format!(
-                    "Rule comment contains control characters: {:?}",
-                    c
+                    "Empty domain in profile '{}'",
+                    profile.name
+                )));
+            }
+            if domain
+                .chars()
+                .any(|c| c.is_whitespace() || c == '\n' || c == '\0')
+            {
+                return Err(MhostError::InvalidInput(format!(
+                    "Invalid domain '{}' in profile '{}'",
+                    domain, profile.name
                 )));
             }
         }
     }
 
-    // 4. Validate tags (reject control characters and excessive length)
-    for tag in &profile.tags {
-        if tag.chars().any(|c| c.is_control()) || tag.len() > 50 {
-            return Err(MhostError::InvalidInput(format!(
-                "Invalid tag: {:?}",
-                tag
-            )));
-        }
-    }
-
     Ok(())
 }
 
-#[tauri::command]
-pub fn list_profiles(state: State<'_, AppState>) -> Result<Vec<Profile>, MhostError> {
-    state.storage.list_profiles().map_err(Into::into)
-}
-
-#[tauri::command]
-pub fn get_profile(id: String, state: State<'_, AppState>) -> Result<Profile, MhostError> {
-    let profile_id = ProfileId::from_str(&id)?;
-    state.storage.load_profile(&profile_id).map_err(Into::into)
-}
-
+/// Create a new profile with auto-generated ID.
+///
+/// Calls `profile.save()` which writes:
+/// - `profiles/{id}.json`
+/// - Updates `manifest.json`
+///
+/// Security fix (#18): Validates profile before saving.
 #[tauri::command]
 pub fn create_profile(
     name: String,
+    mode: Option<ProfileMode>,
     state: State<'_, AppState>,
     #[allow(unused_variables)] app_handle: AppHandle,
 ) -> Result<Profile, MhostError> {
-    let profile = Profile::new(name);
-    // Security fix (#18): Validate profile before saving
-    validate_profile(&profile)?;
-    state.storage.save_profile(&profile)?;
-    #[cfg(target_os = "macos")]
-    crate::tray::update_tray_menu(&app_handle);
-    Ok(profile)
-}
-
-#[tauri::command]
-pub async fn update_profile(
-    profile: Profile,
-    state: State<'_, AppState>,
-    #[allow(unused_variables)] app_handle: AppHandle,
-) -> Result<Profile, MhostError> {
-    // Security fix (#18): Validate profile before saving
-    validate_profile(&profile)?;
-
-    // Always acquire lock first to prevent TOCTOU race
-    let _guard = state.apply_lock.lock().await;
-
-    let needs_apply = match state.storage.list_profiles() {
-        Ok(profiles) => profiles
-            .into_iter()
-            .find(|p| p.id == profile.id)
-            .map(|old| {
-                let rules_or_enabled_changed =
-                    old.rules != profile.rules || old.enabled != profile.enabled;
-                rules_or_enabled_changed && profile.enabled
-            })
-            .unwrap_or(false),
-        Err(_) => false,
-    };
-
-    state.storage.save_profile(&profile)?;
-
-    if needs_apply {
-        let writer = state.writer.clone();
-        let storage = state.storage.clone();
-        tauri::async_runtime::spawn_blocking(move || {
-            crate::commands::apply::apply_current_plan_logic(storage.as_ref(), &writer)
-        })
-        .await
-        .map_err(|e| MhostError::InvalidInput(e.to_string()))??;
+    let mut profile = Profile::new(name);
+    if let Some(m) = mode {
+        profile.mode = m;
     }
-
+    // Security fix (#18): Validate profile before saving
+    validate_profile(&profile)?;
+    state.storage.save_profile(&profile)?;
     #[cfg(target_os = "macos")]
     crate::tray::update_tray_menu(&app_handle);
     Ok(profile)
 }
 
+/// Get a single profile by ID.
+///
+/// Returns `None` if not found.
 #[tauri::command]
-pub fn delete_profile(
-    id: String,
-    state: State<'_, AppState>,
-    #[allow(unused_variables)] app_handle: AppHandle,
-) -> Result<(), MhostError> {
+pub fn get_profile(id: String, state: State<'_, AppState>) -> Result<Option<Profile>, MhostError> {
     let profile_id = ProfileId::from_str(&id)?;
-    state.storage.delete_profile(&profile_id)?;
-    #[cfg(target_os = "macos")]
-    crate::tray::update_tray_menu(&app_handle);
-    Ok(())
+    match state.storage.load_profile(&profile_id) {
+        Ok(profile) => Ok(Some(profile)),
+        Err(mhost_core::StorageError::ProfileNotFound(_)) => Ok(None),
+        Err(e) => Err(MhostError::from(e)),
+    }
 }
 
-/// Disable all profiles except the given one.
+/// List all profiles in storage.
 ///
-/// Phase 0 constraint: only one profile can be enabled at a time.
+/// Reads `manifest.json` to get profile IDs, then loads each profile.
+/// Perf fix (#30): Uses `list_profiles` instead of individual `load_profile` calls.
+#[tauri::command]
+pub fn list_profiles(
+    mode: Option<ProfileMode>,
+    state: State<'_, AppState>,
+) -> Result<Vec<Profile>, MhostError> {
+    match mode {
+        Some(m) => state.storage.list_profiles_by_mode(m).map_err(Into::into),
+        None => state.storage.list_profiles().map_err(Into::into),
+    }
+}
+
+/// 列出 DNS 模式 Profile（快捷命令）。
+#[tauri::command]
+pub fn list_dns_profiles(state: State<'_, AppState>) -> Result<Vec<Profile>, MhostError> {
+    state
+        .storage
+        .list_profiles_by_mode(ProfileMode::Dns)
+        .map_err(Into::into)
+}
+
+/// Disable all hosts-mode profiles except the given one.
+///
+/// Phase 0 constraint: only one hosts profile can be enabled at a time.
+/// DNS mode profiles are not affected (multi-activation is allowed).
 /// Perf fix (#31): Collect profiles to disable first to avoid unnecessary iterations.
 pub fn disable_other_profiles(
     storage: &(dyn Storage + Send + Sync),
@@ -192,7 +167,7 @@ pub fn disable_other_profiles(
 }
 
 #[tauri::command]
-pub fn set_profile_enabled(
+pub async fn set_profile_enabled(
     id: String,
     enabled: bool,
     state: State<'_, AppState>,
@@ -200,16 +175,162 @@ pub fn set_profile_enabled(
 ) -> Result<Profile, MhostError> {
     let profile_id = ProfileId::from_str(&id)?;
 
-    // 阶段 0：只允许一个 Profile 启用
-    if enabled {
+    let mut profile = state.storage.load_profile(&profile_id)?;
+
+    // Hosts 模式保持互斥；DNS 模式允许多激活
+    if profile.mode == ProfileMode::Hosts && enabled {
         disable_other_profiles(state.storage.as_ref(), &profile_id)?;
     }
 
-    let mut profile = state.storage.load_profile(&profile_id)?;
     profile.enabled = enabled;
     profile.updated_at = chrono::Utc::now();
+    state.storage.save_profile(&profile)?;
+
+    // 如果启用的是 DNS 模式 Profile 且 dns_enabled == true，热重载规则
+    if profile.mode == ProfileMode::Dns
+        && enabled
+        && state.dns_enabled.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        crate::commands::dns::reload_dns_rules(state).await?;
+    }
+
+    #[cfg(target_os = "macos")]
+    crate::tray::update_tray_menu(&app_handle);
+    Ok(profile)
+}
+
+/// Update an existing profile's name, description, and rules.
+///
+/// Replaces the entire profile file atomically.
+/// Security fix (#18): Validates updated profile before saving.
+#[tauri::command]
+pub fn update_profile(
+    id: String,
+    name: String,
+    description: Option<String>,
+    rules: Vec<mhost_core::HostRule>,
+    state: State<'_, AppState>,
+    #[allow(unused_variables)] app_handle: AppHandle,
+) -> Result<Profile, MhostError> {
+    let profile_id = ProfileId::from_str(&id)?;
+    let mut profile = state.storage.load_profile(&profile_id)?;
+
+    profile.name = name;
+    profile.description = description;
+    profile.rules = rules;
+    profile.updated_at = chrono::Utc::now();
+
+    // N4: Validate profile data before applying changes to system hosts.
+    validate_profile(&profile)?;
     state.storage.save_profile(&profile)?;
     #[cfg(target_os = "macos")]
     crate::tray::update_tray_menu(&app_handle);
     Ok(profile)
+}
+
+/// Delete a profile and remove it from the manifest.
+///
+/// Calls `profile.delete()` which:
+/// - Removes `profiles/{id}.json`
+/// - Updates `manifest.json`
+#[tauri::command]
+pub fn delete_profile(
+    id: String,
+    state: State<'_, AppState>,
+    #[allow(unused_variables)] app_handle: AppHandle,
+) -> Result<(), MhostError> {
+    let profile_id = ProfileId::from_str(&id)?;
+    state.storage.delete_profile(&profile_id)?;
+    #[cfg(target_os = "macos")]
+    crate::tray::update_tray_menu(&app_handle);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mhost_storage::storage::{FileStorage, Storage};
+    use std::sync::Arc;
+
+    fn create_test_storage() -> (tempfile::TempDir, Arc<dyn Storage + Send + Sync>) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(FileStorage::new(temp_dir.path())) as Arc<dyn Storage + Send + Sync>;
+        (temp_dir, storage)
+    }
+
+    fn create_profile(
+        storage: &Arc<dyn Storage + Send + Sync>,
+        name: &str,
+        mode: ProfileMode,
+    ) -> Profile {
+        let mut profile = Profile::new(name.to_string());
+        profile.mode = mode;
+        storage.save_profile(&profile).unwrap();
+        profile
+    }
+
+    #[test]
+    fn test_disable_other_profiles_only_affects_hosts_mode() {
+        let (_temp, storage) = create_test_storage();
+
+        // Create two hosts profiles, enable both
+        let mut hosts_a = create_profile(&storage, "hosts_a", ProfileMode::Hosts);
+        hosts_a.enabled = true;
+        storage.save_profile(&hosts_a).unwrap();
+
+        let mut hosts_b = create_profile(&storage, "hosts_b", ProfileMode::Hosts);
+        hosts_b.enabled = true;
+        storage.save_profile(&hosts_b).unwrap();
+
+        // Create a DNS profile, enable it
+        let mut dns_a = create_profile(&storage, "dns_a", ProfileMode::Dns);
+        dns_a.enabled = true;
+        storage.save_profile(&dns_a).unwrap();
+
+        // Disable others for hosts_a
+        disable_other_profiles(storage.as_ref(), &hosts_a.id).unwrap();
+
+        // hosts_a stays enabled, hosts_b disabled, dns_a stays enabled
+        let hosts_a_loaded = storage.load_profile(&hosts_a.id).unwrap();
+        let hosts_b_loaded = storage.load_profile(&hosts_b.id).unwrap();
+        let dns_a_loaded = storage.load_profile(&dns_a.id).unwrap();
+
+        assert!(hosts_a_loaded.enabled, "hosts_a should remain enabled");
+        assert!(!hosts_b_loaded.enabled, "hosts_b should be disabled");
+        assert!(
+            dns_a_loaded.enabled,
+            "dns_a should remain enabled (not affected by hosts-mode mutual exclusion)"
+        );
+    }
+
+    #[test]
+    fn test_list_profiles_by_mode() {
+        let (_temp, storage) = create_test_storage();
+
+        let hosts_profile = create_profile(&storage, "hosts_dev", ProfileMode::Hosts);
+        let dns_profile = create_profile(&storage, "dns_dev", ProfileMode::Dns);
+
+        // list_profiles (default hosts mode) should only return hosts profile
+        let default_list = storage.list_profiles().unwrap();
+        assert_eq!(default_list.len(), 1);
+        assert_eq!(default_list[0].id, hosts_profile.id);
+
+        // list_profiles_by_mode(Hosts) should return hosts profile
+        let hosts_list = storage.list_profiles_by_mode(ProfileMode::Hosts).unwrap();
+        assert_eq!(hosts_list.len(), 1);
+        assert_eq!(hosts_list[0].id, hosts_profile.id);
+
+        // list_profiles_by_mode(Dns) should return dns profile
+        let dns_list = storage.list_profiles_by_mode(ProfileMode::Dns).unwrap();
+        assert_eq!(dns_list.len(), 1);
+        assert_eq!(dns_list[0].id, dns_profile.id);
+
+        // list_all_profiles should return both
+        let all_list = storage.list_all_profiles().unwrap();
+        assert_eq!(all_list.len(), 2);
+    }
 }

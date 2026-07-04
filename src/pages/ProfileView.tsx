@@ -14,32 +14,60 @@ import {
   deleteProfileAtom,
   fetchProfilesAtom,
   previewApplyAtom,
+  dnsProfilesAtom,
+  dnsErrorAtom,
+  isDnsLoadingAtom,
+  createDnsProfileAtom,
+  fetchDnsProfilesAtom,
+  toggleDnsProfileEnabledAtom,
+  updateDnsProfileAtom,
+  deleteDnsProfileAtom,
 } from "../stores/profiles";
 import { countRealRules } from "../lib/rules";
 import { exportProfileToFile, deleteProfile } from "../lib/tauri";
 import { extractErrorMessage } from "../lib/error";
 import { useWebKitPointerDown } from "../hooks/useWebKitPointerDown";
-import type { HostRule } from "../types";
+import type { HostRule, ProfileMode } from "../types";
 import RuleEditor from "../components/RuleEditor";
 import ImportDialog from "../components/ImportDialog";
 import CreateProfileDialog from "../components/CreateProfileDialog";
 import styles from "./ProfileView.module.css";
 
-function ProfileView() {
+interface ProfileViewProps {
+  mode?: ProfileMode;
+}
+
+function ProfileView({ mode = "hosts" }: ProfileViewProps) {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
-  const profiles = useAtomValue(profilesAtom);
-  const isLoading = useAtomValue(isLoadingAtom);
-  const error = useAtomValue(errorAtom);
+
+  const hostsProfiles = useAtomValue(profilesAtom);
+  const dnsProfiles = useAtomValue(dnsProfilesAtom);
+  const profiles = mode === "hosts" ? hostsProfiles : dnsProfiles;
+
+  const hostsLoading = useAtomValue(isLoadingAtom);
+  const dnsLoading = useAtomValue(isDnsLoadingAtom);
+  const isLoading = mode === "hosts" ? hostsLoading : dnsLoading;
+
+  const hostsError = useAtomValue(errorAtom);
+  const dnsErrorValue = useAtomValue(dnsErrorAtom);
+  const error = mode === "hosts" ? hostsError : dnsErrorValue;
+
   const isApplying = useAtomValue(isApplyingAtom);
   const setSelectedId = useSetAtom(selectedProfileIdAtom);
-  const setError = useSetAtom(errorAtom);
-  const updateProfile = useSetAtom(updateProfileAtom);
-  const deleteProfileAction = useSetAtom(deleteProfileAtom);
-  const createProfile = useSetAtom(createProfileAtom);
-  const fetchProfiles = useSetAtom(fetchProfilesAtom);
-  const previewApply = useSetAtom(previewApplyAtom);
+  const setHostsError = useSetAtom(errorAtom);
+  const setDnsError = useSetAtom(dnsErrorAtom);
+  const updateHostsProfile = useSetAtom(updateProfileAtom);
+  const updateDnsProfile = useSetAtom(updateDnsProfileAtom);
+  const deleteHostsProfile = useSetAtom(deleteProfileAtom);
+  const deleteDnsProfile = useSetAtom(deleteDnsProfileAtom);
+  const createHostsProfile = useSetAtom(createProfileAtom);
+  const createDnsProfileAction = useSetAtom(createDnsProfileAtom);
+  const fetchHostsProfiles = useSetAtom(fetchProfilesAtom);
+  const fetchDnsProfilesAction = useSetAtom(fetchDnsProfilesAtom);
+  const previewApplyAction = useSetAtom(previewApplyAtom);
   const setApplyError = useSetAtom(applyErrorAtom);
+  const toggleDnsEnabled = useSetAtom(toggleDnsProfileEnabledAtom);
   const { onPointerDown } = useWebKitPointerDown();
 
   const profile = profiles.find((p) => p.id === id);
@@ -66,11 +94,22 @@ function ProfileView() {
   });
   const [infoHasChanges, setInfoHasChanges] = useState(false);
 
+  const setError = useCallback(
+    (msg: string | null) => {
+      if (mode === "hosts") {
+        setHostsError(msg);
+      } else {
+        setDnsError(msg);
+      }
+    },
+    [mode, setHostsError, setDnsError],
+  );
+
   useEffect(() => {
-    if (id) {
+    if (id && mode === "hosts") {
       setSelectedId(id);
     }
-  }, [id, setSelectedId]);
+  }, [id, setSelectedId, mode]);
 
   // Track whether we are currently editing to reset draft when profile changes
   const isEditingRef = useRef(false);
@@ -91,10 +130,16 @@ function ProfileView() {
     }
   }, [profile?.id]);
 
-  // Clear error on unmount
+  // Clear error on unmount (only clear the current mode's error)
   useEffect(() => {
-    return () => { setError(null); };
-  }, [setError]);
+    return () => {
+      if (mode === "hosts") {
+        setHostsError(null);
+      } else {
+        setDnsError(null);
+      }
+    };
+  }, [mode, setHostsError, setDnsError]);
 
   const ruleCount = useMemo(() => countRealRules(profile?.rules ?? []), [profile?.rules]);
 
@@ -163,7 +208,11 @@ function ProfileView() {
         description: draftInfo.description.trim() || null,
         tags,
       };
-      await updateProfile(updated);
+      if (mode === "hosts") {
+        await updateHostsProfile(updated);
+      } else {
+        await updateDnsProfile(updated);
+      }
       setInfoHasChanges(false);
       setIsEditingInfo(false);
       setIsInfoBarExpanded(false);
@@ -172,14 +221,18 @@ function ProfileView() {
     } finally {
       setIsSavingInfo(false);
     }
-  }, [profile, draftInfo, infoHasChanges, isSavingInfo, updateProfile, setError]);
+  }, [profile, draftInfo, infoHasChanges, isSavingInfo, mode, updateHostsProfile, updateDnsProfile, setError]);
 
   const handleSave = useCallback(async () => {
     if (!profile || ruleErrors || isSaving) return;
     setIsSaving(true);
     try {
       const updated = { ...profile, rules: draftRules };
-      await updateProfile(updated);
+      if (mode === "hosts") {
+        await updateHostsProfile(updated);
+      } else {
+        await updateDnsProfile(updated);
+      }
       setHasChanges(false);
       setIsEditing(false);
       isEditingRef.current = false;
@@ -188,25 +241,30 @@ function ProfileView() {
     } finally {
       setIsSaving(false);
     }
-  }, [profile, draftRules, ruleErrors, isSaving, updateProfile, setError]);
+  }, [profile, draftRules, ruleErrors, isSaving, mode, updateHostsProfile, updateDnsProfile, setError]);
 
   const handleDeleteProfile = useCallback(async () => {
     if (!profile || !id || profile.protected) return;
     const confirmed = await confirm(`Delete profile "${profile.name}"?`);
     if (!confirmed) return;
     try {
-      await deleteProfileAction(id);
-      navigate("/profiles");
+      if (mode === "hosts") {
+        await deleteHostsProfile(id);
+      } else {
+        await deleteDnsProfile(id);
+      }
+      navigate(mode === "hosts" ? "/profiles" : "/dns-profiles");
     } catch (err: unknown) {
       setError(extractErrorMessage(err));
     }
-  }, [profile, id, deleteProfileAction, navigate, setError]);
+  }, [profile, id, mode, deleteHostsProfile, deleteDnsProfile, navigate, setError]);
 
   const handleExport = useCallback(async () => {
     if (!profile || !id) return;
+    const ext = mode === "hosts" ? "hosts" : "dns";
     try {
       const path = await save({
-        defaultPath: `${profile.name}.hosts`,
+        defaultPath: `${profile.name}.${ext}`,
         filters: [{ name: "Hosts", extensions: ["hosts", "txt"] }],
       });
       if (path) {
@@ -215,49 +273,83 @@ function ProfileView() {
     } catch (err: unknown) {
       setError(extractErrorMessage(err));
     }
-  }, [profile, id, setError]);
+  }, [profile, id, mode, setError]);
 
-  const handleRulesParsed = useCallback(async (rules: HostRule[], tempProfileId?: string) => {
-    setImportDialogOpen(false);
-    if (!profile) {
-      setError("No profile selected. Cannot import rules.");
-      return;
-    }
-    try {
-      // Update current profile with imported rules
-      const updated = { ...profile, rules };
-      await updateProfile(updated);
-      // Clean up temporary profile if file import was used
-      if (tempProfileId) {
-        await deleteProfile(tempProfileId);
+  const handleRulesParsed = useCallback(
+    async (rules: HostRule[], tempProfileId?: string) => {
+      setImportDialogOpen(false);
+      if (!profile) {
+        setError("No profile selected. Cannot import rules.");
+        return;
       }
-      await fetchProfiles();
-    } catch (err: unknown) {
-      setError(extractErrorMessage(err));
-    }
-  }, [profile, updateProfile, setError, fetchProfiles]);
+      try {
+        // Update current profile with imported rules
+        const updated = { ...profile, rules };
+        if (mode === "hosts") {
+          await updateHostsProfile(updated);
+        } else {
+          await updateDnsProfile(updated);
+        }
+        // Clean up temporary profile if file import was used
+        if (tempProfileId) {
+          await deleteProfile(tempProfileId);
+        }
+        if (mode === "hosts") {
+          await fetchHostsProfiles();
+        } else {
+          await fetchDnsProfilesAction();
+        }
+      } catch (err: unknown) {
+        setError(extractErrorMessage(err));
+      }
+    },
+    [profile, mode, updateHostsProfile, updateDnsProfile, setError, fetchHostsProfiles, fetchDnsProfilesAction],
+  );
 
-  const handleCreateProfile = useCallback(async (name: string) => {
-    try {
-      const profile = await createProfile(name);
-      setShowCreateDialog(false);
-      navigate(`/profiles/${profile.id}`);
-    } catch (err: unknown) {
-      setError(extractErrorMessage(err));
+  const handleCreateProfile = useCallback(
+    async (name: string) => {
+      try {
+        let profile;
+        if (mode === "hosts") {
+          profile = await createHostsProfile(name);
+        } else {
+          profile = await createDnsProfileAction(name);
+        }
+        setShowCreateDialog(false);
+        navigate(mode === "hosts" ? `/profiles/${profile.id}` : `/dns-profiles/${profile.id}`);
+      } catch (err: unknown) {
+        setError(extractErrorMessage(err));
+      }
+    },
+    [mode, createHostsProfile, createDnsProfileAction, navigate, setError],
+  );
+
+  const handleToggleEnabled = useCallback(() => {
+    if (!id || !profile) return;
+    if (mode === "hosts") {
+      setApplyError(null);
+      previewApplyAction({ id, enabled: !profile.enabled });
+    } else {
+      toggleDnsEnabled({ id, enabled: !profile.enabled });
     }
-  }, [createProfile, navigate, setError]);
+  }, [id, profile, mode, setApplyError, previewApplyAction, toggleDnsEnabled]);
 
   if (!id) {
     // No profile selected - redirect to first profile or show empty state
     if (profiles.length > 0) {
-      return <Navigate to={`/profiles/${profiles[0].id}`} replace />;
+      return (
+        <Navigate
+          to={`${mode === "hosts" ? "/profiles" : "/dns-profiles"}/${profiles[0].id}`}
+          replace
+        />
+      );
     }
     return (
       <div className={styles.viewPage}>
         <div className="empty-state">
-          <p>No profiles yet</p>
+          <p>{mode === "hosts" ? "No profiles yet" : "No DNS profiles yet"}</p>
           <button className="btn btn-primary" onClick={() => setShowCreateDialog(true)}>
-            + New Profile
+            + {mode === "hosts" ? "New Profile" : "New DNS Profile"}
           </button>
         </div>
         <CreateProfileDialog
@@ -275,8 +367,11 @@ function ProfileView() {
       <div className={styles.viewPage}>
         <div className="empty-state">
           <p>Profile not found.</p>
-          <button className="btn btn-primary" onClick={() => navigate("/profiles")}>
-            Back to Profiles
+          <button
+            className="btn btn-primary"
+            onClick={() => navigate(mode === "hosts" ? "/profiles" : "/dns-profiles")}
+          >
+            Back to {mode === "hosts" ? "Profiles" : "DNS Profiles"}
           </button>
         </div>
       </div>
@@ -299,7 +394,9 @@ function ProfileView() {
               {profile.tags.length > 0 && (
                 <div className={styles.infoBarTags}>
                   {profile.tags.map((tag) => (
-                    <span key={tag} className={styles.infoBarTag}>{tag}</span>
+                    <span key={tag} className={styles.infoBarTag}>
+                      {tag}
+                    </span>
                   ))}
                 </div>
               )}
@@ -369,27 +466,15 @@ function ProfileView() {
                 <div className={styles.infoBarFields}>
                   <div className="form-group">
                     <label className="form-label">Name</label>
-                    <input
-                      className="input"
-                      value={profile.name}
-                      readOnly
-                    />
+                    <input className="input" value={profile.name} readOnly />
                   </div>
                   <div className="form-group">
                     <label className="form-label">Description</label>
-                    <input
-                      className="input"
-                      value={profile.description ?? ""}
-                      readOnly
-                    />
+                    <input className="input" value={profile.description ?? ""} readOnly />
                   </div>
                   <div className="form-group">
                     <label className="form-label">Tags</label>
-                    <input
-                      className="input"
-                      value={profile.tags.join(", ")}
-                      readOnly
-                    />
+                    <input className="input" value={profile.tags.join(", ")} readOnly />
                   </div>
                 </div>
                 <div className={styles.infoBarActions}>
@@ -414,6 +499,11 @@ function ProfileView() {
         <div className={styles.viewHeaderLeft}>
           <h1 className={styles.viewTitle}>{profile.name}</h1>
           <div className={styles.viewBadges}>
+            <span
+              className={`${styles.badge} ${profile.mode === "dns" ? styles.badgeModeDns : styles.badgeModeHosts}`}
+            >
+              {profile.mode === "dns" ? "DNS" : "Hosts"}
+            </span>
             {profile.enabled ? (
               <span className={`${styles.badge} ${styles.badgeEnabled}`}>Enabled</span>
             ) : (
@@ -421,18 +511,8 @@ function ProfileView() {
             )}
             <button
               className={`btn btn-sm ${profile.enabled ? "btn-ghost" : "btn-primary"}`}
-              onClick={() => {
-                if (id) {
-                  setApplyError(null);
-                  previewApply({ id, enabled: !profile.enabled });
-                }
-              }}
-              onPointerDown={onPointerDown(() => {
-                if (id) {
-                  setApplyError(null);
-                  previewApply({ id, enabled: !profile.enabled });
-                }
-              })}
+              onClick={handleToggleEnabled}
+              onPointerDown={onPointerDown(handleToggleEnabled)}
               disabled={isApplying || isLoading}
             >
               {profile.enabled ? "Disable" : "Enable"}
@@ -448,18 +528,32 @@ function ProfileView() {
         <div className={styles.viewHeaderActions}>
           {!isEditing ? (
             <>
-              <button className="btn btn-ghost btn-sm" onClick={() => setImportDialogOpen(true)}>
+              <button
+                className="btn btn-ghost btn-sm"
+                onClick={() => setImportDialogOpen(true)}
+                onPointerDown={onPointerDown(() => setImportDialogOpen(true))}
+              >
                 Import
               </button>
-              <button className="btn btn-ghost btn-sm" onClick={handleExport} disabled={isLoading}>
+              <button
+                className="btn btn-ghost btn-sm"
+                onClick={handleExport}
+                onPointerDown={onPointerDown(handleExport)}
+                disabled={isLoading}
+              >
                 Export
               </button>
-              <button className="btn btn-primary btn-sm" onClick={handleEditRules}>
+              <button
+                className="btn btn-primary btn-sm"
+                onClick={handleEditRules}
+                onPointerDown={onPointerDown(handleEditRules)}
+              >
                 Edit Rules
               </button>
               <button
                 className="btn btn-danger btn-sm"
                 onClick={handleDeleteProfile}
+                onPointerDown={onPointerDown(handleDeleteProfile)}
                 disabled={profile.protected || isLoading}
               >
                 Delete
@@ -499,7 +593,9 @@ function ProfileView() {
             )}
           </div>
         </div>
-        <div className={`${styles.rulesContent} ${isEditing ? styles.rulesContentEditing : styles.rulesContentReadOnly}`}>
+        <div
+          className={`${styles.rulesContent} ${isEditing ? styles.rulesContentEditing : styles.rulesContentReadOnly}`}
+        >
           <RuleEditor
             rules={isEditing ? draftRules : profile.rules}
             onChange={handleRulesChange}

@@ -58,7 +58,10 @@ pub fn build_tooltip_text(enabled_profile_name: Option<&str>) -> String {
     }
 }
 
-pub fn determine_menu_update_kind(old_profile_ids: &[String], new_profile_ids: &[String]) -> MenuUpdateKind {
+pub fn determine_menu_update_kind(
+    old_profile_ids: &[String],
+    new_profile_ids: &[String],
+) -> MenuUpdateKind {
     if old_profile_ids == new_profile_ids {
         MenuUpdateKind::CheckOnly
     } else {
@@ -73,15 +76,22 @@ mod tests {
     #[test]
     fn test_resolve_menu_action() {
         let cases = vec![
-            ("uuid_profile", "profile.550e8400-e29b-41d4-a716-446655440000",
-             TrayMenuAction::SwitchProfile("550e8400-e29b-41d4-a716-446655440000".into())),
+            (
+                "uuid_profile",
+                "profile.550e8400-e29b-41d4-a716-446655440000",
+                TrayMenuAction::SwitchProfile("550e8400-e29b-41d4-a716-446655440000".into()),
+            ),
             ("refresh", "refresh_rules", TrayMenuAction::RefreshRules),
             ("open_window", "open_window", TrayMenuAction::OpenWindow),
             ("quit", "quit", TrayMenuAction::Quit),
             ("adblock", "adblock", TrayMenuAction::AdBlock),
             ("unknown", "unknown_id", TrayMenuAction::Unknown),
             ("empty", "", TrayMenuAction::Unknown),
-            ("profile_prefix_only", "profile.", TrayMenuAction::SwitchProfile("".into())),
+            (
+                "profile_prefix_only",
+                "profile.",
+                TrayMenuAction::SwitchProfile("".into()),
+            ),
         ];
         for (name, input, expected) in cases {
             let result = resolve_menu_action(input);
@@ -94,11 +104,7 @@ mod tests {
         let cases = vec![
             (vec![], vec![]),
             (
-                vec![(
-                    "p1".to_string(),
-                    "Profile 1".to_string(),
-                    false,
-                )],
+                vec![("p1".to_string(), "Profile 1".to_string(), false)],
                 vec![ProfileMenuItem {
                     profile_id: "p1".to_string(),
                     name: "Profile 1".to_string(),
@@ -106,11 +112,7 @@ mod tests {
                 }],
             ),
             (
-                vec![(
-                    "p1".to_string(),
-                    "Profile 1".to_string(),
-                    true,
-                )],
+                vec![("p1".to_string(), "Profile 1".to_string(), true)],
                 vec![ProfileMenuItem {
                     profile_id: "p1".to_string(),
                     name: "Profile 1".to_string(),
@@ -197,16 +199,8 @@ mod tests {
                 MenuUpdateKind::Rebuild,
             ),
             (vec![], vec![], MenuUpdateKind::CheckOnly),
-            (
-                vec![],
-                vec!["a".to_string()],
-                MenuUpdateKind::Rebuild,
-            ),
-            (
-                vec!["a".to_string()],
-                vec![],
-                MenuUpdateKind::Rebuild,
-            ),
+            (vec![], vec!["a".to_string()], MenuUpdateKind::Rebuild),
+            (vec!["a".to_string()], vec![], MenuUpdateKind::Rebuild),
         ];
 
         for (old, new, expected) in cases {

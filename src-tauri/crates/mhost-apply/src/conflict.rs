@@ -69,7 +69,7 @@ mod tests {
     fn make_conflict(domain: &str, ips: Vec<&str>, profiles: Vec<&str>) -> RuleConflict {
         let rules = ips
             .into_iter()
-            .zip(profiles.into_iter())
+            .zip(profiles)
             .map(|(ip, profile)| ResolvedRule {
                 ip: ip.parse().unwrap(),
                 domain: domain.to_string(),

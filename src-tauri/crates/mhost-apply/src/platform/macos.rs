@@ -115,7 +115,11 @@ mod tests {
         let result = escape_applescript_path("/path/with space");
         assert!(result.is_err(), "space should be rejected");
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("illegal character"), "error should mention illegal character: {}", msg);
+        assert!(
+            msg.contains("illegal character"),
+            "error should mention illegal character: {}",
+            msg
+        );
 
         let result = escape_applescript_path("/path/with;semicolon");
         assert!(result.is_err(), "semicolon should be rejected");

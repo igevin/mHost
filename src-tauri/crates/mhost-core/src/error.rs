@@ -36,7 +36,7 @@ impl From<std::io::Error> for MhostError {
 
 impl From<ApplyError> for std::io::Error {
     fn from(err: ApplyError) -> Self {
-        std::io::Error::new(std::io::ErrorKind::Other, err.to_string())
+        std::io::Error::other(err.to_string())
     }
 }
 
@@ -235,8 +235,14 @@ mod tests {
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file gone");
         let mhost_err: MhostError = io_err.into();
         let msg = mhost_err.to_string();
-        assert!(msg.contains("file gone"), "message should contain 'file gone'");
-        assert!(msg.contains("NotFound"), "message should contain ErrorKind 'NotFound' (Debug format)");
+        assert!(
+            msg.contains("file gone"),
+            "message should contain 'file gone'"
+        );
+        assert!(
+            msg.contains("NotFound"),
+            "message should contain ErrorKind 'NotFound' (Debug format)"
+        );
         // Verify it serializes correctly
         let json = serde_json::to_string(&mhost_err).unwrap();
         let restored: MhostError = serde_json::from_str(&json).unwrap();

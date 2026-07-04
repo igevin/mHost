@@ -18,7 +18,9 @@ pub fn set_activation_policy_accessory() {
         let app = NSApplication::sharedApplication(mtm);
         app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
     } else {
-        eprintln!("[mHost] Warning: set_activation_policy_accessory called from non-main thread, skipped");
+        eprintln!(
+            "[mHost] Warning: set_activation_policy_accessory called from non-main thread, skipped"
+        );
     }
 }
 
@@ -32,6 +34,8 @@ pub fn set_activation_policy_regular() {
         let app = NSApplication::sharedApplication(mtm);
         app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
     } else {
-        eprintln!("[mHost] Warning: set_activation_policy_regular called from non-main thread, skipped");
+        eprintln!(
+            "[mHost] Warning: set_activation_policy_regular called from non-main thread, skipped"
+        );
     }
 }

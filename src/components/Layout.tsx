@@ -16,6 +16,8 @@ import {
   executeApplyAtom,
   closeApplyConfirmAtom,
   rollbackHostsActionAtom,
+  dnsEnabledAtom,
+  dnsStatusAtom,
 } from "../stores/profiles";
 import { extractErrorMessage } from "../lib/error";
 import { useWebKitPointerDown } from "../hooks/useWebKitPointerDown";
@@ -119,6 +121,23 @@ function FileTextIcon() {
   );
 }
 
+function DnsIcon() {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      width="18"
+      height="18"
+    >
+      <circle cx="12" cy="12" r="10" />
+      <path d="M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z" />
+      <line x1="2" y1="12" x2="22" y2="12" />
+    </svg>
+  );
+}
+
 /* ---- Static tool nav items (module-level constant, created once) ---- */
 
 const toolNavItems: NavItem[] = [
@@ -143,6 +162,12 @@ const toolNavItems: NavItem[] = [
     disabled: false,
   },
   {
+    to: "/dns-profiles",
+    label: "DNS Profiles",
+    icon: <DnsIcon />,
+    disabled: false,
+  },
+  {
     to: "/hosts",
     label: "System Hosts",
     icon: <FileTextIcon />,
@@ -156,6 +181,8 @@ function Layout() {
   const selectedProfileId = useAtomValue(selectedProfileIdAtom);
   const createProfile = useSetAtom(createProfileAtom);
   const isLoading = useAtomValue(isLoadingAtom);
+  const dnsEnabled = useAtomValue(dnsEnabledAtom);
+  const dnsStatus = useAtomValue(dnsStatusAtom);
 
   const navigate = useNavigate();
   const setError = useSetAtom(errorAtom);
@@ -211,6 +238,16 @@ function Layout() {
             <span className={styles.logoIcon}>m</span>
             <span className={styles.logoText}>mHost</span>
           </div>
+          {dnsEnabled && (
+            <button
+              className={styles.dnsStatusIndicator}
+              onClick={() => navigate("/settings")}
+              title={`DNS running on port ${dnsStatus?.port ?? "?"}`}
+            >
+              <span className={styles.dnsStatusDot} />
+              <span className={styles.dnsStatusLabel}>DNS</span>
+            </button>
+          )}
         </div>
 
         {/* Profiles Section */}

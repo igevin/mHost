@@ -73,7 +73,11 @@ impl Parser {
         }
 
         let duplicates = validator::check_duplicates(&rules);
-        ValidateResult { rules, errors, duplicates }
+        ValidateResult {
+            rules,
+            errors,
+            duplicates,
+        }
     }
 
     /// Parse hosts text and collect only errors with their line numbers.
@@ -354,7 +358,10 @@ mod tests {
         // Verify the comment rule has correct content
         let comment_result = Parser::parse("# this is a comment");
         assert!(comment_result.rules[0].is_comment_only());
-        assert_eq!(comment_result.rules[0].comment, Some("# this is a comment".to_string()));
+        assert_eq!(
+            comment_result.rules[0].comment,
+            Some("# this is a comment".to_string())
+        );
         assert_eq!(comment_result.rules[0].ip, None);
     }
 
@@ -420,7 +427,10 @@ mod tests {
         let result = Parser::parse(input);
         assert_eq!(result.rules.len(), 3); // 2 comment-only + 1 host rule
         let formatted = Parser::format(&result.rules);
-        assert_eq!(formatted, "# header comment\n127.0.0.1 example.com\n# footer comment\n");
+        assert_eq!(
+            formatted,
+            "# header comment\n127.0.0.1 example.com\n# footer comment\n"
+        );
         let reparsed = Parser::parse(&formatted);
         assert_rules_eq(&result.rules, &reparsed.rules);
     }
@@ -447,7 +457,10 @@ mod tests {
         let result = Parser::parse(input);
         assert!(result.errors.is_empty());
         assert_eq!(result.rules.len(), 1);
-        assert_eq!(result.rules[0].ip, Some("127.0.0.1".parse::<IpAddr>().unwrap()));
+        assert_eq!(
+            result.rules[0].ip,
+            Some("127.0.0.1".parse::<IpAddr>().unwrap())
+        );
         assert_eq!(result.rules[0].domains, vec!["example.com"]);
         // empty comment after # is stored as None because we trim and check empty
         assert_eq!(result.rules[0].comment, None);
@@ -471,7 +484,10 @@ mod tests {
         assert_eq!(result.rules.len(), 4);
         assert!(result.rules[0].is_comment_only());
         assert_eq!(result.rules[0].comment, Some("# header".to_string()));
-        assert_eq!(result.rules[1].ip, Some("127.0.0.1".parse::<IpAddr>().unwrap()));
+        assert_eq!(
+            result.rules[1].ip,
+            Some("127.0.0.1".parse::<IpAddr>().unwrap())
+        );
         assert_eq!(result.rules[1].domains, vec!["a.com"]);
         assert_eq!(result.rules[2].ip, Some("::1".parse::<IpAddr>().unwrap()));
         assert_eq!(result.rules[2].domains, vec!["localhost"]);
@@ -554,9 +570,13 @@ mod tests {
 
     #[test]
     fn test_extract_managed_block_content_multi_line() {
-        let input = "# ---- mHost start ----\n127.0.0.1 a.com\n192.168.1.1 b.com\n# ---- mHost end ----";
+        let input =
+            "# ---- mHost start ----\n127.0.0.1 a.com\n192.168.1.1 b.com\n# ---- mHost end ----";
         let result = Parser::extract_managed_block_content(input);
-        assert_eq!(result, Some("127.0.0.1 a.com\n192.168.1.1 b.com".to_string()));
+        assert_eq!(
+            result,
+            Some("127.0.0.1 a.com\n192.168.1.1 b.com".to_string())
+        );
     }
 
     #[test]
@@ -573,23 +593,48 @@ mod tests {
     #[test]
     fn test_parse_with_lines_valid() {
         let cases = vec![
-            ("single_ipv4", "127.0.0.1 example.com",
-             vec![("127.0.0.1", vec!["example.com"])], 0),
-            ("ipv6", "::1 localhost",
-             vec![("::1", vec!["localhost"])], 0),
-            ("multi_domain", "127.0.0.1 a.com b.com",
-             vec![("127.0.0.1", vec!["a.com", "b.com"])], 0),
-            ("with_comment", "127.0.0.1 x.com # dev",
-             vec![("127.0.0.1", vec!["x.com"])], 0),
-            ("empty_lines", "\n\n127.0.0.1 x.com\n\n",
-             vec![("127.0.0.1", vec!["x.com"])], 0),
+            (
+                "single_ipv4",
+                "127.0.0.1 example.com",
+                vec![("127.0.0.1", vec!["example.com"])],
+                0,
+            ),
+            ("ipv6", "::1 localhost", vec![("::1", vec!["localhost"])], 0),
+            (
+                "multi_domain",
+                "127.0.0.1 a.com b.com",
+                vec![("127.0.0.1", vec!["a.com", "b.com"])],
+                0,
+            ),
+            (
+                "with_comment",
+                "127.0.0.1 x.com # dev",
+                vec![("127.0.0.1", vec!["x.com"])],
+                0,
+            ),
+            (
+                "empty_lines",
+                "\n\n127.0.0.1 x.com\n\n",
+                vec![("127.0.0.1", vec!["x.com"])],
+                0,
+            ),
         ];
         for (name, input, expected_rules, expected_errors) in cases {
             let result = Parser::parse_with_lines(input);
             assert_eq!(result.rules.len(), expected_rules.len(), "case: {}", name);
             for (i, (expected_ip, expected_domains)) in expected_rules.iter().enumerate() {
-                assert_eq!(result.rules[i].ip, Some(expected_ip.parse::<IpAddr>().unwrap()), "case: {} rule {} ip", name, i);
-                assert_eq!(result.rules[i].domains, *expected_domains, "case: {} rule {} domains", name, i);
+                assert_eq!(
+                    result.rules[i].ip,
+                    Some(expected_ip.parse::<IpAddr>().unwrap()),
+                    "case: {} rule {} ip",
+                    name,
+                    i
+                );
+                assert_eq!(
+                    result.rules[i].domains, *expected_domains,
+                    "case: {} rule {} domains",
+                    name, i
+                );
             }
             assert_eq!(result.errors.len(), expected_errors, "case: {}", name);
         }
@@ -598,7 +643,10 @@ mod tests {
         let comment_result = Parser::parse_with_lines("# this is a comment");
         assert_eq!(comment_result.rules.len(), 1);
         assert!(comment_result.rules[0].is_comment_only());
-        assert_eq!(comment_result.rules[0].comment, Some("# this is a comment".to_string()));
+        assert_eq!(
+            comment_result.rules[0].comment,
+            Some("# this is a comment".to_string())
+        );
         assert_eq!(comment_result.errors.len(), 0);
     }
 
@@ -611,10 +659,19 @@ mod tests {
         ];
         for (name, input, expected_msg_contains) in cases {
             let result = Parser::parse_with_lines(input);
-            assert!(!result.errors.is_empty(), "case: {} should have errors", name);
+            assert!(
+                !result.errors.is_empty(),
+                "case: {} should have errors",
+                name
+            );
             let msg = result.errors[0].error.to_string().to_lowercase();
-            assert!(msg.contains(expected_msg_contains),
-                "case: {} error '{}' should contain '{}'", name, msg, expected_msg_contains);
+            assert!(
+                msg.contains(expected_msg_contains),
+                "case: {} error '{}' should contain '{}'",
+                name,
+                msg,
+                expected_msg_contains
+            );
         }
     }
 
@@ -628,7 +685,7 @@ mod tests {
     #[test]
     fn test_parse_with_lines_multiple_errors() {
         let result = Parser::parse_with_lines(
-            "127.0.0.1 ok.com\nbad_line\n127.0.0.1 ok2.com\n999.999.999.999 bad.com"
+            "127.0.0.1 ok.com\nbad_line\n127.0.0.1 ok2.com\n999.999.999.999 bad.com",
         );
         assert_eq!(result.errors.len(), 2);
         assert_eq!(result.errors[0].line_number, 2);
@@ -661,7 +718,10 @@ mod tests {
         assert_eq!(result.duplicates.len(), 1);
         assert_eq!(result.duplicates[0].domain, "a.com");
         assert_eq!(result.duplicates[0].lines, vec![1, 2]);
-        assert!(matches!(result.duplicates[0].kind, mhost_core::DuplicateKind::SameIp));
+        assert!(matches!(
+            result.duplicates[0].kind,
+            mhost_core::DuplicateKind::SameIp
+        ));
     }
 
     #[test]
@@ -669,7 +729,10 @@ mod tests {
         let input = "127.0.0.1 a.com\n192.168.1.1 a.com";
         let result = Parser::parse_with_lines(input);
         assert_eq!(result.duplicates.len(), 1);
-        assert!(matches!(result.duplicates[0].kind, mhost_core::DuplicateKind::DifferentIp));
+        assert!(matches!(
+            result.duplicates[0].kind,
+            mhost_core::DuplicateKind::DifferentIp
+        ));
     }
 
     #[test]

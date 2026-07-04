@@ -7,6 +7,8 @@ import {
   profilesAtom,
   selectedProfileIdAtom,
   isApplyingAtom,
+  dnsEnabledAtom,
+  dnsStatusAtom,
 } from "../../stores/profiles";
 
 // Mock tauri invoke
@@ -29,6 +31,7 @@ function makeProfile(overrides: Partial<Profile> = {}): Profile {
     protected: false,
     tags: [],
     rules: [],
+    mode: "hosts",
     created_at: "2024-01-01T00:00:00Z",
     updated_at: "2024-01-01T00:00:00Z",
     ...overrides,
@@ -50,6 +53,8 @@ describe("Layout", () => {
     store.set(profilesAtom, []);
     store.set(selectedProfileIdAtom, null);
     store.set(isApplyingAtom, false);
+    store.set(dnsEnabledAtom, false);
+    store.set(dnsStatusAtom, null);
   });
 
   it("renders the mHost logo", () => {
@@ -210,5 +215,24 @@ describe("Layout", () => {
     if (profileItem) {
       fireEvent.click(profileItem);
     }
+  });
+
+  it("shows DNS status indicator when dnsEnabled is true", () => {
+    const store = getDefaultStore();
+    store.set(dnsEnabledAtom, true);
+    store.set(dnsStatusAtom, { running: true, port: 53, upstream: [], rule_count: 0, cache_capacity: 100 });
+
+    renderWithProviders(<Layout />);
+
+    expect(screen.getByText("DNS")).toBeInTheDocument();
+  });
+
+  it("hides DNS status indicator when dnsEnabled is false", () => {
+    const store = getDefaultStore();
+    store.set(dnsEnabledAtom, false);
+
+    renderWithProviders(<Layout />);
+
+    expect(screen.queryByText("DNS")).not.toBeInTheDocument();
   });
 });

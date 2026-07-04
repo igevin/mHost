@@ -12,21 +12,30 @@ use serde_json::Value;
 /// 存储格式清单，用于数据版本管理。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Manifest {
-    /// 数据格式版本，阶段 0 = 1
+    /// 数据格式版本，v2 起支持 DNS 模式
     pub version: u32,
     /// 应用版本号
     pub app_version: String,
     /// 最后更新时间戳（UTC）
     pub updated_at: DateTime<Utc>,
+    /// DNS 模式全局开关状态（v2 新增，旧版本兼容为 None）
+    #[serde(default)]
+    pub dns_enabled: Option<bool>,
+    /// 启用 DNS 模式前的系统 DNS 服务器列表（v2.1 新增，用于崩溃/强杀后恢复）。
+    /// 旧版本或全新安装时为 `None`。
+    #[serde(default)]
+    pub original_dns: Option<Vec<String>>,
 }
 
 impl Manifest {
-    /// 创建阶段 0 的默认清单（version = 1）。
+    /// 创建 v2 默认清单（version = 2）。
     pub fn new(app_version: impl Into<String>) -> Self {
         Self {
-            version: 1,
+            version: 2,
             app_version: app_version.into(),
             updated_at: Utc::now(),
+            dns_enabled: Some(false),
+            original_dns: None,
         }
     }
 }
@@ -58,20 +67,43 @@ mod tests {
     #[test]
     fn test_manifest_default_version() {
         let manifest = Manifest::new("0.1.0");
-        assert_eq!(manifest.version, 1);
+        assert_eq!(manifest.version, 2);
         assert_eq!(manifest.app_version, "0.1.0");
+        assert_eq!(manifest.dns_enabled, Some(false));
     }
 
     #[test]
     fn test_manifest_serialization_roundtrip() {
         let cases = vec![
-            ("v1_0_1_0", Manifest::new("0.1.0")),
+            ("v2_0_1_0", Manifest::new("0.1.0")),
             (
-                "v1_1_0_0",
+                "v2_explicit_dns_false",
                 Manifest {
-                    version: 1,
+                    version: 2,
                     app_version: "1.0.0".to_string(),
                     updated_at: "2024-01-01T00:00:00+00:00".parse().unwrap(),
+                    dns_enabled: Some(false),
+                    original_dns: None,
+                },
+            ),
+            (
+                "v2_dns_enabled",
+                Manifest {
+                    version: 2,
+                    app_version: "1.1.0".to_string(),
+                    updated_at: "2024-06-01T00:00:00+00:00".parse().unwrap(),
+                    dns_enabled: Some(true),
+                    original_dns: None,
+                },
+            ),
+            (
+                "v2_dns_with_original",
+                Manifest {
+                    version: 2,
+                    app_version: "1.2.0".to_string(),
+                    updated_at: "2024-07-01T00:00:00+00:00".parse().unwrap(),
+                    dns_enabled: Some(true),
+                    original_dns: Some(vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()]),
                 },
             ),
         ];
@@ -90,7 +122,8 @@ mod tests {
         assert!(json.contains("\"version\""));
         assert!(json.contains("\"app_version\""));
         assert!(json.contains("\"updated_at\""));
-        assert!(json.contains("1"));
+        assert!(json.contains("\"dns_enabled\""));
+        assert!(json.contains("2"));
         assert!(json.contains("0.1.0"));
     }
 
@@ -101,5 +134,52 @@ mod tests {
         // 验证是有效的 RFC 3339 时间戳
         assert!(rfc3339.contains('T'));
         assert!(rfc3339.contains('+') || rfc3339.contains('Z'));
+    }
+
+    #[test]
+    fn test_manifest_v1_backward_compatibility() {
+        // 模拟旧版本 v1 manifest JSON（不含 dns_enabled 字段）
+        let v1_json = r#"{
+            "version": 1,
+            "app_version": "0.1.0",
+            "updated_at": "2024-01-01T00:00:00Z"
+        }"#;
+
+        let manifest: Manifest = serde_json::from_str(v1_json).unwrap();
+        assert_eq!(manifest.version, 1);
+        assert_eq!(manifest.app_version, "0.1.0");
+        assert_eq!(
+            manifest.dns_enabled, None,
+            "旧版本 manifest 反序列化时 dns_enabled 应为 None"
+        );
+        assert_eq!(
+            manifest.original_dns, None,
+            "旧版本 manifest 反序列化时 original_dns 应为 None"
+        );
+    }
+
+    #[test]
+    fn test_manifest_default_has_none_original_dns() {
+        // 新建 manifest 应默认 original_dns = None
+        let manifest = Manifest::new("1.0.0");
+        assert_eq!(manifest.original_dns, None);
+    }
+
+    #[test]
+    fn test_manifest_original_dns_backward_compat_pre_v2_1() {
+        // v2.0 manifest 不包含 original_dns 字段，反序列化时默认为 None
+        let v2_pre_2_1 = r#"{
+            "version": 2,
+            "app_version": "1.0.0",
+            "updated_at": "2024-01-01T00:00:00Z",
+            "dns_enabled": true
+        }"#;
+
+        let manifest: Manifest = serde_json::from_str(v2_pre_2_1).unwrap();
+        assert_eq!(manifest.dns_enabled, Some(true));
+        assert_eq!(
+            manifest.original_dns, None,
+            "v2.0 不含 original_dns 字段时应默认为 None"
+        );
     }
 }

@@ -24,9 +24,7 @@ pub fn verify(written: &str, plan: &ApplyPlan) -> Result<(), MhostError> {
 
     let block = Parser::extract_managed_block(written);
     if block.is_none() {
-        return Err(
-            ApplyError::VerificationFailed("managed block missing".to_string()).into(),
-        );
+        return Err(ApplyError::VerificationFailed("managed block missing".to_string()).into());
     }
 
     // Extract managed block lines into a HashSet for O(1) lookup
