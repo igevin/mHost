@@ -203,8 +203,13 @@ pub async fn set_profile_enabled(
 ///
 /// Replaces the entire profile file atomically.
 /// Security fix (#18): Validates updated profile before saving.
+///
+/// **fix: DNS 规则热重载** —— 之前实现只 save_profile，不通知运行中的
+/// DnsServer 重新加载规则集，导致用户编辑一个 enabled 的 DNS profile
+/// 后新规则不生效。修复：保存后如果 profile 是 enabled DNS profile
+/// 且 DNS 模式在跑，调 `reload_dns_rules`。
 #[tauri::command]
-pub fn update_profile(
+pub async fn update_profile(
     id: String,
     name: String,
     description: Option<String>,
@@ -223,6 +228,24 @@ pub fn update_profile(
     // N4: Validate profile data before applying changes to system hosts.
     validate_profile(&profile)?;
     state.storage.save_profile(&profile)?;
+
+    // 如果这是一个 enabled 的 DNS 模式 Profile 且 DNS 模式在跑，
+    // 把新规则热加载到运行中的 DnsServer.RuleEngine。
+    if profile.mode == ProfileMode::Dns
+        && profile.enabled
+        && state.dns_enabled.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        if let Err(e) = crate::commands::dns::reload_dns_rules(state).await {
+            // 规则已存盘，下次 set_profile_enabled(true) 也会触发 reload，
+            // 所以这里不向用户抛 Err —— storage 是 source of truth，DNS
+            // server reload 是 best-effort。
+            eprintln!(
+                "[mHost] DNS rule hot-reload failed after update_profile: {}",
+                e
+            );
+        }
+    }
+
     #[cfg(target_os = "macos")]
     crate::tray::update_tray_menu(&app_handle);
     Ok(profile)

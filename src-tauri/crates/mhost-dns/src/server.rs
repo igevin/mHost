@@ -257,6 +257,12 @@ impl DnsServer {
     pub fn rule_count(&self) -> usize {
         self.rule_engine.rule_count()
     }
+
+    /// 测试用：直接拿到 RuleEngine（验证热重载后的规则状态）
+    #[doc(hidden)]
+    pub fn rule_engine_for_test(&self) -> Arc<crate::resolver::RuleEngine> {
+        Arc::clone(&self.rule_engine)
+    }
 }
 
 /// 处理单个 DNS 请求，返回编码后的响应数据。
@@ -922,6 +928,66 @@ mod tests {
         }
 
         server.stop().await.unwrap();
+    }
+
+    /// 回归测试：用户编辑 enabled DNS profile 后，新规则应立即生效。
+    ///
+    /// 之前 update_profile 只 save_profile，不调 reload_dns_rules，
+    /// 导致用户加新规则后必须重启 app 或 toggle profile 才能生效。
+    /// 修复：update_profile 在保存后调 reload_dns_rules。
+    ///
+    /// 这个测试验证 DnsServer 层的 reload_rules 机制对 in-place
+    /// profile 变更的正确性（命令层的修复见 profile.rs::update_profile）。
+    #[tokio::test]
+    async fn test_dns_server_reload_after_profile_edit() {
+        use mhost_core::HostRule;
+        use std::net::IpAddr;
+
+        let config = DnsConfig {
+            port: 1062,
+            ..Default::default()
+        };
+        let server = Arc::new(DnsServer::new(config).unwrap());
+
+        // 初始加载：profile 含 rule `local1.dns → 127.0.0.1`
+        let profile = Arc::new(tokio::sync::Mutex::new(make_profile(
+            "p1",
+            mhost_core::ProfileMode::Dns,
+            true,
+            vec![make_rule(Some("127.0.0.1"), vec!["local1.dns"], true)],
+        )));
+        let p1 = Arc::clone(&profile);
+        server.reload_rules(&[(*p1.lock().await).clone()]);
+        assert_eq!(server.rule_count(), 1);
+
+        // 模拟用户编辑：在 profile 里加 rule `local3.dns → 127.0.0.1`
+        let mut updated = profile.lock().await.clone();
+        updated.rules.push(HostRule {
+            id: mhost_core::RuleId(uuid::Uuid::new_v4()),
+            ip: Some("127.0.0.1".parse::<IpAddr>().unwrap()),
+            domains: vec!["local3.dns".to_string()],
+            enabled: true,
+            comment: None,
+            source: mhost_core::RuleSource::Manual,
+            line_number: None,
+        });
+
+        // 关键：update_profile 修复后会调 reload_dns_rules
+        server.reload_rules(&[updated]);
+
+        // 关键断言：新规则应立即生效（不再需要重启或 toggle profile）
+        assert_eq!(server.rule_count(), 2);
+        // 通过 DnsServer 内部 RuleEngine 直接验证（避免 DNS 协议编解码
+        // 让测试更聚焦于「规则热重载」这一行为）
+        let engine = server.rule_engine_for_test();
+        assert_eq!(
+            engine.resolve("local1.dns"),
+            Some("127.0.0.1".parse().unwrap())
+        );
+        assert_eq!(
+            engine.resolve("local3.dns"),
+            Some("127.0.0.1".parse().unwrap())
+        );
     }
 
     /// 回归测试（fix: systematic DNS logic review）：并发 start() 不应 panic。
