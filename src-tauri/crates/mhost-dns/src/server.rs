@@ -318,8 +318,7 @@ async fn handle_dns_request(
                         let ttl = record.ttl();
                         response.add_answer(*record.clone());
                         // 缓存：把单条记录放进 vec，未来多 record 也好扩展
-                        let expires_at =
-                            now + std::time::Duration::from_secs(ttl as u64);
+                        let expires_at = now + std::time::Duration::from_secs(ttl as u64);
                         let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
                         guard.put(cache_key, (vec![*record], expires_at));
                     }
@@ -367,9 +366,11 @@ async fn handle_address_query(
     // 1. 优先匹配本地规则
     if let Some(ip) = rule_engine.resolve(name_str) {
         let record = match (qtype, ip) {
-            (RecordType::A, IpAddr::V4(v4)) => {
-                Some(Record::from_rdata(name.clone(), LOCAL_RULE_TTL, RData::A(A(v4))))
-            }
+            (RecordType::A, IpAddr::V4(v4)) => Some(Record::from_rdata(
+                name.clone(),
+                LOCAL_RULE_TTL,
+                RData::A(A(v4)),
+            )),
             (RecordType::AAAA, IpAddr::V6(v6)) => {
                 use hickory_proto::rr::rdata::AAAA;
                 Some(Record::from_rdata(
@@ -635,11 +636,7 @@ mod tests {
             "dns_test_aaaa",
             ProfileMode::Dns,
             true,
-            vec![make_rule(
-                Some("::1"),
-                vec!["v6.example.com"],
-                true,
-            )],
+            vec![make_rule(Some("::1"), vec!["v6.example.com"], true)],
         );
 
         let config = DnsConfig {
@@ -688,7 +685,11 @@ mod tests {
             panic!("期望 AAAA 记录，实际 {:?}", answer.data());
         }
         // 本地规则 TTL = LOCAL_RULE_TTL
-        assert_eq!(answer.ttl(), LOCAL_RULE_TTL, "本地规则应使用 LOCAL_RULE_TTL");
+        assert_eq!(
+            answer.ttl(),
+            LOCAL_RULE_TTL,
+            "本地规则应使用 LOCAL_RULE_TTL"
+        );
 
         server.stop().await.unwrap();
     }
@@ -700,11 +701,7 @@ mod tests {
             "dns_test_family_mismatch",
             ProfileMode::Dns,
             true,
-            vec![make_rule(
-                Some("127.0.0.1"),
-                vec!["v4.example.com"],
-                true,
-            )],
+            vec![make_rule(Some("127.0.0.1"), vec!["v4.example.com"], true)],
         );
 
         let config = DnsConfig {
@@ -754,11 +751,7 @@ mod tests {
             "dns_test_ttl",
             ProfileMode::Dns,
             true,
-            vec![make_rule(
-                Some("127.0.0.1"),
-                vec!["ttl.example.com"],
-                true,
-            )],
+            vec![make_rule(Some("127.0.0.1"), vec!["ttl.example.com"], true)],
         );
 
         let config = DnsConfig {
@@ -820,7 +813,11 @@ mod tests {
             "p1",
             ProfileMode::Dns,
             true,
-            vec![make_rule(Some("127.0.0.1"), vec!["cache.example.com"], true)],
+            vec![make_rule(
+                Some("127.0.0.1"),
+                vec!["cache.example.com"],
+                true,
+            )],
         );
         server.reload_rules(&[profile1]);
 
@@ -889,7 +886,11 @@ mod tests {
         let answer = &response2.answers()[0];
         // 缓存命中 —— 仍是 127.0.0.1（第一次的）
         if let Some(RData::A(a)) = answer.data() {
-            assert_eq!(a.0, std::net::Ipv4Addr::new(127, 0, 0, 1), "缓存命中应返回第一次的 IP");
+            assert_eq!(
+                a.0,
+                std::net::Ipv4Addr::new(127, 0, 0, 1),
+                "缓存命中应返回第一次的 IP"
+            );
         } else {
             panic!("期望 A 记录");
         }

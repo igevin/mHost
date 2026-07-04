@@ -45,9 +45,8 @@ pub async fn set_dns_mode(enabled: bool, state: State<'_, AppState>) -> Result<(
             ..Default::default()
         };
         let dns_port = config.port;
-        let server = mhost_dns::DnsServer::new(config).map_err(|e| {
-            MhostError::InvalidInput(format!("dns server init failed: {}", e))
-        })?;
+        let server = mhost_dns::DnsServer::new(config)
+            .map_err(|e| MhostError::InvalidInput(format!("dns server init failed: {}", e)))?;
 
         // 3. 加载所有 enabled 的 DNS 模式 Profile，reload_rules
         let profiles = state

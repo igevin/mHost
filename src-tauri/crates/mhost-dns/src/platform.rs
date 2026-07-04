@@ -612,7 +612,8 @@ networksetup -setdnsservers Wi-Fi 127.0.0.1
         );
         // 验证脚本包含关键行
         assert!(
-            script.contains(r#"echo "$! /usr/local/bin/mhost-dns-proxy" > /tmp/mhost-dns-proxy.pid"#),
+            script
+                .contains(r#"echo "$! /usr/local/bin/mhost-dns-proxy" > /tmp/mhost-dns-proxy.pid"#),
             "PID 文件写入应包含 binary 路径，脚本:\n{}",
             script
         );
@@ -646,9 +647,9 @@ networksetup -setdnsservers Wi-Fi 127.0.0.1
     fn test_process_name_contains_proxy_marker() {
         // 模拟 `ps -p <pid> -o comm=` 输出含 mhost-dns-proxy 时的判定
         let comm_lines = [
-            "/usr/local/bin/mhost-dns-proxy\n",       // 真实路径
-            "./target/debug/mhost-dns-proxy\n",      // cargo run 路径
-            "mhost-dns-proxy\n",                     // 简写
+            "/usr/local/bin/mhost-dns-proxy\n", // 真实路径
+            "./target/debug/mhost-dns-proxy\n", // cargo run 路径
+            "mhost-dns-proxy\n",                // 简写
         ];
         for line in &comm_lines {
             assert!(
