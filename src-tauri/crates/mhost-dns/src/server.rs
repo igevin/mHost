@@ -226,9 +226,13 @@ impl DnsServer {
         &self.config.upstream
     }
 
-    /// 返回缓存容量（配置值）。
+    /// 返回缓存容量（实际 LRU 大小，已对 0 做 min 1 处理）。
     pub fn cache_capacity(&self) -> usize {
-        self.config.cache_size
+        self.cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .cap()
+            .get()
     }
 
     /// 返回当前规则数量。
@@ -317,10 +321,14 @@ async fn handle_dns_request(
                     QueryResult::Answer(record) => {
                         let ttl = record.ttl();
                         response.add_answer(*record.clone());
-                        // 缓存：把单条记录放进 vec，未来多 record 也好扩展
-                        let expires_at = now + std::time::Duration::from_secs(ttl as u64);
-                        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-                        guard.put(cache_key, (vec![*record], expires_at));
+                        // 缓存：把单条记录放进 vec，未来多 record 也好扩展。
+                        // TTL=0 是合法 DNS 值（"不要缓存"），跳过 put 避免
+                        // 浪费 LRU slot 且下次 peek 立刻过期被 pop。
+                        if ttl > 0 {
+                            let expires_at = now + std::time::Duration::from_secs(ttl as u64);
+                            let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+                            guard.put(cache_key, (vec![*record], expires_at));
+                        }
                     }
                     QueryResult::NoError => {
                         // 没匹配 —— 不缓存（避免缓存"NoError"导致上游变更后不感知）

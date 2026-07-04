@@ -459,43 +459,6 @@ Device: en0
     }
 
     // -----------------------------------------------------------------------
-    // Command build logic verification (mock-style)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_set_local_dns_command_args() {
-        // 验证 set_local_dns 构建的命令参数逻辑。
-        // 由于无法在实际测试环境中执行 networksetup，
-        // 我们验证辅助函数对给定输入的处理行为。
-        let interface = "Wi-Fi";
-        let expected_args = vec!["-setdnsservers", interface, "127.0.0.1"];
-        assert_eq!(expected_args, vec!["-setdnsservers", "Wi-Fi", "127.0.0.1"]);
-    }
-
-    #[test]
-    fn test_restore_system_dns_command_args_empty() {
-        let interface = "Wi-Fi";
-        let _servers: Vec<String> = vec![];
-        // 空列表对应 "Empty" 参数
-        let expected_args = vec!["-setdnsservers", interface, "Empty"];
-        assert_eq!(expected_args, vec!["-setdnsservers", "Wi-Fi", "Empty"]);
-    }
-
-    #[test]
-    fn test_restore_system_dns_command_args_with_servers() {
-        let interface = "Wi-Fi";
-        let servers = vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()];
-        let mut expected_args = vec!["-setdnsservers", interface];
-        for s in &servers {
-            expected_args.push(s.as_str());
-        }
-        assert_eq!(
-            expected_args,
-            vec!["-setdnsservers", "Wi-Fi", "8.8.8.8", "1.1.1.1"]
-        );
-    }
-
-    // -----------------------------------------------------------------------
     // 注入防护测试（fix #77）
     // -----------------------------------------------------------------------
 
