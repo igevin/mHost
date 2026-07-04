@@ -30,14 +30,15 @@ pub async fn set_dns_mode(enabled: bool, state: State<'_, AppState>) -> Result<(
         }
 
         // 2. 创建 DnsConfig 和 DnsServer（macOS 上使用非特权端口）
-        // upstream = 系统当前 DNS 列表。
-        // 当系统 DNS 为空时（典型场景：macOS 用 DHCP，networksetup 返 "Empty"），
-        // 保留空 vec —— server.rs::build_resolver 看到空 upstream 会用
-        // hickory 的 tokio_from_system_conf() 读 /etc/resolv.conf（含 DHCP
-        // 解析到的 DNS），行为与用户正常上网一致。
-        // 不要硬塞 8.8.8.8/1.1.1.1 当兜底 —— 那会让 UI 错误显示用户
-        // 实际在用的 DNS。
-        let upstream = mhost_dns::platform::get_system_dns().unwrap_or_default();
+        // upstream 使用系统原始 DNS 作为兜底，确保无规则匹配时行为不变
+        let upstream = {
+            let system_dns = mhost_dns::platform::get_system_dns().unwrap_or_default();
+            if system_dns.is_empty() {
+                vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()]
+            } else {
+                system_dns
+            }
+        };
         let config = mhost_dns::DnsConfig {
             port: mhost_dns::MHOST_DNS_PORT,
             upstream,
