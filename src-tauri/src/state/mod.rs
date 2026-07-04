@@ -164,14 +164,22 @@ impl AppState {
         } else {
             original.clone()
         };
-        let dns_port = mhost_dns::MHOST_DNS_PORT;
+        let dns_port = {
+            #[cfg(target_os = "macos")]
+            {
+                1053u16
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                53u16
+            }
+        };
         let config = mhost_dns::DnsConfig {
             port: dns_port,
             upstream,
             ..Default::default()
         };
-        let server = mhost_dns::DnsServer::new(config)
-            .map_err(|e| MhostError::InvalidInput(format!("dns server init failed: {}", e)))?;
+        let server = mhost_dns::DnsServer::new(config);
 
         // 3. 加载所有 enabled 的 DNS 模式 Profile，reload_rules
         let profiles = storage
