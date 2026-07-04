@@ -45,7 +45,9 @@ fn create_profile_with_mode(
     let mut profile = Profile::new(name);
     profile.mode = mode;
     for (ip, domain) in rules {
-        profile.rules.push(HostRule::new(ip.parse().unwrap(), vec![domain.to_string()]));
+        profile
+            .rules
+            .push(HostRule::new(ip.parse().unwrap(), vec![domain.to_string()]));
     }
     storage.save_profile(&profile).unwrap();
     profile
@@ -137,7 +139,11 @@ mod test_6_1_hosts_regression {
         let _dns = create_dns_profile(&storage, "d1", vec![("192.168.1.1", "b.com")]);
 
         let listed = storage.list_profiles().unwrap();
-        assert_eq!(listed.len(), 1, "list_profiles() should return only hosts profiles");
+        assert_eq!(
+            listed.len(),
+            1,
+            "list_profiles() should return only hosts profiles"
+        );
         assert_eq!(listed[0].mode, ProfileMode::Hosts);
         assert_eq!(listed[0].name, "h1");
     }
@@ -162,7 +168,10 @@ mod test_6_1_hosts_regression {
         let loaded_b = storage.load_profile(&hosts_b.id).unwrap();
 
         assert!(loaded_a.enabled, "hosts_a should stay enabled");
-        assert!(!loaded_b.enabled, "hosts_b should be disabled by mutual exclusion");
+        assert!(
+            !loaded_b.enabled,
+            "hosts_b should be disabled by mutual exclusion"
+        );
     }
 
     // 验证 apply_hosts 只处理 hosts 模式 Profile
@@ -170,7 +179,8 @@ mod test_6_1_hosts_regression {
     fn test_apply_hosts_only_writes_hosts_mode_profiles() {
         let (_temp, storage, writer) = create_test_storage_and_writer();
 
-        let mut hosts = create_hosts_profile(&storage, "hosts_p", vec![("127.0.0.1", "hosts.local")]);
+        let mut hosts =
+            create_hosts_profile(&storage, "hosts_p", vec![("127.0.0.1", "hosts.local")]);
         hosts.enabled = true;
         storage.save_profile(&hosts).unwrap();
 
@@ -201,7 +211,8 @@ mod test_6_1_hosts_regression {
         p1.enabled = true;
         storage.save_profile(&p1).unwrap();
 
-        let meta = save_snapshot_logic(storage.as_ref(), "hosts_snapshot".to_string(), None).unwrap();
+        let meta =
+            save_snapshot_logic(storage.as_ref(), "hosts_snapshot".to_string(), None).unwrap();
         assert_eq!(meta.profile_count, 1);
 
         // 删除所有 profiles
@@ -268,7 +279,10 @@ mod test_6_1_hosts_regression {
 
         // Update
         let mut loaded = storage.load_profile(&profile.id).unwrap();
-        loaded.rules.push(HostRule::new("192.168.1.1".parse().unwrap(), vec!["b.com".to_string()]));
+        loaded.rules.push(HostRule::new(
+            "192.168.1.1".parse().unwrap(),
+            vec!["b.com".to_string()],
+        ));
         loaded.updated_at = chrono::Utc::now();
         storage.save_profile(&loaded).unwrap();
 
@@ -390,7 +404,10 @@ mod test_6_2_dns_mode_logic {
         let request_bytes = request.to_bytes().unwrap();
 
         let client = UdpSocket::bind("0.0.0.0:0").await.unwrap();
-        client.send_to(&request_bytes, "127.0.0.1:1057").await.unwrap();
+        client
+            .send_to(&request_bytes, "127.0.0.1:1057")
+            .await
+            .unwrap();
 
         let mut buf = vec![0u8; 512];
         let (len, _src) = tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut buf))
@@ -400,7 +417,10 @@ mod test_6_2_dns_mode_logic {
 
         let response = hickory_proto::op::Message::from_bytes(&buf[..len]).unwrap();
         assert_eq!(response.id(), 9999);
-        assert_eq!(response.response_code(), hickory_proto::op::ResponseCode::NoError);
+        assert_eq!(
+            response.response_code(),
+            hickory_proto::op::ResponseCode::NoError
+        );
         assert!(!response.answers().is_empty());
 
         server.stop().await.unwrap();
@@ -429,7 +449,11 @@ mod test_6_3_dual_mode_coexistence {
         let _d2 = create_dns_profile(&storage, "d2", vec![("192.168.1.1", "d2.local")]);
 
         let hosts_list = storage.list_profiles().unwrap();
-        assert_eq!(hosts_list.len(), 2, "list_profiles() should only return hosts mode profiles");
+        assert_eq!(
+            hosts_list.len(),
+            2,
+            "list_profiles() should only return hosts mode profiles"
+        );
         assert!(hosts_list.iter().all(|p| p.mode == ProfileMode::Hosts));
     }
 
@@ -480,7 +504,10 @@ mod test_6_3_dual_mode_coexistence {
 
         // DNS profile 仍然存在且 enabled
         let dns_loaded = storage.load_profile(&dns.id).unwrap();
-        assert!(dns_loaded.enabled, "DNS profile should still be enabled after apply_hosts");
+        assert!(
+            dns_loaded.enabled,
+            "DNS profile should still be enabled after apply_hosts"
+        );
         assert_eq!(dns_loaded.mode, ProfileMode::Dns);
 
         // hosts 文件只包含 hosts profile 的规则
@@ -495,7 +522,8 @@ mod test_6_3_dual_mode_coexistence {
         let (_temp, storage, writer) = create_test_storage_and_writer();
 
         // 创建并启用 hosts profile
-        let mut hosts = create_hosts_profile(&storage, "hosts_active", vec![("127.0.0.1", "hosts.co")]);
+        let mut hosts =
+            create_hosts_profile(&storage, "hosts_active", vec![("127.0.0.1", "hosts.co")]);
         hosts.enabled = true;
         storage.save_profile(&hosts).unwrap();
 
@@ -537,7 +565,10 @@ mod test_6_3_dual_mode_coexistence {
 
         // DNS profile 仍然 enabled
         let dns_loaded = storage.load_profile(&dns.id).unwrap();
-        assert!(dns_loaded.enabled, "enabling hosts profile should NOT disable dns profile");
+        assert!(
+            dns_loaded.enabled,
+            "enabling hosts profile should NOT disable dns profile"
+        );
     }
 
     // 表格驱动: 双模式列表分离
@@ -626,8 +657,14 @@ mod test_6_4_dns_multi_profile_union {
         assert_eq!(engine.rule_count(), 4);
         assert_eq!(engine.resolve("a.com"), Some("127.0.0.1".parse().unwrap()));
         assert_eq!(engine.resolve("b.com"), Some("127.0.0.1".parse().unwrap()));
-        assert_eq!(engine.resolve("c.com"), Some("192.168.1.1".parse().unwrap()));
-        assert_eq!(engine.resolve("d.com"), Some("192.168.1.1".parse().unwrap()));
+        assert_eq!(
+            engine.resolve("c.com"),
+            Some("192.168.1.1".parse().unwrap())
+        );
+        assert_eq!(
+            engine.resolve("d.com"),
+            Some("192.168.1.1".parse().unwrap())
+        );
     }
 
     // 相同域名取并集（第一个生效）
@@ -676,17 +713,21 @@ mod test_6_4_dns_multi_profile_union {
             "dev",
             ProfileMode::Dns,
             true,
-            vec![
-                make_rule(Some("127.0.0.1"), vec!["api.local", "db.local"], true),
-            ],
+            vec![make_rule(
+                Some("127.0.0.1"),
+                vec!["api.local", "db.local"],
+                true,
+            )],
         );
         let p3 = make_profile_for_engine(
             "testing",
             ProfileMode::Dns,
             true,
-            vec![
-                make_rule(Some("192.168.1.100"), vec!["staging.local"], true),
-            ],
+            vec![make_rule(
+                Some("192.168.1.100"),
+                vec!["staging.local"],
+                true,
+            )],
         );
 
         engine.rebuild(&[p1, p2, p3]);
@@ -694,8 +735,14 @@ mod test_6_4_dns_multi_profile_union {
         // 总共 6 条唯一规则
         assert_eq!(engine.rule_count(), 6);
         assert_eq!(engine.resolve("ad1.com"), Some("0.0.0.0".parse().unwrap()));
-        assert_eq!(engine.resolve("api.local"), Some("127.0.0.1".parse().unwrap()));
-        assert_eq!(engine.resolve("staging.local"), Some("192.168.1.100".parse().unwrap()));
+        assert_eq!(
+            engine.resolve("api.local"),
+            Some("127.0.0.1".parse().unwrap())
+        );
+        assert_eq!(
+            engine.resolve("staging.local"),
+            Some("192.168.1.100".parse().unwrap())
+        );
     }
 
     // 禁用其中一个 Profile，规则减少
@@ -740,7 +787,12 @@ mod test_6_4_dns_multi_profile_union {
             ("2 profiles, 2+3 rules", vec![2, 3], 5, vec![]),
             ("3 profiles, 1+1+1 rules", vec![1, 1, 1], 3, vec![]),
             // p0 has 2 rules, p1 has 2 rules but both share "shared.local" with p0's j=0 -> 3 unique
-            ("2 profiles with overlap", vec![2, 2], 3, vec![(0, 0), (1, 0)]),
+            (
+                "2 profiles with overlap",
+                vec![2, 2],
+                3,
+                vec![(0, 0), (1, 0)],
+            ),
         ];
 
         for (name, rules_per_profile, expected_rules, overlap_pairs) in cases {
@@ -807,8 +859,15 @@ mod test_6_4_dns_multi_profile_union {
         engine.rebuild(&[p2]);
         assert_eq!(engine.rule_count(), 1);
         assert_eq!(engine.resolve("old.com"), None, "old rule should be gone");
-        assert_eq!(engine.resolve("stale.com"), None, "stale rule should be gone");
-        assert_eq!(engine.resolve("new.com"), Some("192.168.1.1".parse().unwrap()));
+        assert_eq!(
+            engine.resolve("stale.com"),
+            None,
+            "stale rule should be gone"
+        );
+        assert_eq!(
+            engine.resolve("new.com"),
+            Some("192.168.1.1".parse().unwrap())
+        );
     }
 }
 
@@ -820,8 +879,8 @@ mod test_6_4_dns_multi_profile_union {
 mod test_6_5_data_migration_supplement {
     use super::*;
     use crate::commands::apply::*;
-    use mhost_storage::migration::migrate_v1_to_v2;
     use mhost_storage::manifest::Manifest;
+    use mhost_storage::migration::migrate_v1_to_v2;
 
     // 迁移后所有 hosts Profile 正常可用
     #[test]
@@ -835,6 +894,7 @@ mod test_6_5_data_migration_supplement {
             app_version: "0.1.0".to_string(),
             updated_at: chrono::Utc::now(),
             dns_enabled: None,
+            original_dns: None,
         };
         storage.save_manifest(&v1_manifest).unwrap();
 
@@ -866,7 +926,8 @@ mod test_6_5_data_migration_supplement {
         assert_eq!(listed.len(), 1);
 
         // 验证可用于 apply
-        let storage_arc: Arc<dyn Storage + Send + Sync> = Arc::new(FileStorage::new(temp_dir.path()));
+        let storage_arc: Arc<dyn Storage + Send + Sync> =
+            Arc::new(FileStorage::new(temp_dir.path()));
         let hosts_path = temp_dir.path().join("hosts");
         let backup_dir = temp_dir.path().join("backups");
         std::fs::write(&hosts_path, "# original\n").unwrap();
@@ -877,7 +938,11 @@ mod test_6_5_data_migration_supplement {
         storage_arc.save_profile(&loaded_mut).unwrap();
 
         let result = apply_current_plan_logic(storage_arc.as_ref(), &writer);
-        assert!(result.is_ok(), "apply should work with migrated profiles: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "apply should work with migrated profiles: {:?}",
+            result.err()
+        );
 
         let hosts_content = std::fs::read_to_string(&hosts_path).unwrap();
         assert!(hosts_content.contains("127.0.0.1 migrated.local"));
@@ -923,7 +988,10 @@ mod test_6_6_exception_scenarios {
         storage.save_profile(&dns).unwrap();
 
         let plan = generate_preview_plan_logic(&dns.id, true, storage.as_ref(), &writer).unwrap();
-        assert!(plan.rules.is_empty(), "DNS profile preview plan should be empty");
+        assert!(
+            plan.rules.is_empty(),
+            "DNS profile preview plan should be empty"
+        );
         assert!(!plan.backup_required);
     }
 
@@ -933,7 +1001,8 @@ mod test_6_6_exception_scenarios {
         let (_temp, storage, writer) = create_test_storage_and_writer();
 
         // 创建正常 profile
-        let mut normal = create_hosts_profile(&storage, "normal", vec![("127.0.0.1", "normal.local")]);
+        let mut normal =
+            create_hosts_profile(&storage, "normal", vec![("127.0.0.1", "normal.local")]);
         normal.enabled = true;
         storage.save_profile(&normal).unwrap();
 
@@ -943,12 +1012,20 @@ mod test_6_6_exception_scenarios {
 
         // list_profiles 应正常工作（跳过损坏的文件）
         let listed = storage.list_profiles().unwrap();
-        assert_eq!(listed.len(), 1, "should skip corrupt file and still list valid profiles");
+        assert_eq!(
+            listed.len(),
+            1,
+            "should skip corrupt file and still list valid profiles"
+        );
         assert_eq!(listed[0].name, "normal");
 
         // apply 应正常工作
         let result = apply_current_plan_logic(storage.as_ref(), &writer);
-        assert!(result.is_ok(), "apply should succeed despite corrupt profile file: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "apply should succeed despite corrupt profile file: {:?}",
+            result.err()
+        );
     }
 
     // 并发启用多个 hosts profile，互斥逻辑仍正确
@@ -986,7 +1063,8 @@ mod test_6_6_exception_scenarios {
         let _h1 = create_hosts_profile(&storage, "h1", vec![("127.0.0.1", "h.local")]);
         let _d1 = create_dns_profile(&storage, "d1", vec![("192.168.1.1", "d.local")]);
 
-        let meta = save_snapshot_logic(storage.as_ref(), "dual_mode_snap".to_string(), None).unwrap();
+        let meta =
+            save_snapshot_logic(storage.as_ref(), "dual_mode_snap".to_string(), None).unwrap();
         assert_eq!(meta.profile_count, 2);
 
         // 删除所有
@@ -999,8 +1077,12 @@ mod test_6_6_exception_scenarios {
 
         let all = storage.list_all_profiles().unwrap();
         assert_eq!(all.len(), 2);
-        assert!(all.iter().any(|p| p.mode == ProfileMode::Hosts && p.name == "h1"));
-        assert!(all.iter().any(|p| p.mode == ProfileMode::Dns && p.name == "d1"));
+        assert!(all
+            .iter()
+            .any(|p| p.mode == ProfileMode::Hosts && p.name == "h1"));
+        assert!(all
+            .iter()
+            .any(|p| p.mode == ProfileMode::Dns && p.name == "d1"));
     }
 
     // 空存储的 list 操作不应 panic
@@ -1009,13 +1091,23 @@ mod test_6_6_exception_scenarios {
         let (_temp, storage, writer) = create_test_storage_and_writer();
 
         assert!(storage.list_profiles().unwrap().is_empty());
-        assert!(storage.list_profiles_by_mode(ProfileMode::Hosts).unwrap().is_empty());
-        assert!(storage.list_profiles_by_mode(ProfileMode::Dns).unwrap().is_empty());
+        assert!(storage
+            .list_profiles_by_mode(ProfileMode::Hosts)
+            .unwrap()
+            .is_empty());
+        assert!(storage
+            .list_profiles_by_mode(ProfileMode::Dns)
+            .unwrap()
+            .is_empty());
         assert!(storage.list_all_profiles().unwrap().is_empty());
 
         // apply 到空存储不应 panic
         let result = apply_current_plan_logic(storage.as_ref(), &writer);
-        assert!(result.is_ok(), "apply on empty storage should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "apply on empty storage should succeed: {:?}",
+            result.err()
+        );
 
         // 验证 hosts 文件未被写入 managed block
         let hosts_content = std::fs::read_to_string(writer.hosts_path()).unwrap();

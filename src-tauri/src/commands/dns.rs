@@ -18,19 +18,21 @@ pub async fn set_dns_mode(enabled: bool, state: State<'_, AppState>) -> Result<(
         // 1. 获取当前系统 DNS 并保存
         let original = mhost_dns::platform::get_system_dns()
             .map_err(|e| MhostError::InvalidInput(format!("get system dns failed: {}", e)))?;
+        // 先把 original 写到 state（in-memory），后续 enable_dns_mode 成功
+        // 后还会再把同一份值持久化到 manifest —— 此刻只 clone 一份给 state。
+        let original_for_state = original.clone();
         match state.original_dns.lock() {
-            Ok(mut guard) => *guard = original,
+            Ok(mut guard) => *guard = original_for_state,
             Err(poisoned) => {
                 let mut guard = poisoned.into_inner();
-                *guard = original;
+                *guard = original_for_state;
             }
         }
 
         // 2. 创建 DnsConfig 和 DnsServer（macOS 上使用非特权端口）
         // upstream 使用系统原始 DNS 作为兜底，确保无规则匹配时行为不变
         let upstream = {
-            let system_dns = mhost_dns::platform::get_system_dns()
-                .unwrap_or_default();
+            let system_dns = mhost_dns::platform::get_system_dns().unwrap_or_default();
             if system_dns.is_empty() {
                 vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()]
             } else {
@@ -80,10 +82,16 @@ pub async fn set_dns_mode(enabled: bool, state: State<'_, AppState>) -> Result<(
             }
         }
 
-        // 7. 更新 manifest.dns_enabled = true
+        // 7. 更新 manifest：写入 dns_enabled = true 并保存 original_dns。
+        //    original_dns 必须在 enable_dns_mode 成功之后、save_manifest 之前写入，
+        //    因为系统 DNS 一旦被改写为 127.0.0.1，崩溃后只能从 manifest 恢复原值。
         let mut manifest = state.storage.load_manifest().map_err(MhostError::from)?;
         manifest.dns_enabled = Some(true);
-        state.storage.save_manifest(&manifest).map_err(MhostError::from)?;
+        manifest.original_dns = Some(original);
+        state
+            .storage
+            .save_manifest(&manifest)
+            .map_err(MhostError::from)?;
 
         // 8. 设置 dns_enabled = true
         state.dns_enabled.store(true, Ordering::Relaxed);
@@ -118,7 +126,10 @@ pub async fn set_dns_mode(enabled: bool, state: State<'_, AppState>) -> Result<(
         // 3. 更新 manifest.dns_enabled = false
         let mut manifest = state.storage.load_manifest().map_err(MhostError::from)?;
         manifest.dns_enabled = Some(false);
-        state.storage.save_manifest(&manifest).map_err(MhostError::from)?;
+        state
+            .storage
+            .save_manifest(&manifest)
+            .map_err(MhostError::from)?;
 
         // 4. 设置 dns_enabled = false
         state.dns_enabled.store(false, Ordering::Relaxed);

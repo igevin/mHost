@@ -1,9 +1,9 @@
-use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
-use mhost_storage::migration::migrate_v1_to_v2;
-use mhost_storage::storage::{FileStorage, Storage};
 use mhost_apply::writer::HostsWriter;
 use mhost_core::{MhostError, ProfileMode};
+use mhost_storage::migration::migrate_v1_to_v2;
+use mhost_storage::storage::{FileStorage, Storage};
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 
 /// Async mutex to serialize apply operations and prevent concurrent writes to /etc/hosts.
 /// Security fix (#16): Prevents race conditions when user rapidly toggles profiles.
@@ -97,13 +97,19 @@ impl AppState {
                     eprintln!("[mHost] DNS service auto-recovered successfully.");
                 }
                 Err(e) => {
-                    eprintln!("[mHost] DNS auto-recovery failed: {}. Resetting dns_enabled to false.", e);
+                    eprintln!(
+                        "[mHost] DNS auto-recovery failed: {}. Resetting dns_enabled to false.",
+                        e
+                    );
                     dns_enabled = false;
                     {
                         let mut updated_manifest = manifest.clone();
                         updated_manifest.dns_enabled = Some(false);
                         if let Err(e) = storage.save_manifest(&updated_manifest) {
-                            eprintln!("[mHost] Failed to update manifest after DNS recovery failure: {}", e);
+                            eprintln!(
+                                "[mHost] Failed to update manifest after DNS recovery failure: {}",
+                                e
+                            );
                         }
                     }
                 }
@@ -128,9 +134,29 @@ impl AppState {
     async fn try_recover_dns(
         storage: Arc<dyn Storage + Send + Sync>,
     ) -> Result<(mhost_dns::DnsServer, Vec<String>), MhostError> {
-        // 1. 获取当前系统 DNS 并保存
-        let original = mhost_dns::platform::get_system_dns()
-            .map_err(|e| MhostError::InvalidInput(format!("get system dns failed: {}", e)))?;
+        // 1. 优先从 manifest.original_dns 恢复（避免再次问系统 —— 系统 DNS
+        //    此时已经是 127.0.0.1，问到的也是错的）。若 manifest 没保存则
+        //    fallback 到 get_system_dns，但此时 127.0.0.1 不一定是原始值，
+        //    这种情况下用户可能需要手动设置。
+        let manifest = storage.load_manifest()?;
+        let original: Vec<String> = if let Some(saved) = &manifest.original_dns {
+            saved.clone()
+        } else {
+            mhost_dns::platform::get_system_dns()
+                .map_err(|e| MhostError::InvalidInput(format!("get system dns failed: {}", e)))?
+        };
+
+        // 1.1 立即把恢复到的 original 回填到 manifest（避免下次又重新查询）
+        let mut manifest = manifest;
+        if manifest.original_dns.is_none() {
+            manifest.original_dns = Some(original.clone());
+            if let Err(e) = storage.save_manifest(&manifest) {
+                eprintln!(
+                    "[mHost] Failed to persist original_dns after recovery: {}",
+                    e
+                );
+            }
+        }
 
         // 2. 创建 DnsConfig 和 DnsServer（upstream 使用系统原始 DNS 兜底）
         let upstream = if original.is_empty() {
@@ -140,9 +166,13 @@ impl AppState {
         };
         let dns_port = {
             #[cfg(target_os = "macos")]
-            { 1053u16 }
+            {
+                1053u16
+            }
             #[cfg(not(target_os = "macos"))]
-            { 53u16 }
+            {
+                53u16
+            }
         };
         let config = mhost_dns::DnsConfig {
             port: dns_port,
