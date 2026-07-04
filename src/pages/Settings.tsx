@@ -104,7 +104,12 @@ function Settings() {
           </div>
           {dnsEnabled && dnsStatus && (
             <div className={styles.dnsDetails}>
-              <div>Upstream: {dnsStatus.upstream.join(", ") || "System default"}</div>
+              <div>
+                Upstream (启用 DNS 模式时的系统 DNS 快照):{" "}
+                {dnsStatus.upstream.length > 0
+                  ? dnsStatus.upstream.join(", ")
+                  : "System default"}
+              </div>
               <div>Cache capacity: {dnsStatus.cache_capacity}</div>
             </div>
           )}

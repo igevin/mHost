@@ -79,15 +79,34 @@ impl DnsServer {
 
     /// 启动 DNS 服务（异步，在后台运行）。
     /// TODO: 当前仅监听 UDP，TCP 支持计划在后续迭代中添加。
+    ///
+    /// # 并发安全（fix: systematic DNS logic review）
+    ///
+    /// 之前用 `is_running()` 检查 + 后面 `running.store(true)`，中间存在
+    /// TOCTOU 窗口：两个并发 start() 都过检查、都 bind 端口，第二个 bind
+    /// 失败但前一个已成功。
+    ///
+    /// 现在用 `compare_exchange(false, true, ...)` 把检查 + 标记合并为一个
+    /// 原子操作。抢到 CAS 的 caller 才继续 bind；bind 失败时 CAS 回滚到 false。
     pub async fn start(&self) -> Result<(), DnsError> {
-        if self.is_running() {
+        // 原子抢占 running 标志。已经是 true 的并发 start() 直接返回 Ok。
+        if self
+            .running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
             return Ok(());
         }
 
         let addr = SocketAddr::from(([127, 0, 0, 1], self.config.port));
-        let socket = UdpSocket::bind(addr)
-            .await
-            .map_err(|e| DnsError::Bind(format!("{}: {}", addr, e)))?;
+        let socket = match UdpSocket::bind(addr).await {
+            Ok(s) => s,
+            Err(e) => {
+                // bind 失败：回滚 running 标志，让下次 start() 可以重试。
+                self.running.store(false, Ordering::SeqCst);
+                return Err(DnsError::Bind(format!("{}: {}", addr, e)));
+            }
+        };
 
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
         match self.shutdown_tx.lock() {
@@ -166,7 +185,6 @@ impl DnsServer {
             }
         }
 
-        self.running.store(true, Ordering::SeqCst);
         Ok(())
     }
 
@@ -902,6 +920,36 @@ mod tests {
         } else {
             panic!("期望 A 记录");
         }
+
+        server.stop().await.unwrap();
+    }
+
+    /// 回归测试（fix: systematic DNS logic review）：并发 start() 不应 panic。
+    ///
+    /// 之前用 `if is_running() { return; }` + 后面 `running.store(true)`，
+    /// 两个并发 start() 都过 is_running 检查、都尝试 bind，第二个 bind 失败
+    /// 留下脏状态。现在用 compare_exchange 原子抢占，只有一个 caller 会 bind。
+    #[tokio::test]
+    async fn test_dns_server_double_start_concurrent() {
+        let config = DnsConfig {
+            port: 1061,
+            ..Default::default()
+        };
+        let server = Arc::new(DnsServer::new(config).unwrap());
+
+        // 并发调 start() 两次：第一个抢到 running flag，第二个直接返回 Ok。
+        let s1 = Arc::clone(&server);
+        let s2 = Arc::clone(&server);
+        let h1 = tokio::spawn(async move { s1.start().await });
+        let h2 = tokio::spawn(async move { s2.start().await });
+
+        let r1 = h1.await.unwrap();
+        let r2 = h2.await.unwrap();
+        // 至少一个成功；另一个应也是 Ok（短路径返回）或 Bind（同端口失败但 graceful）
+        // 关键是都不能 panic 且 is_running 状态一致。
+        assert!(r1.is_ok(), "first start should succeed: {:?}", r1);
+        assert!(r2.is_ok(), "second start should also Ok (no-op): {:?}", r2);
+        assert!(server.is_running());
 
         server.stop().await.unwrap();
     }
