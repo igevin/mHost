@@ -59,6 +59,16 @@ impl AppState {
         #[cfg(target_os = "macos")]
         mhost_dns::platform::cleanup_stale_proxy();
 
+        // 清理上次退出残留的 signal / original DNS 文件（fix: proxy
+        // self-cleanup）。如果 mhost 上次崩溃 / kill -9 没机会清理，
+        // 这些 /tmp 文件会留下。下次启动时让下次启用的 enable 路径
+        // 重新写（覆盖）。
+        #[cfg(target_os = "macos")]
+        {
+            let _ = std::fs::remove_file("/tmp/mhost-dns-original.txt");
+            let _ = std::fs::remove_file("/tmp/mhost-dns-shutdown.signal");
+        }
+
         // v1 → v2 数据迁移：失败记录错误日志，不阻断应用启动
         if let Ok(fs) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             migrate_v1_to_v2(&file_storage)
@@ -216,7 +226,9 @@ impl AppState {
             .map_err(|e| MhostError::InvalidInput(format!("dns server start failed: {}", e)))?;
 
         // 5. 启动 dns-proxy 并设置系统 DNS
-        if let Err(e) = mhost_dns::platform::enable_dns_mode(dns_port) {
+        // fix（proxy self-cleanup）：把 original 传给 proxy，让它
+        // 退出时能自己恢复系统 DNS。
+        if let Err(e) = mhost_dns::platform::enable_dns_mode(dns_port, &original) {
             let _ = server.stop().await;
             return Err(MhostError::InvalidInput(format!(
                 "Failed to enable DNS mode: {}",

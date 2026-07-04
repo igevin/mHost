@@ -85,7 +85,9 @@ async fn set_dns_mode_enable(state: &AppState) -> Result<(), MhostError> {
 
     // 5. 启动 privileged proxy + 把系统 DNS 切到 127.0.0.1。
     //    这是不可逆的副作用；失败必须 stop server 并返回 Err。
-    if let Err(e) = mhost_dns::platform::enable_dns_mode(dns_port) {
+    //    fix（proxy self-cleanup）：把 original 传给 proxy，让它在
+    //    退出时能自己恢复系统 DNS（不需走 osascript sudo 弹窗）。
+    if let Err(e) = mhost_dns::platform::enable_dns_mode(dns_port, &original) {
         let _ = server.stop().await;
         return Err(MhostError::InvalidInput(format!(
             "Failed to enable DNS mode: {}",
