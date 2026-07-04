@@ -57,6 +57,10 @@ node_modules/
 *.seed
 *.pid.lock
 
+# Stray artifact: empty file at root named "0" (likely `cmd > 0` residue).
+# See commit history (4d84e25) for the original accidental commit.
+/0
+
 # Rust
 target/
 # Cargo.lock is committed for binary projects (build reproducibility)

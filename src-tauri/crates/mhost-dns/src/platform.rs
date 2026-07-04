@@ -190,7 +190,15 @@ rm -f {pid_file}
     );
     let output = run_with_privileges(&script_body)
         .map_err(|e| PlatformError::RestoreDns(format!("disable dns mode failed: {}", e)))?;
-    let _ = output;
+    // 与 enable_dns_mode 对称：检查 networksetup 退出码，否则系统 DNS 仍
+    // 指向 127.0.0.1 但函数返回 Ok，让用户以为已经恢复。
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(PlatformError::RestoreDns(format!(
+            "networksetup -setdnsservers failed: {}",
+            stderr
+        )));
+    }
     Ok(())
 }
 
@@ -199,6 +207,10 @@ rm -f {pid_file}
 /// **安全修复（#81）**：PID 文件不再仅含 PID，还含 `mhost-dns-proxy` 路径。
 /// 清理时先 `kill(pid, 0)` 检查存活，再用 `ps -p` 校验进程名是 `mhost-dns-proxy`
 /// 才 SIGTERM；防止误杀其他进程（PID 重用）。
+///
+/// **fix（systematic DNS logic review）**：之前用 `comm.trim().contains("mhost-dns-proxy")`
+/// 模糊匹配，攻击者或巧合的二进制名（如 `not-mhost-dns-proxy`）会被错杀。
+/// 现在从 PID 文件读出原始 binary_path，与 `ps -o comm=` 做**精确相等比较**。
 pub fn cleanup_stale_proxy() {
     let content = match std::fs::read_to_string(PROXY_PID_FILE) {
         Ok(c) => c,
@@ -208,6 +220,13 @@ pub fn cleanup_stale_proxy() {
     let mut parts = content.split_whitespace();
     if let Some(pid_str) = parts.next() {
         if let Ok(pid) = pid_str.trim().parse::<u32>() {
+            // 取出当时记录的 binary_path，用于精确比对
+            let recorded_binary = parts.collect::<Vec<_>>().join(" ");
+            let expected_comm = std::path::Path::new(&recorded_binary)
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| recorded_binary.clone());
+
             let alive = unsafe { libc::kill(pid as libc::pid_t, 0) == 0 };
             if !alive {
                 eprintln!(
@@ -215,14 +234,22 @@ pub fn cleanup_stale_proxy() {
                     pid
                 );
             } else {
-                // 校验进程名是 mhost-dns-proxy（防 PID 重用误杀）
+                // 校验进程名精确匹配当时记录的 binary_path basename。
+                // 防止 PID 重用时被同 PID 的其他进程（如 `not-mhost-dns-proxy`）误杀。
+                //
+                // 注：macOS 的 `ps -o comm=` 返回完整可执行路径，Linux 只
+                // 返回 basename。两侧都取 basename 做精确比较，跨平台语义一致。
                 let ps_output = Command::new("ps")
                     .args(["-p", &pid.to_string(), "-o", "comm="])
                     .output();
                 let is_proxy = match ps_output {
                     Ok(out) if out.status.success() => {
                         let comm = String::from_utf8_lossy(&out.stdout);
-                        comm.trim().contains("mhost-dns-proxy")
+                        let comm_basename = std::path::Path::new(comm.trim())
+                            .file_name()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_else(|| comm.trim().to_string());
+                        comm_basename == expected_comm
                     }
                     _ => false,
                 };
@@ -233,8 +260,8 @@ pub fn cleanup_stale_proxy() {
                     eprintln!("[mHost] Killed stale dns-proxy process (pid {})", pid);
                 } else {
                     eprintln!(
-                        "[mHost] pid {} alive but cmdline is not mhost-dns-proxy, skipping kill",
-                        pid
+                        "[mHost] pid {} alive but cmdline basename != expected '{}', skipping kill",
+                        pid, expected_comm
                     );
                 }
             }
@@ -608,26 +635,44 @@ networksetup -setdnsservers Wi-Fi 127.0.0.1
 
     #[test]
     fn test_process_name_contains_proxy_marker() {
-        // 模拟 `ps -p <pid> -o comm=` 输出含 mhost-dns-proxy 时的判定
-        let comm_lines = [
-            "/usr/local/bin/mhost-dns-proxy\n", // 真实路径
-            "./target/debug/mhost-dns-proxy\n", // cargo run 路径
-            "mhost-dns-proxy\n",                // 简写
+        // fix（systematic review）：之前用 contains() 模糊匹配，攻击者
+        // 进程名 `not-mhost-dns-proxy` 也会被错杀。现在改用精确比较：
+        // 两侧都取 basename 后做相等比较，跨 macOS（comm=full path）/
+        // Linux（comm=basename）一致。
+        let cases = [
+            // (recorded_binary_path, ps_comm, expected_is_proxy)
+            (
+                "/usr/local/bin/mhost-dns-proxy",
+                "/usr/local/bin/mhost-dns-proxy\n",
+                true,
+            ),
+            ("/usr/local/bin/mhost-dns-proxy", "mhost-dns-proxy\n", true), // Linux ps basename
+            // 攻击者场景：进程名含 mhost-dns-proxy 但不是同一个二进制
+            (
+                "/usr/local/bin/mhost-dns-proxy",
+                "not-mhost-dns-proxy\n",
+                false,
+            ),
+            // 完全不相关的进程
+            ("/usr/local/bin/mhost-dns-proxy", "/bin/sh\n", false),
+            ("/usr/local/bin/mhost-dns-proxy", "/usr/bin/ssh\n", false),
+            ("/usr/local/bin/mhost-dns-proxy", "cargo\n", false),
         ];
-        for line in &comm_lines {
-            assert!(
-                line.trim().contains("mhost-dns-proxy"),
-                "应识别为 proxy: {:?}",
-                line
-            );
-        }
-        // 不应被误识为 proxy
-        let non_proxy = ["/bin/sh\n", "/usr/bin/ssh\n", "cargo\n"];
-        for line in &non_proxy {
-            assert!(
-                !line.trim().contains("mhost-dns-proxy"),
-                "不应识别为 proxy: {:?}",
-                line
+        for (recorded, ps_line, expected) in &cases {
+            // 模拟 cleanup_stale_proxy 的精确比较逻辑
+            let expected_comm = std::path::Path::new(recorded)
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| recorded.to_string());
+            let comm_basename = std::path::Path::new(ps_line.trim())
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| ps_line.trim().to_string());
+            let is_proxy = comm_basename == expected_comm;
+            assert_eq!(
+                is_proxy, *expected,
+                "recorded={:?}, ps={:?}, expected_comm={:?}, ps_basename={:?}",
+                recorded, ps_line, expected_comm, comm_basename
             );
         }
     }

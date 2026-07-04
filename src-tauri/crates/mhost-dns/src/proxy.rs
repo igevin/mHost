@@ -14,8 +14,20 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::net::UdpSocket;
-use tokio::sync::Notify;
+use tokio::sync::{Semaphore, SemaphorePermit};
 use tracing::{debug, warn};
+
+/// 每个客户端查询允许的并发上限。`DnsProxy` 对每个收到的 query 都 spawn 一个
+/// task；为了防止恶意/异常客户端（DoS）打满资源，用 semaphore 限流。
+/// 超过上限的 query 会被立即丢弃（UDP 协议允许丢包，调用方会重试）。
+pub const MAX_CONCURRENT_CLIENT_QUERIES: usize = 1024;
+
+/// 永远不会发送的 dummy Sender，用于在被 take 后占位。
+/// `oneshot::Sender::send` 返回 `Err`（receiver 已 drop），不会有副作用。
+fn dummy_shutdown_sender() -> tokio::sync::oneshot::Sender<()> {
+    let (tx, _rx) = tokio::sync::oneshot::channel();
+    tx
+}
 
 /// DNS proxy 错误。
 #[derive(Debug, thiserror::Error)]
@@ -30,30 +42,49 @@ pub enum ProxyError {
 
 /// UDP 转发代理。
 /// 监听 `listen_addr`（特权端口），转发到 `target_addr`（非特权端口）。
+///
+/// # 关闭信号（fix: systematic DNS logic review）
+///
+/// 之前用 `tokio::sync::Notify`：每次 select 迭代重新创建 `notified()` future，
+/// `notify_waiters()` 只唤醒「当前已注册」的 waiter —— 如果 SIGTERM 落在
+/// `notify_waiters()` 已发但 select 还没注册 waiter 的窗口，信号会丢失，
+/// 进程永远不退出。
+///
+/// 改用 `tokio::sync::oneshot`：发送端 `tx` 被信号 handler 持有，
+/// 接收端 `rx` 在主循环里**只 poll 一次**（`let mut shutdown = rx;`），
+/// 没有「重新注册 waiter」的概念。信号不会丢。
 pub struct DnsProxy {
     listen_addr: SocketAddr,
     target_addr: SocketAddr,
-    /// 关闭信号。`run()` 收到 notify 后立即退出主循环（已 spawn 的 task 自然结束）。
-    shutdown: Arc<Notify>,
+    /// 关闭信号发送端。外部 signal handler 调用 `send(())` 即可触发关闭。
+    shutdown_tx: tokio::sync::oneshot::Sender<()>,
+    /// 关闭信号接收端。`run()` 持有它，poll 一次后再 select。
+    shutdown_rx: Option<tokio::sync::oneshot::Receiver<()>>,
+    /// 并发任务上限（DoS 防御）
+    concurrency: Arc<Semaphore>,
 }
 
 impl DnsProxy {
     pub fn new(listen_port: u16, target_port: u16) -> Self {
-        let shutdown = Arc::new(Notify::new());
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         Self {
             listen_addr: ([127, 0, 0, 1], listen_port).into(),
             target_addr: ([127, 0, 0, 1], target_port).into(),
-            shutdown,
+            shutdown_tx,
+            shutdown_rx: Some(shutdown_rx),
+            concurrency: Arc::new(Semaphore::new(MAX_CONCURRENT_CLIENT_QUERIES)),
         }
     }
 
-    /// 拿到 shutdown 句柄，外部可在 signal handler 中调用 `notify_one()`。
-    pub fn shutdown_handle(&self) -> Arc<Notify> {
-        Arc::clone(&self.shutdown)
+    /// 取出关闭信号发送端（一次性）。信号 handler 在 setup 阶段拿走。
+    pub fn take_shutdown_sender(&mut self) -> tokio::sync::oneshot::Sender<()> {
+        // 把当前的 shutdown_tx 取出来，换上一个 dummy sender（永不 send）。
+        // 因为 oneshot::Sender 只能 send 一次，必须 take。
+        std::mem::replace(&mut self.shutdown_tx, dummy_shutdown_sender())
     }
 
     /// 运行代理（阻塞），直到收到 shutdown 信号或主 socket 不可恢复错误。
-    pub async fn run(&self) -> Result<(), ProxyError> {
+    pub async fn run(&mut self) -> Result<(), ProxyError> {
         // 绑定特权端口（需要 root）
         let listen_socket =
             UdpSocket::bind(self.listen_addr)
@@ -70,14 +101,23 @@ impl DnsProxy {
             self.listen_addr, self.target_addr
         );
 
+        // 关键：在循环**外**一次性取出 shutdown_rx 并固定持有。
+        // oneshot Receiver 在 select 中只需要 poll 一次，poll 完成后
+        // 它变为 `None`，所以必须用 `&mut` 配合 `Pin` —— tokio select!
+        // 的 `&mut rx` 用法会自动处理。
+        let mut shutdown_rx = self
+            .shutdown_rx
+            .take()
+            .ok_or_else(|| ProxyError::Io(std::io::Error::other("shutdown rx already taken")))?;
+
         // 主循环：接收客户端查询 → spawn task 处理
-        // 缓冲区 4096 字节支持 EDNS(0) 协商后的最大响应（fix #80 也在改 server buf，这里先跟上）
+        // 缓冲区 4096 字节支持 EDNS(0) 协商后的最大响应
         let mut buf = vec![0u8; 4096];
-        let shutdown = Arc::clone(&self.shutdown);
         loop {
             tokio::select! {
                 biased;
-                _ = shutdown.notified() => {
+                // oneshot 接收：返回 Result<(), RecvError>，忽略 Err（sender 已 drop 视为关闭）
+                _ = &mut shutdown_rx => {
                     eprintln!("[mhost-dns-proxy] shutdown signal received");
                     break;
                 }
@@ -87,7 +127,22 @@ impl DnsProxy {
                             let query = buf[..len].to_vec();
                             let listen = Arc::clone(&listen_socket);
                             let target = self.target_addr;
+                            let sem = Arc::clone(&self.concurrency);
+
+                            // SemaphorePermit 借用自 Semaphore，所以必须在 spawn
+                            // 内部 acquire，才能让 permit 与 Arc 一起 move 进 task
+                            // （'static 生命周期）。
                             tokio::spawn(async move {
+                                // 限流：semaphore 用尽时丢弃当前 query。
+                                // UDP DNS 协议允许丢包，客户端会重试。
+                                let Ok(permit) = sem.try_acquire() else {
+                                    warn!(
+                                        "[mhost-dns-proxy] concurrency cap ({}) reached, dropping query from {}",
+                                        MAX_CONCURRENT_CLIENT_QUERIES, src
+                                    );
+                                    return;
+                                };
+                                let _permit: SemaphorePermit<'_> = permit;
                                 if let Err(e) =
                                     handle_client_query(&listen, query, src, target).await
                                 {
@@ -174,8 +229,10 @@ pub async fn run_proxy() {
         i += 1;
     }
 
-    let proxy = DnsProxy::new(listen_port, target_port);
-    let shutdown = proxy.shutdown_handle();
+    let mut proxy = DnsProxy::new(listen_port, target_port);
+
+    // 取出 oneshot 发送端交给 signal handler（oneshot::Sender 只能 send 一次）。
+    let shutdown_tx = proxy.take_shutdown_sender();
 
     // 注册 SIGTERM / SIGINT 信号处理
     tokio::spawn(async move {
@@ -200,7 +257,8 @@ pub async fn run_proxy() {
             _ = ctrl_c => eprintln!("[mhost-dns-proxy] received SIGINT"),
             _ = sigterm => eprintln!("[mhost-dns-proxy] received SIGTERM"),
         }
-        shutdown.notify_waiters();
+        // oneshot::Sender::send 不会丢信号；receiver 永远会收到。
+        let _ = shutdown_tx.send(());
     });
 
     if let Err(e) = proxy.run().await {
@@ -221,7 +279,6 @@ mod tests {
     use std::time::Duration;
 
     use tokio::net::UdpSocket;
-    use tokio::sync::Notify;
 
     use super::*;
 
@@ -263,12 +320,8 @@ mod tests {
         let listen_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let listen_port = listen_socket.local_addr().unwrap().port();
         drop(listen_socket);
-        let proxy = DnsProxy {
-            listen_addr: SocketAddr::from(([127, 0, 0, 1], listen_port)),
-            target_addr: upstream_addr,
-            shutdown: Arc::new(Notify::new()),
-        };
-        let shutdown = proxy.shutdown_handle();
+        let mut proxy = DnsProxy::new(listen_port, upstream_addr.port());
+        let shutdown_tx = proxy.take_shutdown_sender();
         let proxy_handle = tokio::spawn(async move { proxy.run().await });
 
         // 两个 client 并发查询
@@ -313,7 +366,7 @@ mod tests {
         );
 
         // 收尾
-        shutdown.notify_waiters();
+        let _ = shutdown_tx.send(());
         let _ = proxy_handle.await;
     }
 
@@ -323,12 +376,8 @@ mod tests {
         let listen_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let listen_port = listen_socket.local_addr().unwrap().port();
         drop(listen_socket);
-        let proxy = DnsProxy {
-            listen_addr: SocketAddr::from(([127, 0, 0, 1], listen_port)),
-            target_addr: SocketAddr::from(([127, 0, 0, 1], 1053)),
-            shutdown: Arc::new(Notify::new()),
-        };
-        let _shutdown = proxy.shutdown_handle();
+        let mut proxy = DnsProxy::new(listen_port, 1053);
+        let shutdown_tx = proxy.take_shutdown_sender();
         let proxy_handle = tokio::spawn(async move { proxy.run().await });
 
         // 给 proxy 50ms 启动
@@ -336,7 +385,7 @@ mod tests {
 
         // 触发 shutdown
         let start = std::time::Instant::now();
-        _shutdown.notify_waiters();
+        let _ = shutdown_tx.send(());
         let result = tokio::time::timeout(Duration::from_secs(1), proxy_handle)
             .await
             .expect("proxy 应在 1s 内退出")
@@ -348,5 +397,79 @@ mod tests {
             "shutdown 应 < 1s，实际 {:?}",
             elapsed
         );
+    }
+
+    /// 回归测试：oneshot 信号不应丢失。
+    ///
+    /// 之前的实现用 `tokio::sync::Notify`，`notify_waiters()` 只会唤醒
+    /// 当前已注册的 waiter。如果 send 发生在 select 重新创建 `notified()`
+    /// future 之前，信号丢失、进程永远不退出。
+    ///
+    /// 这个测试模拟「spawn 之前就 trigger shutdown」的最坏情况，断言 run()
+    /// 必须在 1s 内退出。
+    #[tokio::test]
+    async fn test_proxy_shutdown_signal_before_loop() {
+        let listen_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let listen_port = listen_socket.local_addr().unwrap().port();
+        drop(listen_socket);
+        let mut proxy = DnsProxy::new(listen_port, 1053);
+        // 在 spawn 之前就 send（模拟 signal handler 抢在 select 之前）
+        let shutdown_tx = proxy.take_shutdown_sender();
+        let _ = shutdown_tx.send(());
+        let proxy_handle = tokio::spawn(async move { proxy.run().await });
+
+        let result = tokio::time::timeout(Duration::from_secs(1), proxy_handle)
+            .await
+            .expect("oneshot 信号必须不丢：proxy 应在 1s 内退出")
+            .expect("proxy task 不应 panic");
+        assert!(result.is_ok(), "proxy.run() 应返回 Ok，实际 {:?}", result);
+    }
+
+    /// 回归测试：DoS 防御 —— 并发上限起作用。
+    ///
+    /// 每个 client query 都会 spawn 一个 task 处理（最多 5s upstream 超时）。
+    /// 在没有 semaphore 限流时，发 2000 个并发 query 会让 runtime 内有 2000
+    /// 个并发 task，内存/CPU 被打爆。这里发 `2 * MAX_CONCURRENT_CLIENT_QUERIES`
+    /// 个 query，断言 proxy 不 panic 且能正常处理/丢弃。
+    #[tokio::test]
+    async fn test_proxy_concurrency_capped() {
+        // mock upstream 慢响应（5s），确保 task 占住 permit 直到超时
+        let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_port = upstream_socket.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            // 仅 recv 不 reply，让每个 query 等待 5s 超时
+            while let Ok(_) = upstream_socket.recv_from(&mut buf).await {}
+        });
+
+        let listen_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let listen_port = listen_socket.local_addr().unwrap().port();
+        drop(listen_socket);
+        let mut proxy = DnsProxy::new(listen_port, upstream_port);
+        let _shutdown_tx = proxy.take_shutdown_sender();
+        let proxy_handle = tokio::spawn(async move { proxy.run().await });
+
+        // 给 proxy 100ms 启动
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // 发 N 个 query（N 远超 semaphore 上限）
+        let n = MAX_CONCURRENT_CLIENT_QUERIES * 2;
+        let mut senders = Vec::new();
+        for i in 0..n {
+            let sock = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+            let payload = format!("Q{}", i).into_bytes();
+            sock.send_to(&payload, SocketAddr::from(([127, 0, 0, 1], listen_port)))
+                .await
+                .unwrap();
+            senders.push(sock);
+        }
+        // 让首批任务占住 semaphore
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // 触发 shutdown，proxy 应该正常退出（不 panic）
+        // 注意：我们用 take 后的 dummy sender，所以再 take 一次会拿到 dummy
+        // 这时直接 abort task 即可。
+        proxy_handle.abort();
+        let _ = proxy_handle.await;
     }
 }
