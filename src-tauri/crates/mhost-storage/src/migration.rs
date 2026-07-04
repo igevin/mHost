@@ -49,6 +49,7 @@ pub fn migrate_v1_to_v2(storage: &FileStorage) -> Result<bool, StorageError> {
     let mut new_manifest = manifest;
     new_manifest.version = 2;
     new_manifest.dns_enabled = Some(false);
+    new_manifest.original_dns = None;
     new_manifest.updated_at = Utc::now();
 
     // 5. 保存新 manifest
@@ -65,7 +66,8 @@ fn backup_root(root: &Path) -> Result<(), StorageError> {
 
     // 如果 root 没有父目录（不太可能），直接在 root 同级创建备份
     let backup_target = if backup_path == *root {
-        let file_name = root.file_name()
+        let file_name = root
+            .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "mhost_backup".to_string());
         root.with_file_name(format!("{}_backup", file_name))
@@ -98,9 +100,9 @@ fn move_profiles_to_hosts(root: &Path) -> Result<(), StorageError> {
 
         // 只移动 .json 文件，跳过子目录
         if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("json") {
-            let file_name = path.file_name().ok_or_else(|| {
-                StorageError::Io(format!("获取文件名失败: {}", path.display()))
-            })?;
+            let file_name = path
+                .file_name()
+                .ok_or_else(|| StorageError::Io(format!("获取文件名失败: {}", path.display())))?;
             let target = hosts_dir.join(file_name);
             fs::rename(&path, &target).map_err(|e| {
                 StorageError::Io(format!(
@@ -154,6 +156,7 @@ mod tests {
             app_version: "0.1.0".to_string(),
             updated_at: chrono::Utc::now(),
             dns_enabled: None,
+            original_dns: None,
         };
         storage.save_manifest(&v1_manifest)?;
 
@@ -172,8 +175,14 @@ mod tests {
         // 创建一些 v1 Profile
         let profile1 = Profile::new("p1");
         let profile2 = Profile::new("p2");
-        let old_path1 = temp_dir.path().join("profiles").join(format!("{}.json", profile1.id));
-        let old_path2 = temp_dir.path().join("profiles").join(format!("{}.json", profile2.id));
+        let old_path1 = temp_dir
+            .path()
+            .join("profiles")
+            .join(format!("{}.json", profile1.id));
+        let old_path2 = temp_dir
+            .path()
+            .join("profiles")
+            .join(format!("{}.json", profile2.id));
         fs::write(&old_path1, serde_json::to_string_pretty(&profile1).unwrap()).unwrap();
         fs::write(&old_path2, serde_json::to_string_pretty(&profile2).unwrap()).unwrap();
 
@@ -185,6 +194,10 @@ mod tests {
         let manifest = storage.load_manifest().unwrap();
         assert_eq!(manifest.version, 2);
         assert_eq!(manifest.dns_enabled, Some(false));
+        assert_eq!(
+            manifest.original_dns, None,
+            "v1 迁移后 original_dns 应默认为 None"
+        );
 
         // 验证 Profile 已移动到 hosts/ 子目录
         let new_path1 = temp_dir
@@ -277,14 +290,22 @@ mod tests {
             .path()
             .join("profiles")
             .join(format!("{}.json", good_profile.id));
-        fs::write(&good_file, serde_json::to_string_pretty(&good_profile).unwrap()).unwrap();
+        fs::write(
+            &good_file,
+            serde_json::to_string_pretty(&good_profile).unwrap(),
+        )
+        .unwrap();
 
         // 执行迁移
         let migrated = migrate_v1_to_v2(&storage).unwrap();
         assert!(migrated, "应执行迁移");
 
         // 损坏的文件也应被移动到 hosts/
-        let moved_bad = temp_dir.path().join("profiles").join("hosts").join("bad.json");
+        let moved_bad = temp_dir
+            .path()
+            .join("profiles")
+            .join("hosts")
+            .join("bad.json");
         assert!(moved_bad.exists(), "损坏文件也应被移动");
 
         // 正常文件也应被移动

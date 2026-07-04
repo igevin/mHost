@@ -13,6 +13,7 @@
   --yellow-light: rgba(245, 158, 11, 0.1);
   --orange: #f97316;
   --purple: #8b5cf6;
+  --purple-light: rgba(139, 92, 246, 0.1);
 
   /* Light theme (default) */
   --color-bg: #f8f9fb;

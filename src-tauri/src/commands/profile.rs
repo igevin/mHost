@@ -11,22 +11,32 @@ use crate::state::AppState;
 pub fn validate_profile(profile: &Profile) -> Result<(), MhostError> {
     // Name: non-empty, max 255 chars, no newlines or nulls
     if profile.name.is_empty() {
-        return Err(MhostError::InvalidInput("Profile name cannot be empty".to_string()));
+        return Err(MhostError::InvalidInput(
+            "Profile name cannot be empty".to_string(),
+        ));
     }
     if profile.name.len() > 255 {
-        return Err(MhostError::InvalidInput("Profile name exceeds 255 characters".to_string()));
+        return Err(MhostError::InvalidInput(
+            "Profile name exceeds 255 characters".to_string(),
+        ));
     }
     if profile.name.contains('\n') || profile.name.contains('\0') {
-        return Err(MhostError::InvalidInput("Profile name contains invalid characters".to_string()));
+        return Err(MhostError::InvalidInput(
+            "Profile name contains invalid characters".to_string(),
+        ));
     }
 
     // Description: optional, max 4096 chars, no nulls
     if let Some(desc) = &profile.description {
         if desc.len() > 4096 {
-            return Err(MhostError::InvalidInput("Profile description exceeds 4096 characters".to_string()));
+            return Err(MhostError::InvalidInput(
+                "Profile description exceeds 4096 characters".to_string(),
+            ));
         }
         if desc.contains('\0') {
-            return Err(MhostError::InvalidInput("Profile description contains invalid characters".to_string()));
+            return Err(MhostError::InvalidInput(
+                "Profile description contains invalid characters".to_string(),
+            ));
         }
     }
 
@@ -43,18 +53,24 @@ pub fn validate_profile(profile: &Profile) -> Result<(), MhostError> {
         // Domains must not be empty
         if rule.domains.is_empty() {
             return Err(MhostError::InvalidInput(format!(
-                "Empty domains list in profile '{}'", profile.name
+                "Empty domains list in profile '{}'",
+                profile.name
             )));
         }
         for domain in &rule.domains {
             if domain.is_empty() {
                 return Err(MhostError::InvalidInput(format!(
-                    "Empty domain in profile '{}'", profile.name
+                    "Empty domain in profile '{}'",
+                    profile.name
                 )));
             }
-            if domain.chars().any(|c| c.is_whitespace() || c == '\n' || c == '\0') {
+            if domain
+                .chars()
+                .any(|c| c.is_whitespace() || c == '\n' || c == '\0')
+            {
                 return Err(MhostError::InvalidInput(format!(
-                    "Invalid domain '{}' in profile '{}'", domain, profile.name
+                    "Invalid domain '{}' in profile '{}'",
+                    domain, profile.name
                 )));
             }
         }
@@ -171,7 +187,10 @@ pub async fn set_profile_enabled(
     state.storage.save_profile(&profile)?;
 
     // 如果启用的是 DNS 模式 Profile 且 dns_enabled == true，热重载规则
-    if profile.mode == ProfileMode::Dns && enabled && state.dns_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+    if profile.mode == ProfileMode::Dns
+        && enabled
+        && state.dns_enabled.load(std::sync::atomic::Ordering::Relaxed)
+    {
         crate::commands::dns::reload_dns_rules(state).await?;
     }
 
@@ -243,7 +262,11 @@ mod tests {
         (temp_dir, storage)
     }
 
-    fn create_profile(storage: &Arc<dyn Storage + Send + Sync>, name: &str, mode: ProfileMode) -> Profile {
+    fn create_profile(
+        storage: &Arc<dyn Storage + Send + Sync>,
+        name: &str,
+        mode: ProfileMode,
+    ) -> Profile {
         let mut profile = Profile::new(name.to_string());
         profile.mode = mode;
         storage.save_profile(&profile).unwrap();
@@ -278,7 +301,10 @@ mod tests {
 
         assert!(hosts_a_loaded.enabled, "hosts_a should remain enabled");
         assert!(!hosts_b_loaded.enabled, "hosts_b should be disabled");
-        assert!(dns_a_loaded.enabled, "dns_a should remain enabled (not affected by hosts-mode mutual exclusion)");
+        assert!(
+            dns_a_loaded.enabled,
+            "dns_a should remain enabled (not affected by hosts-mode mutual exclusion)"
+        );
     }
 
     #[test]

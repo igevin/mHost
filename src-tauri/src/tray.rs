@@ -77,14 +77,7 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>) -> Result<Menu<R>, Box<dyn std::er
     let mut profile_items: Vec<CheckMenuItem<R>> = Vec::new();
     for p in &profiles {
         let id = format!("{}{}", PROFILE_ID_PREFIX, p.id);
-        let item = CheckMenuItem::with_id(
-            app,
-            id,
-            &p.name,
-            true,
-            p.enabled,
-            None::<&str>,
-        )?;
+        let item = CheckMenuItem::with_id(app, id, &p.name, true, p.enabled, None::<&str>)?;
         profile_items.push(item);
     }
 
@@ -93,13 +86,8 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>) -> Result<Menu<R>, Box<dyn std::er
         .map(|item| item as &dyn tauri::menu::IsMenuItem<R>)
         .collect();
 
-    let profiles_submenu = Submenu::with_id_and_items(
-        app,
-        PROFILES_SUBMENU_ID,
-        "环境配置",
-        true,
-        &profile_refs,
-    )?;
+    let profiles_submenu =
+        Submenu::with_id_and_items(app, PROFILES_SUBMENU_ID, "环境配置", true, &profile_refs)?;
 
     let sep1 = PredefinedMenuItem::separator(app)?;
     let adblock = MenuItem::with_id(app, "adblock", "广告屏蔽（即将推出）", false, None::<&str>)?;
@@ -163,7 +151,10 @@ pub fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::Men
                     Err(e) => {
                         // Security fix (#22): truncate profile ID to first 8 chars to prevent log injection
                         let safe_id = &profile_id_clone[..8.min(profile_id_clone.len())];
-                        eprintln!("[mHost] Tray switch profile failed: invalid profile ID '{}...': {}", safe_id, e);
+                        eprintln!(
+                            "[mHost] Tray switch profile failed: invalid profile ID '{}...': {}",
+                            safe_id, e
+                        );
                         return;
                     }
                 };
@@ -214,7 +205,9 @@ pub fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::Men
 }
 
 /// Update only checkmark states and tooltip.
-pub fn update_tray_checkmark<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::error::Error>> {
+pub fn update_tray_checkmark<R: Runtime>(
+    app: &AppHandle<R>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let tray = match app.tray_by_id(TRAY_ID) {
         Some(t) => t,
         None => return Err("tray not found".into()),
@@ -237,16 +230,16 @@ pub fn update_tray_checkmark<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<d
 /// Full menu rebuild when profile list changes.
 pub fn update_tray_menu<R: Runtime>(app: &AppHandle<R>) {
     // Read current profile IDs from existing menu
-    let old_profile_ids = match get_current_profile_ids_from_menu(app) {
-        Ok(ids) => ids,
-        Err(_) => Vec::new(),
-    };
+    let old_profile_ids = get_current_profile_ids_from_menu(app).unwrap_or_default();
 
     // Read new profile IDs from AppState
     let new_profile_ids = {
         let state = app.state::<AppState>();
         match state.storage.list_profiles() {
-            Ok(profiles) => profiles.into_iter().map(|p| p.id.to_string()).collect::<Vec<_>>(),
+            Ok(profiles) => profiles
+                .into_iter()
+                .map(|p| p.id.to_string())
+                .collect::<Vec<_>>(),
             Err(_) => Vec::new(),
         }
     };

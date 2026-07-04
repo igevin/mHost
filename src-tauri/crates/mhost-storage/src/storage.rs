@@ -91,7 +91,8 @@ impl FileStorage {
 
     /// 返回指定 Profile ID 和模式对应的文件路径。
     fn profile_path_for_mode(&self, id: &ProfileId, mode: ProfileMode) -> PathBuf {
-        self.profiles_dir_for_mode(mode).join(format!("{}.json", id))
+        self.profiles_dir_for_mode(mode)
+            .join(format!("{}.json", id))
     }
 
     /// 遍历 hosts 和 dns 子目录，查找指定 ID 的 Profile 文件路径。

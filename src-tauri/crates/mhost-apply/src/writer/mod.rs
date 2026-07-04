@@ -65,9 +65,7 @@ impl HostsWriter {
         Self {
             hosts_path: hosts_path.clone(),
             backup_dir: backup_dir.into(),
-            platform: Box::new(TestPlatformAdapter {
-                hosts_path,
-            }),
+            platform: Box::new(TestPlatformAdapter { hosts_path }),
         }
     }
 

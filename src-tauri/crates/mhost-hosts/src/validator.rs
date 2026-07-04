@@ -109,7 +109,11 @@ pub fn check_duplicates(rules: &[HostRule]) -> Vec<DuplicateRule> {
             DuplicateKind::DifferentIp
         };
 
-        duplicates.push(DuplicateRule { domain, lines, kind });
+        duplicates.push(DuplicateRule {
+            domain,
+            lines,
+            kind,
+        });
     }
 
     duplicates
@@ -171,7 +175,11 @@ mod tests {
             ("url_with_port", "example.com:8080", false),
             ("url_with_scheme", "http://example.com", false),
             ("ipv6_loopback", "::1", true),
-            ("ipv6_full_expanded", "2001:0db8:85a3:0000:0000:8a2e:0370:7334", true),
+            (
+                "ipv6_full_expanded",
+                "2001:0db8:85a3:0000:0000:8a2e:0370:7334",
+                true,
+            ),
         ];
 
         for (name, token, expected) in cases {

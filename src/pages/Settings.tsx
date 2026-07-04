@@ -1,20 +1,33 @@
+import { useCallback } from "react";
 import { useAtomValue, useSetAtom } from "jotai";
 import {
   dnsEnabledAtom,
   dnsStatusAtom,
   isDnsLoadingAtom,
   toggleDnsModeAtom,
+  dnsErrorAtom,
 } from "../stores/profiles";
+import { useWebKitPointerDown } from "../hooks/useWebKitPointerDown";
 import styles from "./Settings.module.css";
 
 function Settings() {
   const dnsEnabled = useAtomValue(dnsEnabledAtom);
   const dnsStatus = useAtomValue(dnsStatusAtom);
   const isDnsLoading = useAtomValue(isDnsLoadingAtom);
+  const dnsError = useAtomValue(dnsErrorAtom);
   const toggleDnsMode = useSetAtom(toggleDnsModeAtom);
+  const { onPointerDown } = useWebKitPointerDown();
+
+  const handleToggleDns = useCallback(
+    (enabled: boolean) => {
+      toggleDnsMode(enabled);
+    },
+    [toggleDnsMode],
+  );
 
   return (
     <div className="mhost-page">
+      {dnsError && <div className="alert alert-error">{dnsError}</div>}
       <header className="mhost-page-header">
         <h1 className="mhost-page-title">Settings</h1>
       </header>
@@ -72,7 +85,8 @@ function Settings() {
             {dnsEnabled ? (
               <button
                 className="btn btn-danger"
-                onClick={() => toggleDnsMode(false)}
+                onClick={() => handleToggleDns(false)}
+                onPointerDown={onPointerDown(() => handleToggleDns(false))}
                 disabled={isDnsLoading}
               >
                 {isDnsLoading ? "Disabling..." : "Disable DNS Mode"}
@@ -80,7 +94,8 @@ function Settings() {
             ) : (
               <button
                 className="btn btn-primary"
-                onClick={() => toggleDnsMode(true)}
+                onClick={() => handleToggleDns(true)}
+                onPointerDown={onPointerDown(() => handleToggleDns(true))}
                 disabled={isDnsLoading}
               >
                 {isDnsLoading ? "Enabling..." : "Enable DNS Mode"}

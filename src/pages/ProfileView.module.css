@@ -195,6 +195,16 @@
   color: var(--color-primary);
 }
 
+.badgeModeHosts {
+  background: var(--accent-light);
+  color: var(--accent);
+}
+
+.badgeModeDns {
+  background: var(--purple-light);
+  color: var(--purple);
+}
+
 .viewHeaderActions {
   display: flex;
   align-items: center;

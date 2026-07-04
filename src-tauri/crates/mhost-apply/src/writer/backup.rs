@@ -76,7 +76,10 @@ pub fn prune_old_backups(backup_dir: &Path) -> Result<(), MhostError> {
         // Return error if ALL deletions failed (nothing was pruned)
         if failed_count == to_remove {
             return Err(MhostError::Apply(mhost_core::ApplyError::BackupFailed(
-                format!("failed to prune old backups: {} deletions failed", failed_count),
+                format!(
+                    "failed to prune old backups: {} deletions failed",
+                    failed_count
+                ),
             )));
         }
     }

@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
-use mhost_apply::{ApplyPlan, generate_plan};
 use mhost_apply::writer::HostsWriter;
+use mhost_apply::{generate_plan, ApplyPlan};
 use mhost_core::{MhostError, ProfileId, ProfileMode};
 use mhost_storage::storage::Storage;
 use tauri::{AppHandle, State};
@@ -22,8 +22,10 @@ pub async fn generate_apply_plan(state: State<'_, AppState>) -> Result<ApplyPlan
                 return Err(e.into());
             }
         };
-        generate_plan(&profiles, &current_hosts).map_err(Into::into)
-    }).await.map_err(|e| MhostError::InvalidInput(e.to_string()))?
+        generate_plan(&profiles, &current_hosts)
+    })
+    .await
+    .map_err(|e| MhostError::InvalidInput(e.to_string()))?
 }
 
 /// Generate a preview plan for enabling/disabling a profile without modifying storage.
@@ -64,7 +66,10 @@ pub fn generate_preview_plan_logic(
     }
 
     if !found {
-        return Err(MhostError::InvalidInput(format!("profile not found: {}", id)));
+        return Err(MhostError::InvalidInput(format!(
+            "profile not found: {}",
+            id
+        )));
     }
 
     let current_hosts = match std::fs::read_to_string(writer.hosts_path()) {
@@ -75,7 +80,7 @@ pub fn generate_preview_plan_logic(
         }
     };
 
-    generate_plan(&profiles, &current_hosts).map_err(Into::into)
+    generate_plan(&profiles, &current_hosts)
 }
 
 /// Preview the apply plan for enabling/disabling a profile without modifying storage.
@@ -92,7 +97,9 @@ pub async fn generate_preview_plan(
     tauri::async_runtime::spawn_blocking(move || {
         let profile_id = std::str::FromStr::from_str(&id)?;
         generate_preview_plan_logic(&profile_id, enabled, storage.as_ref(), &writer)
-    }).await.map_err(|e| MhostError::InvalidInput(e.to_string()))?
+    })
+    .await
+    .map_err(|e| MhostError::InvalidInput(e.to_string()))?
 }
 
 /// Reject an empty plan (no enabled profiles with rules).
@@ -138,7 +145,7 @@ pub async fn apply_hosts(state: State<'_, AppState>) -> Result<(), MhostError> {
         writer.apply(&plan)?;
 
         // Write last_applied timestamp only on success
-        write_last_applied(&storage.root())?;
+        write_last_applied(storage.root())?;
 
         // Auto-snapshot after successful apply
         if let Err(e) = crate::commands::snapshot::auto_snapshot_logic(storage.as_ref()) {
@@ -146,7 +153,9 @@ pub async fn apply_hosts(state: State<'_, AppState>) -> Result<(), MhostError> {
         }
 
         Ok(())
-    }).await.map_err(|e| MhostError::InvalidInput(e.to_string()))?
+    })
+    .await
+    .map_err(|e| MhostError::InvalidInput(e.to_string()))?
 }
 
 /// Core logic: regenerate plan from all enabled profiles and apply to system hosts.
@@ -177,7 +186,7 @@ pub fn apply_current_plan_logic(
     writer.apply(&plan)?;
 
     // Record timestamp (only after successful apply)
-    write_last_applied(&storage.root())?;
+    write_last_applied(storage.root())?;
 
     Ok(())
 }
@@ -247,9 +256,7 @@ pub async fn enable_and_apply(
         state.storage.save_profile(&profile)?;
 
         if enabled && state.dns_enabled.load(std::sync::atomic::Ordering::Relaxed) {
-            let profiles = state
-                .storage
-                .list_profiles_by_mode(ProfileMode::Dns)?;
+            let profiles = state.storage.list_profiles_by_mode(ProfileMode::Dns)?;
             let enabled_profiles: Vec<_> = profiles.into_iter().filter(|p| p.enabled).collect();
 
             match state.dns_server.lock() {
@@ -277,16 +284,18 @@ pub async fn enable_and_apply(
 pub async fn rollback_hosts(state: State<'_, AppState>) -> Result<(), MhostError> {
     let _guard = state.apply_lock.lock().await;
     let writer = state.writer.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        writer.rollback().map_err(Into::into)
-    }).await.map_err(|e| MhostError::InvalidInput(e.to_string()))?
+    tauri::async_runtime::spawn_blocking(move || writer.rollback())
+        .await
+        .map_err(|e| MhostError::InvalidInput(e.to_string()))?
 }
 
 #[tauri::command]
 pub async fn read_system_hosts() -> Result<String, MhostError> {
     tauri::async_runtime::spawn_blocking(|| {
         std::fs::read_to_string("/etc/hosts").map_err(Into::into)
-    }).await.map_err(|e| MhostError::InvalidInput(e.to_string()))?
+    })
+    .await
+    .map_err(|e| MhostError::InvalidInput(e.to_string()))?
 }
 
 #[tauri::command]
@@ -299,7 +308,9 @@ pub async fn get_managed_block_content(
         Ok(mhost_hosts::parser::Parser::extract_managed_block_content(
             &hosts_text,
         ))
-    }).await.map_err(|e| MhostError::InvalidInput(e.to_string()))?
+    })
+    .await
+    .map_err(|e| MhostError::InvalidInput(e.to_string()))?
 }
 
 /// Strong-typed struct for last_applied.json to prevent recursive deserialization attacks.
@@ -320,11 +331,34 @@ pub async fn get_last_applied(state: State<'_, AppState>) -> Result<Option<Strin
             return Ok(None);
         }
         let content = std::fs::read_to_string(&path)?;
-        let data: LastApplied = serde_json::from_str(&content).map_err(|e| MhostError::InvalidInput(
-            format!("failed to parse last_applied.json: {}", e),
-        ))?;
+        let data: LastApplied = serde_json::from_str(&content).map_err(|e| {
+            MhostError::InvalidInput(format!("failed to parse last_applied.json: {}", e))
+        })?;
         Ok(Some(data.timestamp))
-    }).await.map_err(|e| MhostError::InvalidInput(e.to_string()))?
+    })
+    .await
+    .map_err(|e| MhostError::InvalidInput(e.to_string()))?
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn write_last_applied(root: &std::path::Path) -> Result<(), MhostError> {
+    let last_applied_path = root.join("last_applied.json");
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let data = serde_json::json!({ "timestamp": timestamp });
+    let json = match serde_json::to_string_pretty(&data) {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("Warning: failed to serialize last_applied: {}", e);
+            return Ok(());
+        }
+    };
+    if let Err(e) = std::fs::write(&last_applied_path, json) {
+        eprintln!("[mHost] Warning: failed to write last_applied.json: {}", e);
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -358,7 +392,9 @@ mod tests {
     ) -> Profile {
         let mut profile = Profile::new(name);
         for (ip, domain) in rules {
-            profile.rules.push(HostRule::new(ip.parse().unwrap(), vec![domain.to_string()]));
+            profile
+                .rules
+                .push(HostRule::new(ip.parse().unwrap(), vec![domain.to_string()]));
         }
         storage.save_profile(&profile).unwrap();
         profile
@@ -369,28 +405,21 @@ mod tests {
         let (_temp, storage, writer) = create_test_storage_and_writer();
 
         // Create two profiles, enable the first one
-        let mut profile_a = create_profile_with_rules(
-            &storage,
-            "dev",
-            vec![("127.0.0.1", "example.com")],
-        );
+        let mut profile_a =
+            create_profile_with_rules(&storage, "dev", vec![("127.0.0.1", "example.com")]);
         profile_a.enabled = true;
         storage.save_profile(&profile_a).unwrap();
 
-        let profile_b = create_profile_with_rules(
-            &storage,
-            "test",
-            vec![("192.168.1.1", "test.local")],
-        );
+        let profile_b =
+            create_profile_with_rules(&storage, "test", vec![("192.168.1.1", "test.local")]);
 
         // Enable profile_b via enable_and_apply_logic
-        let result = enable_and_apply_logic(
-            &profile_b.id,
-            true,
-            storage.as_ref(),
-            &writer,
+        let result = enable_and_apply_logic(&profile_b.id, true, storage.as_ref(), &writer);
+        assert!(
+            result.is_ok(),
+            "enable_and_apply should succeed: {:?}",
+            result.err()
         );
-        assert!(result.is_ok(), "enable_and_apply should succeed: {:?}", result.err());
 
         // Verify profile_b is enabled
         let loaded_b = storage.load_profile(&profile_b.id).unwrap();
@@ -419,33 +448,20 @@ mod tests {
         let (_temp, storage, writer) = create_test_storage_and_writer();
 
         // Create and enable a profile
-        let mut profile = create_profile_with_rules(
-            &storage,
-            "dev",
-            vec![("127.0.0.1", "example.com")],
-        );
+        let mut profile =
+            create_profile_with_rules(&storage, "dev", vec![("127.0.0.1", "example.com")]);
         profile.enabled = true;
         storage.save_profile(&profile).unwrap();
 
         // Apply first so there's a managed block
-        let result = enable_and_apply_logic(
-            &profile.id,
-            true,
-            storage.as_ref(),
-            &writer,
-        );
+        let result = enable_and_apply_logic(&profile.id, true, storage.as_ref(), &writer);
         assert!(result.is_ok());
 
         let hosts_before = std::fs::read_to_string(writer.hosts_path()).unwrap();
         assert!(hosts_before.contains("# ---- mHost start ----"));
 
         // Now disable the profile
-        let result = enable_and_apply_logic(
-            &profile.id,
-            false,
-            storage.as_ref(),
-            &writer,
-        );
+        let result = enable_and_apply_logic(&profile.id, false, storage.as_ref(), &writer);
         assert!(result.is_ok(), "disable should succeed: {:?}", result.err());
 
         // Verify profile is disabled
@@ -476,11 +492,8 @@ mod tests {
         let (_temp, storage, writer) = create_test_storage_and_writer();
 
         // Create a profile but do NOT enable it
-        let profile = create_profile_with_rules(
-            &storage,
-            "dev",
-            vec![("127.0.0.1", "example.com")],
-        );
+        let profile =
+            create_profile_with_rules(&storage, "dev", vec![("127.0.0.1", "example.com")]);
         // profile.enabled defaults to false
         storage.save_profile(&profile).unwrap();
 
@@ -490,7 +503,10 @@ mod tests {
         let plan = generate_plan(&profiles, &current_hosts).unwrap();
 
         // Verify plan is empty
-        assert!(plan.rules.is_empty(), "plan should be empty when no profiles are enabled");
+        assert!(
+            plan.rules.is_empty(),
+            "plan should be empty when no profiles are enabled"
+        );
 
         // Verify reject_empty_plan correctly rejects the empty plan
         let result = reject_empty_plan(&plan);
@@ -509,11 +525,8 @@ mod tests {
         let (_temp, storage, writer) = create_test_storage_and_writer();
 
         // Create and enable a profile
-        let mut profile = create_profile_with_rules(
-            &storage,
-            "dev",
-            vec![("127.0.0.1", "example.com")],
-        );
+        let mut profile =
+            create_profile_with_rules(&storage, "dev", vec![("127.0.0.1", "example.com")]);
         profile.enabled = true;
         storage.save_profile(&profile).unwrap();
 
@@ -523,11 +536,18 @@ mod tests {
         let plan = generate_plan(&profiles, &current_hosts).unwrap();
 
         // Verify plan is NOT empty
-        assert!(!plan.rules.is_empty(), "plan should have rules when a profile is enabled");
+        assert!(
+            !plan.rules.is_empty(),
+            "plan should have rules when a profile is enabled"
+        );
 
         // Verify reject_empty_plan accepts the non-empty plan
         let result = reject_empty_plan(&plan);
-        assert!(result.is_ok(), "should accept non-empty plan: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "should accept non-empty plan: {:?}",
+            result.err()
+        );
     }
 
     // Fix (#44): Test that apply_current_plan_logic re-applies enabled profiles
@@ -537,17 +557,18 @@ mod tests {
         let (_temp, storage, writer) = create_test_storage_and_writer();
 
         // Create and enable a profile with initial rules
-        let mut profile = create_profile_with_rules(
-            &storage,
-            "dev",
-            vec![("127.0.0.1", "example.com")],
-        );
+        let mut profile =
+            create_profile_with_rules(&storage, "dev", vec![("127.0.0.1", "example.com")]);
         profile.enabled = true;
         storage.save_profile(&profile).unwrap();
 
         // Initial apply
         let result = apply_current_plan_logic(storage.as_ref(), &writer);
-        assert!(result.is_ok(), "initial apply should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "initial apply should succeed: {:?}",
+            result.err()
+        );
 
         let hosts_before = std::fs::read_to_string(writer.hosts_path()).unwrap();
         assert!(
@@ -571,7 +592,11 @@ mod tests {
 
         // Re-apply (this is what update_profile does when profile.enabled == true)
         let result = apply_current_plan_logic(storage.as_ref(), &writer);
-        assert!(result.is_ok(), "re-apply after rule update should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "re-apply after rule update should succeed: {:?}",
+            result.err()
+        );
 
         // Verify new rules are now in hosts file
         let hosts_after = std::fs::read_to_string(writer.hosts_path()).unwrap();
@@ -593,11 +618,8 @@ mod tests {
         let (_temp, storage, writer) = create_test_storage_and_writer();
 
         // Create and enable a profile
-        let mut profile = create_profile_with_rules(
-            &storage,
-            "dev",
-            vec![("127.0.0.1", "example.com")],
-        );
+        let mut profile =
+            create_profile_with_rules(&storage, "dev", vec![("127.0.0.1", "example.com")]);
         profile.enabled = true;
         storage.save_profile(&profile).unwrap();
 
@@ -614,7 +636,11 @@ mod tests {
 
         // Re-apply
         let result = apply_current_plan_logic(storage.as_ref(), &writer);
-        assert!(result.is_ok(), "re-apply after disable should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "re-apply after disable should succeed: {:?}",
+            result.err()
+        );
 
         // Verify managed block is removed
         let hosts_after = std::fs::read_to_string(writer.hosts_path()).unwrap();
@@ -635,46 +661,47 @@ mod tests {
         let (_temp, storage, writer) = create_test_storage_and_writer();
 
         // Create two profiles, enable the first one
-        let mut profile_a = create_profile_with_rules(
-            &storage,
-            "dev",
-            vec![("127.0.0.1", "example.com")],
-        );
+        let mut profile_a =
+            create_profile_with_rules(&storage, "dev", vec![("127.0.0.1", "example.com")]);
         profile_a.enabled = true;
         storage.save_profile(&profile_a).unwrap();
 
-        let profile_b = create_profile_with_rules(
-            &storage,
-            "test",
-            vec![("192.168.1.1", "test.local")],
-        );
+        let profile_b =
+            create_profile_with_rules(&storage, "test", vec![("192.168.1.1", "test.local")]);
 
         // Preview enabling profile_b (should disable profile_a)
-        let plan = generate_preview_plan_logic(
-            &profile_b.id,
-            true,
-            storage.as_ref(),
-            &writer,
-        ).unwrap();
+        let plan =
+            generate_preview_plan_logic(&profile_b.id, true, storage.as_ref(), &writer).unwrap();
 
         // Verify plan contains profile_b's rules
         assert!(
-            plan.rules.iter().any(|r| r.ip.to_string() == "192.168.1.1" && r.domain == "test.local"),
+            plan.rules
+                .iter()
+                .any(|r| r.ip.to_string() == "192.168.1.1" && r.domain == "test.local"),
             "plan should contain profile_b rules: {:?}",
             plan.rules
         );
         // Verify plan does NOT contain profile_a's rules
         assert!(
-            !plan.rules.iter().any(|r| r.ip.to_string() == "127.0.0.1" && r.domain == "example.com"),
+            !plan
+                .rules
+                .iter()
+                .any(|r| r.ip.to_string() == "127.0.0.1" && r.domain == "example.com"),
             "plan should NOT contain profile_a rules: {:?}",
             plan.rules
         );
 
         // Verify storage state was NOT modified
         let loaded_a = storage.load_profile(&profile_a.id).unwrap();
-        assert!(loaded_a.enabled, "profile_a should still be enabled in storage");
+        assert!(
+            loaded_a.enabled,
+            "profile_a should still be enabled in storage"
+        );
         let loaded_b = storage.load_profile(&profile_b.id).unwrap();
-        assert!(!loaded_b.enabled, "profile_b should still be disabled in storage");
+        assert!(
+            !loaded_b.enabled,
+            "profile_b should still be disabled in storage"
+        );
     }
 
     #[test]
@@ -682,24 +709,21 @@ mod tests {
         let (_temp, storage, writer) = create_test_storage_and_writer();
 
         // Create and enable a profile
-        let mut profile = create_profile_with_rules(
-            &storage,
-            "dev",
-            vec![("127.0.0.1", "example.com")],
-        );
+        let mut profile =
+            create_profile_with_rules(&storage, "dev", vec![("127.0.0.1", "example.com")]);
         profile.enabled = true;
         storage.save_profile(&profile).unwrap();
 
         // Preview disabling the profile
-        let plan = generate_preview_plan_logic(
-            &profile.id,
-            false,
-            storage.as_ref(),
-            &writer,
-        ).unwrap();
+        let plan =
+            generate_preview_plan_logic(&profile.id, false, storage.as_ref(), &writer).unwrap();
 
         // Verify plan is empty
-        assert!(plan.rules.is_empty(), "plan should be empty when disabling the only enabled profile: {:?}", plan.rules);
+        assert!(
+            plan.rules.is_empty(),
+            "plan should be empty when disabling the only enabled profile: {:?}",
+            plan.rules
+        );
 
         // Verify storage state was NOT modified
         let loaded = storage.load_profile(&profile.id).unwrap();
@@ -762,37 +786,13 @@ mod tests {
         storage.save_profile(&dns_profile).unwrap();
 
         // Preview plan should be empty (DNS profile does not affect hosts)
-        let plan = generate_preview_plan_logic(
-            &dns_profile.id,
-            true,
-            storage.as_ref(),
-            &writer,
-        ).unwrap();
+        let plan =
+            generate_preview_plan_logic(&dns_profile.id, true, storage.as_ref(), &writer).unwrap();
 
-        assert!(plan.rules.is_empty(), "plan should be empty when target is dns profile: {:?}", plan.rules);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn write_last_applied(root: &std::path::Path) -> Result<(), MhostError> {
-    let last_applied_path = root.join("last_applied.json");
-    let timestamp = chrono::Utc::now().to_rfc3339();
-    let data = serde_json::json!({ "timestamp": timestamp });
-    let json = match serde_json::to_string_pretty(&data) {
-        Ok(j) => j,
-        Err(e) => {
-            eprintln!("Warning: failed to serialize last_applied: {}", e);
-            return Ok(());
-        }
-    };
-    if let Err(e) = std::fs::write(&last_applied_path, json) {
-        eprintln!(
-            "[mHost] Warning: failed to write last_applied.json: {}",
-            e
+        assert!(
+            plan.rules.is_empty(),
+            "plan should be empty when target is dns profile: {:?}",
+            plan.rules
         );
     }
-    Ok(())
 }
