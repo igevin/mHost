@@ -341,7 +341,9 @@ mod tests {
             as Arc<dyn mhost_storage::storage::Storage + Send + Sync>;
         // seed manifest (set_dns_mode_disable 会 load_manifest，缺少会 Err)
         storage
-            .save_manifest(&mhost_storage::manifest::Manifest::new(env!("CARGO_PKG_VERSION")))
+            .save_manifest(&mhost_storage::manifest::Manifest::new(env!(
+                "CARGO_PKG_VERSION"
+            )))
             .unwrap();
         let state = AppState {
             storage,
