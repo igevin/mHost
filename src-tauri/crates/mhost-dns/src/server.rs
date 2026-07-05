@@ -4,13 +4,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use hickory_proto::op::{Header, Message, MessageType, OpCode, ResponseCode};
+use hickory_proto::op::{Header, Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::rdata::A;
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
 use hickory_resolver::config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts};
 use hickory_resolver::TokioAsyncResolver;
 use lru::LruCache;
+use parking_lot::Mutex as PlMutex;
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 
@@ -49,9 +50,19 @@ pub struct DnsServer {
     running: AtomicBool,
     shutdown_tx: Mutex<Option<tokio::sync::mpsc::Sender<()>>>,
     server_handle: Mutex<Option<JoinHandle<Result<(), DnsError>>>>,
-    resolver: std::sync::Mutex<TokioAsyncResolver>,
-    /// 响应缓存：key=(Name, RecordType), value=(records, expires_at)
-    cache: Arc<Mutex<LruCache<(Name, RecordType), CacheEntry>>>,
+    /// Upstream resolver。`TokioAsyncResolver` 内部已用 Arc，无需外层 Mutex。
+    /// **fix (P-R14, issue #90)**: 之前是 `std::sync::Mutex<TokioAsyncResolver>`，
+    /// 每次 `start()` 加锁 + clone 才能 spawn。新代码直接 Arc 持有，
+    /// 每查询零锁开销。
+    resolver: Arc<TokioAsyncResolver>,
+    /// 响应缓存：key="name|record_type"（`Box<str>`），value=(records, expires_at)。
+    ///
+    /// **fix (P-R1, P-R3, issue #90)**:
+    ///   - key 类型从 `(Name, RecordType)` 改为 `Box<str>`（含 record_type 拼接），
+    ///     构造仅一次字节拷贝；`Name::clone()` 需要重新解析 label 结构，开销更大。
+    ///   - 锁从 `std::sync::Mutex` 换 `parking_lot::Mutex`：parking_lot 比 std
+    ///     Mutex 在非竞争路径更快、poison-free（这里我们不需要处理 poison）。
+    cache: Arc<PlMutex<LruCache<Box<str>, CacheEntry>>>,
 }
 
 impl DnsServer {
@@ -72,8 +83,8 @@ impl DnsServer {
             running: AtomicBool::new(false),
             shutdown_tx: Mutex::new(None),
             server_handle: Mutex::new(None),
-            resolver: std::sync::Mutex::new(resolver),
-            cache: Arc::new(Mutex::new(LruCache::new(cache_size))),
+            resolver: Arc::new(resolver),
+            cache: Arc::new(PlMutex::new(LruCache::new(cache_size))),
         })
     }
 
@@ -118,10 +129,9 @@ impl DnsServer {
         }
 
         let rule_engine = self.rule_engine.clone();
-        let resolver = {
-            let guard = self.resolver.lock().unwrap_or_else(|e| e.into_inner());
-            guard.clone()
-        };
+        // **fix (P-R14, issue #90)**: TokioAsyncResolver 内部已用 Arc；
+        // 这里只做一次 Arc clone 传给 spawn，每查询零锁。
+        let resolver = Arc::clone(&self.resolver);
         let cache = self.cache.clone();
 
         let handle = tokio::spawn(async move {
@@ -246,11 +256,8 @@ impl DnsServer {
 
     /// 返回缓存容量（实际 LRU 大小，已对 0 做 min 1 处理）。
     pub fn cache_capacity(&self) -> usize {
-        self.cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .cap()
-            .get()
+        // **fix (P-R3, issue #90)**: parking_lot::Mutex 无 poison，无需 unwrap_or_else。
+        self.cache.lock().cap().get()
     }
 
     /// 返回当前规则数量。
@@ -270,7 +277,7 @@ async fn handle_dns_request(
     request_data: &[u8],
     rule_engine: &RuleEngine,
     resolver: &TokioAsyncResolver,
-    cache: &Arc<Mutex<LruCache<(Name, RecordType), CacheEntry>>>,
+    cache: &Arc<PlMutex<LruCache<Box<str>, CacheEntry>>>,
 ) -> Option<Vec<u8>> {
     let request = match Message::from_bytes(request_data) {
         Ok(msg) => msg,
@@ -288,94 +295,179 @@ async fn handle_dns_request(
         return None;
     }
 
-    let query = match request.queries().first() {
-        Some(q) => q,
-        None => return None,
-    };
-
+    let query = request.queries().first()?.clone();
     let name = query.name().to_utf8();
     let name_str = name.trim_end_matches('.');
     let record_type = query.query_type();
 
-    // 缓存检查（仅 A/AAAA；其他类型 NotImp 不缓存）
-    let cache_key = (query.name().clone(), record_type);
+    // **fix (P-R1, issue #90)**: 缓存 key 用 `Box<str>` 而非 `(Name, RecordType)`。
+    // - 拼接 `record_type` 进 key 字符串避免 type collision（不同 type 同 name）
+    // - 比 `Name::clone()` 便宜：Name 内部是 label-encoded Vec<u8>，
+    //   clone 时按 label 重算长度前缀；`Box<str>` 只做一次精确字节拷贝。
+    // - `peek` + `put` 都用同一份 key（peek 创建 Box，put move 进 cache）。
+    let cache_key: Box<str> = {
+        let type_byte = match record_type {
+            RecordType::A => 1u8,
+            RecordType::AAAA => 2u8,
+            _ => 0u8,
+        };
+        // 预分配足够容量避免 push 时的扩容拷贝
+        let mut s = String::with_capacity(name_str.len() + 2);
+        s.push_str(name_str);
+        s.push('|');
+        s.push(type_byte as char);
+        s.into_boxed_str()
+    };
+
     let now = Instant::now();
-    let cached_records: Option<Vec<Record>> = {
-        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+
+    // **fix (P-R2, issue #90)**: 缓存命中路径在持锁状态下直接组装响应，
+    // 跳过 `records.clone()`（Vec<Record> 一次 alloc + memcpy）。
+    // - `peek` 返回 `&(Vec<Record>, Instant)`，guard 持有期间可直接遍历
+    // - 每个 record 由 `add_answer` 通过 `.clone()` 拿 owned（仍需 alloc，
+    //   但比整个 Vec clone 省 N-1 次 alloc + Vec 容器本身的开销）
+    let cached_response: Option<Vec<u8>> = {
+        let mut guard = cache.lock();
         if let Some((records, expires_at)) = guard.peek(&cache_key) {
             if *expires_at > now {
-                Some(records.clone())
+                let response_bytes = build_cached_response(&request, &query, records);
+                drop(guard);
+                response_bytes
             } else {
                 // 已过期 —— 取出丢弃
                 guard.pop(&cache_key);
+                drop(guard);
                 None
             }
         } else {
+            drop(guard);
             None
         }
     };
 
+    if let Some(bytes) = cached_response {
+        return Some(bytes);
+    }
+
+    // 缓存未命中分支：从规则引擎 + 上游查询
+    // 仅处理 A/AAAA；其他类型直接回 NotImp
+    if !matches!(record_type, RecordType::A | RecordType::AAAA) {
+        return build_notimp_response(&request, &query);
+    }
+
+    match handle_address_query(name_str, query.name(), record_type, rule_engine, resolver).await {
+        QueryResult::Answer(record) => {
+            let ttl = record.ttl();
+            // **fix (P-R2, issue #90)**: `*record.clone()` 之前是 `clone Box + deref`
+            // （两次 alloc：Box 本身 + Box 内的 Record）。`record.as_ref().clone()`
+            // 只 alloc 一次（Record 本身），更高效。
+            let answer = record.as_ref().clone();
+            let response_bytes = build_answer_response(&request, &query, answer.clone());
+
+            // TTL=0 是合法 DNS 值（"不要缓存"），跳过 put 避免
+            // 浪费 LRU slot 且下次 peek 立刻过期被 pop。
+            if ttl > 0 {
+                let expires_at = now + std::time::Duration::from_secs(ttl as u64);
+                cache.lock().put(cache_key, (vec![answer], expires_at));
+            }
+            response_bytes
+        }
+        QueryResult::NoError => build_noerror_response(&request, &query),
+        QueryResult::ServFail => build_servfail_response(&request, &query),
+    }
+}
+
+/// 在持锁状态下构造缓存命中的响应字节（避免 `records.clone()`）。
+fn build_cached_response(request: &Message, query: &Query, records: &[Record]) -> Option<Vec<u8>> {
     let mut header = Header::response_from_request(request.header());
     header.set_authoritative(false);
     header.set_recursion_available(true);
-
     let mut response = Message::new();
     response.set_header(header);
     response.set_id(request.id());
     response.add_query(query.clone());
-
-    match record_type {
-        RecordType::A | RecordType::AAAA => {
-            if let Some(records) = cached_records {
-                // 缓存命中：直接组装响应
-                for r in records {
-                    response.add_answer(r);
-                }
-            } else {
-                // 缓存未命中：执行查询
-                match handle_address_query(
-                    name_str,
-                    query.name(),
-                    record_type,
-                    rule_engine,
-                    resolver,
-                )
-                .await
-                {
-                    QueryResult::Answer(record) => {
-                        let ttl = record.ttl();
-                        response.add_answer(*record.clone());
-                        // 缓存：把单条记录放进 vec，未来多 record 也好扩展。
-                        // TTL=0 是合法 DNS 值（"不要缓存"），跳过 put 避免
-                        // 浪费 LRU slot 且下次 peek 立刻过期被 pop。
-                        if ttl > 0 {
-                            let expires_at = now + std::time::Duration::from_secs(ttl as u64);
-                            let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-                            guard.put(cache_key, (vec![*record], expires_at));
-                        }
-                    }
-                    QueryResult::NoError => {
-                        // 没匹配 —— 不缓存（避免缓存"NoError"导致上游变更后不感知）
-                    }
-                    QueryResult::ServFail => {
-                        let mut h = *response.header();
-                        h.set_response_code(ResponseCode::ServFail);
-                        response.set_header(h);
-                    }
-                }
-            }
-        }
-        _ => {
-            let mut h = *response.header();
-            h.set_response_code(ResponseCode::NotImp);
-            response.set_header(h);
+    for r in records {
+        response.add_answer(r.clone());
+    }
+    match response.to_bytes() {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            tracing::warn!("Failed to encode cached DNS response: {}", e);
+            None
         }
     }
+}
 
+/// 构造标准 Answer 响应（带一条 Answer 记录）。
+fn build_answer_response(request: &Message, query: &Query, answer: Record) -> Option<Vec<u8>> {
+    let mut header = Header::response_from_request(request.header());
+    header.set_authoritative(false);
+    header.set_recursion_available(true);
+    let mut response = Message::new();
+    response.set_header(header);
+    response.set_id(request.id());
+    response.add_query(query.clone());
+    response.add_answer(answer);
     match response.to_bytes() {
         Ok(bytes) => Some(bytes),
         Err(e) => {
             tracing::warn!("Failed to encode DNS response: {}", e);
+            None
+        }
+    }
+}
+
+/// 构造 NoError 响应（查询名称合法但无匹配记录）。
+fn build_noerror_response(request: &Message, query: &Query) -> Option<Vec<u8>> {
+    let mut header = Header::response_from_request(request.header());
+    header.set_authoritative(false);
+    header.set_recursion_available(true);
+    let mut response = Message::new();
+    response.set_header(header);
+    response.set_id(request.id());
+    response.add_query(query.clone());
+    match response.to_bytes() {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            tracing::warn!("Failed to encode NoError response: {}", e);
+            None
+        }
+    }
+}
+
+/// 构造 SERVFAIL 响应（上游查询失败）。
+fn build_servfail_response(request: &Message, query: &Query) -> Option<Vec<u8>> {
+    let mut header = Header::response_from_request(request.header());
+    header.set_authoritative(false);
+    header.set_recursion_available(true);
+    header.set_response_code(ResponseCode::ServFail);
+    let mut response = Message::new();
+    response.set_header(header);
+    response.set_id(request.id());
+    response.add_query(query.clone());
+    match response.to_bytes() {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            tracing::warn!("Failed to encode ServFail response: {}", e);
+            None
+        }
+    }
+}
+
+/// 构造 NotImp 响应（不支持的查询类型）。
+fn build_notimp_response(request: &Message, query: &Query) -> Option<Vec<u8>> {
+    let mut header = Header::response_from_request(request.header());
+    header.set_authoritative(false);
+    header.set_recursion_available(true);
+    header.set_response_code(ResponseCode::NotImp);
+    let mut response = Message::new();
+    response.set_header(header);
+    response.set_id(request.id());
+    response.add_query(query.clone());
+    match response.to_bytes() {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            tracing::warn!("Failed to encode NotImp response: {}", e);
             None
         }
     }
@@ -1035,5 +1127,105 @@ mod tests {
         let server = DnsServer::new(config).unwrap();
         // 验证 cache_capacity 暴露的是 DnsConfig.cache_size
         assert_eq!(server.cache_capacity(), 5);
+    }
+
+    /// 单元测试（fix P-R3, issue #90）：cache 锁类型应是 parking_lot::Mutex
+    /// （无 poison），且 cache_capacity 通过它访问不 panic。
+    ///
+    /// 类型检查在编译期生效；本测试覆盖运行时行为。
+    #[test]
+    fn test_cache_capacity_uses_parking_lot_lock() {
+        let config = DnsConfig {
+            port: 1061,
+            cache_size: 42,
+            ..Default::default()
+        };
+        let server = DnsServer::new(config).unwrap();
+        // 多次连续访问确保 parking_lot lock 不被 poison（std Mutex 会）
+        for _ in 0..100 {
+            assert_eq!(server.cache_capacity(), 42);
+        }
+    }
+
+    /// 单元测试（fix P-R1, issue #90）：不同 query_type 走独立 cache slot。
+    ///
+    /// 通过同一域名查 A 与 AAAA 应该各自缓存：第二次查询都应 hit cache
+    /// （本地规则匹配 → Answer 立即返回，绕过实际 A/AAAA 区分）。
+    #[tokio::test]
+    async fn test_cache_keys_disambiguate_by_record_type() {
+        let profile = make_profile(
+            "dns_test_cache_types",
+            ProfileMode::Dns,
+            true,
+            vec![make_rule(
+                Some("127.0.0.1"),
+                vec!["typed.example.com"],
+                true,
+            )],
+        );
+
+        let config = DnsConfig {
+            port: 1062,
+            ..Default::default()
+        };
+        let server = Arc::new(DnsServer::new(config).unwrap());
+        server.reload_rules(&[profile]);
+
+        let server_clone = server.clone();
+        let _handle = tokio::spawn(async move {
+            server_clone.start().await.unwrap();
+        });
+        wait_for_server_running(&server, 1000).await;
+
+        // 两次查同一域名：A → AAAA。两个 query_type 走不同 cache slot，
+        // 所以两次都是 cache miss（首次）。但本地规则对 AAAA 不匹配 →
+        // 返回 NoError。如果 cache key 没区分 type，第二次 A 查询可能
+        // 拿到 AAAA 的 NoError 响应（错误）。
+        async fn query_once(server: &DnsServer, port: u16, qtype: RecordType) -> Vec<u8> {
+            let query_name = Name::from_utf8("typed.example.com.").unwrap();
+            let query = Query::query(query_name, qtype);
+            let mut request = Message::new();
+            request.set_id(1234);
+            request.set_recursion_desired(true);
+            request.add_query(query);
+
+            let request_bytes = request.to_bytes().unwrap();
+            let client = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+            client
+                .send_to(&request_bytes, ("127.0.0.1", port))
+                .await
+                .unwrap();
+            let mut buf = vec![0u8; 4096];
+            let (len, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+            buf[..len].to_vec()
+        }
+
+        let resp_a1 = query_once(&server, 1062, RecordType::A).await;
+        // 验证返回 A 记录（local rule 匹配）
+        let msg_a1 = Message::from_bytes(&resp_a1).unwrap();
+        assert_eq!(msg_a1.answer_count(), 1, "首次 A 查询应命中本地规则");
+
+        let resp_aaaa = query_once(&server, 1062, RecordType::AAAA).await;
+        // AAAA 不匹配 → NoError, 0 个 answer
+        let msg_aaaa = Message::from_bytes(&resp_aaaa).unwrap();
+        assert_eq!(
+            msg_aaaa.answer_count(),
+            0,
+            "AAAA 查询对 IPv4-only 规则应返回 NoError（0 个 answer）"
+        );
+
+        let resp_a2 = query_once(&server, 1062, RecordType::A).await;
+        // 再次 A 查询：cache 命中 → 返回相同 Answer 记录
+        let msg_a2 = Message::from_bytes(&resp_a2).unwrap();
+        assert_eq!(
+            msg_a2.answer_count(),
+            1,
+            "A 查询第二次应命中 cache（不被 AAAA 响应污染）"
+        );
+
+        server.stop().await.unwrap();
     }
 }

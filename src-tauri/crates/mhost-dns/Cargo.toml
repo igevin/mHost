@@ -20,6 +20,7 @@ thiserror = { workspace = true }
 tracing = "0.1"
 lru = "0.12"
 dirs = { workspace = true }
+parking_lot = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"

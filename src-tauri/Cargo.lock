@@ -2187,6 +2187,7 @@ dependencies = [
  "libc",
  "lru",
  "mhost-core",
+ "parking_lot",
  "serde",
  "serde_json",
  "tempfile",
