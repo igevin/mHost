@@ -6,6 +6,7 @@
 use chrono::Utc;
 use mhost_core::MhostError;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Maximum number of backup files to retain.
@@ -15,11 +16,30 @@ const MAX_BACKUPS: usize = 10;
 ///
 /// After creating the backup, enforces the maximum backup limit by
 /// removing the oldest backups if the count exceeds `MAX_BACKUPS`.
+///
+/// **fix（H2, issue #90）**：backup 文件用 `OpenOptions` + `mode(0o600)` 写，
+/// 不再用 `fs::write` 默认 umask（macOS 上是 0o644）。backups 可能含内部
+/// dev/staging 主机名 + ad-block patterns，多用户机器上其他本地用户可
+/// 能读取 → 收紧权限。
 pub fn create_backup(backup_dir: &Path, content: &str) -> Result<PathBuf, MhostError> {
+    use std::os::unix::fs::OpenOptionsExt;
     fs::create_dir_all(backup_dir)?;
     let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
     let path = backup_dir.join(format!("hosts-{}.bak", timestamp));
-    fs::write(&path, content)?;
+    // mode(0o600) owner-only — 备份内容含敏感内部主机名
+    // create(true).truncate(true)：timestamp 到秒级，同秒内多次备份
+    // （如测试场景或快速连续写入）允许覆盖同名文件；生产中同一秒两次
+    // 备份几乎不可能，但 truncate 兜底更稳。
+    {
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)?;
+        f.write_all(content.as_bytes())?;
+        f.flush()?;
+    }
 
     // Enforce backup limit
     prune_old_backups(backup_dir)?;
@@ -91,6 +111,30 @@ pub fn prune_old_backups(backup_dir: &Path) -> Result<(), MhostError> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// 单元测试（fix H2, issue #90）：backup 文件创建后必须是 0o600 权限，
+    /// 不能用 fs::write 默认 umask（macOS 上是 0o644，多用户机器可读）。
+    #[test]
+    fn test_backup_file_created_with_0o600() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "127.0.0.1 internal-api.corp.example.com\n";
+
+        let path = create_backup(dir.path(), content).expect("create_backup 失败");
+
+        // 关键断言：权限 = 0o600（owner read/write, 其他无权限）
+        let meta = fs::metadata(&path).expect("stat 失败");
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "backup 文件权限应为 0o600（owner-only），实际 0o{:o}",
+            mode
+        );
+
+        // 内容一致（确认功能未坏）
+        let read_back = fs::read_to_string(&path).expect("read 失败");
+        assert_eq!(read_back, content);
+    }
 
     #[test]
     fn test_prune_old_backups_removes_oldest() {

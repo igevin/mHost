@@ -2181,6 +2181,7 @@ name = "mhost-dns"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "dirs 5.0.1",
  "hickory-proto",
  "hickory-resolver",
  "libc",
@@ -2188,6 +2189,7 @@ dependencies = [
  "mhost-core",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
