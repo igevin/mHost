@@ -4,7 +4,8 @@
 //! where the same domain maps to different IPs.
 
 use mhost_core::{Profile, ResolvedRule, RuleConflict};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 
 /// Result of merging profiles
 #[derive(Debug, Clone, PartialEq)]
@@ -21,6 +22,15 @@ impl Merger {
     ///
     /// Rules are expanded so each domain gets its own ResolvedRule.
     /// Conflicts are detected when the same domain maps to different IPs.
+    ///
+    /// **fix (P-R10, P-R11, issue #90)**:
+    ///   - **P-R11**: `domain_to_ips` was `HashMap<String, Vec<String>>` and
+    ///     stored IP as `String` (allocated per rule via `IpAddr::to_string`).
+    ///     Now `HashMap<String, HashSet<IpAddr>>` — `IpAddr` itself is
+    ///     `Hash + Eq`, no string allocation needed.
+    ///   - **P-R10**: sort keys were `a.ip.to_string()` (alloc per
+    ///     comparison). `IpAddr` implements `Ord` directly, so we sort by
+    ///     `a.ip` / `b.ip` — zero allocation.
     pub fn merge(profiles: &[Profile]) -> MergeResult {
         // Collect all resolved rules from enabled profiles
         let mut all_rules: Vec<ResolvedRule> = Vec::new();
@@ -50,13 +60,12 @@ impl Merger {
         // only one source_profile is retained. This is acceptable for Phase 0
         // because only a single profile is enabled at a time. Multi-profile
         // conflict tracing is reserved for a future phase.
-        let mut by_domain_ip: HashMap<(String, String), ResolvedRule> = HashMap::new();
-        let mut domain_to_ips: HashMap<String, Vec<String>> = HashMap::new();
+        let mut by_domain_ip: HashMap<(String, IpAddr), ResolvedRule> = HashMap::new();
+        let mut domain_to_ips: HashMap<String, HashSet<IpAddr>> = HashMap::new();
 
         for rule in all_rules {
-            let ip_str = rule.ip.to_string();
-            let domain = rule.domain;
-            let key = (domain.clone(), ip_str.clone());
+            let domain = rule.domain.clone();
+            let key = (domain.clone(), rule.ip);
 
             by_domain_ip.entry(key).or_insert_with(|| ResolvedRule {
                 ip: rule.ip,
@@ -65,7 +74,9 @@ impl Merger {
                 source_profile_name: rule.source_profile_name,
             });
 
-            domain_to_ips.entry(domain).or_default().push(ip_str);
+            // P-R11: insert IpAddr directly, no to_string() alloc. HashSet
+            // auto-dedupes the IPs for "is conflict?" check.
+            domain_to_ips.entry(domain).or_default().insert(rule.ip);
         }
 
         // Build conflicts: same domain with different IPs
@@ -73,8 +84,7 @@ impl Merger {
         let mut conflict_domains: Vec<String> = Vec::new();
 
         for (domain, ips) in &domain_to_ips {
-            let unique_ips: std::collections::HashSet<_> = ips.iter().cloned().collect();
-            if unique_ips.len() > 1 {
+            if ips.len() > 1 {
                 conflict_domains.push(domain.clone());
             }
         }
@@ -84,17 +94,15 @@ impl Merger {
 
         for domain in &conflict_domains {
             let mut conflict_rules: Vec<ResolvedRule> = Vec::new();
-            let unique_ips: std::collections::HashSet<_> =
-                domain_to_ips[domain].iter().cloned().collect();
-
-            for ip_str in unique_ips {
-                if let Some(rule) = by_domain_ip.remove(&(domain.clone(), ip_str)) {
+            // P-R11: iterate HashSet<IpAddr> directly, no String clones
+            for &ip in &domain_to_ips[domain] {
+                if let Some(rule) = by_domain_ip.remove(&(domain.clone(), ip)) {
                     conflict_rules.push(rule);
                 }
             }
 
-            // Sort conflict rules by IP for deterministic output
-            conflict_rules.sort_by_key(|a| a.ip.to_string());
+            // P-R10: sort by IpAddr directly, no to_string() per comparison
+            conflict_rules.sort_by_key(|a| a.ip);
 
             conflicts.push(RuleConflict {
                 domain: domain.clone(),
@@ -104,8 +112,7 @@ impl Merger {
 
         // Build final rules list: exclude domains that have conflicts
         let mut rules: Vec<ResolvedRule> = Vec::new();
-        let conflict_domain_set: std::collections::HashSet<_> =
-            conflict_domains.iter().cloned().collect();
+        let conflict_domain_set: HashSet<&String> = conflict_domains.iter().collect();
 
         for ((domain, _ip), rule) in by_domain_ip {
             if !conflict_domain_set.contains(&domain) {
@@ -113,12 +120,8 @@ impl Merger {
             }
         }
 
-        // Sort for deterministic output: by domain, then by IP
-        rules.sort_by(|a, b| {
-            a.domain
-                .cmp(&b.domain)
-                .then_with(|| a.ip.to_string().cmp(&b.ip.to_string()))
-        });
+        // P-R10: sort by (domain, IpAddr) — both Ord, zero alloc.
+        rules.sort_by(|a, b| a.domain.cmp(&b.domain).then_with(|| a.ip.cmp(&b.ip)));
 
         MergeResult { rules, conflicts }
     }
