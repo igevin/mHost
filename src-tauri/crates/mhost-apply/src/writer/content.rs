@@ -12,34 +12,21 @@ use mhost_hosts::Parser;
 /// - If no managed block exists, append the new block at the end.
 /// - All unmanaged content is preserved exactly as-is, including trailing
 ///   whitespace.
+///
+/// **fix (P-R6, issue #90)**: was using `Parser::extract_managed_block`
+/// which returns **line indices**, then doing a second full-file scan with
+/// `current.lines().scan(0, ...).collect()` to convert to byte offsets —
+/// for a 5000-line ad-block hosts file this allocated a 5000-element Vec
+/// and walked every line just to look up 2 entries. Now uses
+/// `Parser::extract_managed_block_bytes` which returns byte offsets
+/// directly in a single pass. The full-file scan is gone.
 pub fn build_hosts_content(current: &str, plan: &ApplyPlan) -> String {
     let managed_block = crate::format_as_hosts(&plan.rules);
 
-    if let Some((start, end)) = Parser::extract_managed_block(current) {
+    if let Some((block_start, block_end)) = Parser::extract_managed_block_bytes(current) {
         // Replace existing managed block using byte offsets to preserve
         // original formatting including trailing whitespace.
-        let line_offsets: Vec<(usize, usize)> = current
-            .lines()
-            .scan(0, |pos, line| {
-                let line_start = *pos;
-                // lines() does not include the newline; find it manually
-                let after_line = line_start + line.len();
-                let nl_len = if current[after_line..].starts_with("\r\n") {
-                    2
-                } else if current[after_line..].starts_with('\n') {
-                    1
-                } else {
-                    0
-                };
-                *pos = after_line + nl_len;
-                Some((line_start, *pos))
-            })
-            .collect();
-
-        let block_start = line_offsets[start].0;
-        let block_end = line_offsets[end].1;
-
-        let mut output = String::new();
+        let mut output = String::with_capacity(current.len() + managed_block.len());
         output.push_str(&current[..block_start]);
         if !managed_block.is_empty() {
             output.push_str(&managed_block);
@@ -48,7 +35,8 @@ pub fn build_hosts_content(current: &str, plan: &ApplyPlan) -> String {
         output
     } else {
         // No managed block — append at the end
-        let mut output = current.to_string();
+        let mut output = String::with_capacity(current.len() + managed_block.len() + 1);
+        output.push_str(current);
         if !output.ends_with('\n') && !output.is_empty() {
             output.push('\n');
         }
