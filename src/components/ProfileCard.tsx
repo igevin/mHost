@@ -1,3 +1,4 @@
+import { memo, useMemo } from "react";
 import type { Profile, ExportFormat } from "../types";
 import { countRealRules } from "../lib/rules";
 import styles from "../pages/ProfileList.module.css";
@@ -12,6 +13,17 @@ interface ProfileCardProps {
   onDuplicate?: (id: string) => void;
 }
 
+/**
+ * Profile 卡片 —— 展示单个 profile 的基本信息 + 操作按钮。
+ *
+ * **fix (P-F2, issue #90)**:
+ *   - `React.memo` 包裹：profile / handler 引用未变时跳过重渲染。
+ *     父组件 ProfileList 在 apply 状态变化时不应让所有卡片重渲染。
+ *   - `useMemo` 包 `countRealRules(profile.rules)`：每个卡片的 rule
+ *     计数只在该 profile 的 rules 变化时重算（不再每次渲染都跑 O(N)）。
+ *   - 内部 `onClick` 用箭头函数不可避免（依赖 `profile.id`），但因 React.memo
+ *     + 父组件 useCallback'd handlers 后整体开销可控。
+ */
 function ProfileCard({
   profile,
   isLoading,
@@ -21,6 +33,8 @@ function ProfileCard({
   onExport,
   onDuplicate,
 }: ProfileCardProps) {
+  const ruleCount = useMemo(() => countRealRules(profile.rules), [profile.rules]);
+
   return (
     <div
       className={`${styles.profileCard} ${profile.enabled ? styles.profileCardEnabled : ""}`}
@@ -33,7 +47,7 @@ function ProfileCard({
           >
             {profile.name}
           </h3>
-          <div className={styles.profileTags}>
+          <div className={styles.profileCardTags}>
             {profile.tags.map((tag) => (
               <span key={tag} className="tag">
                 {tag}
@@ -44,8 +58,8 @@ function ProfileCard({
         {profile.description && (
           <p className={styles.profileDesc}>{profile.description}</p>
         )}
-        <div className={styles.profileMeta}>
-          <span>{countRealRules(profile.rules)} rules</span>
+        <div className={styles.profileCardMeta}>
+          <span>{ruleCount} rules</span>
           <span className={styles.metaSep}>·</span>
           <span>{profile.enabled ? "Enabled" : "Disabled"}</span>
           {profile.protected && (
@@ -103,4 +117,4 @@ function ProfileCard({
   );
 }
 
-export default ProfileCard;
+export default memo(ProfileCard);

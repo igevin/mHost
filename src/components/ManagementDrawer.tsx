@@ -28,6 +28,7 @@ import type { Profile, ExportFormat } from "../types";
 import ImportDialog from "./ImportDialog";
 import CreateProfileDialog from "./CreateProfileDialog";
 import ApplyConfirmDialog from "./ApplyConfirmDialog";
+import DrawerProfileCard from "./DrawerProfileCard";
 import styles from "./ManagementDrawer.module.css";
 
 interface ManagementDrawerProps {
@@ -249,95 +250,22 @@ function ManagementDrawer({ open, onClose }: ManagementDrawerProps) {
               </button>
             </div>
 
-            {/* Profile Cards */}
+            {/* Profile Cards (P-F3: extracted to DrawerProfileCard, React.memo'd) */}
             {profiles.map((profile) => (
-              <div
+              <DrawerProfileCard
                 key={profile.id}
-                className={`${styles.profileCard} ${
-                  profile.enabled
-                    ? styles.profileCardEnabled
-                    : styles.profileCardDisabled
-                } ${profile.protected ? styles.profileCardProtected : ""}`}
-              >
-                <div className={styles.profileCardHeader}>
-                  <h3 className={styles.profileName}>{profile.name}</h3>
-                  <div className={styles.profileBadges}>
-                    {profile.enabled ? (
-                      <span className={`${styles.badge} ${styles.badgeEnabled}`}>
-                        Enabled
-                      </span>
-                    ) : (
-                      <span className={`${styles.badge} ${styles.badgeDisabled}`}>
-                        Disabled
-                      </span>
-                    )}
-                    {profile.protected && (
-                      <span className={`${styles.badge} ${styles.badgeProtected}`}>
-                        Protected
-                      </span>
-                    )}
-                  </div>
-                </div>
-
-                {profile.description && (
-                  <p className={styles.profileDesc}>{profile.description}</p>
-                )}
-
-                <div className={styles.profileMeta}>
-                  <span>{countRealRules(profile.rules)} rules</span>
-                  <span className={styles.metaSep}>|</span>
-                  <span>{formatDate(profile.updated_at || profile.created_at)}</span>
-                </div>
-
-                {profile.tags.length > 0 && (
-                  <div className={styles.profileTags}>
-                    {profile.tags.map((tag) => (
-                      <span key={tag} className="tag">
-                        {tag}
-                      </span>
-                    ))}
-                  </div>
-                )}
-
-                <div className={styles.profileCardActions}>
-                  <button
-                    className="btn btn-ghost btn-sm"
-                    onClick={() => handleEdit(profile.id)}
-                  >
-                    Edit
-                  </button>
-                  <button
-                    className="btn btn-ghost btn-sm"
-                    onClick={() => handleToggle(profile.id, profile.enabled)}
-                    onPointerDown={onPointerDown(() => {
-                      handleToggle(profile.id, profile.enabled);
-                    })}
-                    disabled={isApplying}
-                  >
-                    {profile.enabled ? "Disable" : "Enable"}
-                  </button>
-                  <button
-                    className="btn btn-ghost btn-sm"
-                    onClick={() => handleDuplicate(profile)}
-                    disabled={duplicatingId === profile.id}
-                  >
-                    {duplicatingId === profile.id ? "Duplicating..." : "Duplicate"}
-                  </button>
-                  <button
-                    className="btn btn-ghost btn-sm"
-                    onClick={() => handleExport(profile, "hosts")}
-                  >
-                    Export
-                  </button>
-                  <button
-                    className="btn btn-danger btn-sm"
-                    onClick={() => handleDelete(profile.id)}
-                    disabled={profile.protected || deletingId === profile.id}
-                  >
-                    {deletingId === profile.id ? "Deleting..." : "Delete"}
-                  </button>
-                </div>
-              </div>
+                profile={profile}
+                isApplying={isApplying}
+                duplicatingId={duplicatingId}
+                deletingId={deletingId}
+                onEdit={handleEdit}
+                onToggle={handleToggle}
+                onDuplicate={handleDuplicate}
+                onExport={(p) => handleExport(p, "hosts")}
+                onDelete={handleDelete}
+                onPointerDownToggle={onPointerDown}
+                formatDate={formatDate}
+              />
             ))}
 
             {profiles.length === 0 && (

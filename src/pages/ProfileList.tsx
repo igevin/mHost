@@ -135,6 +135,31 @@ function ProfileList() {
     setExportTarget(null);
   }, [setError]);
 
+  // **fix (P-F2, issue #90)**: 之前 onExport / onDuplicate 是 inline arrow，
+  // 每次 ProfileList 渲染都生成新函数 → ProfileCard 的 React.memo 失效。
+  // 抽出 useCallback 稳定引用。依赖 [profiles] 是因为要从 profiles 里查找
+  // 对应 profile 来设置 dialog state。
+  const handleCardExport = useCallback(
+    (id: string) => {
+      const target = profiles.find((p) => p.id === id);
+      if (target) {
+        setExportTarget(target);
+      }
+    },
+    [profiles],
+  );
+
+  const handleCardDuplicate = useCallback(
+    (id: string) => {
+      const target = profiles.find((p) => p.id === id);
+      if (target) {
+        setDuplicateTarget(target);
+        setDuplicateName(`${target.name} (copy)`);
+      }
+    },
+    [profiles],
+  );
+
   const handleDuplicate = useCallback(async () => {
     if (!duplicateTarget || !duplicateName.trim()) return;
     try {
@@ -221,19 +246,8 @@ function ProfileList() {
             onEdit={handleEdit}
             onToggle={handleToggle}
             onDelete={handleDelete}
-            onExport={(id) => {
-              const target = profiles.find((p) => p.id === id);
-              if (target) {
-                setExportTarget(target);
-              }
-            }}
-            onDuplicate={(id) => {
-              const target = profiles.find((p) => p.id === id);
-              if (target) {
-                setDuplicateTarget(target);
-                setDuplicateName(`${target.name} (copy)`);
-              }
-            }}
+            onExport={handleCardExport}
+            onDuplicate={handleCardDuplicate}
           />
         ))}
       </div>
