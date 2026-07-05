@@ -16,6 +16,7 @@ const mockGetDnsStatus = vi.fn().mockResolvedValue({
   running: true,
   port: 53,
   upstream: ["8.8.8.8"],
+  original_dns: ["192.168.31.1"],
   rule_count: 10,
   cache_capacity: 100,
 });
@@ -68,6 +69,7 @@ describe("Settings", () => {
       running: true,
       port: 53,
       upstream: ["8.8.8.8"],
+      original_dns: ["192.168.31.1"],
       rule_count: 10,
       cache_capacity: 100,
     });
@@ -96,6 +98,7 @@ describe("Settings", () => {
       running: true,
       port: 53,
       upstream: ["8.8.8.8"],
+      original_dns: ["192.168.31.1"],
       rule_count: 10,
       cache_capacity: 100,
     });

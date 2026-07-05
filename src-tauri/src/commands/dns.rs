@@ -48,16 +48,20 @@ pub async fn set_dns_mode(enabled: bool, state: State<'_, AppState>) -> Result<(
 async fn set_dns_mode_enable(state: &AppState) -> Result<(), MhostError> {
     // 1. 单一来源读取：state.original_dns 和 DnsConfig.upstream 都从这一次
     //    get_system_dns() 派生，杜绝双重调用之间的 TOCTOU。
+    //    get_system_dns() 内部 fallback chain: networksetup → ipconfig → 公共
+    //    DNS。Tier 3 公共 DNS 是「系统真没配 DNS」的兜底。
     let original = mhost_dns::platform::get_system_dns()
         .map_err(|e| MhostError::InvalidInput(format!("get system dns failed: {}", e)))?;
 
-    let upstream = if original.is_empty() {
-        // 系统的确没有配置 DNS（DHCP 没下发、用户手动清空等）—— 用公共
-        // resolver 兜底，保证无规则匹配时仍能解析公网域名。
-        vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()]
-    } else {
-        original.clone()
-    };
+    // upstream 直接透传：get_system_dns 已经把 fallback chain 跑完了，
+    // 拿到啥就是啥（包括公共兜底 [8.8.8.8, 1.1.1.1]）。
+    let upstream = original.clone();
+    if original == vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()] {
+        eprintln!(
+            "[mHost] no system DNS detected (networksetup empty + ipconfig empty); \
+             using public fallback as upstream. Check your network connection."
+        );
+    }
 
     // 2. 构造并启动 DnsServer（macOS 上监听非特权端口 1053）
     let config = mhost_dns::DnsConfig {
@@ -370,12 +374,20 @@ mod tests {
 pub async fn get_dns_status(
     state: State<'_, AppState>,
 ) -> Result<mhost_core::DnsStatus, MhostError> {
-    fn build(server: Option<&mhost_dns::DnsServer>) -> mhost_core::DnsStatus {
+    let original_dns = match state.original_dns.lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
+    fn build(
+        server: Option<&mhost_dns::DnsServer>,
+        original_dns: Vec<String>,
+    ) -> mhost_core::DnsStatus {
         match server {
             Some(s) => mhost_core::DnsStatus {
                 running: s.is_running(),
                 port: s.port(),
                 upstream: s.upstream().to_vec(),
+                original_dns,
                 rule_count: s.rule_count(),
                 cache_capacity: s.cache_capacity(),
             },
@@ -383,6 +395,7 @@ pub async fn get_dns_status(
                 running: false,
                 port: 53,
                 upstream: vec![],
+                original_dns,
                 rule_count: 0,
                 cache_capacity: 0,
             },
@@ -390,8 +403,8 @@ pub async fn get_dns_status(
     }
 
     let status = match state.dns_server.lock() {
-        Ok(guard) => build(guard.as_ref()),
-        Err(poisoned) => build(poisoned.into_inner().as_ref()),
+        Ok(guard) => build(guard.as_ref(), original_dns),
+        Err(poisoned) => build(poisoned.into_inner().as_ref(), original_dns),
     };
     Ok(status)
 }

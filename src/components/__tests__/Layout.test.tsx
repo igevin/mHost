@@ -220,7 +220,7 @@ describe("Layout", () => {
   it("shows DNS status indicator when dnsEnabled is true", () => {
     const store = getDefaultStore();
     store.set(dnsEnabledAtom, true);
-    store.set(dnsStatusAtom, { running: true, port: 53, upstream: [], rule_count: 0, cache_capacity: 100 });
+    store.set(dnsStatusAtom, { running: true, port: 53, upstream: [], original_dns: [], rule_count: 0, cache_capacity: 100 });
 
     renderWithProviders(<Layout />);
 

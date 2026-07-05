@@ -17,6 +17,9 @@ export interface DnsStatus {
   running: boolean;
   port: number;
   upstream: string[];
+  /// Enable 时捕获的系统 DNS 快照。disable 时会还原成这个值。
+  /// 可能是用户手动配的、DHCP 推的，或空（系统真没 DNS，会用 DHCP 默认）。
+  original_dns: string[];
   rule_count: number;
   cache_capacity: number;
 }

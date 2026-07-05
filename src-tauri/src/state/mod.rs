@@ -208,12 +208,15 @@ impl AppState {
             }
         }
 
-        // 2. 创建 DnsConfig 和 DnsServer（upstream 使用系统原始 DNS 兜底）
+        // 2. 创建 DnsConfig 和 DnsServer（upstream = 透传 original）
         //
-        // 注意：original 可能等于 vec!["Empty"]（v2.0 残留兜底），
-        // 这是个「恢复目标」placeholder，不能作为 upstream DNS。
-        // 所以这里对 upstream 单独 fallback。
-        let upstream = if original.is_empty() || original == vec!["Empty".to_string()] {
+        // 注意：original 可能等于 vec!["Empty"]（v2.0 残留兜底 placeholder）
+        // 或 == [8.8.8.8, 1.1.1.1]（get_system_dns Tier 3 兜底）。这两种都
+        // 是「系统没真 DNS」的场景，upstream 用它们可以让 proxy 至少能解
+        // 公网域名（用 [8.8.8.8, 1.1.1.1]）或后续手动配置（用 ["Empty"]）。
+        let upstream = if original == vec!["Empty".to_string()] {
+            // v2.0 残留 placeholder —— get_system_dns 现在已经能拿到真实
+            // DHCP DNS（Tier 2），所以这条分支基本不会进；以防万一还是 fallback。
             vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()]
         } else {
             original.clone()

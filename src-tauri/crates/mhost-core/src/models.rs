@@ -267,6 +267,10 @@ pub struct DnsStatus {
     pub running: bool,
     pub port: u16,
     pub upstream: Vec<String>,
+    /// Enable 时捕获的系统 DNS 快照（disable 时会还原）。
+    /// 来自 `state.original_dns`：可能是用户手动配的（networksetup）、
+    /// DHCP 推的（ipconfig）、或空（系统真没 DNS）。
+    pub original_dns: Vec<String>,
     pub rule_count: usize,
     pub cache_capacity: usize,
 }

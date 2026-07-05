@@ -105,10 +105,16 @@ function Settings() {
           {dnsEnabled && dnsStatus && (
             <div className={styles.dnsDetails}>
               <div>
-                Upstream (启用 DNS 模式时的系统 DNS 快照):{" "}
+                Upstream (resolver for unmatched queries):{" "}
                 {dnsStatus.upstream.length > 0
                   ? dnsStatus.upstream.join(", ")
                   : "System default"}
+              </div>
+              <div>
+                Original DNS (will be restored on disable):{" "}
+                {(dnsStatus.original_dns ?? []).length > 0
+                  ? (dnsStatus.original_dns ?? []).join(", ")
+                  : "(empty — DHCP default)"}
               </div>
               <div>Cache capacity: {dnsStatus.cache_capacity}</div>
             </div>

@@ -124,13 +124,46 @@ fn invoke_osascript(path: &std::path::Path) -> Result<std::process::Output, Stri
 }
 
 /// 获取当前系统 DNS 服务器列表。
+///
+/// **Fallback chain**（fix: 不要用公共 DNS 覆盖用户实际的 DNS）：
+/// 1. `networksetup -getdnsservers <port>` —— 用户在 System Settings
+///    里手动配的 DNS。如果非空，直接返回（这是最权威的）。
+/// 2. `ipconfig getoption <device> domain_name_server` —— DHCP 推的
+///    DNS。`networksetup` 在「DHCP 推但用户没在 System Settings 里
+///    确认」的情况下会返回空，但系统实际在用 DHCP DNS。这一步能补上。
+/// 3. `[8.8.8.8, 1.1.1.1]` —— 上面两个都空时的兜底（系统真没配 DNS，
+///    例如离线/air-gapped）。调用方看到这种返回值应该打 warning log。
 pub fn get_system_dns() -> Result<Vec<String>, PlatformError> {
-    let interface = get_active_network_interface()?;
-    let output = Command::new("networksetup")
-        .args(["-getdnsservers", &interface])
-        .output()
-        .map_err(|e| PlatformError::GetDns(format!("command failed: {}", e)))?;
+    let port = get_active_network_interface()?;
 
+    // Tier 1: 用户手动配的 DNS（在 System Settings 里能看到）
+    if let Ok(servers) = networksetup_get_dns(&port) {
+        if !servers.is_empty() {
+            return Ok(servers);
+        }
+    }
+
+    // Tier 2: DHCP 推的 DNS（networksetup 看不到，但系统实际在用）
+    if let Some(device) = get_active_network_device() {
+        if let Ok(servers) = ipconfig_get_dns(&device) {
+            if !servers.is_empty() {
+                return Ok(servers);
+            }
+        }
+    }
+
+    // Tier 3: 上面两个都空 → 系统真没 DNS。返回公共 resolver 兜底，
+    // 调用方（commands/dns.rs）会打 warning 告诉用户。
+    Ok(vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()])
+}
+
+/// `networksetup -getdnsservers <port>` —— 用户在 System Settings 里
+/// 手动配的 DNS。返回空 vec 表示「没手动配」（常见于纯 DHCP 场景）。
+fn networksetup_get_dns(port: &str) -> Result<Vec<String>, PlatformError> {
+    let output = Command::new("networksetup")
+        .args(["-getdnsservers", port])
+        .output()
+        .map_err(|e| PlatformError::GetDns(format!("networksetup command failed: {}", e)))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(PlatformError::GetDns(format!(
@@ -138,9 +171,35 @@ pub fn get_system_dns() -> Result<Vec<String>, PlatformError> {
             stderr
         )));
     }
+    parse_dns_servers(&String::from_utf8_lossy(&output.stdout))
+}
 
+/// `ipconfig getoption <device> domain_name_server` —— DHCP 推的 DNS。
+/// 每行一个 IP（legacy 版本可能空格分隔），由 `parse_dns_servers` 统一解析。
+fn ipconfig_get_dns(device: &str) -> Result<Vec<String>, PlatformError> {
+    let output = Command::new("ipconfig")
+        .args(["getoption", device, "domain_name_server"])
+        .output()
+        .map_err(|e| PlatformError::GetDns(format!("ipconfig failed: {}", e)))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(PlatformError::GetDns(format!("ipconfig failed: {}", stderr)));
+    }
+    Ok(parse_dns_servers(&String::from_utf8_lossy(&output.stdout))?)
+}
+
+/// 默认路由对应的 BSD 设备名（如 `en0`），供 ipconfig 使用。
+/// 失败返回 None（get_system_dns 走 Tier 3 兜底）。
+fn get_active_network_device() -> Option<String> {
+    let output = Command::new("route")
+        .args(["-n", "get", "default"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_dns_servers(&stdout)
+    parse_route_interface(&stdout)
 }
 
 /// 在 macOS 上启用 DNS 模式：
