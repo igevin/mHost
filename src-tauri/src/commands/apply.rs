@@ -122,6 +122,9 @@ pub fn reject_empty_plan(plan: &ApplyPlan) -> Result<(), MhostError> {
 /// Security fix (#16): Uses apply_lock to prevent concurrent writes.
 /// Perf fix (#26): Async with spawn_blocking to avoid blocking executor.
 /// Enhancement (#2-N1): Rejects empty plan to avoid writing empty managed block.
+/// Perf fix (P-R8, issue #90): Pass the already-read `current_hosts` to
+/// `writer.apply_with_content` to avoid reading /etc/hosts a second time
+/// (the writer previously re-read inside `HostsWriter::apply`).
 #[tauri::command]
 pub async fn apply_hosts(state: State<'_, AppState>) -> Result<(), MhostError> {
     let _guard = state.apply_lock.lock().await;
@@ -142,7 +145,9 @@ pub async fn apply_hosts(state: State<'_, AppState>) -> Result<(), MhostError> {
         // N1: Reject empty plan to avoid writing empty managed block
         reject_empty_plan(&plan)?;
 
-        writer.apply(&plan)?;
+        // **fix (P-R8, issue #90)**: pass current_hosts through so writer
+        // doesn't re-read /etc/hosts (was happening twice per apply).
+        writer.apply_with_content(&plan, &current_hosts)?;
 
         // Write last_applied timestamp only on success
         write_last_applied(storage.root())?;
@@ -163,6 +168,7 @@ pub async fn apply_hosts(state: State<'_, AppState>) -> Result<(), MhostError> {
 /// Testable without Tauri `State`.
 /// Fix (#44): Extracted as a reusable function so `update_profile` can re-apply
 /// when saving an enabled profile.
+/// Perf fix (P-R8, issue #90): Same single-read pattern as `apply_hosts`.
 pub fn apply_current_plan_logic(
     storage: &(dyn Storage + Send + Sync),
     writer: &HostsWriter,
@@ -183,7 +189,7 @@ pub fn apply_current_plan_logic(
     // This is intentionally NOT rejected here; rejection of empty plans is the
     // responsibility of the `apply_hosts` command (issue #2-N1) to avoid writing
     // an empty managed block when the user explicitly clicks "Apply".
-    writer.apply(&plan)?;
+    writer.apply_with_content(&plan, &current_hosts)?;
 
     // Record timestamp (only after successful apply)
     write_last_applied(storage.root())?;

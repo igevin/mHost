@@ -95,13 +95,19 @@ function ApplyConfirmDialog({
                 <div className={styles.diffEmpty}>No changes detected</div>
               ) : (
                 <div className={styles.diffPreview}>
-                  {plan.diff.added.map((line, i) => (
-                    <div key={`+${i}`} className={`${styles.diffLine} ${styles.diffAdded}`}>
+                  {/* **fix (P-F10, issue #90)**: keys were array indices.
+                   * Toggling "show unchanged" reuses DOM nodes with the same
+                   * index but different content — React reuses nodes that
+                   * no longer match, causing wrong line displayed in wrong
+                   * color slot. Use line content as key (each diff line is
+                   * unique within added/removed/unchanged). */}
+                  {plan.diff.added.map((line) => (
+                    <div key={`+${line}`} className={`${styles.diffLine} ${styles.diffAdded}`}>
                       + {line}
                     </div>
                   ))}
-                  {plan.diff.removed.map((line, i) => (
-                    <div key={`-${i}`} className={`${styles.diffLine} ${styles.diffRemoved}`}>
+                  {plan.diff.removed.map((line) => (
+                    <div key={`-${line}`} className={`${styles.diffLine} ${styles.diffRemoved}`}>
                       - {line}
                     </div>
                   ))}
@@ -116,9 +122,9 @@ function ApplyConfirmDialog({
                         </button>
                       ) : (
                         <>
-                          {plan.diff.unchanged.map((line, i) => (
+                          {plan.diff.unchanged.map((line) => (
                             <div
-                              key={`u${i}`}
+                              key={`u${line}`}
                               className={`${styles.diffLine} ${styles.diffUnchanged}`}
                             >
                               {`  ${line}`}
@@ -145,8 +151,10 @@ function ApplyConfirmDialog({
                   Warning: {plan.conflicts.length} conflict(s) detected
                 </div>
                 <div className={styles.conflictList}>
-                  {plan.conflicts.map((conflict, i) => (
-                    <div key={i} className={styles.conflictItem}>
+                  {/* **fix (P-F10, issue #90)**: conflict.domain is unique
+                   * across conflicts — stable key. */}
+                  {plan.conflicts.map((conflict) => (
+                    <div key={conflict.domain} className={styles.conflictItem}>
                       <span className={styles.conflictDomain}>{conflict.domain}</span>
                       <span>
                         — {conflict.rules.map((r) => r.source_profile_name).join(", ")}

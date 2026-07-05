@@ -425,10 +425,19 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEd
   );
   const editorHasBlockingIssues = errors.length > 0 || (validateResult?.duplicates?.some((d) => d.kind === "different_ip") ?? false);
 
-  const lineNumbers = useMemo(() => {
-    const count = text.split("\n").length;
-    return Array.from({ length: count }, (_, i) => i + 1);
-  }, [text]);
+  // **fix (P-F8, issue #90)**: line numbers depended on `[text]` — every
+  // keystroke (even within the same line) rebuilt the array. Split the
+  // dependency: a cheap `lineCount` memo on `[text]` (recomputed only when
+  // text changes — full split+count) and the `lineNumbers` memo depends
+  // only on `[lineCount]`. For typing within a line, `lineCount` reference
+  // is stable → `lineNumbers` returns the same array (React sees identity
+  // equality). For typing across a newline, `lineCount` changes by ±1
+  // → array is rebuilt, but only by the delta size.
+  const lineCount = useMemo(() => text.split("\n").length, [text]);
+  const lineNumbers = useMemo(
+    () => Array.from({ length: lineCount }, (_, i) => i + 1),
+    [lineCount],
+  );
 
   return (
     <div className={styles.container}>

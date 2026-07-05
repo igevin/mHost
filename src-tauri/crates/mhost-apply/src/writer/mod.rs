@@ -11,7 +11,6 @@ pub mod verification;
 mod tests;
 
 use mhost_core::{ApplyError, ApplyPlan, MhostError};
-use mhost_hosts::Parser;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -87,8 +86,9 @@ impl HostsWriter {
         // 1. Read current system hosts
         let current = fs::read_to_string(&self.hosts_path)?;
 
-        // 2. Detect mHost managed block
-        let _has_managed = Parser::extract_managed_block(&current).is_some();
+        // **fix (P-R7, issue #90)**: deleted `let _has_managed = ...` (computed
+        // but unused). `content::build_hosts_content` already detects the
+        // block internally via `extract_managed_block_bytes`.
 
         // 3. External modification detection (simplified for phase 0)
         //    -- skipped; will be enhanced in later phases.
@@ -127,6 +127,62 @@ impl HostsWriter {
                     .into());
                 }
                 // Verify rollback succeeded
+                let rolled_back = fs::read_to_string(&self.hosts_path)?;
+                if rolled_back != backup_content {
+                    return Err(ApplyError::VerificationFailed(
+                        "verify failed and rollback content mismatch".to_string(),
+                    )
+                    .into());
+                }
+            }
+            return Err(
+                ApplyError::VerificationFailed(format!("verify failed: {}", verify_err)).into(),
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Apply using caller-provided current hosts content.
+    ///
+    /// **fix (P-R8, issue #90)**: `apply` reads /etc/hosts internally. In the
+    /// typical apply path (`commands::apply_hosts` and friends) the caller
+    /// has ALREADY read /etc/hosts for plan generation. Reading again here
+    /// means each apply reads /etc/hosts twice.
+    ///
+    /// This variant lets the caller pass the already-read content, skipping
+    /// the second file read. Existing callers that don't pre-read (e.g.
+    /// single-shot tools) continue to use `apply`.
+    ///
+    /// `backup_required` mirrors `ApplyPlan::backup_required` — taken as a
+    /// separate param because the caller already destructured the plan.
+    pub fn apply_with_content(&self, plan: &ApplyPlan, current: &str) -> Result<(), MhostError> {
+        ensure_regular_file(&self.hosts_path)?;
+
+        let backup_path = if plan.backup_required {
+            Some(backup::create_backup(&self.backup_dir, current)?)
+        } else {
+            None
+        };
+
+        let new_content = content::build_hosts_content(current, plan);
+        self.atomic_write(&new_content)?;
+
+        if let Err(e) = self.platform.flush_dns_cache() {
+            log::warn!("DNS cache flush failed: {}", e);
+        }
+
+        if let Err(verify_err) = verification::verify(&new_content, plan) {
+            if let Some(ref backup) = backup_path {
+                log::warn!("Verification failed, rolling back...");
+                let backup_content = fs::read_to_string(backup)?;
+                if let Err(rollback_err) = self.atomic_write(&backup_content) {
+                    return Err(ApplyError::VerificationFailed(format!(
+                        "verify failed ({}), rollback also failed ({})",
+                        verify_err, rollback_err
+                    ))
+                    .into());
+                }
                 let rolled_back = fs::read_to_string(&self.hosts_path)?;
                 if rolled_back != backup_content {
                     return Err(ApplyError::VerificationFailed(

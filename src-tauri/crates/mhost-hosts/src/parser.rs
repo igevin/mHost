@@ -135,6 +135,50 @@ impl Parser {
         }
     }
 
+    /// Extract the byte range of the managed block (inclusive of the marker
+    /// lines themselves).
+    ///
+    /// **fix (P-R6, issue #90)**: `extract_managed_block` returns line
+    /// indices, which forces callers (e.g. `content::build_hosts_content`)
+    /// to walk the entire input again to convert to byte offsets. This
+    /// function returns byte offsets directly via a single `split_inclusive`
+    /// pass.
+    ///
+    /// Returns `Some((byte_start, byte_end))` where:
+    ///   - `byte_start` is the byte offset of the start-marker line
+    ///   - `byte_end` is the byte offset just past the end-marker line
+    ///     (including its trailing newline), so `&input[byte_end..]`
+    ///     continues at the line after the end marker
+    pub fn extract_managed_block_bytes(input: &str) -> Option<(usize, usize)> {
+        let mut start: Option<usize> = None;
+        let mut end: Option<usize> = None;
+        let mut pos: usize = 0;
+
+        for line in input.split_inclusive('\n') {
+            // Compare against the trimmed line content (strip CRLF / LF)
+            let trimmed = line
+                .trim_end_matches(['\n', '\r'])
+                .trim();
+            if trimmed == MANAGED_START {
+                if start.is_some() {
+                    return None; // Multiple start markers -> malformed
+                }
+                start = Some(pos);
+            } else if trimmed == MANAGED_END {
+                if end.is_some() {
+                    return None; // Multiple end markers -> malformed
+                }
+                end = Some(pos + line.len());
+            }
+            pos += line.len();
+        }
+
+        match (start, end) {
+            (Some(s), Some(e)) if s <= e => Some((s, e)),
+            _ => None,
+        }
+    }
+
     /// Extract the content between managed block markers (exclusive of markers).
     /// Returns `Some(content)` if a valid managed block exists, `None` otherwise.
     /// An empty block (start immediately followed by end) returns `Some("")`.
@@ -370,6 +414,60 @@ mod tests {
         let input =
             "# line 1\n# ---- mHost start ----\n127.0.0.1 x.com\n# ---- mHost end ----\n# line 5";
         assert_eq!(Parser::extract_managed_block(input), Some((1, 3)));
+    }
+
+    /// **fix (P-R6, issue #90)**: byte-based extraction returns byte offsets
+    /// directly, avoiding a second full-file scan from callers that need
+    /// to convert line indices to byte ranges.
+    #[test]
+    fn test_extract_managed_block_bytes() {
+        let input =
+            "# line 1\n# ---- mHost start ----\n127.0.0.1 x.com\n# ---- mHost end ----\n# line 5";
+        let (start, end) = Parser::extract_managed_block_bytes(input).expect("block exists");
+
+        // byte_start points at the '#' of start marker; slice ends at start of the rule line
+        let start_marker = "# ---- mHost start ----\n";
+        let end_marker = "# ---- mHost end ----\n";
+        assert_eq!(&input[start..start + start_marker.len()], start_marker);
+
+        // slice [start..end) covers both markers + the rule between them
+        assert_eq!(
+            &input[start..end],
+            format!("{start_marker}127.0.0.1 x.com\n{end_marker}")
+        );
+
+        // slice past byte_end continues at "# line 5"
+        assert_eq!(&input[end..], "# line 5");
+
+        // slice before byte_start is "# line 1\n"
+        assert_eq!(&input[..start], "# line 1\n");
+    }
+
+    /// byte-based extraction handles CRLF correctly (Windows / some editors
+    /// produce \r\n line endings).
+    #[test]
+    fn test_extract_managed_block_bytes_crlf() {
+        let input = "# hdr\r\n# ---- mHost start ----\r\n127.0.0.1 x.com\r\n# ---- mHost end ----\r\n# tail\r\n";
+        let (start, end) = Parser::extract_managed_block_bytes(input).expect("block exists");
+
+        // byte_end must point just past the \r\n after end marker
+        assert_eq!(input.as_bytes()[end - 2], b'\r');
+        assert_eq!(input.as_bytes()[end - 1], b'\n');
+        assert_eq!(&input[end..], "# tail\r\n");
+    }
+
+    /// byte-based extraction returns None for missing/malformed input.
+    #[test]
+    fn test_extract_managed_block_bytes_missing() {
+        assert_eq!(Parser::extract_managed_block_bytes("no markers"), None);
+        assert_eq!(
+            Parser::extract_managed_block_bytes("# only start\n# ---- mHost start ----\n"),
+            None
+        );
+        assert_eq!(
+            Parser::extract_managed_block_bytes("# only end\n# ---- mHost end ----\n"),
+            None
+        );
     }
 
     #[test]
