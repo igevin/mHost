@@ -132,15 +132,24 @@ impl DnsProxy {
     }
 
     /// 检查 shutdown signal 文件（mhost 写入）。
-    /// 返回 true 表示文件内容 != "running"，proxy 应做自管清理后退出。
+    /// 返回 true 表示文件内容明确 == "shutdown"，proxy 应做自管清理后退出。
     /// **fix（proxy self-cleanup）**：让 proxy 不依赖 SIGTERM（mhost 用户
     /// 态没法直接给 root 进程发信号），改用文件信号。
+    ///
+    /// **fix（B2 review）**：严格匹配 "shutdown"，而不是「非 running 就触发」。
+    /// 之前用 `content.trim() != "running"` 在 mhost 写入时（truncate → write_all
+    /// 之间）读到空字符串会误触发 shutdown。原子写入修了这问题；这里再加固
+    /// 一层：「空文件 = mhost 还没写完，不当作 shutdown 信号」。
     fn check_shutdown_signal(&self) -> bool {
         let Ok(content) = std::fs::read_to_string(PROXY_SHUTDOWN_SIGNAL_FILE) else {
             // 文件不在 = mhost 没在管（手动启 proxy 的情况）
             return false;
         };
-        content.trim() != "running"
+        if content.trim().is_empty() {
+            // 空文件 = mhost 刚 truncate 还没 write_all，不当 shutdown
+            return false;
+        }
+        content.trim() == "shutdown"
     }
 
     /// 以 root 身份恢复系统 DNS 到 original_dns，然后清理 signal 文件退出。
@@ -181,10 +190,14 @@ impl DnsProxy {
                 servers.clone()
             }
         );
-        match std::process::Command::new("sh")
+        // **fix（B1 review）**：用 tokio::process::Command 而不是 std::process。
+        // 同步 Command 会阻塞当前 tokio worker 线程；如果 runtime 是单线程
+        // 或线程池满载，proxy 的 recv_from 并发处理会被一起卡住。
+        match tokio::process::Command::new("sh")
             .arg("-c")
             .arg(&cmd)
             .output()
+            .await
         {
             Ok(out) if out.status.success() => {
                 eprintln!("[mhost-dns-proxy] system DNS restored");
@@ -245,8 +258,11 @@ impl DnsProxy {
         // 会让 receiver 立刻 resolve 为 Err，与 select! 的 biased
         // 语义冲突。统一走文件 signal 更简洁。
         let mut shutdown_poll = tokio::time::interval(SHUTDOWN_POLL_INTERVAL);
-        // 第一次 tick 立即触发（不需要等 1 秒）
-        shutdown_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // **fix（MINOR review）**：`tokio::time::interval` 默认首 tick 在
+        // SHUTDOWN_POLL_INTERVAL 之后。显式 await 一次让首 tick 立即触发，
+        // proxy 启动后能立刻检查一次 signal，而不是等满 1 秒。
+        // `MissedTickBehavior::Delay` 是 tokio 默认值，显式设置无意义，删掉。
+        shutdown_poll.tick().await;
         loop {
             tokio::select! {
                 biased;

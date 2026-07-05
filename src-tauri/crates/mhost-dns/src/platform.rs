@@ -263,15 +263,31 @@ networksetup -setdnsservers {interface} 127.0.0.1
 }
 
 /// 把 shutdown signal 文件写入指定内容，mode 0o666（world-writable）。
+///
+/// **fix（B2 review）**：用「写 tmp + atomic rename」避免 truncate → write_all
+/// 之间的竞态窗口。旧实现用 `OpenOptions::create().truncate()`，open 成功的
+/// 那一瞬文件就被清空；如果 proxy 恰好在 open 和 write_all 之间读
+/// `check_shutdown_signal`，会读到空字符串误触发 shutdown（之前 receiver
+/// 端把「非 running」都当 shutdown）。
+///
+/// 原子写流程：写 `<file>.tmp` → sync → rename 到目标。proxy 要么看到旧内容
+/// （"running"），要么看到新内容（"shutdown"），永远看不到中间空态。
 fn write_signal_file(content: &str) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true).mode(0o666);
-    let mut f = opts.open(PROXY_SHUTDOWN_SIGNAL_FILE)?;
-    f.write_all(content.as_bytes())?;
-    f.sync_all()?;
-    Ok(())
+    let tmp_path = format!("{}.tmp", PROXY_SHUTDOWN_SIGNAL_FILE);
+    {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o666);
+        let mut f = opts.open(&tmp_path)?;
+        f.write_all(content.as_bytes())?;
+        f.sync_all()?;
+    }
+    // atomic rename — POSIX 保证读者要么看到旧 inode（旧内容），要么看到新 inode（新内容）
+    std::fs::rename(&tmp_path, PROXY_SHUTDOWN_SIGNAL_FILE)
 }
 
 /// 在 macOS 上禁用 DNS 模式：
