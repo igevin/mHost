@@ -65,8 +65,17 @@ pub fn run() {
             // 硬退出场景（Tauri 2 RunEvent::ExitRequested 在这些场景
             // 下经常不触发）。在 Tauri 自己的 tokio runtime 里 spawn，
             // 与 RunEvent 钩子互不干扰，cleanup_dns_on_exit 内部幂等。
+            //
+            // fix (bug 3, Ctrl+C 不退出):
+            //   在某些 tao / Tauri 2 版本下，`handle.exit(0)` 不会真正
+            //   终止进程 —— 表现为「Ctrl+C 之后 app 还在」。
+            //   兜底：先尝试优雅退出，400ms 后若进程还活着，强退。
             let sig_app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
+                eprintln!(
+                    "[mHost] signal handler installed (pid={})",
+                    std::process::id()
+                );
                 #[cfg(unix)]
                 {
                     use tokio::signal::unix::{signal, SignalKind};
@@ -97,7 +106,15 @@ pub fn run() {
                             eprintln!("[mHost] DNS cleanup on signal failed: {}", e);
                         }
                     }
-                    sig_app_handle.exit(0);
+                    // 兜底 force-exit：handle.exit(0) 在某些 tao 版本下
+                    // 不真正终止进程。优雅退出 + 400ms 后强退。
+                    let graceful = sig_app_handle.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(400));
+                        eprintln!("[mHost] graceful exit timed out, force-exiting process");
+                        std::process::exit(0);
+                    });
+                    graceful.exit(0);
                 }
                 #[cfg(not(unix))]
                 {
@@ -155,6 +172,12 @@ pub fn run() {
                         eprintln!("[mHost] DNS cleanup on Tauri exit failed: {}", e);
                     }
                 }
+                // fix (bug 3): handle.exit(0) 在某些 tao 版本下不真正
+                // 终止进程。400ms 后若还活着就强退（与 Path B 一致）。
+                std::thread::spawn(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                    std::process::exit(0);
+                });
                 handle.exit(0);
             });
         }

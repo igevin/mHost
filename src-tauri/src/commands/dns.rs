@@ -34,7 +34,9 @@ pub async fn set_dns_mode(enabled: bool, state: State<'_, AppState>) -> Result<(
     if enabled {
         set_dns_mode_enable(&state).await
     } else {
-        set_dns_mode_disable(&state).await
+        // 用户点 Disable → 在场，可以弹 sudo。`interactive=true` 让
+        // proxy 死了 / 5s 超时分支用 osascript 兜底恢复。
+        set_dns_mode_disable(&state, true).await
     }
 }
 
@@ -112,7 +114,9 @@ async fn set_dns_mode_enable(state: &AppState) -> Result<(), MhostError> {
 
     if let Err(e) = manifest_save_result {
         // 尽力回滚：恢复系统 DNS + 停 server。
-        let restore_err = mhost_dns::platform::disable_dns_mode(&original);
+        // 用户刚接受了 enable 的 sudo 弹窗，回滚也用 interactive=true
+        // 让 proxy 死了时也能走 osascript 兜底（同样弹 sudo 框）。
+        let restore_err = mhost_dns::platform::disable_dns_mode(&original, true);
         let _ = server.stop().await;
         return Err(match restore_err {
             Ok(_) => e,
@@ -143,51 +147,37 @@ async fn set_dns_mode_enable(state: &AppState) -> Result<(), MhostError> {
 /// 停用 DNS 模式。
 ///
 /// 与启用对称：先持久化 manifest，再做实际 stop + restore 副作用。
-async fn set_dns_mode_disable(state: &AppState) -> Result<(), MhostError> {
+///
+/// `interactive=true`：用户从 UI 点的 Disable（在场），proxy 没恢复时
+/// 走 osascript 弹 sudo 兜底。
+/// `interactive=false`：app 退出清理（用户可能不在场），不弹 sudo，
+/// marker 保留给下次启动 `try_recover_dns` 走 `force_dns_restore_if_needed`。
+async fn set_dns_mode_disable(state: &AppState, interactive: bool) -> Result<(), MhostError> {
     // 1. 读取 in-memory original_dns（由 enable 路径写入）
-    let mut original = match state.original_dns.lock() {
+    let original = match state.original_dns.lock() {
         Ok(guard) => guard.clone(),
         Err(poisoned) => poisoned.into_inner().clone(),
     };
 
-    // 保护（fix: code review B3）：如果 state.original_dns 是空（v2.0
-    // legacy 升级后被 try_recover_dns 主动跳过；或 Pi-hole / dnsmasq /
-    // systemd-resolved 用户的真实 DNS 恰好含 127.0.0.1），不能简单拒绝。
-    // 先尝试读当前系统 DNS 作为恢复值：
-    //   - 如果非空且不含 127.0.0.1 / ::1 → 视为「用户在升级后修改过 DNS」，
-    //     用它作为恢复值（保守合理：用户已主动改过）
-    //   - 否则仍拒绝，避免把 127.0.0.1 永久写到 manifest
+    // fix (bug 1, disable-mode refuses on empty snapshot):
+    //   之前在 `state.original_dns` 为空 且 当前系统 DNS 含 127.0.0.1 时拒绝
+    //   disable。这是合法场景：用户当时系统 DNS 是空的（DHCP 没下发 /
+    //   用户手动清空），`get_system_dns()` 返回 [] 被写入 original；
+    //   现在系统 DNS 是 127.0.0.1 是 mhost proxy 自己在用。
+    //
+    //   proxy.rs::restore_dns_and_exit 走自己的恢复路径：读 original.txt，
+    //   空时生成 `networksetup -setdnsservers <iface> Empty`（DHCP 默认）。
+    //   所以空 `original` 是可恢复的；disable_dns_mode 拿到空 vec 也安全
+    //   （它只把 vec 传给 proxy，并通过 signal file 让 proxy 自管）。
+    //
+    //   此处只做日志，**不**返回错误。
     if original.is_empty() {
-        match mhost_dns::platform::get_system_dns() {
-            Ok(current) if !current.is_empty() => {
-                let looks_like_residue = current.iter().any(|s| s == "127.0.0.1" || s == "::1");
-                if !looks_like_residue {
-                    eprintln!(
-                        "[mHost] state.original_dns was empty; falling back to current \
-                         system DNS for disable: {:?}",
-                        current
-                    );
-                    original = current;
-                } else {
-                    return Err(MhostError::InvalidInput(
-                        "refusing to disable DNS: state.original_dns snapshot is empty \
-                         and current system DNS contains 127.0.0.1/::1 (likely mhost's \
-                         own proxy). Manually run `sudo networksetup -setdnsservers \
-                         <interface> Empty` to restore, then re-enable mhost DNS mode \
-                         once to refresh the snapshot."
-                            .to_string(),
-                    ));
-                }
-            }
-            Ok(_) | Err(_) => {
-                return Err(MhostError::InvalidInput(
-                    "refusing to disable DNS: state.original_dns snapshot is empty \
-                     and could not query system DNS. Re-enable DNS mode once to \
-                     refresh the snapshot."
-                        .to_string(),
-                ));
-            }
-        }
+        eprintln!(
+            "[mHost] set_dns_mode_disable: state.original_dns was empty (likely user \
+             enabled DNS mode while system DNS was DHCP-empty / manually cleared). \
+             Proxy will restore system DNS to DHCP default via `networksetup \
+             -setdnsservers <iface> Empty`."
+        );
     }
 
     // 2. **PERSIST MANIFEST FIRST** —— 把 dns_enabled 标 false，让
@@ -205,7 +195,7 @@ async fn set_dns_mode_disable(state: &AppState) -> Result<(), MhostError> {
     //    restore_dns 失败会让用户留在「系统 DNS 指向 127.0.0.1」状态，
     //    但 in-memory 状态已经标 false，下次启动会按 dns_enabled=false
     //    处理；这是可恢复的。
-    if let Err(e) = mhost_dns::platform::disable_dns_mode(&original) {
+    if let Err(e) = mhost_dns::platform::disable_dns_mode(&original, interactive) {
         // 已经成功写了 manifest 标 false，所以这里只用 InvalidInput
         // 提示用户「系统 DNS 没恢复成功，需要手动检查」。
         return Err(MhostError::InvalidInput(format!(
@@ -293,7 +283,9 @@ pub async fn cleanup_dns_on_exit(state: &AppState) -> Result<(), MhostError> {
     if !state.dns_enabled.load(Ordering::Relaxed) {
         return Ok(());
     }
-    set_dns_mode_disable(state).await
+    // 退出场景用户可能不在场 → interactive=false，不弹 sudo；
+    // 若 proxy 没恢复 DNS，marker 保留给下次启动 try_recover_dns 兜底。
+    set_dns_mode_disable(state, false).await
 }
 
 #[cfg(test)]
@@ -329,6 +321,47 @@ mod tests {
         // dns_enabled = false → cleanup 应直接返回 Ok
         let result = cleanup_dns_on_exit(&state).await;
         assert!(result.is_ok(), "DNS disabled → cleanup should be a no-op");
+    }
+
+    /// 回归测试（bug 1 + bug 4 fix）：
+    ///   - bug 1: 空 `original` 不应让 disable 报「refusing to disable」。
+    ///     proxy 会用 `networksetup -setdnsservers <iface> Empty` 兜底。
+    ///   - bug 4: exit cleanup（`interactive=false`）走到非 interactive
+    ///     + proxy 不在的分支，必须返回 `Err` 保留 marker，下次启动
+    ///     `try_recover_dns` 走 `force_dns_restore_if_needed` 兜底。
+    ///     如果返回 `Ok(())` 意味着系统 DNS 卡在 127.0.0.1。
+    #[tokio::test]
+    async fn test_set_dns_mode_disable_succeeds_with_empty_original_snapshot() {
+        let temp = TempDir::new().unwrap();
+        let storage = Arc::new(FileStorage::new(temp.path()))
+            as Arc<dyn mhost_storage::storage::Storage + Send + Sync>;
+        // seed manifest (set_dns_mode_disable 会 load_manifest，缺少会 Err)
+        storage
+            .save_manifest(&mhost_storage::manifest::Manifest::new(env!("CARGO_PKG_VERSION")))
+            .unwrap();
+        let state = AppState {
+            storage,
+            writer: Arc::new(HostsWriter::new()),
+            apply_lock: ApplyLock::new(),
+            snapshot_lock: ApplyLock::new(),
+            last_profile_ids: Mutex::new(Vec::new()),
+            dns_server: Arc::new(Mutex::new(None)),
+            dns_enabled: AtomicBool::new(true), // 假装启用 → cleanup 会走 disable 路径
+            original_dns: Mutex::new(Vec::new()), // 空 snapshot = bug 1 的触发条件
+            dns_lock: ApplyLock::new(),
+        };
+        // cleanup_dns_on_exit → set_dns_mode_disable(interactive=false)
+        //   - original 是空 vec → 只打印 warning（不返回 Err，bug 1 修复）
+        //   - manifest 写 dns_enabled=false → 走 disable_dns_mode
+        //   - 测试环境没有真 proxy + non-interactive → 保留 marker
+        //     + 返回 Err（bug 4 修复：不能谎报 Ok 让用户卡在 127.0.0.1）
+        let result = cleanup_dns_on_exit(&state).await;
+        assert!(
+            result.is_err(),
+            "proxy-dead exit cleanup should leave marker (Err) so next launch can \
+             force restore; got {:?}",
+            result
+        );
     }
 }
 

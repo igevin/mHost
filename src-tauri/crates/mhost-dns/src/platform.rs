@@ -12,6 +12,11 @@ const PROXY_ORIGINAL_DNS_FILE: &str = "/tmp/mhost-dns-original.txt";
 /// 写入时 mode 0o666（world-writable），mhost 是用户态也能写。
 const PROXY_SHUTDOWN_SIGNAL_FILE: &str = "/tmp/mhost-dns-shutdown.signal";
 
+/// Disable 路径的恢复标记：proxy 5s 内没退出 → 下次启动 mhost 会看到
+/// 这个标记并强制走 `force_dns_restore_if_needed` 兜底（写 Empty 给活跃
+/// 接口）。仅在确实出现 5s 超时时保留，正常路径会清理掉。
+const PROXY_DISABLE_RECOVERY_MARKER: &str = "/tmp/mhost-dns-disable-recovery.marker";
+
 /// 临时脚本名前缀（用于 osascript 提权）。
 const TEMP_SCRIPT_PREFIX: &str = "mhost-dns-";
 
@@ -217,15 +222,79 @@ fn write_signal_file(content: &str) -> std::io::Result<()> {
 ///   3. 等 proxy 退出（最多 5s）
 ///
 /// **fix（proxy self-cleanup）**：之前用 osascript 弹 sudo 框让 mhost
-/// 调 networksetup；退出时用户不在场，弹窗卡住或失败。改用文件信号 +
-/// proxy 自管，整个 disable 路径**不需要任何用户交互**。
+/// 在 macOS 上禁用 DNS 模式：
+///   1. 写 "shutdown" 到 signal 文件（用户态，不需要 root）
+///   2. proxy 轮询检测到，**自己以 root 身份**调 networksetup 恢复
+///      DNS，然后退出
+///   3. 等 proxy 退出（最多 5s）
+///   4. **interactive=true 且 proxy 未在 5s 内完成恢复**（timeout 或
+///      proxy 已经不存在）：以管理员身份自己调
+///      `networksetup -setdnsservers <iface> <original|Empty>` 兜底，
+///      匹配 enable 路径的 sudo 行为。
 ///
-/// 注：参数 `servers` 仍然保留 API 兼容，但实际不再用于恢复（恢复
-/// 走 proxy 自己的 original.txt）。如果 proxy 死了没读到 signal，
-/// 留下 `servers` 用来诊断 + 写入 manifest。
-pub fn disable_dns_mode(servers: &[String]) -> Result<(), PlatformError> {
+/// **fix（proxy self-cleanup）**：disable 不再默认弹 sudo；先让 proxy
+/// 自管，proxy 真不行时再让 mhost 用户态走 osascript。
+///
+/// **fix（bug 2，DNS 恢复兜底）**：
+/// - 调用一开始就写恢复标记 `PROXY_DISABLE_RECOVERY_MARKER`，**先于**
+///   任何 proxy 交互。如果后续没成功恢复（proxy timeout / 死了 /
+///   interactive 路径的 osascript 也失败），下次启动时 `try_recover_dns`
+///   看到标记会调 `force_dns_restore_if_needed` 强退。
+/// - marker **只在 DNS 确实恢复成功**时被删除；任何恢复失败的分支都
+///   保留 marker + 返回 Err。
+///
+/// **fix（disable-time sudo fallback，interactive）**：
+/// - interactive=true（UI 调用）：proxy 没在 5s 内恢复、或 proxy 已死，
+///   都用 `run_with_privileges` 走 `networksetup -setdnsservers` 兜底，
+///   让用户当场看到 sudo 框 + DNS 恢复成功。`servers` 为空时传 `Empty`。
+/// - interactive=false（退出清理）：**不弹 sudo 框**（用户可能不在场），
+///   保留 marker + 返回 Err，让下次启动 try_recover_dns 走
+///   `force_dns_restore_if_needed`。
+///
+/// 注：参数 `servers` 保留 API 兼容：proxy 用自己的 original.txt 恢复，
+/// 但 interactive 分支用 `servers` 决定要恢复成什么 IP（proxy 不在的
+/// 兜底场景）。
+pub fn disable_dns_mode(servers: &[String], interactive: bool) -> Result<(), PlatformError> {
+    // 0. 写恢复标记（用户态、不需 root）。如果本次 disable 任何分支没
+    //    成功恢复 DNS，marker 会保留 → 下次启动 try_recover_dns 看到标记
+    //    会调 force_dns_restore_if_needed 强退。
+    write_recovery_marker()
+        .map_err(|e| PlatformError::RestoreDns(format!("write recovery marker: {}", e)))?;
+
+    // 内部 helper：interactive 分支用 osascript 兜底恢复系统 DNS。
+    // 只负责调 networksetup；marker / 临时文件的清理由调用方根据
+    // 成功 / 失败统一处理。
+    fn osascript_restore(servers: &[String]) -> Result<(), PlatformError> {
+        let interface = get_active_network_interface()?;
+        validate_interface_name(&interface)?;
+        let target = if servers.is_empty() {
+            "Empty".to_string()
+        } else {
+            servers.join(" ")
+        };
+        let script_body = format!(
+            "networksetup -setdnsservers {iface} {target}",
+            iface = interface,
+            target = target
+        );
+        let out = run_with_privileges(&script_body).map_err(|e| {
+            PlatformError::RestoreDns(format!(
+                "invoke osascript for disable-time restore: {}",
+                e
+            ))
+        })?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(PlatformError::RestoreDns(format!(
+                "disable-time restore failed: {}",
+                stderr
+            )));
+        }
+        Ok(())
+    }
+
     // 1. 检查 proxy 是否真的在跑 —— 如果在跑，写 signal 让它自管；
-    //    如果不在（已崩溃/没启过），跳过 signal 写（无人会读）。
+    //    如果不在（已崩溃/没启过），跳到分支 2。
     if let Some(proxy_pid) = read_proxy_pid() {
         // proxy 存在（PID 文件可读）。检查进程是否还活。
         let alive = unsafe { libc::kill(proxy_pid as libc::pid_t, 0) == 0 };
@@ -241,38 +310,118 @@ pub fn disable_dns_mode(servers: &[String]) -> Result<(), PlatformError> {
             while std::time::Instant::now() < deadline {
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 if unsafe { libc::kill(proxy_pid as libc::pid_t, 0) != 0 } {
-                    // proxy 已退出
+                    // proxy 已退出 → restore_dns_and_exit 已恢复系统 DNS。
+                    // 全部临时文件 + marker 都可以清掉。
                     let _ = std::fs::remove_file(PROXY_PID_FILE);
                     let _ = std::fs::remove_file(PROXY_ORIGINAL_DNS_FILE);
                     // signal 文件由 proxy 自己清理（restore_dns_and_exit）
+                    let _ = std::fs::remove_file(PROXY_DISABLE_RECOVERY_MARKER);
                     return Ok(());
                 }
             }
+            // 5s 超时：proxy 还活着但没自管恢复
             eprintln!(
-                "[mHost] dns mode disable: proxy did not exit within {}s; \
-                 falling back to next start recovery",
+                "[mHost] dns mode disable: proxy did not exit within {}s",
                 PROXY_SHUTDOWN_TIMEOUT_SECS
             );
-            // 超时：DNS 可能仍未恢复。下次启动 try_recover_dns 兜底。
-            return Ok(());
+            if interactive {
+                // UI 路径：弹 sudo 让用户当场恢复
+                if osascript_restore(servers).is_ok() {
+                    // 兜底成功：清全部文件 + marker
+                    let _ = std::fs::remove_file(PROXY_PID_FILE);
+                    let _ = std::fs::remove_file(PROXY_ORIGINAL_DNS_FILE);
+                    let _ = std::fs::remove_file(PROXY_SHUTDOWN_SIGNAL_FILE);
+                    let _ = std::fs::remove_file(PROXY_DISABLE_RECOVERY_MARKER);
+                    return Ok(());
+                }
+                // 兜底也失败：保留 marker 给下次启动 try_recover_dns
+            }
+            // 非 interactive 或 interactive 兜底失败：保留 marker
+            return Err(PlatformError::RestoreDns(format!(
+                "dns proxy did not exit within {}s; recovery marker left at {}",
+                PROXY_SHUTDOWN_TIMEOUT_SECS, PROXY_DISABLE_RECOVERY_MARKER
+            )));
         }
-        // PID 文件存在但进程死了：清理
+        // PID 文件存在但进程死了：清理 PID 文件（marker 保留到下面）
         let _ = std::fs::remove_file(PROXY_PID_FILE);
     }
 
-    // proxy 不在（早死 / 从没启过）：直接清理文件
-    let _ = std::fs::remove_file(PROXY_PID_FILE);
+    // 2. proxy 不在（早死 / 从没启过 / PID 死后到这里）
+    if interactive {
+        // UI 路径：proxy 都没在，肯定没人恢复 DNS，必须 sudo 兜底
+        if osascript_restore(servers).is_ok() {
+            let _ = std::fs::remove_file(PROXY_ORIGINAL_DNS_FILE);
+            let _ = std::fs::remove_file(PROXY_SHUTDOWN_SIGNAL_FILE);
+            let _ = std::fs::remove_file(PROXY_DISABLE_RECOVERY_MARKER);
+            return Ok(());
+        }
+        // 兜底失败：保留 marker 给下次启动 try_recover_dns
+        return Err(PlatformError::RestoreDns(format!(
+            "proxy not running and osascript restore failed; recovery marker left at {}",
+            PROXY_DISABLE_RECOVERY_MARKER
+        )));
+    }
+    // 非 interactive（exit 清理）：proxy 没恢复 DNS → marker 必须保留，
+    // 下次启动 try_recover_dns 看到会调 force_dns_restore_if_needed。
+    // 清理 PID / original / signal 文件（PID 已经在上面清掉了）。
     let _ = std::fs::remove_file(PROXY_ORIGINAL_DNS_FILE);
     let _ = std::fs::remove_file(PROXY_SHUTDOWN_SIGNAL_FILE);
-    // `servers` 参数保留给 caller 日志用；如果 caller 想给用户提示
-    // 「预期恢复到 X」可以 log 出来
     if !servers.is_empty() {
         eprintln!(
-            "[mHost] dns mode disable: proxy not running; \
-             intended restore target was {:?}",
+            "[mHost] dns mode disable (exit cleanup): proxy not running; \
+             intended restore target was {:?}; recovery marker preserved for next launch.",
             servers
         );
     }
+    Err(PlatformError::RestoreDns(format!(
+        "proxy not running; recovery marker left at {} for next-launch force restore",
+        PROXY_DISABLE_RECOVERY_MARKER
+    )))
+}
+
+/// 写恢复标记文件（"pending"，0o666，sync 落盘）。
+///
+/// 用途：disable 启动时先于任何 proxy 交互写下；正常路径会删掉；
+/// 5s 超时 / 进程被 kill 等异常路径会保留 → 下次启动 `try_recover_dns`
+/// 看到标记，调 `force_dns_restore_if_needed` 兜底。
+fn write_recovery_marker() -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o666);
+    let mut f = opts.open(PROXY_DISABLE_RECOVERY_MARKER)?;
+    f.write_all(b"pending")?;
+    f.sync_all()?;
+    Ok(())
+}
+
+/// 上次退出没成功恢复时，下一次启动的兜底：以 admin 身份调用
+/// `networksetup -setdnsservers <iface> Empty`（DHCP），删 marker。
+/// 仅在「确实出现恢复失败」时被调用 —— osascript sudo 弹窗
+/// 只在异常路径出现，正常退出零成本。
+pub fn force_dns_restore_if_needed() -> Result<(), PlatformError> {
+    let interface = get_active_network_interface()?;
+    validate_interface_name(&interface)?;
+
+    let script_body = format!(
+        "networksetup -setdnsservers {iface} Empty",
+        iface = interface
+    );
+    let out = run_with_privileges(&script_body).map_err(|e| {
+        PlatformError::RestoreDns(format!("invoke osascript for force restore: {}", e))
+    })?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(PlatformError::RestoreDns(format!(
+            "force restore failed: {}",
+            stderr
+        )));
+    }
+
+    let _ = std::fs::remove_file(PROXY_DISABLE_RECOVERY_MARKER);
     Ok(())
 }
 

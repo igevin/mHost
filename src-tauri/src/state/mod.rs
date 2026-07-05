@@ -144,6 +144,21 @@ impl AppState {
     async fn try_recover_dns(
         storage: Arc<dyn Storage + Send + Sync>,
     ) -> Result<(mhost_dns::DnsServer, Vec<String>), MhostError> {
+        // fix (bug 2): 如果上次退出时留下恢复标记，proxy 之前没正常退出。
+        // 强制再走一次 `networksetup -setdnsservers <iface> Empty`（DHCP 默认）
+        // 兜底，文件清理掉。osascript sudo 弹窗**只在异常路径**出现：
+        // 正常退出 proxy 自己恢复了，标记文件被删，到不了这里。
+        #[cfg(target_os = "macos")]
+        {
+            if std::path::Path::new("/tmp/mhost-dns-disable-recovery.marker").exists() {
+                eprintln!(
+                    "[mHost] try_recover_dns: disable recovery marker found, forcing restore"
+                );
+                if let Err(e) = mhost_dns::platform::force_dns_restore_if_needed() {
+                    eprintln!("[mHost] force restore failed: {}", e);
+                }
+            }
+        }
         // 1. 优先从 manifest.original_dns 恢复（避免再次问系统 —— 系统 DNS
         //    此时已经是 127.0.0.1，问到的也是错的）。若 manifest 没保存则
         //    fallback 到 get_system_dns。
