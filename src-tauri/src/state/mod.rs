@@ -59,6 +59,16 @@ impl AppState {
         #[cfg(target_os = "macos")]
         mhost_dns::platform::cleanup_stale_proxy();
 
+        // 清理上次退出残留的 signal / original DNS 文件（fix: proxy
+        // self-cleanup）。如果 mhost 上次崩溃 / kill -9 没机会清理，
+        // 这些 /tmp 文件会留下。下次启动时让下次启用的 enable 路径
+        // 重新写（覆盖）。
+        #[cfg(target_os = "macos")]
+        {
+            let _ = std::fs::remove_file("/tmp/mhost-dns-original.txt");
+            let _ = std::fs::remove_file("/tmp/mhost-dns-shutdown.signal");
+        }
+
         // v1 → v2 数据迁移：失败记录错误日志，不阻断应用启动
         if let Ok(fs) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             migrate_v1_to_v2(&file_storage)
@@ -134,11 +144,26 @@ impl AppState {
     async fn try_recover_dns(
         storage: Arc<dyn Storage + Send + Sync>,
     ) -> Result<(mhost_dns::DnsServer, Vec<String>), MhostError> {
+        // fix (bug 2): 如果上次退出时留下恢复标记，proxy 之前没正常退出。
+        // 强制再走一次 `networksetup -setdnsservers <iface> Empty`（DHCP 默认）
+        // 兜底，文件清理掉。osascript sudo 弹窗**只在异常路径**出现：
+        // 正常退出 proxy 自己恢复了，标记文件被删，到不了这里。
+        #[cfg(target_os = "macos")]
+        {
+            if std::path::Path::new("/tmp/mhost-dns-disable-recovery.marker").exists() {
+                eprintln!(
+                    "[mHost] try_recover_dns: disable recovery marker found, forcing restore"
+                );
+                if let Err(e) = mhost_dns::platform::force_dns_restore_if_needed() {
+                    eprintln!("[mHost] force restore failed: {}", e);
+                }
+            }
+        }
         // 1. 优先从 manifest.original_dns 恢复（避免再次问系统 —— 系统 DNS
         //    此时已经是 127.0.0.1，问到的也是错的）。若 manifest 没保存则
         //    fallback 到 get_system_dns。
         let manifest = storage.load_manifest()?;
-        let original: Vec<String> = if let Some(saved) = &manifest.original_dns {
+        let mut original: Vec<String> = if let Some(saved) = &manifest.original_dns {
             saved.clone()
         } else {
             // legacy 路径：v2.0 没把 original_dns 持久化到 manifest。
@@ -151,7 +176,13 @@ impl AppState {
         // 1.1 保护性回写：只把「不像 v2.0 残留」的 original 回写。
         //   - 如果 original 为空（用户在 v2.0 后没配过系统 DNS）→ 写空 vec
         //   - 如果 original 含 127.0.0.1（v2.0 留下来的伪 original）→
-        //     不回写，避免永久污染 manifest
+        //     之前是直接跳过；但这样 state.original_dns 是空、退出时
+        //     cleanup 路径无法恢复（Pi-hole fallback 会拒绝）→ 用户
+        //     永远卡在 127.0.0.1。
+        //     修复：用 vec!["Empty"] 作为兜底（DHCP default），
+        //     这样退出时 networksetup -setdnsservers <iface> Empty 能
+        //     恢复 DHCP，Pi-hole 用户（少数场景）会丢失 Pi-hole 但
+        //     至少能用互联网。
         let mut manifest = manifest;
         if manifest.original_dns.is_none() {
             let looks_like_v2_residue = original.iter().any(|s| s == "127.0.0.1" || s == "::1");
@@ -165,14 +196,27 @@ impl AppState {
                 }
             } else {
                 eprintln!(
-                    "[mHost] Skipped persisting original_dns after recovery: \
-                     system DNS contains 127.0.0.1, likely v2.0 residue"
+                    "[mHost] Detected v2.0 residue (system DNS has 127.0.0.1); \
+                     using DHCP default as fallback original for safe cleanup"
                 );
+                // 兜底：把 ["Empty"] 持久化，作为退出恢复目标。
+                original = vec!["Empty".to_string()];
+                manifest.original_dns = Some(original.clone());
+                if let Err(e) = storage.save_manifest(&manifest) {
+                    eprintln!("[mHost] Failed to persist fallback original_dns: {}", e);
+                }
             }
         }
 
-        // 2. 创建 DnsConfig 和 DnsServer（upstream 使用系统原始 DNS 兜底）
-        let upstream = if original.is_empty() {
+        // 2. 创建 DnsConfig 和 DnsServer（upstream = 透传 original）
+        //
+        // 注意：original 可能等于 vec!["Empty"]（v2.0 残留兜底 placeholder）
+        // 或 == [8.8.8.8, 1.1.1.1]（get_system_dns Tier 3 兜底）。这两种都
+        // 是「系统没真 DNS」的场景，upstream 用它们可以让 proxy 至少能解
+        // 公网域名（用 [8.8.8.8, 1.1.1.1]）或后续手动配置（用 ["Empty"]）。
+        let upstream = if original == vec!["Empty".to_string()] {
+            // v2.0 残留 placeholder —— get_system_dns 现在已经能拿到真实
+            // DHCP DNS（Tier 2），所以这条分支基本不会进；以防万一还是 fallback。
             vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()]
         } else {
             original.clone()
@@ -200,7 +244,9 @@ impl AppState {
             .map_err(|e| MhostError::InvalidInput(format!("dns server start failed: {}", e)))?;
 
         // 5. 启动 dns-proxy 并设置系统 DNS
-        if let Err(e) = mhost_dns::platform::enable_dns_mode(dns_port) {
+        // fix（proxy self-cleanup）：把 original 传给 proxy，让它
+        // 退出时能自己恢复系统 DNS。
+        if let Err(e) = mhost_dns::platform::enable_dns_mode(dns_port, &original) {
             let _ = server.stop().await;
             return Err(MhostError::InvalidInput(format!(
                 "Failed to enable DNS mode: {}",
