@@ -202,11 +202,22 @@ export const fetchSnapshotsAtom = atom(null, async (_get, set) => {
   }
 });
 
+/** Maximum snapshots to keep in the in-memory list. Older snapshots beyond
+ * this cap are dropped from the atom (but the on-disk files in mhost's
+ * storage backend are kept — see apply logic for cleanup if needed).
+ *
+ * **fix (P-F5, issue #90)**: was unbounded; long-running mHost installs
+ * would accumulate hundreds of snapshots and SnapshotPanel would render
+ * every one. 50 is a reasonable cap — covers ~weeks of frequent backups
+ * without dominating UI list render cost.
+ */
+const MAX_SNAPSHOTS = 50;
+
 export const saveSnapshotAtom = atom(null, async (get, set, { name, description }: { name: string; description?: string }) => {
   set(snapshotErrorAtom, null);
   try {
     const meta = await saveSnapshot(name, description);
-    set(snapshotsAtom, [meta, ...get(snapshotsAtom)]);
+    set(snapshotsAtom, [meta, ...get(snapshotsAtom)].slice(0, MAX_SNAPSHOTS));
   } catch (err) {
     set(snapshotErrorAtom, extractErrorMessage(err));
     throw err;
