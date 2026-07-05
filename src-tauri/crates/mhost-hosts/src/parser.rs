@@ -156,9 +156,7 @@ impl Parser {
 
         for line in input.split_inclusive('\n') {
             // Compare against the trimmed line content (strip CRLF / LF)
-            let trimmed = line
-                .trim_end_matches(['\n', '\r'])
-                .trim();
+            let trimmed = line.trim_end_matches(['\n', '\r']).trim();
             if trimmed == MANAGED_START {
                 if start.is_some() {
                     return None; // Multiple start markers -> malformed
