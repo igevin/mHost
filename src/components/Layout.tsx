@@ -11,7 +11,6 @@ import {
   closeApplyConfirmAtom,
   rollbackHostsActionAtom,
 } from "../stores/profiles";
-import StatusBar from "./StatusBar";
 import ManagementDrawer from "./ManagementDrawer";
 import ApplyConfirmDialog from "./ApplyConfirmDialog";
 import Sidebar, { type NavItem } from "./Sidebar";
@@ -197,8 +196,6 @@ function Layout() {
         )}
         <Outlet />
       </main>
-
-      <StatusBar />
 
       <ManagementDrawer
         open={showManagement}
