@@ -2,6 +2,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use mhost_core::OriginalDns;
+
 // ---------------------------------------------------------------------------
 // Runtime directory + signal/state file paths
 // ---------------------------------------------------------------------------
@@ -192,38 +194,66 @@ fn invoke_osascript(path: &std::path::Path) -> Result<std::process::Output, Stri
         .map_err(|e| format!("osascript failed: {}", e))
 }
 
-/// 获取当前系统 DNS 服务器列表。
+/// **fix（disabling-after-network-switch）**：capture the user's original DNS
+/// configuration **type**, separating "user managed" from "DHCP/empty".
 ///
-/// **Fallback chain**（fix: 不要用公共 DNS 覆盖用户实际的 DNS）：
-/// 1. `networksetup -getdnsservers <port>` —— 用户在 System Settings
-///    里手动配的 DNS。如果非空，直接返回（这是最权威的）。
-/// 2. `ipconfig getoption <device> domain_name_server` —— DHCP 推的
-///    DNS。`networksetup` 在「DHCP 推但用户没在 System Settings 里
-///    确认」的情况下会返回空，但系统实际在用 DHCP DNS。这一步能补上。
-/// 3. `[8.8.8.8, 1.1.1.1]` —— 上面两个都空时的兜底（系统真没配 DNS，
-///    例如离线/air-gapped）。调用方看到这种返回值应该打 warning log。
-pub fn get_system_dns() -> Result<Vec<String>, PlatformError> {
+/// Rules:
+/// 1. `networksetup -getdnsservers <port>`  returns non-empty
+///    → `Manual(list)` — user explicitly configured DNS in System Settings.
+/// 2. Tier 1 empty (DHCP-pushed but user hasn't confirmed in System Settings,
+///    or true empty / air-gapped) → `DhcpEmpty`.
+///
+/// Tier 3 (the public `[8.8.8.8, 1.1.1.1]` resolver fallback) is **never**
+/// returned here — it's not a "user state", it's a fallback for the resolver
+/// upstream. See `get_upstream_resolvers` for that purpose.
+pub fn capture_dns_state() -> Result<OriginalDns, PlatformError> {
     let port = get_active_network_interface()?;
 
-    // Tier 1: 用户手动配的 DNS（在 System Settings 里能看到）
+    // Tier 1: 用户在 System Settings 里手动配的 DNS。
     if let Ok(servers) = networksetup_get_dns(&port) {
         if !servers.is_empty() {
-            return Ok(servers);
+            return Ok(OriginalDns::Manual(servers));
         }
     }
 
-    // Tier 2: DHCP 推的 DNS（networksetup 看不到，但系统实际在用）
+    // Tier 1 空：用户没手动配（系统用 DHCP 默认或真没 DNS）。
+    // Tier 2 的具体 IP 值不写进 snapshot —— 不替用户决定配置。
+    Ok(OriginalDns::DhcpEmpty)
+}
+
+/// 获取当前系统上游 DNS resolver 列表（Tlier 1 → Tier 2 → 公共 fallback）。
+///
+/// 用作 `DnsServer.upstream` 的初始值（以及 mid-session 刷新目标），
+/// **不**用来决定 restore target（restore 用 `OriginalDns`，见
+/// `OriginalDns::restore_argv`）。
+///
+/// Tier 3 兜底 `[8.8.8.8, 1.1.1.1]` 是上游 resolver 的最后一道防线，
+/// 绝不是「用户原本的状态」——调用方 get_upstream_resolvers 的调用者应
+/// 在返回为 Tier 3 时打 warning log。
+pub fn get_upstream_resolvers() -> Vec<String> {
+    let port = match get_active_network_interface() {
+        Ok(p) => p,
+        Err(_) => return tier3_fallback(),
+    };
+
+    if let Ok(servers) = networksetup_get_dns(&port) {
+        if !servers.is_empty() {
+            return servers;
+        }
+    }
     if let Some(device) = get_active_network_device() {
         if let Ok(servers) = ipconfig_get_dns(&device) {
             if !servers.is_empty() {
-                return Ok(servers);
+                return servers;
             }
         }
     }
+    tier3_fallback()
+}
 
-    // Tier 3: 上面两个都空 → 系统真没 DNS。返回公共 resolver 兜底，
-    // 调用方（commands/dns.rs）会打 warning 告诉用户。
-    Ok(vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()])
+/// Tier 3 fallback list. Public so tests can compare against it.
+pub fn tier3_fallback() -> Vec<String> {
+    vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()]
 }
 
 /// `networksetup -getdnsservers <port>` —— 用户在 System Settings 里
@@ -287,7 +317,7 @@ fn get_active_network_device() -> Option<String> {
 ///
 /// **fix（H1, issue #90）**：从 /tmp 迁移到 ~/Library/Application Support/mHost/.runtime/，
 /// mode 从 0o666 改 0o600。/tmp 旧路径在 cleanup_stale_proxy 启动时清理。
-pub fn enable_dns_mode(dns_port: u16, original: &[String]) -> Result<(), PlatformError> {
+pub fn enable_dns_mode(dns_port: u16, original: &OriginalDns) -> Result<(), PlatformError> {
     let interface = get_active_network_interface()?;
     validate_interface_name(&interface)?;
 
@@ -297,10 +327,19 @@ pub fn enable_dns_mode(dns_port: u16, original: &[String]) -> Result<(), Platfor
 
     // 1. 写 original DNS 文件（用户态，不需要 root）
     //    proxy 启动时读这个文件，退出时按它恢复系统 DNS
+    //
+    // 关键：仅当用户**手动配过** DNS（Manual）才写文件。
+    // DhcpEmpty 不写 → proxy 启动时 read_original_dns_from_file 返回空 →
+    // restore 走 Empty 分支（不会泄漏 DHCP 推的 IP）。
     let original_path = original_dns_file();
-    let original_content = original.join("\n");
-    write_atomic_0600(&original_path, original_content.as_bytes())
-        .map_err(|e| PlatformError::SetDns(format!("write original dns file: {}", e)))?;
+    if let OriginalDns::Manual(servers) = original {
+        let original_content = servers.join("\n");
+        write_atomic_0600(&original_path, original_content.as_bytes())
+            .map_err(|e| PlatformError::SetDns(format!("write original dns file: {}", e)))?;
+    } else {
+        // DhcpEmpty: 确保没有残留的旧文件（从前一次 Manual enable 留下来）。
+        let _ = std::fs::remove_file(&original_path);
+    }
 
     // 2. 写 signal 文件（0o600 owner-only；proxy 是同 uid 提权启动，能写）
     write_signal_file(&shutdown_signal_file(), "running")
@@ -418,7 +457,7 @@ pub(crate) fn write_signal_file(path: &Path, content: &str) -> std::io::Result<(
 /// 注：参数 `servers` 保留 API 兼容：proxy 用自己的 original.txt 恢复，
 /// 但 interactive 分支用 `servers` 决定要恢复成什么 IP（proxy 不在的
 /// 兜底场景）。
-pub fn disable_dns_mode(servers: &[String], interactive: bool) -> Result<(), PlatformError> {
+pub fn disable_dns_mode(original: &OriginalDns, interactive: bool) -> Result<(), PlatformError> {
     // 0. 写恢复标记（用户态、不需 root）。如果本次 disable 任何分支没
     //    成功恢复 DNS，marker 会保留 → 下次启动 try_recover_dns 看到标记
     //    会调 force_dns_restore_if_needed 强退。
@@ -431,13 +470,14 @@ pub fn disable_dns_mode(servers: &[String], interactive: bool) -> Result<(), Pla
     // 内部 helper：interactive 分支用 osascript 兜底恢复系统 DNS。
     // 只负责调 networksetup；marker / 临时文件的清理由调用方根据
     // 成功 / 失败统一处理。
-    fn osascript_restore(servers: &[String]) -> Result<(), PlatformError> {
+    fn osascript_restore(original: &OriginalDns) -> Result<(), PlatformError> {
         let interface = get_active_network_interface()?;
         validate_interface_name(&interface)?;
-        let target = if servers.is_empty() {
+        let argv = original.restore_argv();
+        let target = if argv.len() == 1 && argv[0] == "Empty" {
             "Empty".to_string()
         } else {
-            servers.join(" ")
+            argv.join(" ")
         };
         let script_body = format!(
             "networksetup -setdnsservers {iface} {target}",
@@ -490,7 +530,7 @@ pub fn disable_dns_mode(servers: &[String], interactive: bool) -> Result<(), Pla
             );
             if interactive {
                 // UI 路径：弹 sudo 让用户当场恢复
-                if osascript_restore(servers).is_ok() {
+                if osascript_restore(original).is_ok() {
                     // 兜底成功：清全部文件 + marker
                     let _ = std::fs::remove_file(proxy_pid_file());
                     let _ = std::fs::remove_file(original_dns_file());
@@ -514,7 +554,7 @@ pub fn disable_dns_mode(servers: &[String], interactive: bool) -> Result<(), Pla
     // 2. proxy 不在（早死 / 从没启过 / PID 死后到这里）
     if interactive {
         // UI 路径：proxy 都没在，肯定没人恢复 DNS，必须 sudo 兜底
-        if osascript_restore(servers).is_ok() {
+        if osascript_restore(original).is_ok() {
             let _ = std::fs::remove_file(original_dns_file());
             let _ = std::fs::remove_file(shutdown_signal_file());
             let _ = std::fs::remove_file(disable_recovery_marker_file());
@@ -531,13 +571,11 @@ pub fn disable_dns_mode(servers: &[String], interactive: bool) -> Result<(), Pla
     // 清理 PID / original / signal 文件（PID 已经在上面清掉了）。
     let _ = std::fs::remove_file(original_dns_file());
     let _ = std::fs::remove_file(shutdown_signal_file());
-    if !servers.is_empty() {
-        eprintln!(
-            "[mHost] dns mode disable (exit cleanup): proxy not running; \
-             intended restore target was {:?}; recovery marker preserved for next launch.",
-            servers
-        );
-    }
+    eprintln!(
+        "[mHost] dns mode disable (exit cleanup): proxy not running; \
+         restore target was {:?}; recovery marker preserved for next launch.",
+        original.restore_argv()
+    );
     Err(PlatformError::RestoreDns(format!(
         "proxy not running; recovery marker left at {} for next-launch force restore",
         disable_recovery_marker_file().display()

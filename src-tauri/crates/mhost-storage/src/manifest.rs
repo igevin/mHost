@@ -1,7 +1,7 @@
 //! Manifest management
 
 use chrono::{DateTime, Utc};
-use mhost_core::StorageError;
+use mhost_core::{OriginalDns, StorageError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -21,10 +21,20 @@ pub struct Manifest {
     /// DNS 模式全局开关状态（v2 新增，旧版本兼容为 None）
     #[serde(default)]
     pub dns_enabled: Option<bool>,
-    /// 启用 DNS 模式前的系统 DNS 服务器列表（v2.1 新增，用于崩溃/强杀后恢复）。
-    /// 旧版本或全新安装时为 `None`。
+    /// 启用 DNS 模式前的系统 DNS 配置快照（v2.1 新增，**fix：v2.2 从
+    /// `Vec<String>` 改为 `OriginalDns` 语义枚举**，用于崩溃/强杀后恢复）。
+    ///
+    /// - `Some(Manual(servers))`：用户在 System Settings 里手动配的；
+    ///   disable 时回写这些 servers。
+    /// - `Some(DhcpEmpty)`：用户没手动配；disable 时回写 `Empty`（DHCP
+    ///   default），避免跨网络切换时泄漏上次抓到的 DHCP 推的 IP。
+    /// - `None`：全新安装或 DNS mode 尚未启用。
+    ///
+    /// 反序列化兼容两种磁盘格式（详见 `OriginalDns::deserialize` 的迁移规则）：
+    ///   - 新格式 `{"kind":"manual","servers":[...]}` 或 `{"kind":"dhcp_empty"}`
+    ///   - 旧格式裸 `Vec<String>`（v2.0 / v2.1）
     #[serde(default)]
-    pub original_dns: Option<Vec<String>>,
+    pub original_dns: Option<OriginalDns>,
 }
 
 impl Manifest {
@@ -103,7 +113,10 @@ mod tests {
                     app_version: "1.2.0".to_string(),
                     updated_at: "2024-07-01T00:00:00+00:00".parse().unwrap(),
                     dns_enabled: Some(true),
-                    original_dns: Some(vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()]),
+                    original_dns: Some(OriginalDns::Manual(vec![
+                        "8.8.8.8".to_string(),
+                        "1.1.1.1".to_string(),
+                    ])),
                 },
             ),
         ];
@@ -181,5 +194,93 @@ mod tests {
             manifest.original_dns, None,
             "v2.0 不含 original_dns 字段时应默认为 None"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // OriginalDns 迁移测试（fix: disabling-after-network-switch）
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_manifest_original_dns_legacy_vec_non_empty_migrates_to_manual() {
+        // v2.0/v2.1 旧格式：裸 Vec<String> 且非空 → Manual(vec)
+        let legacy_json = r#"{
+            "version": 2,
+            "app_version": "1.0.0",
+            "updated_at": "2024-01-01T00:00:00Z",
+            "dns_enabled": true,
+            "original_dns": ["8.8.8.8", "1.1.1.1"]
+        }"#;
+        let manifest: Manifest = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(
+            manifest.original_dns,
+            Some(OriginalDns::Manual(vec![
+                "8.8.8.8".to_string(),
+                "1.1.1.1".to_string()
+            ]))
+        );
+    }
+
+    #[test]
+    fn test_manifest_original_dns_legacy_vec_empty_migrates_to_dhcp_empty() {
+        let legacy_json = r#"{
+            "version": 2,
+            "app_version": "1.0.0",
+            "updated_at": "2024-01-01T00:00:00Z",
+            "dns_enabled": true,
+            "original_dns": []
+        }"#;
+        let manifest: Manifest = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(manifest.original_dns, Some(OriginalDns::DhcpEmpty));
+    }
+
+    #[test]
+    fn test_manifest_original_dns_legacy_vec_placeholder_migrates_to_dhcp_empty() {
+        // v2.0 的 ["Empty"] 残留 placeholder → DhcpEmpty
+        let legacy_json = r#"{
+            "version": 2,
+            "app_version": "1.0.0",
+            "updated_at": "2024-01-01T00:00:00Z",
+            "dns_enabled": true,
+            "original_dns": ["Empty"]
+        }"#;
+        let manifest: Manifest = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(manifest.original_dns, Some(OriginalDns::DhcpEmpty));
+    }
+
+    #[test]
+    fn test_manifest_original_dns_new_tagged_manual_roundtrip() {
+        let manifest = Manifest {
+            version: 2,
+            app_version: "2.2.0".to_string(),
+            updated_at: "2024-07-01T00:00:00+00:00".parse().unwrap(),
+            dns_enabled: Some(true),
+            original_dns: Some(OriginalDns::Manual(vec!["9.9.9.9".to_string()])),
+        };
+        let json = serde_json::to_string(&manifest).unwrap();
+        let restored: Manifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            restored.original_dns,
+            Some(OriginalDns::Manual(vec!["9.9.9.9".to_string()]))
+        );
+        // 验证是新 tagged 格式
+        assert!(json.contains("\"kind\":\"manual\""));
+        assert!(json.contains("\"servers\":[\"9.9.9.9\"]"));
+    }
+
+    #[test]
+    fn test_manifest_original_dns_new_tagged_dhcp_empty_roundtrip() {
+        let manifest = Manifest {
+            version: 2,
+            app_version: "2.2.0".to_string(),
+            updated_at: "2024-07-01T00:00:00+00:00".parse().unwrap(),
+            dns_enabled: Some(true),
+            original_dns: Some(OriginalDns::DhcpEmpty),
+        };
+        let json = serde_json::to_string(&manifest).unwrap();
+        let restored: Manifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.original_dns, Some(OriginalDns::DhcpEmpty));
+        // 验证 DhcpEmpty 序列化不会泄漏空 servers 数组
+        assert!(!json.contains("\"servers\""));
+        assert!(json.contains("\"kind\":\"dhcp_empty\""));
     }
 }

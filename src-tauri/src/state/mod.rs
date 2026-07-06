@@ -1,5 +1,5 @@
 use mhost_apply::writer::HostsWriter;
-use mhost_core::{MhostError, ProfileMode};
+use mhost_core::{MhostError, OriginalDns, ProfileMode};
 use mhost_storage::migration::migrate_v1_to_v2;
 use mhost_storage::storage::{FileStorage, Storage};
 use std::sync::atomic::AtomicBool;
@@ -46,7 +46,12 @@ pub struct AppState {
     // DNS 相关
     pub dns_server: Arc<Mutex<Option<mhost_dns::DnsServer>>>,
     pub dns_enabled: AtomicBool,
-    pub original_dns: Mutex<Vec<String>>,
+    /// 启用 DNS 模式时捕获的 snapshot（语义版本）。
+    /// **fix（disabling-after-network-switch）**：原 `Vec<String>` 没有
+    /// 「manual vs DHCP」的区分，导致 disable 时把 DHCP 推的 IP 错误
+    /// 回写到系统 DNS。现在用 `OriginalDns` 区分，DhcpEmpty 写 Empty
+    /// （= DHCP default）。
+    pub original_dns: Mutex<OriginalDns>,
     /// 串行化 DNS 模式切换操作。
     pub dns_lock: ApplyLock,
 }
@@ -96,7 +101,7 @@ impl AppState {
         };
         let mut dns_enabled = manifest.dns_enabled.unwrap_or(false);
         let mut dns_server_opt: Option<mhost_dns::DnsServer> = None;
-        let mut original_dns = Vec::new();
+        let mut original_dns = OriginalDns::DhcpEmpty;
 
         // 如果上次退出时 DNS 处于启用状态，尝试自动恢复 DNS 服务
         if dns_enabled {
@@ -143,7 +148,7 @@ impl AppState {
     /// 返回 (DnsServer, original_dns) 若成功。
     async fn try_recover_dns(
         storage: Arc<dyn Storage + Send + Sync>,
-    ) -> Result<(mhost_dns::DnsServer, Vec<String>), MhostError> {
+    ) -> Result<(mhost_dns::DnsServer, OriginalDns), MhostError> {
         // fix (bug 2): 如果上次退出时留下恢复标记，proxy 之前没正常退出。
         // 强制再走一次 `networksetup -setdnsservers <iface> Empty`（DHCP 默认）
         // 兜底，文件清理掉。osascript sudo 弹窗**只在异常路径**出现：
@@ -161,70 +166,46 @@ impl AppState {
         }
         // 1. 优先从 manifest.original_dns 恢复（避免再次问系统 —— 系统 DNS
         //    此时已经是 127.0.0.1，问到的也是错的）。若 manifest 没保存则
-        //    fallback 到 get_system_dns。
-        let manifest = storage.load_manifest()?;
-        let mut original: Vec<String> = if let Some(saved) = &manifest.original_dns {
-            saved.clone()
-        } else {
-            // legacy 路径：v2.0 没把 original_dns 持久化到 manifest。
-            // 系统 DNS 此时大概率是 127.0.0.1（v2.0 写过的），
-            // 不能把 127.0.0.1 当作「原始值」回写。
-            mhost_dns::platform::get_system_dns()
-                .map_err(|e| MhostError::InvalidInput(format!("get system dns failed: {}", e)))?
+        //    fallback 到 DhcpEmpty（v2.0 没持久化，安全兜底：让 disable 写
+        //    Empty 而不是错误的 [127.0.0.1]）。
+        let mut manifest = storage.load_manifest()?;
+        let original: OriginalDns = match manifest.original_dns.clone() {
+            Some(saved) => saved,
+            None => {
+                eprintln!(
+                    "[mHost] try_recover_dns: manifest.original_dns is None; \
+                     treating as DhcpEmpty (legacy v2.0 residue). \
+                     Will not write 127.0.0.1 back as the user's original."
+                );
+                OriginalDns::DhcpEmpty
+            }
         };
 
-        // 1.1 保护性回写：只把「不像 v2.0 残留」的 original 回写。
-        //   - 如果 original 为空（用户在 v2.0 后没配过系统 DNS）→ 写空 vec
-        //   - 如果 original 含 127.0.0.1（v2.0 留下来的伪 original）→
-        //     之前是直接跳过；但这样 state.original_dns 是空、退出时
-        //     cleanup 路径无法恢复（Pi-hole fallback 会拒绝）→ 用户
-        //     永远卡在 127.0.0.1。
-        //     修复：用 vec!["Empty"] 作为兜底（DHCP default），
-        //     这样退出时 networksetup -setdnsservers <iface> Empty 能
-        //     恢复 DHCP，Pi-hole 用户（少数场景）会丢失 Pi-hole 但
-        //     至少能用互联网。
-        let mut manifest = manifest;
+        // 1.1 persist back：把 typed value 写回 manifest，下次启动就有值。
         if manifest.original_dns.is_none() {
-            let looks_like_v2_residue = original.iter().any(|s| s == "127.0.0.1" || s == "::1");
-            if !looks_like_v2_residue {
-                manifest.original_dns = Some(original.clone());
-                if let Err(e) = storage.save_manifest(&manifest) {
-                    eprintln!(
-                        "[mHost] Failed to persist original_dns after recovery: {}",
-                        e
-                    );
-                }
-            } else {
+            manifest.original_dns = Some(original.clone());
+            if let Err(e) = storage.save_manifest(&manifest) {
                 eprintln!(
-                    "[mHost] Detected v2.0 residue (system DNS has 127.0.0.1); \
-                     using DHCP default as fallback original for safe cleanup"
+                    "[mHost] Failed to persist original_dns after recovery: {}",
+                    e
                 );
-                // 兜底：把 ["Empty"] 持久化，作为退出恢复目标。
-                original = vec!["Empty".to_string()];
-                manifest.original_dns = Some(original.clone());
-                if let Err(e) = storage.save_manifest(&manifest) {
-                    eprintln!("[mHost] Failed to persist fallback original_dns: {}", e);
-                }
             }
         }
 
-        // 2. 创建 DnsConfig 和 DnsServer（upstream = 透传 original）
-        //
-        // 注意：original 可能等于 vec!["Empty"]（v2.0 残留兜底 placeholder）
-        // 或 == [8.8.8.8, 1.1.1.1]（get_system_dns Tier 3 兜底）。这两种都
-        // 是「系统没真 DNS」的场景，upstream 用它们可以让 proxy 至少能解
-        // 公网域名（用 [8.8.8.8, 1.1.1.1]）或后续手动配置（用 ["Empty"]）。
-        let upstream = if original == vec!["Empty".to_string()] {
-            // v2.0 残留 placeholder —— get_system_dns 现在已经能拿到真实
-            // DHCP DNS（Tier 2），所以这条分支基本不会进；以防万一还是 fallback。
-            vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()]
-        } else {
-            original.clone()
+        // 2. 创建 DnsConfig 和 DnsServer
+        //   - Manual(servers)  → upstream = servers（用户在 System Settings
+        //     里配的，session 内不变）；refresh_upstream = false
+        //   - DhcpEmpty        → upstream = 当前系统能解析到的（Tier 3 兜底
+        //     包括在内），refresh_upstream = true（mid-session 跨网络会自动跟随）
+        let (upstream, refresh_upstream) = match &original {
+            OriginalDns::Manual(servers) => (servers.clone(), false),
+            OriginalDns::DhcpEmpty => (mhost_dns::platform::get_upstream_resolvers(), true),
         };
         let dns_port = mhost_dns::MHOST_DNS_PORT;
         let config = mhost_dns::DnsConfig {
             port: dns_port,
             upstream,
+            refresh_upstream,
             ..Default::default()
         };
         let server = mhost_dns::DnsServer::new(config)

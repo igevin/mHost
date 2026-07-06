@@ -259,6 +259,108 @@ pub struct SnapshotMeta {
 }
 
 // ---------------------------------------------------------------------------
+// OriginalDns
+// ---------------------------------------------------------------------------
+
+/// Snapshot of the user's original DNS configuration captured at enable time.
+///
+/// Distinguishes *user-managed* DNS from *DHCP/empty* so that disable restores
+/// exactly what the user had — not values that DHCP happens to have pushed at
+/// the moment of capture. Concretely:
+///
+/// - `Manual(servers)` — user had DNS set in *System Settings* (`networksetup`
+///   returned a non-empty list). Restore writes those servers back.
+/// - `DhcpEmpty`       — user had nothing manually configured (Tier 1 empty);
+///   the system was relying on DHCP defaults or had no DNS at all. Restore
+///   writes `Empty` (DHCP default) to avoid leaking a captured DHCP-pushed
+///   value across a network switch.
+///
+/// Tier 3 (`[8.8.8.8, 1.1.1.1]`) — the last-resort public-DNS fallback used
+/// exclusively as the `DnsServer` upstream resolver — is *never* represented
+/// here. The separation between this type and `get_upstream_resolvers()`
+/// makes that enforceable by construction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OriginalDns {
+    Manual(Vec<String>),
+    DhcpEmpty,
+}
+
+impl OriginalDns {
+    /// Args to pass to `networksetup -setdnsservers <iface> ...` on restore.
+    /// DhcpEmpty → `["Empty"]` (= DHCP default).
+    pub fn restore_argv(&self) -> Vec<String> {
+        match self {
+            Self::Manual(s) => s.clone(),
+            Self::DhcpEmpty => vec!["Empty".to_string()],
+        }
+    }
+
+    /// Was this captured state a user-managed DNS config (vs DHCP/empty)?
+    pub fn is_manual(&self) -> bool {
+        matches!(self, Self::Manual(_))
+    }
+}
+
+/// Wire format:
+///   `Manual(s)`  → `{"kind":"manual","servers":[...]}`
+///   `DhcpEmpty`  → `{"kind":"dhcp_empty"}`
+///
+/// Hand-written (not `#[derive(Serialize)]`) so DhcpEmpty has no `servers` field.
+impl Serialize for OriginalDns {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        match self {
+            Self::Manual(servers) => {
+                let mut s = ser.serialize_struct("OriginalDns", 2)?;
+                s.serialize_field("kind", "manual")?;
+                s.serialize_field("servers", servers)?;
+                s.end()
+            }
+            Self::DhcpEmpty => {
+                let mut s = ser.serialize_struct("OriginalDns", 1)?;
+                s.serialize_field("kind", "dhcp_empty")?;
+                s.end()
+            }
+        }
+    }
+}
+
+/// Accepts BOTH the new tagged form AND the legacy bare `Vec<String>`
+/// (used in pre-v2.1 manifests). Migration rules:
+///   - `{"kind":"manual","servers":[...]}` → Manual
+///   - `{"kind":"dhcp_empty"}`               → DhcpEmpty
+///   - `[]`                                  → DhcpEmpty
+///   - `["Empty"]`                           → DhcpEmpty (v2.0 placeholder)
+///   - `["1.1.1.1", ...]`                    → Manual(vec)
+impl<'de> Deserialize<'de> for OriginalDns {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Tagged(Tagged),
+            Legacy(Vec<String>),
+        }
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum Tagged {
+            Manual { servers: Vec<String> },
+            DhcpEmpty,
+        }
+        match Repr::deserialize(de)? {
+            Repr::Tagged(Tagged::Manual { servers }) => Ok(OriginalDns::Manual(servers)),
+            Repr::Tagged(Tagged::DhcpEmpty) => Ok(OriginalDns::DhcpEmpty),
+            Repr::Legacy(vec) => {
+                if vec.is_empty() || vec.iter().any(|s| s == "Empty") {
+                    Ok(OriginalDns::DhcpEmpty)
+                } else {
+                    Ok(OriginalDns::Manual(vec))
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // DnsStatus
 // ---------------------------------------------------------------------------
 
@@ -267,10 +369,10 @@ pub struct DnsStatus {
     pub running: bool,
     pub port: u16,
     pub upstream: Vec<String>,
-    /// Enable 时捕获的系统 DNS 快照（disable 时会还原）。
-    /// 来自 `state.original_dns`：可能是用户手动配的（networksetup）、
-    /// DHCP 推的（ipconfig）、或空（系统真没 DNS）。
-    pub original_dns: Vec<String>,
+    /// Enable 时捕获的系统 DNS 快照（disable 时按语义还原）。
+    /// 详见 `OriginalDns`；`Manual(servers)` 回写 server 列表，
+    /// `DhcpEmpty` 回写 `Empty`（DHCP 默认）。
+    pub original_dns: OriginalDns,
     pub rule_count: usize,
     pub cache_capacity: usize,
 }
@@ -578,5 +680,96 @@ mod tests {
         assert!(restored.added.is_empty());
         assert!(restored.removed.is_empty());
         assert!(restored.unchanged.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // OriginalDns tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_original_dns_manual_serde_roundtrip() {
+        let orig = OriginalDns::Manual(vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()]);
+        let json = serde_json::to_string(&orig).unwrap();
+        assert!(json.contains("\"kind\":\"manual\""));
+        assert!(json.contains("\"servers\":[\"8.8.8.8\",\"1.1.1.1\"]"));
+        let restored: OriginalDns = serde_json::from_str(&json).unwrap();
+        assert_eq!(orig, restored);
+    }
+
+    #[test]
+    fn test_original_dns_dhcp_empty_serde_roundtrip() {
+        let orig = OriginalDns::DhcpEmpty;
+        let json = serde_json::to_string(&orig).unwrap();
+        assert_eq!(json, r#"{"kind":"dhcp_empty"}"#);
+        let restored: OriginalDns = serde_json::from_str(&json).unwrap();
+        assert_eq!(orig, restored);
+    }
+
+    #[test]
+    fn test_original_dns_dhcp_empty_has_no_servers_field() {
+        // 反向断言：wire 格式不能泄漏空的 servers 数组。
+        let json = serde_json::to_string(&OriginalDns::DhcpEmpty).unwrap();
+        assert!(
+            !json.contains("servers"),
+            "DhcpEmpty 序列化不应出现 servers 字段，得到: {json}"
+        );
+    }
+
+    #[test]
+    fn test_original_dns_restore_argv() {
+        assert_eq!(
+            OriginalDns::Manual(vec!["8.8.8.8".to_string()]).restore_argv(),
+            vec!["8.8.8.8".to_string()]
+        );
+        assert_eq!(
+            OriginalDns::DhcpEmpty.restore_argv(),
+            vec!["Empty".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_original_dns_is_manual() {
+        assert!(OriginalDns::Manual(vec!["1.1.1.1".to_string()]).is_manual());
+        assert!(!OriginalDns::DhcpEmpty.is_manual());
+    }
+
+    #[test]
+    fn test_original_dns_deserialize_legacy_vec_non_empty() {
+        // 旧 manifest 形态：裸 Vec<String>。
+        let legacy_json = r#"["192.168.1.1", "8.8.8.8"]"#;
+        let restored: OriginalDns = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(
+            restored,
+            OriginalDns::Manual(vec!["192.168.1.1".to_string(), "8.8.8.8".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_original_dns_deserialize_legacy_vec_empty() {
+        let legacy_json = r#"[]"#;
+        let restored: OriginalDns = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(restored, OriginalDns::DhcpEmpty);
+    }
+
+    #[test]
+    fn test_original_dns_deserialize_legacy_vec_placeholder() {
+        // v2.0 的 `["Empty"]` 占位符 → DhcpEmpty。
+        let legacy_json = r#"["Empty"]"#;
+        let restored: OriginalDns = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(restored, OriginalDns::DhcpEmpty);
+    }
+
+    #[test]
+    fn test_original_dns_deserialize_tagged_manual() {
+        let json = r#"{"kind":"manual","servers":["1.1.1.1"]}"#;
+        let restored: OriginalDns = serde_json::from_str(json).unwrap();
+        assert_eq!(restored, OriginalDns::Manual(vec!["1.1.1.1".to_string()]));
+    }
+
+    #[test]
+    fn test_original_dns_deserialize_tagged_dhcp_empty() {
+        let json = r#"{"kind":"dhcp_empty"}"#;
+        let restored: OriginalDns = serde_json::from_str(json).unwrap();
+        assert_eq!(restored, OriginalDns::DhcpEmpty);
     }
 }
