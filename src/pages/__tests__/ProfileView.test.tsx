@@ -364,4 +364,88 @@ describe("ProfileView", () => {
 
     expect(mockSetProfileEnabled).toHaveBeenCalledWith("d1", true);
   });
+
+  // ---- DNS mode rule editor tests (fix: missing Edit button + RuleEditor) ----
+
+  it("renders Edit button alongside Edit Info for DNS profile", () => {
+    const profile = makeProfile({ id: "d1", mode: "dns" });
+    const store = getDefaultStore();
+    store.set(dnsProfilesAtom, [profile]);
+
+    renderWithRouter("/dns-profiles/d1");
+
+    // 两个按钮独立存在
+    expect(screen.getByText("Edit")).toBeInTheDocument();
+    expect(screen.getByText("Edit Info")).toBeInTheDocument();
+  });
+
+  it("shows Read-only badge by default for DNS profile (RuleEditor mounted)", () => {
+    const profile = makeProfile({ id: "d1", mode: "dns" });
+    const store = getDefaultStore();
+    store.set(dnsProfilesAtom, [profile]);
+
+    renderWithRouter("/dns-profiles/d1");
+
+    expect(screen.getByText("Read-only")).toBeInTheDocument();
+  });
+
+  it("switches to Editing mode when Edit is clicked (DNS)", () => {
+    const profile = makeProfile({ id: "d1", mode: "dns" });
+    const store = getDefaultStore();
+    store.set(dnsProfilesAtom, [profile]);
+
+    renderWithRouter("/dns-profiles/d1");
+
+    fireEvent.click(screen.getByText("Edit"));
+
+    expect(screen.getByText("Editing")).toBeInTheDocument();
+    expect(screen.queryByText("Read-only")).not.toBeInTheDocument();
+  });
+
+  it("shows Cancel and Save buttons (and hides Edit Info) when DNS editing", () => {
+    const profile = makeProfile({ id: "d1", mode: "dns" });
+    const store = getDefaultStore();
+    store.set(dnsProfilesAtom, [profile]);
+
+    renderWithRouter("/dns-profiles/d1");
+
+    fireEvent.click(screen.getByText("Edit"));
+
+    expect(screen.getByText("Cancel")).toBeInTheDocument();
+    expect(screen.getByText("Save")).toBeInTheDocument();
+    // 进入编辑模式后 Edit 和 Edit Info 都不再显示
+    expect(screen.queryByText("Edit")).not.toBeInTheDocument();
+    expect(screen.queryByText("Edit Info")).not.toBeInTheDocument();
+  });
+
+  it("disables Save button initially in DNS editing mode (no changes yet)", () => {
+    const profile = makeProfile({ id: "d1", mode: "dns" });
+    const store = getDefaultStore();
+    store.set(dnsProfilesAtom, [profile]);
+
+    renderWithRouter("/dns-profiles/d1");
+
+    fireEvent.click(screen.getByText("Edit"));
+
+    const saveButton = screen.getByText("Save");
+    expect(saveButton).toBeDisabled();
+  });
+
+  it("returns to Read-only when Cancel is clicked in DNS editing mode", () => {
+    const profile = makeProfile({ id: "d1", mode: "dns" });
+    const store = getDefaultStore();
+    store.set(dnsProfilesAtom, [profile]);
+
+    renderWithRouter("/dns-profiles/d1");
+
+    fireEvent.click(screen.getByText("Edit"));
+    expect(screen.getByText("Editing")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByText("Cancel"));
+
+    expect(screen.getByText("Read-only")).toBeInTheDocument();
+    expect(screen.queryByText("Editing")).not.toBeInTheDocument();
+    expect(screen.getByText("Edit")).toBeInTheDocument();
+    expect(screen.getByText("Edit Info")).toBeInTheDocument();
+  });
 });

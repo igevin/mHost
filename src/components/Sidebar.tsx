@@ -15,6 +15,7 @@ import {
 import { extractErrorMessage } from "../lib/error";
 import { useWebKitPointerDown } from "../hooks/useWebKitPointerDown";
 import CreateProfileDialog from "./CreateProfileDialog";
+import StatusBar from "./StatusBar";
 import styles from "./Layout.module.css";
 
 interface NavItem {
@@ -227,6 +228,13 @@ function Sidebar({ toolNavItems, onOpenManagement }: SidebarProps) {
           )}
         </nav>
       </div>
+
+      {/*
+       * sidebarSpacer 推 StatusBar 到 sidebar 底部。
+       * sidebar 是 column-direction flex；spacer 拿剩余高度让 StatusBar 贴在最下方。
+       */}
+      <div className={styles.sidebarSpacer} />
+      <StatusBar />
     </aside>
   );
 }
