@@ -2,7 +2,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use hickory_proto::op::{Header, Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::rdata::A;
@@ -11,7 +11,7 @@ use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
 use hickory_resolver::config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts};
 use hickory_resolver::TokioAsyncResolver;
 use lru::LruCache;
-use parking_lot::Mutex as PlMutex;
+use parking_lot::{Mutex as PlMutex, RwLock as PlRwLock};
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 
@@ -42,6 +42,13 @@ const UDP_BUF_SIZE: usize = 4096;
 /// DNS 响应缓存条目：记录列表 + 过期时间。
 type CacheEntry = (Vec<Record>, Instant);
 
+/// 后台上游刷新任务的间隔。
+///
+/// **fix（disabling-after-network-switch）**：DhcpEmpty snapshot 启用
+/// refresh_upstream 时，每 `UPSTREAM_REFRESH_INTERVAL` 重新解析一次上游；
+/// 变化才 hot-swap，不变化是 no-op。
+const UPSTREAM_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
 /// DNS 服务核心。
 /// TODO: TCP 监听支持计划在后续迭代中添加。
 pub struct DnsServer {
@@ -50,11 +57,23 @@ pub struct DnsServer {
     running: AtomicBool,
     shutdown_tx: Mutex<Option<tokio::sync::mpsc::Sender<()>>>,
     server_handle: Mutex<Option<JoinHandle<Result<(), DnsError>>>>,
-    /// Upstream resolver。`TokioAsyncResolver` 内部已用 Arc，无需外层 Mutex。
+    /// Upstream resolver。`TokioAsyncResolver` 内部已用 Arc，外层用
+    /// `parking_lot::RwLock<Arc<TokioAsyncResolver>>` 允许 hot-swap。
+    ///
     /// **fix (P-R14, issue #90)**: 之前是 `std::sync::Mutex<TokioAsyncResolver>`，
     /// 每次 `start()` 加锁 + clone 才能 spawn。新代码直接 Arc 持有，
     /// 每查询零锁开销。
-    resolver: Arc<TokioAsyncResolver>,
+    ///
+    /// **fix（disabling-after-network-switch）**：外层 RwLock 让后台上游
+    /// 刷新 task 可以重建并替换内部 Arc；查询路径仅取一次读锁 + clone
+    /// 内层 Arc（原子 ref bump），不影响热路径。
+    resolver: Arc<PlRwLock<Arc<TokioAsyncResolver>>>,
+    /// UI 看到的上游列表（`get_dns_status`）。后台上游刷新 task 同步更新。
+    current_upstream: Arc<PlRwLock<Vec<String>>>,
+    /// 后台 refresh task 句柄（`refresh_upstream=true` 时存在）。
+    refresh_handle: Mutex<Option<JoinHandle<()>>>,
+    /// 后台 refresh task 的 shutdown 通知。`stop()` 时 notify 一发即退出 loop。
+    refresh_shutdown: Arc<tokio::sync::Notify>,
     /// 响应缓存：key="name|record_type"（`Box<str>`），value=(records, expires_at)。
     ///
     /// **fix (P-R1, P-R3, issue #90)**:
@@ -77,13 +96,17 @@ impl DnsServer {
         });
         let cache_size = NonZeroUsize::new(config.cache_size.max(1))
             .expect("cache_size is always > 0 due to .max(1)");
+        let initial_upstream = config.upstream.clone();
         Ok(Self {
             config,
             rule_engine: Arc::new(RuleEngine::new()),
             running: AtomicBool::new(false),
             shutdown_tx: Mutex::new(None),
             server_handle: Mutex::new(None),
-            resolver: Arc::new(resolver),
+            resolver: Arc::new(PlRwLock::new(Arc::new(resolver))),
+            current_upstream: Arc::new(PlRwLock::new(initial_upstream)),
+            refresh_handle: Mutex::new(None),
+            refresh_shutdown: Arc::new(tokio::sync::Notify::new()),
             cache: Arc::new(PlMutex::new(LruCache::new(cache_size))),
         })
     }
@@ -131,7 +154,10 @@ impl DnsServer {
         let rule_engine = self.rule_engine.clone();
         // **fix (P-R14, issue #90)**: TokioAsyncResolver 内部已用 Arc；
         // 这里只做一次 Arc clone 传给 spawn，每查询零锁。
-        let resolver = Arc::clone(&self.resolver);
+        //
+        // **fix（disabling-after-network-switch）**：resolver 在 RwLock 里，
+        // 取读锁 + clone 内层 Arc（原子 ref bump），让后台上游刷新能 hot-swap。
+        let resolver = self.resolver.read().clone();
         let cache = self.cache.clone();
 
         let handle = tokio::spawn(async move {
@@ -195,11 +221,51 @@ impl DnsServer {
             }
         }
 
+        // **fix（disabling-after-network-switch）**：DhcpEmpty snapshot 时
+        // 启动后台上游刷新。Manual snapshot 时不启动 —— 用户配的就是意图。
+        if self.config.refresh_upstream {
+            let resolver = Arc::clone(&self.resolver);
+            let current_upstream = Arc::clone(&self.current_upstream);
+            let refresh_shutdown = Arc::clone(&self.refresh_shutdown);
+            let timeout_ms = self.config.timeout_ms;
+            let handle = tokio::spawn(async move {
+                run_upstream_refresh_loop(resolver, current_upstream, timeout_ms, refresh_shutdown)
+                    .await;
+            });
+            match self.refresh_handle.lock() {
+                Ok(mut guard) => *guard = Some(handle),
+                Err(poisoned) => {
+                    let mut guard = poisoned.into_inner();
+                    *guard = Some(handle);
+                }
+            }
+            tracing::info!(
+                "DNS server: upstream auto-refresh enabled (interval = {:?})",
+                UPSTREAM_REFRESH_INTERVAL
+            );
+        }
+
         Ok(())
     }
 
     /// 优雅停止 DNS 服务。
     pub async fn stop(&self) -> Result<(), DnsError> {
+        // **fix（disabling-after-network-switch）**：先停后台上游刷新 task，
+        // 避免它在 stop 过程中还在 swap resolver。
+        self.refresh_shutdown.notify_waiters();
+        let rh = {
+            match self.refresh_handle.lock() {
+                Ok(mut guard) => guard.take(),
+                Err(poisoned) => {
+                    let mut guard = poisoned.into_inner();
+                    guard.take()
+                }
+            }
+        };
+        if let Some(h) = rh {
+            let _ = h.await;
+        }
+
         let tx = {
             match self.shutdown_tx.lock() {
                 Ok(mut guard) => guard.take(),
@@ -249,9 +315,12 @@ impl DnsServer {
         self.config.port
     }
 
-    /// 返回上游 DNS 服务器列表。
-    pub fn upstream(&self) -> &[String] {
-        &self.config.upstream
+    /// 返回当前生效的上游 DNS 服务器列表。
+    ///
+    /// 当 `config.refresh_upstream=true` 时，session 内被后台上游刷新
+    /// task 替换过；这里返回的是实时值，不一定是 `config.upstream`。
+    pub fn upstream(&self) -> Vec<String> {
+        self.current_upstream.read().clone()
     }
 
     /// 返回缓存容量（实际 LRU 大小，已对 0 做 min 1 处理）。
@@ -270,13 +339,24 @@ impl DnsServer {
     pub fn rule_engine_for_test(&self) -> Arc<crate::resolver::RuleEngine> {
         Arc::clone(&self.rule_engine)
     }
+
+    /// 测试用：直接给一个上游列表，模拟 refresh 完成，写入
+    /// `current_upstream` 和 resolver 槽。完整跑一遍「build_resolver +
+    /// hot-swap」逻辑，不依赖 `platform::get_upstream_resolvers`。
+    #[doc(hidden)]
+    pub fn set_upstream_for_test(&self, new_upstream: Vec<String>) -> Result<(), DnsError> {
+        let new_resolver = build_resolver(&new_upstream, self.config.timeout_ms)?;
+        *self.resolver.write() = Arc::new(new_resolver);
+        *self.current_upstream.write() = new_upstream;
+        Ok(())
+    }
 }
 
 /// 处理单个 DNS 请求，返回编码后的响应数据。
 async fn handle_dns_request(
     request_data: &[u8],
     rule_engine: &RuleEngine,
-    resolver: &TokioAsyncResolver,
+    resolver: &Arc<TokioAsyncResolver>,
     cache: &Arc<PlMutex<LruCache<Box<str>, CacheEntry>>>,
 ) -> Option<Vec<u8>> {
     let request = match Message::from_bytes(request_data) {
@@ -485,7 +565,7 @@ async fn handle_address_query(
     name: &Name,
     qtype: RecordType,
     rule_engine: &RuleEngine,
-    resolver: &TokioAsyncResolver,
+    resolver: &Arc<TokioAsyncResolver>,
 ) -> QueryResult {
     // 1. 优先匹配本地规则
     if let Some(ip) = rule_engine.resolve(name_str) {
@@ -532,7 +612,7 @@ enum QueryError {
 async fn resolve_upstream_typed(
     domain: &str,
     qtype: RecordType,
-    resolver: &TokioAsyncResolver,
+    resolver: &Arc<TokioAsyncResolver>,
 ) -> Result<(Record, u32), QueryError> {
     let lookup = resolver
         .lookup(domain, qtype)
@@ -567,6 +647,62 @@ fn build_resolver(upstream: &[String], timeout_ms: u64) -> Result<TokioAsyncReso
         let mut opts = ResolverOpts::default();
         opts.timeout = std::time::Duration::from_millis(timeout_ms);
         Ok(TokioAsyncResolver::tokio(config, opts))
+    }
+}
+
+/// **fix（disabling-after-network-switch）**：DhcpEmpty snapshot 启用的
+/// 后台上游刷新循环。每 `UPSTREAM_REFRESH_INTERVAL` 调用一次
+/// `platform::get_upstream_resolvers()`，对比当前上游；**仅在变化时**
+/// 重建 resolver 并 hot-swap 通过 `RwLock::write`。
+///
+/// Manual snapshot 不进这里（`start()` 判断 `config.refresh_upstream`）。
+async fn run_upstream_refresh_loop(
+    resolver: Arc<PlRwLock<Arc<TokioAsyncResolver>>>,
+    current_upstream: Arc<PlRwLock<Vec<String>>>,
+    timeout_ms: u64,
+    refresh_shutdown: Arc<tokio::sync::Notify>,
+) {
+    let mut ticker = tokio::time::interval(UPSTREAM_REFRESH_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // 第一次 tick 立即到 —— 跳过一次避免启动时的瞬时抢锁。
+    ticker.tick().await;
+
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = refresh_shutdown.notified() => {
+                tracing::info!("DNS server: upstream refresh task exiting (shutdown)");
+                return;
+            }
+        }
+
+        let new_upstream = crate::platform::get_upstream_resolvers();
+        let current: Vec<String> = current_upstream.read().clone();
+        if new_upstream == current {
+            continue;
+        }
+
+        match build_resolver(&new_upstream, timeout_ms) {
+            Ok(new_resolver) => {
+                {
+                    let mut guard = resolver.write();
+                    *guard = Arc::new(new_resolver);
+                }
+                *current_upstream.write() = new_upstream.clone();
+                tracing::info!(
+                    "DNS server upstream refreshed: {:?} -> {:?} (network change detected)",
+                    current,
+                    new_upstream
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "DNS server upstream refresh failed (build_resolver): {}; keeping {:?}",
+                    e,
+                    current
+                );
+            }
+        }
     }
 }
 
@@ -1227,5 +1363,92 @@ mod tests {
         );
 
         server.stop().await.unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // 上游 hot-swap 测试（fix: disabling-after-network-switch）
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dns_server_upstream_snapshot_reflects_current_upstream() {
+        // 构造一个 server，初始 upstream = [A, B]，验证 `upstream()` getter 返回该列表。
+        // 这是 hot-swap 的 baseline：refresh 后 getter 应反映新值（见下面 test）。
+        let config = DnsConfig {
+            port: 1070,
+            upstream: vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()],
+            refresh_upstream: false,
+            ..Default::default()
+        };
+        let server = DnsServer::new(config).unwrap();
+        assert_eq!(
+            server.upstream(),
+            vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()]
+        );
+
+        // 模拟 mid-session refresh（通过 test helper）
+        server
+            .set_upstream_for_test(vec!["9.9.9.9".to_string()])
+            .unwrap();
+        assert_eq!(server.upstream(), vec!["9.9.9.9".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_dns_server_refresh_upstream_false_does_not_spawn_task() {
+        // `refresh_upstream=false` → start() 不应该 spawn 后台 task。
+        let config = DnsConfig {
+            port: 1071,
+            upstream: vec!["1.1.1.1".to_string()],
+            refresh_upstream: false,
+            ..Default::default()
+        };
+        let server = DnsServer::new(config).unwrap();
+
+        let server_clone = Arc::new(server);
+        let s = Arc::clone(&server_clone);
+        let h = tokio::spawn(async move { s.start().await });
+        wait_for_server_running(&server_clone, 1000).await;
+
+        let has_refresh = match server_clone.refresh_handle.lock() {
+            Ok(g) => g.is_some(),
+            Err(p) => p.into_inner().is_some(),
+        };
+        assert!(!has_refresh, "refresh_upstream=false 时不应有后台 task");
+
+        server_clone.stop().await.unwrap();
+        let _ = h.await;
+    }
+
+    #[tokio::test]
+    async fn test_dns_server_refresh_upstream_true_starts_task() {
+        // `refresh_upstream=true` → start() 应 spawn 后台 task。
+        // stop() 后 task 应正常退出（不会卡死）。
+        let config = DnsConfig {
+            port: 1072,
+            upstream: vec!["1.1.1.1".to_string()],
+            refresh_upstream: true,
+            timeout_ms: 100,
+            ..Default::default()
+        };
+        let server = Arc::new(DnsServer::new(config).unwrap());
+
+        let s = Arc::clone(&server);
+        let h = tokio::spawn(async move { s.start().await });
+        wait_for_server_running(&server, 1000).await;
+
+        let has_refresh = match server.refresh_handle.lock() {
+            Ok(g) => g.is_some(),
+            Err(p) => p.into_inner().is_some(),
+        };
+        assert!(has_refresh, "refresh_upstream=true 时应有后台 task");
+
+        // stop() 应在合理时间内完成（task 通过 Notify 退出，不卡 60s）
+        let stop_start = std::time::Instant::now();
+        server.stop().await.unwrap();
+        let stop_elapsed = stop_start.elapsed();
+        assert!(
+            stop_elapsed < Duration::from_secs(2),
+            "stop() 应快速退出（{stop_elapsed:?}）"
+        );
+        let _ = h.await;
     }
 }

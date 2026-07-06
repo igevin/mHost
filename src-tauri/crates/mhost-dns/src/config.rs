@@ -11,6 +11,13 @@ pub struct DnsConfig {
     pub cache_size: usize,
     /// 上游查询超时毫秒数（默认 3000）。
     pub timeout_ms: u64,
+    /// **fix（disabling-after-network-switch）**：是否启动后台上游刷新
+    /// task。Manual snapshot (`OriginalDns::Manual(s)`) → `false`：用户在
+    /// System Settings 里配的就是其意图，session 内不应替他改。
+    /// DhcpEmpty (`OriginalDns::DhcpEmpty`) → `true`：session 内换网络时
+    /// 上游要跟随当前网络。
+    #[serde(default)]
+    pub refresh_upstream: bool,
 }
 
 impl Default for DnsConfig {
@@ -20,6 +27,7 @@ impl Default for DnsConfig {
             upstream: vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()],
             cache_size: 1000,
             timeout_ms: 3000,
+            refresh_upstream: false,
         }
     }
 }
@@ -47,6 +55,7 @@ mod tests {
                     upstream: vec!["9.9.9.9".to_string()],
                     cache_size: 500,
                     timeout_ms: 3000,
+                    refresh_upstream: true,
                 },
             ),
             (
@@ -56,6 +65,7 @@ mod tests {
                     upstream: vec![],
                     cache_size: 0,
                     timeout_ms: 3000,
+                    refresh_upstream: false,
                 },
             ),
         ];

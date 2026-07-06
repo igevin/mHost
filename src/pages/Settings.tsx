@@ -112,9 +112,11 @@ function Settings() {
               </div>
               <div>
                 Original DNS (will be restored on disable):{" "}
-                {(dnsStatus.original_dns ?? []).length > 0
-                  ? (dnsStatus.original_dns ?? []).join(", ")
-                  : "(empty — DHCP default)"}
+                {dnsStatus.original_dns.kind === "manual"
+                  ? dnsStatus.original_dns.servers.length > 0
+                    ? dnsStatus.original_dns.servers.join(", ")
+                    : "(empty — DHCP default)"
+                  : "(DHCP default — captured empty)"}
               </div>
               <div>Cache capacity: {dnsStatus.cache_capacity}</div>
             </div>

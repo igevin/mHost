@@ -16,7 +16,7 @@ const mockGetDnsStatus = vi.fn().mockResolvedValue({
   running: true,
   port: 53,
   upstream: ["8.8.8.8"],
-  original_dns: ["192.168.31.1"],
+  original_dns: { kind: "manual", servers: ["192.168.31.1"] },
   rule_count: 10,
   cache_capacity: 100,
 });
@@ -69,13 +69,47 @@ describe("Settings", () => {
       running: true,
       port: 53,
       upstream: ["8.8.8.8"],
-      original_dns: ["192.168.31.1"],
+      original_dns: { kind: "manual", servers: ["192.168.31.1"] },
       rule_count: 10,
       cache_capacity: 100,
     });
 
     renderWithProviders(<Settings />);
     expect(screen.getByText("Running")).toBeInTheDocument();
+  });
+
+  it("renders manual original DNS snapshot by joining servers list", () => {
+    const store = getDefaultStore();
+    store.set(dnsEnabledAtom, true);
+    store.set(dnsStatusAtom, {
+      running: true,
+      port: 53,
+      upstream: ["8.8.8.8"],
+      original_dns: { kind: "manual", servers: ["192.168.31.1"] },
+      rule_count: 10,
+      cache_capacity: 100,
+    });
+
+    renderWithProviders(<Settings />);
+    expect(screen.getByText(/Original DNS/)).toBeInTheDocument();
+    expect(screen.getByText(/192\.168\.31\.1/)).toBeInTheDocument();
+  });
+
+  it("renders DhcpEmpty original DNS snapshot with 'DHCP default' label", () => {
+    const store = getDefaultStore();
+    store.set(dnsEnabledAtom, true);
+    store.set(dnsStatusAtom, {
+      running: true,
+      port: 53,
+      upstream: ["8.8.8.8"],
+      original_dns: { kind: "dhcp_empty" },
+      rule_count: 10,
+      cache_capacity: 100,
+    });
+
+    renderWithProviders(<Settings />);
+    expect(screen.getByText(/Original DNS/)).toBeInTheDocument();
+    expect(screen.getByText(/DHCP default/)).toBeInTheDocument();
   });
 
   it("clicks Enable DNS Mode button and triggers toggle", async () => {
@@ -98,7 +132,7 @@ describe("Settings", () => {
       running: true,
       port: 53,
       upstream: ["8.8.8.8"],
-      original_dns: ["192.168.31.1"],
+      original_dns: { kind: "manual", servers: ["192.168.31.1"] },
       rule_count: 10,
       cache_capacity: 100,
     });

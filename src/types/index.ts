@@ -13,13 +13,20 @@ export interface Profile {
   updated_at: string;
 }
 
+/// Enable 时捕获的系统 DNS 快照（语义版本，与 Rust `OriginalDns` 同步）。
+/// - `manual`: 用户在 System Settings 里手动配的；disable 时回写 servers
+/// - `dhcp_empty`: 用户没手动配；disable 时写 `Empty`（DHCP default），
+///   避免跨网络切换时泄漏上次抓到的 DHCP 推的 IP
+export type OriginalDns =
+  | { kind: "manual"; servers: string[] }
+  | { kind: "dhcp_empty" };
+
 export interface DnsStatus {
   running: boolean;
   port: number;
   upstream: string[];
-  /// Enable 时捕获的系统 DNS 快照。disable 时会还原成这个值。
-  /// 可能是用户手动配的、DHCP 推的，或空（系统真没 DNS，会用 DHCP 默认）。
-  original_dns: string[];
+  /// Enable 时捕获的系统 DNS 快照（disable 时按语义还原）。详见 `OriginalDns`。
+  original_dns: OriginalDns;
   rule_count: number;
   cache_capacity: number;
 }
