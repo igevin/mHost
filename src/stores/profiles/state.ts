@@ -1,5 +1,6 @@
 import { atom } from "jotai";
 import type { Profile, DnsStatus } from "../../types";
+import { countRealRules } from "../../lib/rules";
 
 // ---- Base atoms ----
 
@@ -29,6 +30,22 @@ export const enabledProfileAtom = atom((get) => {
   const profiles = get(profilesAtom);
   return profiles.find((p) => p.enabled) ?? null;
 });
+
+/** issue #67：DNS 模式允许多 profile 同时启用。
+ * 此派生 atom 列出所有启用的 DNS profile，供 StatusBar 摘要与 DnsProfileList 使用。 */
+export const enabledDnsProfilesAtom = atom((get) =>
+  get(dnsProfilesAtom).filter((p) => p.enabled),
+);
+
+/** 启用 DNS profile 的规则总数（跨 profile 求和）。
+ * 纯派生：不需要后端调用；`dnsStatusAtom.rule_count` 来自 `RuleEngine` 内存视图，
+ * 此 atom 用于 UI 摘要；两侧数据源独立，但启用态下应一致。 */
+export const dnsRuleCountAtom = atom((get) =>
+  get(enabledDnsProfilesAtom).reduce(
+    (sum, p) => sum + countRealRules(p.rules),
+    0,
+  ),
+);
 
 // ---- Apply confirm dialog atoms ----
 
