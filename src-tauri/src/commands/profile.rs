@@ -214,6 +214,12 @@ pub async fn update_profile(
     name: String,
     description: Option<String>,
     rules: Vec<mhost_core::HostRule>,
+    // **fix issue #67 bug 2**: 显式接受 mode。前端 create 时如果 Tauri
+    // 反序列化 Option<ProfileMode> 漏掉（Hypothesis A），profile 会以
+    // 默认 mode=Hosts 落盘到 profiles/hosts/，后续 set_profile_enabled
+    // 的 reload 条件 `mode == Dns` 永远不满足 → DNS 规则永不生效。
+    // 每次 update 显式 reassert mode，纠正任何磁盘上错误的 mode。
+    mode: Option<ProfileMode>,
     state: State<'_, AppState>,
     #[allow(unused_variables)] app_handle: AppHandle,
 ) -> Result<Profile, MhostError> {
@@ -223,6 +229,9 @@ pub async fn update_profile(
     profile.name = name;
     profile.description = description;
     profile.rules = rules;
+    if let Some(m) = mode {
+        profile.mode = m;
+    }
     profile.updated_at = chrono::Utc::now();
 
     // N4: Validate profile data before applying changes to system hosts.

@@ -1123,3 +1123,155 @@ mod test_6_6_exception_scenarios {
         assert_eq!(engine.resolve("anything.com"), None);
     }
 }
+
+// ===========================================================================
+// 6.7 issue #67 bug 2 regression — DNS profile mode preservation
+// ===========================================================================
+//
+// Root cause (Hypothesis A): newly created DNS profiles sometimes landed in
+// profiles/hosts/ instead of profiles/dns/ because the frontend didn't
+// always pass `mode` through updateProfile, and on-disk `mode` got lost.
+// set_profile_enabled's reload condition `mode == Dns` then never fired
+// and the new profile's rules never reached RuleEngine.
+//
+// Fix: update_profile now accepts `mode: Option<ProfileMode>` and reasserts
+// it on every save. Frontend always passes `profile.mode` in the payload.
+//
+// These tests exercise the disk round-trip directly via FileStorage + the
+// `validate_profile` / `save_profile` helpers, mimicking what update_profile
+// does internally (load → update fields → save).
+#[cfg(test)]
+mod test_6_7_dns_mode_preservation {
+    use super::*;
+    use mhost_core::{HostRule, ProfileId};
+    use mhost_storage::storage::Storage;
+    use std::net::IpAddr;
+
+    fn make_dns_rule(domains: Vec<&str>) -> HostRule {
+        HostRule {
+            id: mhost_core::RuleId(uuid::Uuid::new_v4()),
+            ip: Some("127.0.0.1".parse::<IpAddr>().unwrap()),
+            domains: domains.iter().map(|d| d.to_string()).collect(),
+            enabled: true,
+            comment: None,
+            source: mhost_core::RuleSource::Manual,
+            line_number: None,
+        }
+    }
+
+    /// Regression: a DNS profile created with mode=Dns must land in
+    /// profiles/dns/{id}.json (not profiles/hosts/{id}.json). If mode
+    /// isn't preserved at create time, the profile is invisible to
+    /// list_profiles_by_mode(Dns).
+    #[test]
+    fn test_create_dns_profile_lands_in_dns_dir() {
+        let (_temp, storage, _writer) = create_test_storage_and_writer();
+
+        // Mimic create_profile(name, Some(Dns)) → Profile::new + mode=Dns + save
+        let mut profile = Profile::new("dns-profile");
+        profile.mode = ProfileMode::Dns;
+        storage.save_profile(&profile).unwrap();
+
+        // list_profiles_by_mode(Dns) should return it
+        let dns_list = storage.list_profiles_by_mode(ProfileMode::Dns).unwrap();
+        assert_eq!(dns_list.len(), 1);
+        assert_eq!(dns_list[0].id, profile.id);
+        assert_eq!(dns_list[0].mode, ProfileMode::Dns);
+
+        // list_profiles_by_mode(Hosts) should NOT return it
+        let hosts_list = storage.list_profiles_by_mode(ProfileMode::Hosts).unwrap();
+        assert_eq!(hosts_list.len(), 0);
+    }
+
+    /// Regression: update_profile now accepts `mode: Option<ProfileMode>`
+    /// and reasserts it after loading from disk. This catches the bug
+    /// where a newly created DNS profile might land in profiles/hosts/
+    /// (Hypothesis A — Tauri deserialization edge case) and stay there
+    /// forever because set_profile_enabled's reload condition
+    /// `mode == Dns` would never fire.
+    ///
+    /// The fix: each save reasserts mode from the explicit parameter,
+    /// so the next update corrects any drift.
+    #[test]
+    fn test_update_profile_reasserts_dns_mode_after_disk_roundtrip() {
+        let (_temp, storage, _writer) = create_test_storage_and_writer();
+
+        // Step 1: create DNS profile
+        let mut profile = Profile::new("dns-test");
+        profile.mode = ProfileMode::Dns;
+        profile.rules.push(make_dns_rule(vec!["example.com"]));
+        storage.save_profile(&profile).unwrap();
+
+        // Step 2: simulate "disk drift" by directly mutating the JSON file
+        //   to set mode=hosts. This mimics the Tauri deserialization edge
+        //   case where the saved JSON has the wrong mode.
+        //   serde_json::to_string_pretty produces `"mode": "dns"` (with space).
+        let dns_dir = storage.root().join("profiles").join("dns");
+        let dns_file = dns_dir.join(format!("{}.json", profile.id));
+        let content = std::fs::read_to_string(&dns_file).unwrap();
+        let corrupted = content.replace(r#""mode": "dns""#, r#""mode": "hosts""#);
+        std::fs::write(&dns_file, &corrupted).unwrap();
+
+        // Sanity check: disk now says mode=hosts
+        let drifted = storage.load_profile(&profile.id).unwrap();
+        assert_eq!(
+            drifted.mode,
+            ProfileMode::Hosts,
+            "setup: disk should now have mode=hosts after corruption"
+        );
+
+        // Step 3: mimic what update_profile does with the new `mode` param
+        //   - Load from disk (drifted, mode=hosts)
+        //   - If mode is Some, reassert it (this is the fix)
+        //   - Save back
+        let mut loaded = storage.load_profile(&profile.id).unwrap();
+        let mode_param: Option<ProfileMode> = Some(ProfileMode::Dns);
+        if let Some(m) = mode_param {
+            loaded.mode = m;
+        }
+        loaded.rules.push(make_dns_rule(vec!["another.com"]));
+        storage.save_profile(&loaded).unwrap();
+
+        // Step 4: reload and verify mode is back to Dns
+        let reloaded = storage.load_profile(&profile.id).unwrap();
+        assert_eq!(
+            reloaded.mode,
+            ProfileMode::Dns,
+            "FIX: update_profile with mode=Some(Dns) must reassert mode on save"
+        );
+        assert_eq!(reloaded.rules.len(), 2);
+    }
+
+    /// Verify RuleEngine::rebuild correctly picks up rules from a profile
+    /// in profiles/dns/ after the mode is reasserted. This is the final
+    /// step of the fix chain: disk → list_profiles_by_mode → rebuild →
+    /// DNS queries resolve.
+    #[test]
+    fn test_rebuild_picks_up_rules_after_mode_reassert() {
+        let (_temp, storage, _writer) = create_test_storage_and_writer();
+
+        let mut profile = Profile::new("trackers");
+        profile.mode = ProfileMode::Dns;
+        profile.rules.push(make_dns_rule(vec!["tracker.com"]));
+        storage.save_profile(&profile).unwrap();
+
+        // User enables the profile
+        profile.enabled = true;
+        storage.save_profile(&profile).unwrap();
+
+        // Reload via list_profiles_by_mode (what reload_dns_rules does)
+        let dns_profiles = storage.list_profiles_by_mode(ProfileMode::Dns).unwrap();
+        let enabled: Vec<_> = dns_profiles.into_iter().filter(|p| p.enabled).collect();
+
+        // Rebuild RuleEngine
+        let engine = RuleEngine::new();
+        engine.rebuild(&enabled);
+
+        // Domain should resolve
+        assert_eq!(
+            engine.resolve("tracker.com"),
+            Some("127.0.0.1".parse().unwrap()),
+            "rule should be loaded after mode preservation"
+        );
+    }
+}

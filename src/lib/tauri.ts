@@ -16,11 +16,16 @@ export async function createProfile(name: string, mode?: ProfileMode): Promise<P
 }
 
 export async function updateProfile(profile: Profile): Promise<Profile> {
+  // **fix issue #67 bug 2**: 显式带上 mode。后端 update_profile 默认从 disk
+  // 读 mode，如果 disk 上的 mode 是错的（Hypothesis A：create 时
+  // Tauri 反序列化 Option<ProfileMode> 漏掉 → 落盘为 Hosts default），
+  // 编辑规则后仍然错。显式传 mode 后每次 update 都会强制 reassert。
   return invoke("update_profile", {
     id: profile.id,
     name: profile.name,
     description: profile.description,
     rules: profile.rules,
+    mode: profile.mode,
   });
 }
 

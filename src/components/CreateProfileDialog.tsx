@@ -14,7 +14,11 @@ function CreateProfileDialog({ open, onClose, onCreate, isLoading }: CreateProfi
   const [name, setName] = useState("");
   const [isCreating, setIsCreating] = useState(false);
   const isCreatingRef = useRef(false);
-  const { fire, release, onPointerDown } = useWebKitPointerDown();
+  // **fix issue #67 bug 1**: 不要在 handler 里再调 fire()/release()。
+  // WebKit hook 的 `onPointerDown` wrapper 已经 fire() 了一次；
+  // handler 自己的 fire() 会看到锁被消费 → bail → 用户必须点第二次。
+  // 改为：依赖 `isCreatingRef.current` 同步守卫做双重提交保护。
+  const { onPointerDown } = useWebKitPointerDown();
 
   useEffect(() => {
     if (open) {
@@ -25,12 +29,8 @@ function CreateProfileDialog({ open, onClose, onCreate, isLoading }: CreateProfi
   }, [open]);
 
   const handleCreate = useCallback(async () => {
-    if (!fire()) return;
     const trimmed = name.trim();
-    if (!trimmed || isCreatingRef.current) {
-      release();
-      return;
-    }
+    if (!trimmed || isCreatingRef.current) return;
     isCreatingRef.current = true;
     setIsCreating(true);
     try {
@@ -40,9 +40,8 @@ function CreateProfileDialog({ open, onClose, onCreate, isLoading }: CreateProfi
     } finally {
       isCreatingRef.current = false;
       setIsCreating(false);
-      release();
     }
-  }, [name, onCreate, fire, release]);
+  }, [name, onCreate]);
 
   const handleCancel = useCallback(() => {
     if (isCreatingRef.current) return;
