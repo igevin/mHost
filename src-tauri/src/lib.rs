@@ -221,7 +221,7 @@ pub fn run() {
     //
     // 两条路径 cleanup_dns_on_exit 内部幂等（dns_enabled=false 是
     // no-op），重复触发不会出问题。
-    app.run(|app_handle, event| {
+    app.run(|_app_handle, event| {
         if let RunEvent::ExitRequested { api, .. } = event {
             // **fix issue #67 bug 3**: 防止 ExitRequested 递归。第一次
             // ExitRequested 进来 swap 到 true 并跑 cleanup；cleanup 调
@@ -231,22 +231,25 @@ pub fn run() {
                 api.prevent_exit();
                 return;
             }
-            eprintln!("[mHost] exit: Tauri ExitRequested, cleaning up DNS");
+            eprintln!("[mHost] exit: Tauri ExitRequested → forwarding to SIGTERM handler");
             api.prevent_exit();
-            // **fix (app-close DNS cleanup)**：之前用 `tauri::async_runtime::spawn`
-            // fire-and-forget，spawn task 不一定在 Tauri tearDown 之前跑完，
-            // cleanup 实际没执行就被 400ms watchdog 强退 → 系统 DNS 卡在
-            // 127.0.0.1。现在用 `block_on` 同步等待 `cleanup_and_exit` 完成，
-            // RunEvent 回调在 tao 主线程（不是 tokio task），block_on 安全。
+            // **fix (Cmd-Q 也要走 spawn+await 路径)**：
             //
-            // **fix (Cmd-Q 也要 sudo fallback)**：Cmd-Q 是用户主动退出，
-            // 大概率在场 → `interactive=true`，让 proxy 没自恢复时走
-            // osascript sudo 兜底（与 tray Quit 行为一致）。如果用户在
-            // OS 关机场景误用 Cmd-Q，最坏情况是 sudo dialog 短暂弹出后
-            // 由超时 / 关机流程打断，recovery marker 留给下次启动兜底。
-            tauri::async_runtime::block_on(async move {
-                cleanup_and_exit(app_handle, true).await;
-            });
+            // 用户实测发现 Path A 用 `tauri::async_runtime::block_on` 不工作
+            // （Cmd-Q 后 DNS 还原不了），但 SIGINT/SIGTERM handler（Path B）
+            // 用 `tauri::async_runtime::spawn(async move { .await })` 工作
+            // 正常（Ctrl+C 后 DNS 能还原）。
+            //
+            // 怀疑原因：block_on 在 tao 主线程 + Tauri event callback 上下文
+            // 里有 race condition（runtime worker 与 tao loop 互相等待）。
+            //
+            // 解决：forwarding 到 SIGTERM handler（已验证可靠），让 cleanup
+            // 走 spawn + .await 的路径。SIGTERM 会触发 setup() 里 spawn 的
+            // tokio signal handler，运行 cleanup_dns_on_exit → handle.exit(0)，
+            // 后者再触发 ExitRequested → 递归守卫拦住。
+            unsafe {
+                libc::kill(std::process::id() as libc::pid_t, libc::SIGTERM);
+            }
         }
     });
 }
