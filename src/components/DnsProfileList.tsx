@@ -1,4 +1,4 @@
-import { memo, useCallback, useMemo, useState } from "react";
+import { memo, useCallback, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAtomValue, useSetAtom } from "jotai";
 import { save, confirm } from "@tauri-apps/plugin-dialog";
@@ -56,6 +56,11 @@ function DnsProfileList() {
   const [duplicatingId, setDuplicatingId] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
 
+  // issue #67：单击 label 会触发 pointerdown + click 两个事件，两个事件
+  // 都直接调 handleToggle 会让 setProfileEnabled 跑两次（true → false），
+  // 结果 profile 留在 disabled、规则永不生效。用 ref 锁 100ms 防双触发。
+  const toggleLockedRef = useRef(false);
+
   const stats = useMemo(
     () => ({
       totalProfiles: profiles.length,
@@ -80,6 +85,11 @@ function DnsProfileList() {
 
   const handleToggle = useCallback(
     (id: string, enabled: boolean) => {
+      if (toggleLockedRef.current) return;
+      toggleLockedRef.current = true;
+      setTimeout(() => {
+        toggleLockedRef.current = false;
+      }, 100);
       toggleEnabled({ id, enabled: !enabled });
     },
     [toggleEnabled],
@@ -166,7 +176,6 @@ function DnsProfileList() {
               className="btn btn-primary btn-sm"
               onClick={() => setShowCreateDialog(true)}
               onPointerDown={onPointerDown(() => setShowCreateDialog(true))}
-              disabled={isLoading}
             >
               + New DNS Profile
             </button>
@@ -225,7 +234,6 @@ function DnsProfileList() {
               className="btn btn-primary"
               onClick={() => setShowCreateDialog(true)}
               onPointerDown={onPointerDown(() => setShowCreateDialog(true))}
-              disabled={isLoading}
             >
               + New DNS Profile
             </button>

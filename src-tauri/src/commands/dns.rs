@@ -295,17 +295,37 @@ pub async fn reload_dns_rules(state: State<'_, AppState>) -> Result<(), MhostErr
 /// Tauri 2 内部 task 上下文，没有命令调用栈，`State<'_, AppState>`
 /// 这种借用参数无法构造。直接用 `&AppState`。
 ///
-/// 幂等：dns_enabled=false 时直接 no-op，两个钩子同时触发也不会
-/// 重复清理。
-///
-/// 失败处理：清理失败时返回 Err 由调用方记录日志，但**不阻止退出**。
+/// 幂等性（fix issue #67）：
+///   - 入口先把 in-memory `dns_enabled` 标 false，让 SIGINT 和
+///     `RunEvent::ExitRequested` 两条路径竞态时只有第一个真正跑 cleanup；
+///     第二个直接 early-return 走 no-op 分支。
+///   - cleanup 本身失败（proxy 进程早死、osascript 兜底失败）是可恢复的：
+///     `disable_dns_mode` 已经写了 recovery marker，下次启动
+///     `try_recover_dns` 会兜底强退。所以这里**返回 Ok**，只在 stderr
+///     留一条 warning，避免退出时连续刷两条「DNS cleanup failed」误导用户。
 pub async fn cleanup_dns_on_exit(state: &AppState) -> Result<(), MhostError> {
     if !state.dns_enabled.load(Ordering::Relaxed) {
         return Ok(());
     }
+    // 标记 in-memory 为 disabled，让后续 cleanup_dns_on_exit 调用的路径
+    // （SIGINT + Tauri ExitRequested 双钩子）走 no-op。
+    state.dns_enabled.store(false, Ordering::Relaxed);
+
     // 退出场景用户可能不在场 → interactive=false，不弹 sudo；
     // 若 proxy 没恢复 DNS，marker 保留给下次启动 try_recover_dns 兜底。
-    set_dns_mode_disable(state, false).await
+    match set_dns_mode_disable(state, false).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // 清理失败一般是 proxy 早死或 osascript 失败 —— 留给下次启动
+            // 的 recovery marker 兜底。这里只记一条 warning，不返回 Err
+            // （避免 lib.rs 的「DNS cleanup on signal/exit failed」误导用户）。
+            eprintln!(
+                "[mHost] DNS cleanup on exit: {} (recovery marker preserved for next launch)",
+                e
+            );
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -380,12 +400,14 @@ mod tests {
         //   - original 是 DhcpEmpty → 只打印 warning（不返回 Err，bug 1 修复）
         //   - manifest 写 dns_enabled=false → 走 disable_dns_mode
         //   - 测试环境没有真 proxy + non-interactive → 保留 marker
-        //     + 返回 Err（bug 4 修复：不能谎报 Ok 让用户卡在 127.0.0.1）
+        //     + 返回 Ok（fix issue #67 bug 4：cleanup 失败转 warning，
+        //       避免 SIGINT + ExitRequested 两条路径刷两条 failed 误导用户；
+        //       DNS 真没恢复由 recovery marker 兜底，下次启动 try_recover_dns 强退）
         let result = cleanup_dns_on_exit(&state).await;
         assert!(
-            result.is_err(),
-            "proxy-dead exit cleanup should leave marker (Err) so next launch can \
-             force restore; got {:?}",
+            result.is_ok(),
+            "cleanup_dns_on_exit should return Ok even on proxy failure (recovery marker \
+             handles actual restoration); got {:?}",
             result
         );
 

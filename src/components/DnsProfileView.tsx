@@ -410,6 +410,15 @@ export default function DnsProfileView() {
           </div>
         </div>
         <div className={styles.viewHeaderActions}>
+          {/* issue #67: 详情页必须能回到 /dns-profiles 列表 */}
+          <button
+            className="btn btn-ghost btn-sm"
+            onClick={() => navigate("/dns-profiles")}
+            onPointerDown={onPointerDown(() => navigate("/dns-profiles"))}
+            title="Back to DNS Profiles"
+          >
+            ← Back
+          </button>
           {isEditing ? (
             <>
               <button

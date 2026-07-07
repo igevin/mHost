@@ -266,6 +266,40 @@ describe("DnsProfileList", () => {
     );
   });
 
+  // Regression test for issue #67 bug #3:
+  //   In macOS WebView, a single label click fires BOTH pointerdown AND click.
+  //   Both events previously called handleToggle, so setProfileEnabled ran
+  //   twice (true → false) and the profile ended up disabled → rules never
+  //   loaded. The ref-based debounce (toggleLockedRef) prevents this.
+  it("inline switch debounces double-fire (pointerdown + click)", async () => {
+    const { invoke } = await import("@tauri-apps/api/core");
+    const store = getDefaultStore();
+    store.set(dnsProfilesAtom, [makeProfile({ id: "d1", enabled: false })]);
+
+    renderWithRouter();
+
+    const switchEl = screen.getByRole("switch");
+    const label = switchEl.closest("label")!;
+
+    // Simulate WebView behavior: pointerdown + click on same label
+    await act(async () => {
+      fireEvent.pointerDown(label);
+      fireEvent.click(label);
+    });
+
+    // setProfileEnabled should be called exactly once (with enabled=true).
+    // The second call would have set enabled=false, leaving the profile
+    // disabled and preventing DNS rule reload.
+    const setEnabledCalls = (invoke as unknown as { mock: { calls: unknown[][] } }).mock.calls.filter(
+      (c: unknown[]) => c[0] === "set_profile_enabled",
+    );
+    expect(setEnabledCalls).toHaveLength(1);
+    expect(setEnabledCalls[0]).toEqual([
+      "set_profile_enabled",
+      expect.objectContaining({ id: "d1", enabled: true }),
+    ]);
+  });
+
   // ---- Edit ----
 
   it("clicking Edit on a card does not throw", () => {
