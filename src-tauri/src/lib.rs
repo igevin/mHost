@@ -155,8 +155,13 @@ pub fn run() {
                         }
                     }
                     if let Some(state) = sig_app_handle.try_state::<AppState>() {
+                        // **fix (Ctrl+C / pnpm tauri dev 也要 sudo fallback)**：
+                        // SIGINT/SIGTERM 通常来自用户的 Ctrl+C 或 kill（用户在场），
+                        // → `interactive=true` 让 proxy 没自恢复时走 osascript 兜底。
+                        // OS 关机场景下 sudo 弹窗会短暂无人响应，但 recovery marker
+                        // 留给下次启动 `try_recover_dns` 兜底。
                         if let Err(e) =
-                            commands::dns::cleanup_dns_on_exit(state.inner(), false).await
+                            commands::dns::cleanup_dns_on_exit(state.inner(), true).await
                         {
                             eprintln!("[mHost] DNS cleanup on signal failed: {}", e);
                         }
@@ -233,8 +238,14 @@ pub fn run() {
             // cleanup 实际没执行就被 400ms watchdog 强退 → 系统 DNS 卡在
             // 127.0.0.1。现在用 `block_on` 同步等待 `cleanup_and_exit` 完成，
             // RunEvent 回调在 tao 主线程（不是 tokio task），block_on 安全。
+            //
+            // **fix (Cmd-Q 也要 sudo fallback)**：Cmd-Q 是用户主动退出，
+            // 大概率在场 → `interactive=true`，让 proxy 没自恢复时走
+            // osascript sudo 兜底（与 tray Quit 行为一致）。如果用户在
+            // OS 关机场景误用 Cmd-Q，最坏情况是 sudo dialog 短暂弹出后
+            // 由超时 / 关机流程打断，recovery marker 留给下次启动兜底。
             tauri::async_runtime::block_on(async move {
-                cleanup_and_exit(app_handle, false).await;
+                cleanup_and_exit(app_handle, true).await;
             });
         }
     });
