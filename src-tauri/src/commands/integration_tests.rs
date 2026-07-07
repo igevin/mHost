@@ -1143,8 +1143,7 @@ mod test_6_6_exception_scenarios {
 #[cfg(test)]
 mod test_6_7_dns_mode_preservation {
     use super::*;
-    use mhost_core::{HostRule, ProfileId};
-    use mhost_storage::storage::Storage;
+    use mhost_core::HostRule;
     use std::net::IpAddr;
 
     fn make_dns_rule(domains: Vec<&str>) -> HostRule {
@@ -1293,7 +1292,6 @@ mod test_6_7_dns_mode_preservation {
 #[cfg(test)]
 mod test_6_8_dns_profile_enable_disable_union {
     use super::*;
-    use mhost_core::ProfileId;
 
     fn make_dns_profile(name: &str, domains: Vec<&str>, ip: &str) -> Profile {
         let mut profile = Profile::new(name);

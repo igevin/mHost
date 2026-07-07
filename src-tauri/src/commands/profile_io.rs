@@ -106,6 +106,13 @@ pub fn export_profile_logic(
 }
 
 /// Duplicate a profile with a new name.
+///
+/// **fix issue #67 round 4 (review follow-up)**: 必须保留 source 的
+/// `mode`。`Profile::new` 默认 `ProfileMode::Hosts`，原本会让所有
+/// 复制的 profile 都变成 hosts 模式 —— 这在「DNS profile 列表加
+/// Duplicate 按钮」（issue #67）后变成 user-visible bug：复制 DNS
+/// profile 后丢到 hosts 目录，下次 `set_profile_enabled` 重载时
+/// `mode == Dns` 条件 false，规则永远不生效。
 pub fn duplicate_profile_logic(
     id: &str,
     new_name: String,
@@ -123,6 +130,7 @@ pub fn duplicate_profile_logic(
     let final_name = resolve_name_conflict(&new_name, storage)?;
 
     let mut dup = Profile::new(&final_name);
+    dup.mode = source.mode; // fix: 保留 source 的 mode（Hosts 或 Dns）
     dup.rules = source.rules;
     dup.description = source.description.clone();
     dup.tags = source.tags.clone();
@@ -608,6 +616,70 @@ mod tests {
 
         assert_eq!(dup.description, Some("test desc".to_string()));
         assert_eq!(dup.tags, vec!["tag1".to_string(), "tag2".to_string()]);
+    }
+
+    /// **fix issue #67 round 4 (review follow-up)**: 复制的 profile 必须
+    /// 保留 source 的 mode。DNS 模式 profile 在新 UI 里有 Duplicate 按钮，
+    /// 这个 bug 是 user-visible 的。
+    #[test]
+    fn test_duplicate_preserves_mode() {
+        let (_temp, storage) = create_test_storage();
+
+        // Source: hosts mode (default)
+        let hosts_source = create_profile_with_rules(
+            &storage,
+            "hosts-source",
+            vec![("127.0.0.1".parse().unwrap(), vec!["a.com".to_string()])],
+        );
+        let hosts_dup = duplicate_profile_logic(
+            &hosts_source.id.to_string(),
+            "hosts-copy".to_string(),
+            &storage,
+        )
+        .unwrap();
+        assert_eq!(
+            hosts_dup.mode,
+            mhost_core::ProfileMode::Hosts,
+            "FIX: hosts source → hosts copy"
+        );
+
+        // Source: dns mode
+        let mut dns_source = Profile::new("dns-source");
+        dns_source.mode = mhost_core::ProfileMode::Dns;
+        dns_source.rules.push(HostRule::new(
+            "127.0.0.1".parse().unwrap(),
+            vec!["test.local".to_string()],
+        ));
+        storage.save_profile(&dns_source).unwrap();
+
+        let dns_dup =
+            duplicate_profile_logic(&dns_source.id.to_string(), "dns-copy".to_string(), &storage)
+                .unwrap();
+        assert_eq!(
+            dns_dup.mode,
+            mhost_core::ProfileMode::Dns,
+            "FIX: dns source must produce dns copy (was always Hosts before fix)"
+        );
+
+        // 落盘验证：dns-copy 必须在 profiles/dns/ 而不是 profiles/hosts/
+        let dns_path = storage
+            .root()
+            .join("profiles")
+            .join("dns")
+            .join(format!("{}.json", dns_dup.id));
+        let hosts_path = storage
+            .root()
+            .join("profiles")
+            .join("hosts")
+            .join(format!("{}.json", dns_dup.id));
+        assert!(
+            dns_path.exists(),
+            "FIX: dns copy must be saved in profiles/dns/"
+        );
+        assert!(
+            !hosts_path.exists(),
+            "FIX: dns copy must NOT be saved in profiles/hosts/"
+        );
     }
 
     // -----------------------------------------------------------------------

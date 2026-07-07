@@ -96,14 +96,36 @@ impl FileStorage {
     }
 
     /// 遍历 hosts 和 dns 子目录，查找指定 ID 的 Profile 文件路径。
+    ///
+    /// **fix issue #67 round 4 (review follow-up)**: 之前总是先返回
+    /// Hosts 文件。配合 round-3 的 delete-before-write 顺序，
+    /// save_profile 短暂窗口内两个文件同时存在时，load_profile 总会
+    /// 拿到 stale 的 Hosts 文件 → mode 错 → DNS 规则永不生效。
+    ///
+    /// round-4 fix：save_profile 改成 write-then-delete（先 atomic_write
+    /// 新文件，再删除 stale 文件）。这个窗口期内两个文件会同时存在，
+    /// 所以 find_profile_path 在两个都存在时按 **mtime** 选更新的
+    /// （atomic_write rename 后 mtime 是 now，stale 文件 mtime 更早）。
+    /// 若 mtime 拿不到（极端情况），fallback 到 Hosts（同旧行为，至少
+    /// 不会比之前更差）。
     fn find_profile_path(&self, id: &ProfileId) -> Option<PathBuf> {
-        for mode in [ProfileMode::Hosts, ProfileMode::Dns] {
-            let path = self.profile_path_for_mode(id, mode);
-            if path.exists() {
-                return Some(path);
+        let hosts_path = self.profile_path_for_mode(id, ProfileMode::Hosts);
+        let dns_path = self.profile_path_for_mode(id, ProfileMode::Dns);
+        let hosts_exists = hosts_path.exists();
+        let dns_exists = dns_path.exists();
+        match (hosts_exists, dns_exists) {
+            (false, false) => None,
+            (true, false) => Some(hosts_path),
+            (false, true) => Some(dns_path),
+            (true, true) => {
+                let hosts_mtime = fs::metadata(&hosts_path).and_then(|m| m.modified()).ok();
+                let dns_mtime = fs::metadata(&dns_path).and_then(|m| m.modified()).ok();
+                match (hosts_mtime, dns_mtime) {
+                    (Some(_h), Some(d)) if d > _h => Some(dns_path),
+                    _ => Some(hosts_path),
+                }
             }
         }
-        None
     }
 
     /// 返回 manifest 文件路径。
@@ -185,13 +207,28 @@ impl Storage for FileStorage {
     }
 
     fn save_profile(&self, profile: &Profile) -> Result<(), StorageError> {
-        // **fix issue #67 round 3 (Bug A)**: Single-file invariant. 在写入
-        // 当前 mode 路径前，先清理掉另一 mode 路径下的同名 id 文件。否则
-        // 任何一次 mode 漂移（如 Hypothesis A：Tauri 反序列化
-        // Option<ProfileMode> 漏掉 → 默认 Hosts）都会留下孤儿文件，
-        // find_profile_path 检查 Hosts 在前 → load_profile 永远拿到 stale
-        // 文件 → mode 始终是错的 → DNS 重载条件 `mode == Dns` 永远
-        // 不满足 → DNS 规则永不生效。
+        // **fix issue #67 round 3 (Bug A)**: Single-file invariant.
+        // 一个 profile 在任意时刻只能存在于一个 mode 目录下，否则
+        // find_profile_path 的查找会变得不确定（旧版本先查 Hosts）。
+        //
+        // **fix issue #67 round 4 (review follow-up)**: 顺序从
+        // delete-before-write 改成 write-then-delete。原本先 remove_file
+        // 再 atomic_write 的顺序有一个亚毫秒级窗口：crash 在两步之间
+        // 会同时丢掉新文件和 stale 文件，且没有 .tmp/.bak 可以恢复。
+        // 改成 write-then-delete 后：crash 在两步之间只是短暂有两个文件
+        // 存在，find_profile_path 按 mtime 选更新的那个（详见 find_profile_path），
+        // 任何时刻都至少有一个文件在 → 没有数据丢失窗口。
+        let dir = self.profiles_dir_for_mode(profile.mode);
+        self.ensure_dir(&dir)?;
+        let path = self.profile_path_for_mode(&profile.id, profile.mode);
+        let json = serde_json::to_string_pretty(profile)
+            .map_err(|e| StorageError::ManifestCorrupted(format!("序列化 Profile 失败: {}", e)))?;
+        atomic_write(&path, json.as_bytes())
+            .map_err(|e| StorageError::Io(format!("写入 Profile 失败: {}", e)))?;
+
+        // 写入成功后再清理 stale 文件。如果两步之间 crash，
+        // 两个文件同时存在 → find_profile_path 按 mtime 选更新的；
+        // 下次正常 save 仍然会清理 stale。所以这条路径永远不会丢数据。
         for other_mode in [ProfileMode::Hosts, ProfileMode::Dns] {
             if other_mode != profile.mode {
                 let stale = self.profile_path_for_mode(&profile.id, other_mode);
@@ -207,13 +244,6 @@ impl Storage for FileStorage {
             }
         }
 
-        let dir = self.profiles_dir_for_mode(profile.mode);
-        self.ensure_dir(&dir)?;
-        let path = self.profile_path_for_mode(&profile.id, profile.mode);
-        let json = serde_json::to_string_pretty(profile)
-            .map_err(|e| StorageError::ManifestCorrupted(format!("序列化 Profile 失败: {}", e)))?;
-        atomic_write(&path, json.as_bytes())
-            .map_err(|e| StorageError::Io(format!("写入 Profile 失败: {}", e)))?;
         Ok(())
     }
 
