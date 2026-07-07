@@ -193,7 +193,23 @@ pub fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::Men
             }
         }
         tray_logic::TrayMenuAction::Quit => {
-            app.exit(0);
+            // **fix (app-close DNS cleanup)**：用户主动从 tray 退出，
+            // 在场 → `interactive=true`，proxy 死了时走 osascript sudo 兜底
+            // （与 UI 点 Disable DNS 按钮行为一致）。
+            //
+            // 之前是 `app.exit(0)` 一行 → 触发 ExitRequested → Path A
+            // 用 spawn fire-and-forget 跑 cleanup，spawn task 不一定在
+            // Tauri tearDown 之前跑完，cleanup 实际没执行就 400ms watchdog
+            // 强退 → 系统 DNS 卡在 127.0.0.1。
+            //
+            // 现在走 `cleanup_and_exit(app_handle, true)`，block_on 同步
+            // 等待 cleanup_dns_on_exit 完成（最多 5s proxy 自恢复超时），
+            // 再 handle.exit(0) + watchdog。handle_menu_event 在 tao 主线程，
+            // block_on 安全。
+            let app_clone = app.clone();
+            tauri::async_runtime::block_on(async move {
+                crate::cleanup_and_exit(&app_clone, true).await;
+            });
         }
         tray_logic::TrayMenuAction::AdBlock => {
             // Placeholder: ad block is coming soon

@@ -286,34 +286,41 @@ pub async fn reload_dns_rules(state: State<'_, AppState>) -> Result<(), MhostErr
 
 /// App 退出时的 DNS 清理（fix: 用户反馈"退出后 DNS 出问题"）。
 ///
-/// 由 `lib.rs::run()` 在两处调用：
-///   1) Tauri `RunEvent::ExitRequested` 钩子（tray 退出 / Cmd-Q）
-///   2) setup() 里 spawn 的 tokio signal handler（SIGINT/SIGTERM，
-///      覆盖 Ctrl+C / kill / OS 关机）
+/// 由 `lib.rs::run()` / `lib.rs::cleanup_and_exit` 在三处调用：
+///   1) Tray Quit 菜单（用户在场 → `interactive=true`，proxy 死了走
+///      osascript sudo 兜底）
+///   2) Tauri `RunEvent::ExitRequested` 钩子（Cmd-Q 兜底 → `interactive=false`）
+///   3) setup() 里 spawn 的 tokio signal handler（SIGINT/SIGTERM，
+///      覆盖 Ctrl+C / kill / OS 关机 → `interactive=false`）
 ///
 /// 不持 Tauri `State<'_, AppState>` 的原因：RunEvent 回调运行在
 /// Tauri 2 内部 task 上下文，没有命令调用栈，`State<'_, AppState>`
 /// 这种借用参数无法构造。直接用 `&AppState`。
 ///
 /// 幂等性（fix issue #67）：
-///   - 入口先把 in-memory `dns_enabled` 标 false，让 SIGINT 和
-///     `RunEvent::ExitRequested` 两条路径竞态时只有第一个真正跑 cleanup；
-///     第二个直接 early-return 走 no-op 分支。
+///   - 入口先把 in-memory `dns_enabled` 标 false，让 SIGINT / ExitRequested /
+///     tray Quit 三条路径竞态时只有第一个真正跑 cleanup；其余直接
+///     early-return 走 no-op 分支。
 ///   - cleanup 本身失败（proxy 进程早死、osascript 兜底失败）是可恢复的：
 ///     `disable_dns_mode` 已经写了 recovery marker，下次启动
 ///     `try_recover_dns` 会兜底强退。所以这里**返回 Ok**，只在 stderr
 ///     留一条 warning，避免退出时连续刷两条「DNS cleanup failed」误导用户。
-pub async fn cleanup_dns_on_exit(state: &AppState) -> Result<(), MhostError> {
+///
+/// `interactive` 参数语义：
+///   - `true`：调用方确认用户在场，proxy 没恢复时走 osascript sudo 兜底，
+///     让用户当场看到恢复成功。Tray Quit 用这个值。
+///   - `false`：用户可能不在场（OS 关机 / SIGINT），不弹 sudo，marker
+///     保留给下次启动 `try_recover_dns` 兜底。ExitRequested + signal handler
+///     用这个值。
+pub async fn cleanup_dns_on_exit(state: &AppState, interactive: bool) -> Result<(), MhostError> {
     if !state.dns_enabled.load(Ordering::Relaxed) {
         return Ok(());
     }
     // 标记 in-memory 为 disabled，让后续 cleanup_dns_on_exit 调用的路径
-    // （SIGINT + Tauri ExitRequested 双钩子）走 no-op。
+    // （SIGINT + Tauri ExitRequested + tray Quit 三条路径竞态时）走 no-op。
     state.dns_enabled.store(false, Ordering::Relaxed);
 
-    // 退出场景用户可能不在场 → interactive=false，不弹 sudo；
-    // 若 proxy 没恢复 DNS，marker 保留给下次启动 try_recover_dns 兜底。
-    match set_dns_mode_disable(state, false).await {
+    match set_dns_mode_disable(state, interactive).await {
         Ok(()) => Ok(()),
         Err(e) => {
             // 清理失败一般是 proxy 早死或 osascript 失败 —— 留给下次启动
@@ -359,7 +366,7 @@ mod tests {
             dns_lock: ApplyLock::new(),
         };
         // dns_enabled = false → cleanup 应直接返回 Ok
-        let result = cleanup_dns_on_exit(&state).await;
+        let result = cleanup_dns_on_exit(&state, false).await;
         assert!(result.is_ok(), "DNS disabled → cleanup should be a no-op");
     }
 
@@ -403,7 +410,7 @@ mod tests {
         //     + 返回 Ok（fix issue #67 bug 4：cleanup 失败转 warning，
         //       避免 SIGINT + ExitRequested 两条路径刷两条 failed 误导用户；
         //       DNS 真没恢复由 recovery marker 兜底，下次启动 try_recover_dns 强退）
-        let result = cleanup_dns_on_exit(&state).await;
+        let result = cleanup_dns_on_exit(&state, false).await;
         assert!(
             result.is_ok(),
             "cleanup_dns_on_exit should return Ok even on proxy failure (recovery marker \
@@ -420,6 +427,58 @@ mod tests {
             vec!["Empty".to_string()],
             "DhcpEmpty snapshot 必须产生 Empty restore target"
         );
+    }
+
+    /// 回归测试（app-close DNS cleanup）：
+    ///   - interactive 参数不影响 dns_enabled 标志行为
+    ///   - 多次调用必须幂等（Path A + Path B + tray Quit 三条路径竞态时
+    ///     只有第一个真正跑 cleanup，其余 no-op）
+    #[tokio::test]
+    async fn test_cleanup_dns_on_exit_idempotent_across_calls() {
+        let temp = TempDir::new().unwrap();
+        let storage = Arc::new(FileStorage::new(temp.path()))
+            as Arc<dyn mhost_storage::storage::Storage + Send + Sync>;
+        storage
+            .save_manifest(&mhost_storage::manifest::Manifest::new(env!(
+                "CARGO_PKG_VERSION"
+            )))
+            .unwrap();
+        let state = AppState {
+            storage,
+            writer: Arc::new(HostsWriter::new()),
+            apply_lock: ApplyLock::new(),
+            snapshot_lock: ApplyLock::new(),
+            last_profile_ids: Mutex::new(Vec::new()),
+            dns_server: Arc::new(Mutex::new(None)),
+            dns_enabled: AtomicBool::new(true),
+            original_dns: Mutex::new(OriginalDns::DhcpEmpty),
+            dns_lock: ApplyLock::new(),
+        };
+
+        // 第一次 cleanup（模拟 tray Quit → interactive=true）：跑 disable 路径
+        let r1 = cleanup_dns_on_exit(&state, true).await;
+        assert!(r1.is_ok());
+        assert!(
+            !state.dns_enabled.load(Ordering::Relaxed),
+            "first cleanup must clear dns_enabled"
+        );
+
+        // 第二次 cleanup（模拟 Path A/B 同时触发 → interactive=false）：
+        // dns_enabled 已被标 false，必须 no-op，不能再去碰 set_dns_mode_disable
+        // （那里会再次 save_manifest + 调 networksetup）。
+        let r2 = cleanup_dns_on_exit(&state, false).await;
+        assert!(
+            r2.is_ok(),
+            "second cleanup must be a no-op (idempotency for double-exit paths)"
+        );
+        assert!(
+            !state.dns_enabled.load(Ordering::Relaxed),
+            "dns_enabled stays false across multiple cleanup calls"
+        );
+
+        // 第三次（同样）
+        let r3 = cleanup_dns_on_exit(&state, true).await;
+        assert!(r3.is_ok(), "third cleanup must also be a no-op");
     }
 }
 

@@ -18,6 +18,50 @@ use tauri::{Manager, RunEvent};
 /// 把这个标志置 true，后续直接 bail（仍然 prevent_exit()）。
 static EXIT_CLEANUP_STARTED: AtomicBool = AtomicBool::new(false);
 
+/// App 退出时的统一清理入口（fix: 用户反馈"关闭 app 后系统 DNS 没还原"）。
+///
+/// 三条退出路径都汇聚到这里：
+///   1) tray Quit（用户在场 → `interactive=true`，proxy 死了时走
+///      osascript sudo 兜底，让用户当场看到恢复成功）
+///   2) Tauri `RunEvent::ExitRequested`（Cmd-Q + 兜底 → `interactive=false`，
+///      用户可能不在场，marker 留给下次启动 `try_recover_dns` 兜底）
+///   3) SIGINT/SIGTERM handler（Ctrl+C / kill / OS 关机 → `interactive=false`）
+///
+/// 与 `cleanup_dns_on_exit` 的关系：本函数**包装** `cleanup_dns_on_exit`，
+/// 添加 Tauri 特定的 watchdog + `handle.exit(0)`。幂等性由
+/// `cleanup_dns_on_exit` 内部的 `dns_enabled` 标志保证（重复调用 no-op）。
+///
+/// # 为什么调用方用 `block_on` 而不是直接 `.await`
+/// RunEvent 回调（Path A）和 `handle_menu_event` 回调（tray Quit）都
+/// 运行在 tao 的主事件循环，**不是** tokio task。Tauri 2 的
+/// `async_runtime::block_on` 在这种同步上下文里调用是安全的（tauri 文档
+/// 显式支持）。`SIGINT/SIGTERM` handler（Path B）运行在 spawn 出来的
+/// tokio task 里，直接 `.await` 即可，不需要 `block_on`。
+///
+/// # 为什么 Path B 不走这里
+/// Path B 的现有实现已经 `await cleanup_dns_on_exit` 后再 `handle.exit(0)`，
+/// 本身可靠。集中到这里会引入 `handle.exit(0)` → ExitRequested 递归的
+/// 额外路径（虽然 EXIT_CLEANUP_STARTED 守卫能挡住，但增加无意义的递归）。
+/// 保持 Path B 内联以减少 blast radius。
+async fn cleanup_and_exit<R: tauri::Runtime>(app_handle: &tauri::AppHandle<R>, interactive: bool) {
+    // 1. 同步执行 DNS cleanup：写 manifest、恢复系统 DNS、停 DnsServer。
+    if let Some(state) = app_handle.try_state::<AppState>() {
+        if let Err(e) = commands::dns::cleanup_dns_on_exit(state.inner(), interactive).await {
+            eprintln!("[mHost] DNS cleanup on exit failed: {}", e);
+        }
+    }
+    // 2. 兜底 watchdog：在某些 tao 版本下 `handle.exit(0)` 不会真正终止进程
+    //    （issue #67 bug 3）。如果 400ms 后进程还活着，强退。
+    let handle = app_handle.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        eprintln!("[mHost] graceful exit timed out, force-exiting process");
+        std::process::exit(0);
+    });
+    // 3. 优雅退出（best effort，被 watchdog 兜底）。
+    handle.exit(0);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app_state = match tauri::async_runtime::block_on(AppState::new()) {
@@ -111,7 +155,9 @@ pub fn run() {
                         }
                     }
                     if let Some(state) = sig_app_handle.try_state::<AppState>() {
-                        if let Err(e) = commands::dns::cleanup_dns_on_exit(state.inner()).await {
+                        if let Err(e) =
+                            commands::dns::cleanup_dns_on_exit(state.inner(), false).await
+                        {
                             eprintln!("[mHost] DNS cleanup on signal failed: {}", e);
                         }
                     }
@@ -182,20 +228,13 @@ pub fn run() {
             }
             eprintln!("[mHost] exit: Tauri ExitRequested, cleaning up DNS");
             api.prevent_exit();
-            let handle = app_handle.clone();
-            tauri::async_runtime::spawn(async move {
-                if let Some(state) = handle.try_state::<AppState>() {
-                    if let Err(e) = commands::dns::cleanup_dns_on_exit(state.inner()).await {
-                        eprintln!("[mHost] DNS cleanup on Tauri exit failed: {}", e);
-                    }
-                }
-                // fix (bug 3): handle.exit(0) 在某些 tao 版本下不真正
-                // 终止进程。400ms 后若还活着就强退（与 Path B 一致）。
-                std::thread::spawn(|| {
-                    std::thread::sleep(std::time::Duration::from_millis(400));
-                    std::process::exit(0);
-                });
-                handle.exit(0);
+            // **fix (app-close DNS cleanup)**：之前用 `tauri::async_runtime::spawn`
+            // fire-and-forget，spawn task 不一定在 Tauri tearDown 之前跑完，
+            // cleanup 实际没执行就被 400ms watchdog 强退 → 系统 DNS 卡在
+            // 127.0.0.1。现在用 `block_on` 同步等待 `cleanup_and_exit` 完成，
+            // RunEvent 回调在 tao 主线程（不是 tokio task），block_on 安全。
+            tauri::async_runtime::block_on(async move {
+                cleanup_and_exit(app_handle, false).await;
             });
         }
     });
