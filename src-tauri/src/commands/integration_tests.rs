@@ -1275,3 +1275,191 @@ mod test_6_7_dns_mode_preservation {
         );
     }
 }
+
+// ===========================================================================
+// 6.8 issue #67 round 3 — DNS profile enable/disable union semantics
+// ===========================================================================
+//
+// Tests the user's exact symptom: "only the first profile takes effect,
+// disabling all doesn't actually disable, only DNS mode restart clears".
+//
+// Bug A: save_profile left orphan files in the OTHER mode's dir, so
+// find_profile_path returned stale data forever.
+// Bug B: set_profile_enabled didn't reload on disable, so disabled
+// profiles' rules stayed in the in-memory engine.
+//
+// These tests exercise the disk+RuleEngine pipeline (no DnsServer
+// required) to verify that the user's flow now produces correct union.
+#[cfg(test)]
+mod test_6_8_dns_profile_enable_disable_union {
+    use super::*;
+    use mhost_core::ProfileId;
+
+    fn make_dns_profile(name: &str, domains: Vec<&str>, ip: &str) -> Profile {
+        let mut profile = Profile::new(name);
+        profile.mode = ProfileMode::Dns;
+        profile.enabled = true; // Profile::new defaults to false; we want enabled for these tests
+        profile.rules.push(mhost_core::HostRule {
+            id: mhost_core::RuleId(uuid::Uuid::new_v4()),
+            ip: Some(ip.parse().unwrap()),
+            domains: domains.iter().map(|d| d.to_string()).collect(),
+            enabled: true,
+            comment: None,
+            source: mhost_core::RuleSource::Manual,
+            line_number: None,
+        });
+        profile
+    }
+
+    /// End-to-end regression: enable a DNS profile → engine has its rule.
+    /// Disable it → engine no longer has the rule. (Bug B fix.)
+    /// No DNS mode restart required.
+    #[test]
+    fn test_dns_enable_then_disable_clears_rule() {
+        let (_temp, storage, _writer) = create_test_storage_and_writer();
+        let engine = RuleEngine::new();
+
+        // Create and save a DNS profile (enabled=true).
+        let mut profile = make_dns_profile("ad-blocker", vec!["ad.com"], "0.0.0.0");
+        storage.save_profile(&profile).unwrap();
+
+        // Mimic what reload_dns_rules does after set_profile_enabled(true):
+        let dns_profiles = storage.list_profiles_by_mode(ProfileMode::Dns).unwrap();
+        let enabled: Vec<_> = dns_profiles.iter().filter(|p| p.enabled).cloned().collect();
+        engine.rebuild(&enabled);
+        assert_eq!(engine.rule_count(), 1);
+        assert_eq!(
+            engine.resolve("ad.com"),
+            Some("0.0.0.0".parse().unwrap()),
+            "FIX-B: enable must load the rule"
+        );
+
+        // User disables the profile (via set_profile_enabled(false)).
+        profile.enabled = false;
+        storage.save_profile(&profile).unwrap();
+
+        // Mimic what reload_dns_rules does after Bug-B fix
+        // (drops `&& enabled` guard):
+        let dns_profiles = storage.list_profiles_by_mode(ProfileMode::Dns).unwrap();
+        let enabled: Vec<_> = dns_profiles.iter().filter(|p| p.enabled).cloned().collect();
+        engine.rebuild(&enabled);
+        assert_eq!(
+            engine.rule_count(),
+            0,
+            "FIX-B: disable must remove the rule (reload on disable)"
+        );
+        assert_eq!(
+            engine.resolve("ad.com"),
+            None,
+            "FIX-B: disabled profile's rule must not resolve"
+        );
+    }
+
+    /// End-to-end regression: multi-profile union after DNS mode
+    /// restart. All 3 profiles enabled, all 3 rule sets must be in
+    /// the engine (no union only picks the first).
+    #[test]
+    fn test_dns_mode_restart_loads_all_enabled_profiles() {
+        let (_temp, storage, _writer) = create_test_storage_and_writer();
+        let engine = RuleEngine::new();
+
+        // Three DNS profiles with non-overlapping domains.
+        let p1 = make_dns_profile("ads", vec!["ad.com"], "0.0.0.0");
+        let p2 = make_dns_profile("trackers", vec!["track.com"], "0.0.0.0");
+        let p3 = make_dns_profile("dev", vec!["api.local"], "127.0.0.1");
+        storage.save_profile(&p1).unwrap();
+        storage.save_profile(&p2).unwrap();
+        storage.save_profile(&p3).unwrap();
+
+        // DNS mode restart → reload from disk
+        let dns_profiles = storage.list_profiles_by_mode(ProfileMode::Dns).unwrap();
+        let enabled: Vec<_> = dns_profiles.iter().filter(|p| p.enabled).cloned().collect();
+        engine.rebuild(&enabled);
+
+        // All 3 domains must resolve (union, not just the first).
+        assert_eq!(
+            engine.rule_count(),
+            3,
+            "FIX-A: all 3 profiles' rules must load"
+        );
+        assert_eq!(engine.resolve("ad.com"), Some("0.0.0.0".parse().unwrap()));
+        assert_eq!(
+            engine.resolve("track.com"),
+            Some("0.0.0.0".parse().unwrap())
+        );
+        assert_eq!(
+            engine.resolve("api.local"),
+            Some("127.0.0.1".parse().unwrap())
+        );
+    }
+
+    /// User's exact scenario: 2 DNS profiles, mode drift (Hosts → Dns)
+    /// via the round-2 update_profile reassert. Before Fix A, the
+    /// drift left a stale Hosts file that load_profile returned forever.
+    /// After Fix A, the next save deletes the orphan, and the union
+    /// works correctly.
+    #[test]
+    fn test_dns_profile_mode_drift_then_union_works() {
+        let (_temp, storage, _writer) = create_test_storage_and_writer();
+        let engine = RuleEngine::new();
+
+        // Simulate Hypothesis A: profile initially saved as Hosts
+        // (Tauri deserialization missed mode="dns").
+        let mut profile = make_dns_profile("first", vec!["first.com"], "0.0.0.0");
+        profile.mode = ProfileMode::Hosts; // simulate drift
+        storage.save_profile(&profile).unwrap();
+
+        // List as Dns → empty (file is in hosts/)
+        let dns_list_before = storage.list_profiles_by_mode(ProfileMode::Dns).unwrap();
+        assert!(
+            dns_list_before.is_empty(),
+            "setup: profile should be invisible to DNS listing before fix"
+        );
+
+        // User edits rules → update_profile reasserts mode=Dns.
+        // With Fix A, save_profile now deletes the stale hosts file
+        // and writes the dns file. Without Fix A, the hosts file
+        // would remain and load_profile would still return Hosts.
+        profile.mode = ProfileMode::Dns;
+        profile.rules.push(mhost_core::HostRule {
+            id: mhost_core::RuleId(uuid::Uuid::new_v4()),
+            ip: Some("127.0.0.1".parse().unwrap()),
+            domains: vec!["second.com".to_string()],
+            enabled: true,
+            comment: None,
+            source: mhost_core::RuleSource::Manual,
+            line_number: None,
+        });
+        storage.save_profile(&profile).unwrap();
+
+        // Reload via list_profiles_by_mode(Dns) — must now see the profile.
+        let dns_profiles = storage.list_profiles_by_mode(ProfileMode::Dns).unwrap();
+        assert_eq!(
+            dns_profiles.len(),
+            1,
+            "FIX-A: after reassert, profile must be visible to DNS listing"
+        );
+        assert_eq!(dns_profiles[0].mode, ProfileMode::Dns);
+
+        // And load_profile returns mode=Dns (not the stale Hosts file).
+        let reloaded = storage.load_profile(&profile.id).unwrap();
+        assert_eq!(
+            reloaded.mode,
+            ProfileMode::Dns,
+            "FIX-A: load_profile must return current mode, not stale file"
+        );
+
+        // Union works.
+        let enabled: Vec<_> = dns_profiles.iter().filter(|p| p.enabled).cloned().collect();
+        engine.rebuild(&enabled);
+        assert_eq!(engine.rule_count(), 2);
+        assert_eq!(
+            engine.resolve("first.com"),
+            Some("0.0.0.0".parse().unwrap())
+        );
+        assert_eq!(
+            engine.resolve("second.com"),
+            Some("127.0.0.1".parse().unwrap())
+        );
+    }
+}
