@@ -301,8 +301,24 @@ impl DnsServer {
     }
 
     /// 重新加载规则。
+    ///
+    /// **fix (DNS rule hot-reload cache staleness)**:
+    /// 之前只 rebuild RuleEngine，不动 LRU 缓存。如果某域名在 reload 前
+    /// 已向上游查询并缓存（按上游 TTL，最长可达数分钟），reload 后即使
+    /// RuleEngine 现在对该域名有本地规则，缓存命中仍会返回旧的 upstream IP。
+    ///
+    /// 多 Profile 场景：用户启用 Profile B（B 含 X 的本地规则），X 此前
+    /// 已缓存 upstream 响应 → 启用 B 后查询 X 仍拿到 upstream IP，必须
+    /// 关掉再开 DNS 模式才能清除缓存（DNS off/on 重启 server）。
+    ///
+    /// 修复：rebuild RuleEngine 后清空整个 LRU 缓存。`reload_rules` 只在
+    /// 用户操作（toggle profile / edit rule / snapshot apply）时触发，
+    /// 不在热查询路径；clear 是 O(cache_size)（默认 1000），锁持有时间
+    /// 在微秒级，无可观察的延迟影响。
     pub fn reload_rules(&self, profiles: &[mhost_core::Profile]) {
         self.rule_engine.rebuild(profiles);
+        // 清空响应缓存，避免 stale upstream 响应覆盖新的本地规则。
+        self.cache.lock().clear();
     }
 
     /// 是否正在运行。
@@ -1058,9 +1074,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_dns_server_cache_hit_on_second_query() {
-        // 同一个 query 发两次，第二次应走缓存（不查上游）。
-        // 验证方法：第一次 reload_rules 用有效 IP，第二次 reload_rules 改成不同 IP，
-        // 但第二次查询仍返回第一次的 IP（说明走了缓存）。
+        // 同一 query 在 reload 之间发两次，第二次应走缓存（不查上游）。
+        // 验证方法：reload_rules 用 IP A，重复查询拿到 A 的 IP 两次（第二次命中 cache）。
+        //
+        // 另：reload_rules 之间必须清空 cache（见 `test_user_scenario_reload_must_invalidate_cache`），
+        // 否则 reload 之后命中 stale 响应 = bug，破坏用户的"切 profile 立即生效"体验。
         let config = DnsConfig {
             port: 1059,
             cache_size: 100,
@@ -1068,7 +1086,7 @@ mod tests {
         };
         let server = Arc::new(DnsServer::new(config).unwrap());
 
-        // 第一次设置规则
+        // 设置规则
         let profile1 = make_profile(
             "p1",
             ProfileMode::Dns,
@@ -1087,20 +1105,19 @@ mod tests {
         });
         wait_for_server_running(&server, 1000).await;
 
-        // 第一次查询
         let query_name = Name::from_utf8("cache.example.com.").unwrap();
+        let client = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+
+        // 第一次查询
         let query = hickory_proto::op::Query::query(query_name.clone(), RecordType::A);
         let mut request = Message::new();
         request.set_id(3000);
         request.add_query(query);
         let request_bytes = request.to_bytes().unwrap();
-
-        let client = UdpSocket::bind("0.0.0.0:0").await.unwrap();
         client
             .send_to(&request_bytes, "127.0.0.1:1059")
             .await
             .unwrap();
-
         let mut buf = vec![0u8; 4096];
         let (len, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
             .await
@@ -1115,7 +1132,36 @@ mod tests {
             other => panic!("期望 A 记录，实际 {:?}", other),
         }
 
-        // 第二次：reload_rules 改 IP 为 10.0.0.1
+        // 第二次查询 —— 同一 reload 状态下应命中 cache，仍是 127.0.0.1
+        let mut request_b = Message::new();
+        request_b.set_id(3001);
+        request_b.add_query(hickory_proto::op::Query::query(
+            query_name.clone(),
+            RecordType::A,
+        ));
+        let request_bytes_b = request_b.to_bytes().unwrap();
+        client
+            .send_to(&request_bytes_b, "127.0.0.1:1059")
+            .await
+            .unwrap();
+        let mut buf_b = vec![0u8; 4096];
+        let (len_b, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf_b))
+            .await
+            .unwrap()
+            .unwrap();
+        let response_b = Message::from_bytes(&buf_b[..len_b]).unwrap();
+        if let Some(RData::A(a)) = response_b.answers()[0].data() {
+            assert_eq!(
+                a.0,
+                std::net::Ipv4Addr::new(127, 0, 0, 1),
+                "无 reload 时第二次查询应命中缓存"
+            );
+        } else {
+            panic!("期望 A 记录");
+        }
+
+        // 现在 reload（IP 改为 10.0.0.1）。reload 必须清空 cache，
+        // 否则下面那次查询会拿到 stale 127.0.0.1（= bug）。
         let profile2 = make_profile(
             "p2",
             ProfileMode::Dns,
@@ -1124,15 +1170,13 @@ mod tests {
         );
         server.reload_rules(&[profile2]);
 
-        // 第二次查询 —— 应该还是 127.0.0.1（缓存）
         let mut request2 = Message::new();
-        request2.set_id(3001);
+        request2.set_id(3002);
         request2.add_query(hickory_proto::op::Query::query(
             query_name.clone(),
             RecordType::A,
         ));
         let request_bytes2 = request2.to_bytes().unwrap();
-
         client
             .send_to(&request_bytes2, "127.0.0.1:1059")
             .await
@@ -1143,17 +1187,107 @@ mod tests {
             .unwrap()
             .unwrap();
         let response2 = Message::from_bytes(&buf2[..len2]).unwrap();
-        let answer = &response2.answers()[0];
-        // 缓存命中 —— 仍是 127.0.0.1（第一次的）
-        if let Some(RData::A(a)) = answer.data() {
+        if let Some(RData::A(a)) = response2.answers()[0].data() {
             assert_eq!(
                 a.0,
-                std::net::Ipv4Addr::new(127, 0, 0, 1),
-                "缓存命中应返回第一次的 IP"
+                std::net::Ipv4Addr::new(10, 0, 0, 1),
+                "reload_rules 必须清空缓存，新规则应立即生效"
             );
         } else {
             panic!("期望 A 记录");
         }
+
+        server.stop().await.unwrap();
+    }
+
+    /// 用户的实际场景：Profile A 在 engine，启用 Profile B（同名域不同 IP）。
+    /// reload_rules 后查询必须返回 Profile B 的 IP（= cache 必须被清空）。
+    ///
+    /// 当前 bug：reload_rules 不清 cache，第二次查询拿到 stale IP。
+    /// DNS off/on 是因为 server 重建、cache 被丢弃，所以才"修好"。
+    #[tokio::test]
+    async fn test_user_scenario_reload_must_invalidate_cache() {
+        let config = DnsConfig {
+            port: 1063,
+            cache_size: 100,
+            ..Default::default()
+        };
+        let server = Arc::new(DnsServer::new(config).unwrap());
+
+        // Profile A：cache.example.com → 127.0.0.1
+        let profile_a = make_profile(
+            "A",
+            ProfileMode::Dns,
+            true,
+            vec![make_rule(
+                Some("127.0.0.1"),
+                vec!["cache.example.com"],
+                true,
+            )],
+        );
+        server.reload_rules(&[profile_a]);
+
+        let server_clone = server.clone();
+        let _handle = tokio::spawn(async move {
+            server_clone.start().await.unwrap();
+        });
+        wait_for_server_running(&server, 1000).await;
+
+        let query_name = Name::from_utf8("cache.example.com.").unwrap();
+        let client = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+
+        async fn send_query(
+            client: &UdpSocket,
+            port: u16,
+            id: u16,
+            name: &Name,
+        ) -> std::net::Ipv4Addr {
+            let query = hickory_proto::op::Query::query(name.clone(), RecordType::A);
+            let mut request = Message::new();
+            request.set_id(id);
+            request.add_query(query);
+            let bytes = request.to_bytes().unwrap();
+            client
+                .send_to(&bytes, format!("127.0.0.1:{port}"))
+                .await
+                .unwrap();
+            let mut buf = vec![0u8; 4096];
+            let (len, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+            let response = Message::from_bytes(&buf[..len]).unwrap();
+            match response.answers()[0].data() {
+                Some(RData::A(a)) => a.0,
+                other => panic!("期望 A 记录，实际 {:?}", other),
+            }
+        }
+
+        // 第一次查询：A 的规则 → 127.0.0.1，cache 写入
+        let first_ip = send_query(&client, 1063, 4000, &query_name).await;
+        assert_eq!(first_ip, std::net::Ipv4Addr::new(127, 0, 0, 1));
+
+        // 不 reload 二次查询：cache 命中，仍是 127.0.0.1（基线）
+        let second_ip = send_query(&client, 1063, 4001, &query_name).await;
+        assert_eq!(second_ip, std::net::Ipv4Addr::new(127, 0, 0, 1));
+
+        // 启用 Profile B：同一域名 → 10.0.0.1
+        let profile_b = make_profile(
+            "B",
+            ProfileMode::Dns,
+            true,
+            vec![make_rule(Some("10.0.0.1"), vec!["cache.example.com"], true)],
+        );
+        server.reload_rules(&[profile_b]);
+
+        // **关键断言**：reload 后查询必须返回 10.0.0.1
+        // （如果 cache 没清空，会拿到 stale 127.0.0.1 = bug）
+        let after_reload_ip = send_query(&client, 1063, 4002, &query_name).await;
+        assert_eq!(
+            after_reload_ip,
+            std::net::Ipv4Addr::new(10, 0, 0, 1),
+            "BUG: reload_rules 没清 cache，第二次拿到 stale IP"
+        );
 
         server.stop().await.unwrap();
     }

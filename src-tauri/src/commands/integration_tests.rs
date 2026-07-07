@@ -1460,4 +1460,67 @@ mod test_6_8_dns_profile_enable_disable_union {
             Some("127.0.0.1".parse().unwrap())
         );
     }
+
+    /// 用户的实际场景：Profile A 已在 running engine 中，启用 Profile B。
+    /// 验证：incremental reload 后，engine 同时拥有 A+B 的规则（不需要 DNS 模式 off→on）。
+    ///
+    /// 这测试 set_profile_enabled(B, true) → reload_dns_rules 的链路：
+    /// 后端调用 list_profiles_by_mode(Dns) → 过滤 enabled → rebuild engine。
+    /// 如果有 bug，会在这里 fail。
+    #[test]
+    fn test_dns_enable_second_profile_in_running_engine() {
+        let (_temp, storage, _writer) = create_test_storage_and_writer();
+        let engine = RuleEngine::new();
+
+        // Step 1: Profile A 已启用并加载进 engine（模拟 DNS 模式开启后的初始状态）
+        let profile_a = make_dns_profile("ad-blocker", vec!["ad.com"], "0.0.0.0");
+        storage.save_profile(&profile_a).unwrap();
+        let dns_profiles = storage.list_profiles_by_mode(ProfileMode::Dns).unwrap();
+        let enabled: Vec<_> = dns_profiles.iter().filter(|p| p.enabled).cloned().collect();
+        engine.rebuild(&enabled);
+        assert_eq!(engine.rule_count(), 1, "setup: A in engine");
+        assert_eq!(engine.resolve("ad.com"), Some("0.0.0.0".parse().unwrap()));
+
+        // Step 2: Profile B 已存在但 disabled（不在 engine）
+        let mut profile_b = make_dns_profile("dev", vec!["api.local"], "127.0.0.1");
+        profile_b.enabled = false;
+        storage.save_profile(&profile_b).unwrap();
+
+        let dns_profiles = storage.list_profiles_by_mode(ProfileMode::Dns).unwrap();
+        let enabled: Vec<_> = dns_profiles.iter().filter(|p| p.enabled).cloned().collect();
+        assert_eq!(enabled.len(), 1, "B 创建时 disabled，列表里只应有 A");
+
+        // Step 3: 用户点击 Profile B 的开关启用它
+        //        （这对应 set_profile_enabled(B, true) 的逻辑：
+        //          save_profile → reload_dns_rules → list + rebuild engine）
+        profile_b.enabled = true;
+        storage.save_profile(&profile_b).unwrap();
+
+        // Step 4: 模拟 reload_dns_rules 内部做的事情
+        let dns_profiles = storage.list_profiles_by_mode(ProfileMode::Dns).unwrap();
+        let enabled: Vec<_> = dns_profiles.iter().filter(|p| p.enabled).cloned().collect();
+        engine.rebuild(&enabled);
+
+        // 断言：engine 应该同时有 A 和 B 的规则
+        assert_eq!(
+            enabled.len(),
+            2,
+            "BUG: 启用 B 后 list 应返回 2 个 enabled profile"
+        );
+        assert_eq!(
+            engine.rule_count(),
+            2,
+            "BUG: 启用 B 后 engine 应该有 A 和 B 两条规则"
+        );
+        assert_eq!(
+            engine.resolve("ad.com"),
+            Some("0.0.0.0".parse().unwrap()),
+            "A 的规则应该保留"
+        );
+        assert_eq!(
+            engine.resolve("api.local"),
+            Some("127.0.0.1".parse().unwrap()),
+            "BUG: B 的规则应该立即生效（不需要 DNS 模式 off→on）"
+        );
+    }
 }
