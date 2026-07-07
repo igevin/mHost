@@ -186,9 +186,13 @@ pub async fn set_profile_enabled(
     profile.updated_at = chrono::Utc::now();
     state.storage.save_profile(&profile)?;
 
-    // 如果启用的是 DNS 模式 Profile 且 dns_enabled == true，热重载规则
+    // 如果是 DNS 模式 Profile 且 dns_enabled == true，热重载规则。
+    // **fix issue #67 round 3 (Bug B)**: 不再要求 `enabled == true` —— 禁用
+    // DNS profile 也要 reload，否则 in-memory RuleEngine 仍保留禁用 profile
+    // 的规则，用户只能通过 DNS 模式 off→on 来真正清空（用户体验：禁用所
+    // 有 profile 之后第一条 profile 的规则仍然生效）。Reload 是 in-memory
+    // rebuild，廉价，无副作用（dns_enabled 关掉时也走这个 guard 不重载）。
     if profile.mode == ProfileMode::Dns
-        && enabled
         && state.dns_enabled.load(std::sync::atomic::Ordering::Relaxed)
     {
         crate::commands::dns::reload_dns_rules(state).await?;
@@ -214,6 +218,12 @@ pub async fn update_profile(
     name: String,
     description: Option<String>,
     rules: Vec<mhost_core::HostRule>,
+    // **fix issue #67 bug 2**: 显式接受 mode。前端 create 时如果 Tauri
+    // 反序列化 Option<ProfileMode> 漏掉（Hypothesis A），profile 会以
+    // 默认 mode=Hosts 落盘到 profiles/hosts/，后续 set_profile_enabled
+    // 的 reload 条件 `mode == Dns` 永远不满足 → DNS 规则永不生效。
+    // 每次 update 显式 reassert mode，纠正任何磁盘上错误的 mode。
+    mode: Option<ProfileMode>,
     state: State<'_, AppState>,
     #[allow(unused_variables)] app_handle: AppHandle,
 ) -> Result<Profile, MhostError> {
@@ -223,6 +233,9 @@ pub async fn update_profile(
     profile.name = name;
     profile.description = description;
     profile.rules = rules;
+    if let Some(m) = mode {
+        profile.mode = m;
+    }
     profile.updated_at = chrono::Utc::now();
 
     // N4: Validate profile data before applying changes to system hosts.

@@ -23,13 +23,21 @@ impl RuleEngine {
     /// 只处理 `mode == ProfileMode::Dns` 且 `enabled == true` 的 Profile，
     /// 每个 Profile 中只处理 `enabled == true` 且 `ip` 不为 `None` 的 HostRule。
     /// 多个 Profile 的相同域名保留第一个，后续冲突记录警告。
+    ///
+    /// **冲突顺序确定性（issue #67 DNS 多 Profile）**：启用 profile 按
+    /// `name` 字典序排序后再迭代，因此 first-wins 与文件系统读取顺序无关，
+    /// 同一组 profile 在不同启动中结果一致。
     pub fn rebuild(&self, profiles: &[Profile]) {
+        // 收集 DNS 模式且启用的 profile，按 name 排序保证 first-wins 确定性。
+        let mut active: Vec<&Profile> = profiles
+            .iter()
+            .filter(|p| p.mode == ProfileMode::Dns && p.enabled)
+            .collect();
+        active.sort_by(|a, b| a.name.cmp(&b.name));
+
         let mut new_rules = HashMap::new();
 
-        for profile in profiles {
-            if profile.mode != ProfileMode::Dns || !profile.enabled {
-                continue;
-            }
+        for profile in active {
             for rule in &profile.rules {
                 if !rule.enabled {
                     continue;
@@ -216,6 +224,55 @@ mod tests {
         assert_eq!(
             engine.resolve("example.com"),
             Some("127.0.0.1".parse::<IpAddr>().unwrap())
+        );
+    }
+
+    /// issue #67：first-wins 必须按 `name` 字典序决定，
+    /// 与输入顺序无关（之前依赖 `fs::read_dir` 系统调用顺序，不确定）。
+    #[test]
+    fn test_rebuild_sort_by_name_deterministic() {
+        // zeta 在前 / alpha 在后：alpha 应胜出（name 字典序在前）
+        let zeta = make_profile(
+            "zeta",
+            ProfileMode::Dns,
+            true,
+            vec![make_rule(Some("10.0.0.1"), vec!["shared.com"], true)],
+        );
+        let alpha = make_profile(
+            "alpha",
+            ProfileMode::Dns,
+            true,
+            vec![make_rule(Some("10.0.0.2"), vec!["shared.com"], true)],
+        );
+        // 输入顺序：zeta 在前（按 slice 顺序）
+        let engine = RuleEngine::new();
+        engine.rebuild(&[zeta, alpha]);
+        // alpha 按 name 排序在前，应胜出
+        assert_eq!(
+            engine.resolve("shared.com"),
+            Some("10.0.0.2".parse::<IpAddr>().unwrap()),
+            "alpha should win by name order, not input order"
+        );
+
+        // 反向输入：alpha 在前 / zeta 在后；结果必须一致（仍是 alpha 胜）
+        let alpha2 = make_profile(
+            "alpha",
+            ProfileMode::Dns,
+            true,
+            vec![make_rule(Some("10.0.0.3"), vec!["shared.com"], true)],
+        );
+        let zeta2 = make_profile(
+            "zeta",
+            ProfileMode::Dns,
+            true,
+            vec![make_rule(Some("10.0.0.4"), vec!["shared.com"], true)],
+        );
+        let engine2 = RuleEngine::new();
+        engine2.rebuild(&[alpha2, zeta2]);
+        assert_eq!(
+            engine2.resolve("shared.com"),
+            Some("10.0.0.3".parse::<IpAddr>().unwrap()),
+            "reversed input order must yield same winner (alpha)"
         );
     }
 

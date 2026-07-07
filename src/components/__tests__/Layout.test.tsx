@@ -224,7 +224,11 @@ describe("Layout", () => {
 
     renderWithProviders(<Layout />);
 
-    expect(screen.getByText("DNS")).toBeInTheDocument();
+    // Scope: sidebar indicator specifically (StatusBar also shows a 'DNS'
+    // label after issue #67, so we cannot use plain getByText).
+    const indicator = document.querySelector("[class*='dnsStatusIndicator']");
+    expect(indicator).toBeTruthy();
+    expect(indicator!.textContent).toContain("DNS");
   });
 
   it("hides DNS status indicator when dnsEnabled is false", () => {
@@ -233,6 +237,9 @@ describe("Layout", () => {
 
     renderWithProviders(<Layout />);
 
-    expect(screen.queryByText("DNS")).not.toBeInTheDocument();
+    // Sidebar indicator must be hidden when dnsEnabled is false.
+    // (StatusBar DNS column is a separate UI element and stays visible.)
+    const indicator = document.querySelector("[class*='dnsStatusIndicator']");
+    expect(indicator).toBeFalsy();
   });
 });

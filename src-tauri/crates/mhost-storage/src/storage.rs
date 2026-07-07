@@ -96,14 +96,36 @@ impl FileStorage {
     }
 
     /// 遍历 hosts 和 dns 子目录，查找指定 ID 的 Profile 文件路径。
+    ///
+    /// **fix issue #67 round 4 (review follow-up)**: 之前总是先返回
+    /// Hosts 文件。配合 round-3 的 delete-before-write 顺序，
+    /// save_profile 短暂窗口内两个文件同时存在时，load_profile 总会
+    /// 拿到 stale 的 Hosts 文件 → mode 错 → DNS 规则永不生效。
+    ///
+    /// round-4 fix：save_profile 改成 write-then-delete（先 atomic_write
+    /// 新文件，再删除 stale 文件）。这个窗口期内两个文件会同时存在，
+    /// 所以 find_profile_path 在两个都存在时按 **mtime** 选更新的
+    /// （atomic_write rename 后 mtime 是 now，stale 文件 mtime 更早）。
+    /// 若 mtime 拿不到（极端情况），fallback 到 Hosts（同旧行为，至少
+    /// 不会比之前更差）。
     fn find_profile_path(&self, id: &ProfileId) -> Option<PathBuf> {
-        for mode in [ProfileMode::Hosts, ProfileMode::Dns] {
-            let path = self.profile_path_for_mode(id, mode);
-            if path.exists() {
-                return Some(path);
+        let hosts_path = self.profile_path_for_mode(id, ProfileMode::Hosts);
+        let dns_path = self.profile_path_for_mode(id, ProfileMode::Dns);
+        let hosts_exists = hosts_path.exists();
+        let dns_exists = dns_path.exists();
+        match (hosts_exists, dns_exists) {
+            (false, false) => None,
+            (true, false) => Some(hosts_path),
+            (false, true) => Some(dns_path),
+            (true, true) => {
+                let hosts_mtime = fs::metadata(&hosts_path).and_then(|m| m.modified()).ok();
+                let dns_mtime = fs::metadata(&dns_path).and_then(|m| m.modified()).ok();
+                match (hosts_mtime, dns_mtime) {
+                    (Some(_h), Some(d)) if d > _h => Some(dns_path),
+                    _ => Some(hosts_path),
+                }
             }
         }
-        None
     }
 
     /// 返回 manifest 文件路径。
@@ -185,6 +207,17 @@ impl Storage for FileStorage {
     }
 
     fn save_profile(&self, profile: &Profile) -> Result<(), StorageError> {
+        // **fix issue #67 round 3 (Bug A)**: Single-file invariant.
+        // 一个 profile 在任意时刻只能存在于一个 mode 目录下，否则
+        // find_profile_path 的查找会变得不确定（旧版本先查 Hosts）。
+        //
+        // **fix issue #67 round 4 (review follow-up)**: 顺序从
+        // delete-before-write 改成 write-then-delete。原本先 remove_file
+        // 再 atomic_write 的顺序有一个亚毫秒级窗口：crash 在两步之间
+        // 会同时丢掉新文件和 stale 文件，且没有 .tmp/.bak 可以恢复。
+        // 改成 write-then-delete 后：crash 在两步之间只是短暂有两个文件
+        // 存在，find_profile_path 按 mtime 选更新的那个（详见 find_profile_path），
+        // 任何时刻都至少有一个文件在 → 没有数据丢失窗口。
         let dir = self.profiles_dir_for_mode(profile.mode);
         self.ensure_dir(&dir)?;
         let path = self.profile_path_for_mode(&profile.id, profile.mode);
@@ -192,15 +225,45 @@ impl Storage for FileStorage {
             .map_err(|e| StorageError::ManifestCorrupted(format!("序列化 Profile 失败: {}", e)))?;
         atomic_write(&path, json.as_bytes())
             .map_err(|e| StorageError::Io(format!("写入 Profile 失败: {}", e)))?;
+
+        // 写入成功后再清理 stale 文件。如果两步之间 crash，
+        // 两个文件同时存在 → find_profile_path 按 mtime 选更新的；
+        // 下次正常 save 仍然会清理 stale。所以这条路径永远不会丢数据。
+        for other_mode in [ProfileMode::Hosts, ProfileMode::Dns] {
+            if other_mode != profile.mode {
+                let stale = self.profile_path_for_mode(&profile.id, other_mode);
+                if stale.exists() {
+                    fs::remove_file(&stale).map_err(|e| {
+                        StorageError::Io(format!(
+                            "清理其他模式 Profile 文件失败 [{}]: {}",
+                            stale.display(),
+                            e
+                        ))
+                    })?;
+                }
+            }
+        }
+
         Ok(())
     }
 
     fn delete_profile(&self, id: &ProfileId) -> Result<(), StorageError> {
-        let path = self
-            .find_profile_path(id)
-            .ok_or_else(|| StorageError::ProfileNotFound(id.clone()))?;
-        fs::remove_file(&path)
-            .map_err(|e| StorageError::Io(format!("删除 Profile 失败: {}", e)))?;
+        // **fix issue #67 round 3 (Bug A)**: 移除两个 mode 路径下的文件，
+        // 避免留下孤儿。否则 save_profile 已经把 orphan 清掉了，delete 却
+        // 只删一个 —— 会再次回到 dual-file 状态。
+        let mut removed = false;
+        for mode in [ProfileMode::Hosts, ProfileMode::Dns] {
+            let path = self.profile_path_for_mode(id, mode);
+            if path.exists() {
+                fs::remove_file(&path).map_err(|e| {
+                    StorageError::Io(format!("删除 Profile 文件失败 [{}]: {}", path.display(), e))
+                })?;
+                removed = true;
+            }
+        }
+        if !removed {
+            return Err(StorageError::ProfileNotFound(id.clone()));
+        }
         Ok(())
     }
 
@@ -674,5 +737,161 @@ mod tests {
         assert!(hosts.is_empty());
         assert!(dns.is_empty());
         assert!(all.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // issue #67 round 3: single-file invariant in save_profile/delete_profile
+    // -----------------------------------------------------------------------
+
+    /// save_profile 必须把旧 mode 路径下的同名 id 文件清掉。否则
+    /// find_profile_path 总是先找 Hosts，load_profile 会拿到 stale 文件。
+    #[test]
+    fn test_save_profile_deletes_other_mode_file() {
+        let (_temp, storage) = create_test_storage();
+
+        // 先存为 Hosts
+        let mut profile = Profile::new("drift_test");
+        profile.mode = ProfileMode::Hosts;
+        storage.save_profile(&profile).unwrap();
+
+        let hosts_file = storage
+            .root()
+            .join("profiles")
+            .join("hosts")
+            .join(format!("{}.json", profile.id));
+        assert!(hosts_file.exists(), "setup: hosts file should exist");
+
+        // mode 漂移到 Dns，save 应该清掉 hosts 文件
+        profile.mode = ProfileMode::Dns;
+        storage.save_profile(&profile).unwrap();
+
+        assert!(
+            !hosts_file.exists(),
+            "FIX: stale hosts file must be removed when mode drifts to Dns"
+        );
+
+        let dns_file = storage
+            .root()
+            .join("profiles")
+            .join("dns")
+            .join(format!("{}.json", profile.id));
+        assert!(dns_file.exists(), "dns file should now exist");
+
+        // load_profile 必须返回最新的 mode=Dns
+        let loaded = storage.load_profile(&profile.id).unwrap();
+        assert_eq!(loaded.mode, ProfileMode::Dns);
+    }
+
+    /// 反向漂移也要清理（Hosts → Dns → Hosts → Dns，最终只保留 Dns）。
+    #[test]
+    fn test_save_profile_idempotent_after_mode_drift_back() {
+        let (_temp, storage) = create_test_storage();
+
+        let mut profile = Profile::new("drift_back");
+        let hosts_file = storage
+            .root()
+            .join("profiles")
+            .join("hosts")
+            .join(format!("{}.json", profile.id));
+        let dns_file = storage
+            .root()
+            .join("profiles")
+            .join("dns")
+            .join(format!("{}.json", profile.id));
+
+        profile.mode = ProfileMode::Hosts;
+        storage.save_profile(&profile).unwrap();
+        assert!(hosts_file.exists());
+
+        profile.mode = ProfileMode::Dns;
+        storage.save_profile(&profile).unwrap();
+        assert!(!hosts_file.exists());
+        assert!(dns_file.exists());
+
+        profile.mode = ProfileMode::Hosts;
+        storage.save_profile(&profile).unwrap();
+        // 漂移回 Hosts 后，dns 文件必须被清理（FIX）
+        assert!(!dns_file.exists());
+        assert!(hosts_file.exists());
+
+        profile.mode = ProfileMode::Dns;
+        storage.save_profile(&profile).unwrap();
+        assert!(
+            !hosts_file.exists(),
+            "FIX: after drift back to Dns, hosts file must be cleaned"
+        );
+        assert!(dns_file.exists());
+
+        let loaded = storage.load_profile(&profile.id).unwrap();
+        assert_eq!(loaded.mode, ProfileMode::Dns);
+    }
+
+    /// delete_profile 必须把两个 mode 路径下的文件都删掉，不能留孤儿。
+    #[test]
+    fn test_delete_profile_removes_both_locations() {
+        let (_temp, storage) = create_test_storage();
+
+        let mut profile = Profile::new("dual_delete");
+        profile.mode = ProfileMode::Hosts;
+        storage.save_profile(&profile).unwrap();
+        profile.mode = ProfileMode::Dns;
+        storage.save_profile(&profile).unwrap();
+
+        // 现在 Hosts 文件已经被 save_profile 清掉，只剩 Dns。但手工造一个
+        // 孤儿 Hosts 文件模拟 dual-file 场景（之前的 bug 残留）。
+        let hosts_file = storage
+            .root()
+            .join("profiles")
+            .join("hosts")
+            .join(format!("{}.json", profile.id));
+        std::fs::write(&hosts_file, "{}").unwrap();
+
+        let dns_file = storage
+            .root()
+            .join("profiles")
+            .join("dns")
+            .join(format!("{}.json", profile.id));
+        assert!(hosts_file.exists());
+        assert!(dns_file.exists());
+
+        storage.delete_profile(&profile.id).unwrap();
+
+        assert!(!hosts_file.exists(), "FIX: hosts orphan must be deleted");
+        assert!(!dns_file.exists(), "dns file must be deleted");
+
+        let result = storage.load_profile(&profile.id);
+        assert!(
+            matches!(result, Err(StorageError::ProfileNotFound(_))),
+            "both files gone → load_profile must return ProfileNotFound"
+        );
+    }
+
+    /// 没孤儿文件时 save_profile 正常工作（回归保护）。
+    #[test]
+    fn test_save_profile_handles_missing_stale_file_gracefully() {
+        let (_temp, storage) = create_test_storage();
+
+        let mut profile = Profile::new("clean_dns");
+        profile.mode = ProfileMode::Dns;
+        storage.save_profile(&profile).unwrap();
+
+        let dns_file = storage
+            .root()
+            .join("profiles")
+            .join("dns")
+            .join(format!("{}.json", profile.id));
+        assert!(dns_file.exists());
+
+        // 二次保存（mode 不变）也应该正常
+        profile.rules.push(mhost_core::HostRule::new(
+            "127.0.0.1".parse().unwrap(),
+            vec!["example.com".to_string()],
+        ));
+        storage.save_profile(&profile).unwrap();
+        assert!(dns_file.exists());
+
+        let loaded = storage.load_profile(&profile.id).unwrap();
+        assert_eq!(loaded.mode, ProfileMode::Dns);
+        assert_eq!(loaded.rules.len(), 1);
     }
 }

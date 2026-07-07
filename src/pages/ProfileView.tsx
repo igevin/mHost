@@ -1,6 +1,8 @@
+import { useParams } from "react-router-dom";
 import type { ProfileMode } from "../types";
 import HostsProfileView from "../components/HostsProfileView";
 import DnsProfileView from "../components/DnsProfileView";
+import DnsProfileList from "../components/DnsProfileList";
 
 interface ProfileViewProps {
   mode?: ProfileMode;
@@ -19,14 +21,19 @@ interface ProfileViewProps {
  *     hosts atoms，对 DNS atom 完全不可见。
  *   - DnsProfileView: 只订阅 dnsProfilesAtom / isDnsLoadingAtom / dnsErrorAtom
  *     等 DNS atoms，对 hosts atom 完全不可见。
- *   - 本组件本身不订阅任何 atom，根据 mode 路由到对应子组件。
+ *   - 本组件本身不订阅任何 atom，根据 mode + URL :id 路由到对应子组件。
+ *
+ * **issue #67 DNS 多 Profile UI 重构**：DNS 模式下，无 :id 时路由到
+ * `<DnsProfileList />`（多 profile 列表落地页），有 :id 时路由到
+ * `<DnsProfileView />`（单 profile 编辑）。
  *
  * JSX 渲染时按 mode 选择，route 切换会卸载一个子组件、挂载另一个，
  * 不存在双订阅问题。
  */
 function ProfileView({ mode = "hosts" }: ProfileViewProps) {
+  const { id } = useParams<{ id?: string }>();
   if (mode === "dns") {
-    return <DnsProfileView />;
+    return id ? <DnsProfileView /> : <DnsProfileList />;
   }
   return <HostsProfileView />;
 }

@@ -5,9 +5,18 @@ pub mod state;
 pub mod tray;
 pub mod tray_logic;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use commands::{apply::*, dns::*, profile::*, profile_io::*, snapshot::*, validate::*};
 use state::AppState;
 use tauri::{Manager, RunEvent};
+
+/// **fix issue #67 bug 3**: 防止 RunEvent::ExitRequested 递归触发 cleanup。
+///
+/// `handle.exit(0)` 会再次触发 ExitRequested → cleanup → handle.exit(0)
+/// 死循环，stderr 刷几百条「exit: Tauri ExitRequested」。首次 ExitRequested
+/// 把这个标志置 true，后续直接 bail（仍然 prevent_exit()）。
+static EXIT_CLEANUP_STARTED: AtomicBool = AtomicBool::new(false);
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -163,6 +172,14 @@ pub fn run() {
     // no-op），重复触发不会出问题。
     app.run(|app_handle, event| {
         if let RunEvent::ExitRequested { api, .. } = event {
+            // **fix issue #67 bug 3**: 防止 ExitRequested 递归。第一次
+            // ExitRequested 进来 swap 到 true 并跑 cleanup；cleanup 调
+            // handle.exit(0) 会再次触发 ExitRequested，第二次 swap 后
+            // 拿到 true → bail，避免 stderr 刷几百条「exit: Tauri ExitRequested」。
+            if EXIT_CLEANUP_STARTED.swap(true, Ordering::SeqCst) {
+                api.prevent_exit();
+                return;
+            }
             eprintln!("[mHost] exit: Tauri ExitRequested, cleaning up DNS");
             api.prevent_exit();
             let handle = app_handle.clone();

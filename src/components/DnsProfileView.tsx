@@ -1,5 +1,5 @@
 import { useState, useCallback, useMemo } from "react";
-import { useParams, useNavigate, Navigate } from "react-router-dom";
+import { useParams, useNavigate } from "react-router-dom";
 import { useAtomValue, useSetAtom } from "jotai";
 import { save } from "@tauri-apps/plugin-dialog";
 import {
@@ -221,33 +221,8 @@ export default function DnsProfileView() {
   // 帮助函数：error atom setter 不直接暴露，从 useSetAtom 取
   const setError = useSetAtom(dnsErrorAtom);
 
-  if (!id) {
-    if (profiles.length > 0) {
-      return (
-        <Navigate to={`/dns-profiles/${profiles[0].id}`} replace />
-      );
-    }
-    return (
-      <div className={styles.viewPage}>
-        <div className="empty-state">
-          <p>No DNS profiles yet</p>
-          <button
-            className="btn btn-primary"
-            onClick={() => setShowCreateDialog(true)}
-          >
-            + New DNS Profile
-          </button>
-        </div>
-        <CreateProfileDialog
-          open={showCreateDialog}
-          onClose={() => setShowCreateDialog(false)}
-          onCreate={handleCreateProfile}
-          isLoading={isLoading}
-        />
-      </div>
-    );
-  }
-
+  // issue #67：无 :id 时路由已被 `ProfileView` 切到 `<DnsProfileList />`，
+  // 这里只处理 :id 存在但找不到 profile 的回退（详情页用）。
   if (!profile) {
     return (
       <div className={styles.viewPage}>
@@ -435,6 +410,15 @@ export default function DnsProfileView() {
           </div>
         </div>
         <div className={styles.viewHeaderActions}>
+          {/* issue #67: 详情页必须能回到 /dns-profiles 列表 */}
+          <button
+            className="btn btn-ghost btn-sm"
+            onClick={() => navigate("/dns-profiles")}
+            onPointerDown={onPointerDown(() => navigate("/dns-profiles"))}
+            title="Back to DNS Profiles"
+          >
+            ← Back
+          </button>
           {isEditing ? (
             <>
               <button

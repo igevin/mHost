@@ -20,6 +20,8 @@ export {
   dnsStatusAtom,
   isDnsLoadingAtom,
   dnsErrorAtom,
+  enabledDnsProfilesAtom,
+  dnsRuleCountAtom,
 } from "./state";
 
 // ---- Async action atoms ----
