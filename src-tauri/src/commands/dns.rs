@@ -59,6 +59,11 @@ async fn set_dns_mode_enable(state: &AppState) -> Result<(), MhostError> {
     //    只作为 upstream 的 fallback —— 见 get_upstream_resolvers）。
     let original = mhost_dns::platform::capture_dns_state()
         .map_err(|e| MhostError::InvalidInput(format!("capture dns state failed: {}", e)))?;
+    tracing::info!(
+        "set_dns_mode_enable: captured OriginalDns = {:?} \
+         (Manual = user-configured in System Settings; DhcpEmpty = no manual DNS, will track network changes)",
+        original
+    );
 
     // 2. 决定 upstream 初始值 + 是否启用 mid-session 上游刷新。
     //    Manual(servers)    → upstream = servers（用户意图，session 内不变）；
@@ -71,6 +76,11 @@ async fn set_dns_mode_enable(state: &AppState) -> Result<(), MhostError> {
         OriginalDns::Manual(servers) => (servers.clone(), false),
         OriginalDns::DhcpEmpty => (mhost_dns::platform::get_upstream_resolvers(), true),
     };
+    tracing::info!(
+        "set_dns_mode_enable: initial upstream = {:?}, refresh_upstream = {}",
+        upstream,
+        refresh_upstream
+    );
     if upstream == vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()] {
         eprintln!(
             "[mHost] no system DNS detected (networksetup empty + ipconfig empty); \

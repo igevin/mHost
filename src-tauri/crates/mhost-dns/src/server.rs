@@ -672,6 +672,11 @@ fn build_resolver(upstream: &[String], timeout_ms: u64) -> Result<TokioAsyncReso
 /// 重建 resolver 并 hot-swap 通过 `RwLock::write`。
 ///
 /// Manual snapshot 不进这里（`start()` 判断 `config.refresh_upstream`）。
+///
+/// **fix issue #103 (debug follow-up)**：加 verbose 日志，每次 tick 都
+/// 打印「current → new」和「无变化」的结果，方便在 `pnpm tauri dev`
+/// 跑起来后用 `RUST_LOG=mhost_dns=debug` 看到 polling 是否真的在跑、
+/// Tier 1 过滤是否生效、最终 new upstream 到底是什么。
 async fn run_upstream_refresh_loop(
     resolver: Arc<PlRwLock<Arc<TokioAsyncResolver>>>,
     current_upstream: Arc<PlRwLock<Vec<String>>>,
@@ -682,6 +687,10 @@ async fn run_upstream_refresh_loop(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // 第一次 tick 立即到 —— 跳过一次避免启动时的瞬时抢锁。
     ticker.tick().await;
+    tracing::debug!(
+        "DNS upstream refresh loop started (interval={:?})",
+        UPSTREAM_REFRESH_INTERVAL
+    );
 
     loop {
         tokio::select! {
@@ -695,9 +704,18 @@ async fn run_upstream_refresh_loop(
         let new_upstream = crate::platform::get_upstream_resolvers();
         let current: Vec<String> = current_upstream.read().clone();
         if new_upstream == current {
+            tracing::debug!(
+                "DNS upstream refresh tick: no change (current={:?})",
+                current
+            );
             continue;
         }
 
+        tracing::info!(
+            "DNS upstream refresh tick: change detected {:?} -> {:?}",
+            current,
+            new_upstream
+        );
         match build_resolver(&new_upstream, timeout_ms) {
             Ok(new_resolver) => {
                 {
@@ -706,7 +724,7 @@ async fn run_upstream_refresh_loop(
                 }
                 *current_upstream.write() = new_upstream.clone();
                 tracing::info!(
-                    "DNS server upstream refreshed: {:?} -> {:?} (network change detected)",
+                    "DNS server upstream hot-swapped: {:?} -> {:?} (network change applied)",
                     current,
                     new_upstream
                 );

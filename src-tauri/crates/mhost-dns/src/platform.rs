@@ -1,3 +1,4 @@
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -230,25 +231,107 @@ pub fn capture_dns_state() -> Result<OriginalDns, PlatformError> {
 /// Tier 3 兜底 `[8.8.8.8, 1.1.1.1]` 是上游 resolver 的最后一道防线，
 /// 绝不是「用户原本的状态」——调用方 get_upstream_resolvers 的调用者应
 /// 在返回为 Tier 3 时打 warning log。
+///
+/// **fix (issue #103)**：Tier 1 拿到结果后会过滤掉本机 loopback /
+/// unspecified 地址。DNS 模式启用后系统 DNS 被改成 `127.0.0.1`
+///（见 `enable_dns_mode`），不剔除会导致 `run_upstream_refresh_loop`
+/// 把 upstream hot-swap 成 `[127.0.0.1]`，DNS 服务器开始向自己递归
+/// 转发，切换 WiFi 后也永远拿不到新网络的 DHCP DNS。
+///
+/// **fix issue #103 (debug follow-up)**：每个 tier 命中的瞬间都打
+/// `tracing::debug!`，包括 Tier 1 过滤前后的差异。配合
+/// `RUST_LOG=mhost_dns=debug` 即可看到：
+///   - networksetup 实际返回什么（启用 DNS 模式后应是 `[127.0.0.1]`）
+///   - 哪些条目被 `is_local_resolver` 过滤掉
+///   - Tier 2 fallback 时 ipconfig 实际返回什么（DHCP-pushed DNS）
+///   - 最终选中的 tier 是哪一个
 pub fn get_upstream_resolvers() -> Vec<String> {
     let port = match get_active_network_interface() {
-        Ok(p) => p,
-        Err(_) => return tier3_fallback(),
+        Ok(p) => {
+            tracing::debug!("get_upstream_resolvers: active interface port = {:?}", p);
+            p
+        }
+        Err(e) => {
+            tracing::debug!(
+                "get_upstream_resolvers: get_active_network_interface failed ({}), falling back to Tier 3",
+                e
+            );
+            return tier3_fallback();
+        }
     };
 
     if let Ok(servers) = networksetup_get_dns(&port) {
-        if !servers.is_empty() {
-            return servers;
+        tracing::debug!(
+            "get_upstream_resolvers: Tier 1 (networksetup -getdnsservers {:?}) raw = {:?}",
+            port,
+            servers
+        );
+        // fix (issue #103): 过滤掉本机 loopback / unspecified（见 `is_local_resolver`）。
+        // 过滤后为空 → 继续走 Tier 2 / Tier 3，而不是把 [127.0.0.1] 当 upstream。
+        let external: Vec<String> = servers
+            .into_iter()
+            .filter(|s| !is_local_resolver(s))
+            .collect();
+        if !external.is_empty() {
+            tracing::debug!(
+                "get_upstream_resolvers: Tier 1 after loopback filter = {:?} (returning)",
+                external
+            );
+            return external;
         }
+        tracing::debug!(
+            "get_upstream_resolvers: Tier 1 empty after loopback filter, falling through to Tier 2"
+        );
+    } else {
+        tracing::debug!(
+            "get_upstream_resolvers: Tier 1 (networksetup) failed, falling through to Tier 2"
+        );
     }
     if let Some(device) = get_active_network_device() {
+        tracing::debug!(
+            "get_upstream_resolvers: Tier 2 querying ipconfig on device {:?}",
+            device
+        );
         if let Ok(servers) = ipconfig_get_dns(&device) {
+            tracing::debug!(
+                "get_upstream_resolvers: Tier 2 (ipconfig getoption {:?}) = {:?}",
+                device,
+                servers
+            );
             if !servers.is_empty() {
                 return servers;
             }
+        } else {
+            tracing::debug!(
+                "get_upstream_resolvers: Tier 2 (ipconfig getoption {:?}) returned empty/failed",
+                device
+            );
         }
+    } else {
+        tracing::debug!(
+            "get_upstream_resolvers: get_active_network_device returned None, skipping Tier 2"
+        );
     }
+    tracing::debug!("get_upstream_resolvers: returning Tier 3 fallback [8.8.8.8, 1.1.1.1]");
     tier3_fallback()
+}
+
+/// **fix (issue #103)**：判断一个 resolver 字符串是否是「指向本机」的
+/// 地址（即不应该被当成 upstream）。覆盖：
+///
+/// - IPv4 loopback（`127.0.0.0/8`，不仅是 `127.0.0.1`）
+/// - IPv6 loopback（`::1`）
+/// - IPv4 / IPv6 unspecified（`0.0.0.0` / `::`）
+///
+/// 同时容忍 `host:port` 和 `[host]:port`（v6 bracketed）形式；如果
+/// 解析不出来（畸形字符串），按「非本地」处理，保留给上层常规校验
+/// 兜底（参见 `proxy.rs::validate_dns_entries`）。
+fn is_local_resolver(server: &str) -> bool {
+    let host = server
+        .parse::<SocketAddr>()
+        .map(|sa| sa.ip())
+        .or_else(|_| server.parse::<IpAddr>());
+    matches!(host, Ok(ip) if ip.is_loopback() || ip.is_unspecified())
 }
 
 /// Tier 3 fallback list. Public so tests can compare against it.
@@ -1071,6 +1154,78 @@ Device: en0
         let output = "  8.8.8.8  \n\n  1.1.1.1  \n";
         let result = parse_dns_servers(output).unwrap();
         assert_eq!(result, vec!["8.8.8.8", "1.1.1.1"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // 上游 loopback 过滤测试（fix issue #103）
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_local_resolver_ipv4() {
+        // 127.0.0.0/8 整段都是 loopback
+        assert!(is_local_resolver("127.0.0.1"));
+        assert!(is_local_resolver("127.5.5.5"));
+        assert!(is_local_resolver("127.255.255.254"));
+        // 0.0.0.0 是 unspecified
+        assert!(is_local_resolver("0.0.0.0"));
+        // 真实公网 / 内网 IP 不算本机
+        assert!(!is_local_resolver("8.8.8.8"));
+        assert!(!is_local_resolver("1.1.1.1"));
+        assert!(!is_local_resolver("192.168.1.1"));
+        assert!(!is_local_resolver("10.0.0.1"));
+    }
+
+    #[test]
+    fn test_is_local_resolver_ipv6() {
+        // ::1 loopback / :: unspecified
+        assert!(is_local_resolver("::1"));
+        assert!(is_local_resolver("::"));
+        // 真实 / 文档段 v6 不算本机
+        assert!(!is_local_resolver("2001:db8::1"));
+        assert!(!is_local_resolver("fe80::1"));
+    }
+
+    #[test]
+    fn test_is_local_resolver_with_port() {
+        // v4 + port
+        assert!(is_local_resolver("127.0.0.1:53"));
+        assert!(is_local_resolver("127.0.0.1:1053"));
+        assert!(is_local_resolver("127.0.0.1:5353")); // mDNSResponder 端口
+        assert!(!is_local_resolver("8.8.8.8:53"));
+        // v6 + port（bracketed）：这种才是 RFC 标准的写法
+        assert!(is_local_resolver("[::1]:53"));
+        assert!(is_local_resolver("[::]:53"));
+        assert!(!is_local_resolver("[2001:db8::1]:53"));
+        // 注：`"::1:53"`（无方括号）会被 Rust 解析成 v6 地址 ::1:53
+        // （= 0:0:0:0:0:0:1:53），这不是 loopback。这种歧义不是我们
+        // 这个 helper 要解决的，靠调用方不要这么传就行。
+    }
+
+    #[test]
+    fn test_is_local_resolver_garbage_input() {
+        // 解析不出来的字符串 → 按「非本地」处理，让上层常规校验兜底
+        assert!(!is_local_resolver(""));
+        assert!(!is_local_resolver("not-an-ip"));
+        assert!(!is_local_resolver("..."));
+        assert!(!is_local_resolver("evil.example.com"));
+    }
+
+    #[test]
+    fn test_parse_dns_servers_then_filter_loopback() {
+        // 模拟 `networksetup -getdnsservers` 在 DNS 模式启用后的输出：
+        // Tier 1 把 mHost 自己的代理地址也列出来了，必须被过滤掉，
+        // 公共 fallback（这里用 1.1.1.1 模拟真实外部 DNS）要保留。
+        let raw = parse_dns_servers("127.0.0.1\n1.1.1.1\n").unwrap();
+        let filtered: Vec<String> = raw.into_iter().filter(|s| !is_local_resolver(s)).collect();
+        assert_eq!(filtered, vec!["1.1.1.1".to_string()]);
+
+        // 全部是 loopback → 过滤后为空 → 调用方应继续走 Tier 2 / Tier 3
+        let all_loopback = parse_dns_servers("127.0.0.1\n0.0.0.0\n").unwrap();
+        let filtered_empty: Vec<String> = all_loopback
+            .into_iter()
+            .filter(|s| !is_local_resolver(s))
+            .collect();
+        assert!(filtered_empty.is_empty());
     }
 
     // -----------------------------------------------------------------------
