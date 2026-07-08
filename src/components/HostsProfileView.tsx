@@ -65,6 +65,8 @@ export default function HostsProfileView() {
   const [isEditingInfo, setIsEditingInfo] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [isSavingInfo, setIsSavingInfo] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
+  const isDeletingRef = useRef(false);
   const [importDialogOpen, setImportDialogOpen] = useState(false);
   const [showCreateDialog, setShowCreateDialog] = useState(false);
 
@@ -218,14 +220,19 @@ export default function HostsProfileView() {
   }, [profile, draftRules, ruleErrors, isSaving, updateProfile, setError]);
 
   const handleDeleteProfile = useCallback(async () => {
-    if (!profile || !id || profile.protected) return;
+    if (!profile || !id || profile.protected || isDeletingRef.current) return;
     const confirmed = await confirm(`Delete profile "${profile.name}"?`);
     if (!confirmed) return;
+    isDeletingRef.current = true;
+    setIsDeleting(true);
     try {
       await deleteProfileAction(id);
       navigate("/profiles");
     } catch (err: unknown) {
       setError(extractErrorMessage(err));
+    } finally {
+      isDeletingRef.current = false;
+      setIsDeleting(false);
     }
   }, [profile, id, deleteProfileAction, navigate, setError]);
 
@@ -527,8 +534,7 @@ export default function HostsProfileView() {
               <button
                 className="btn btn-danger btn-sm"
                 onClick={handleDeleteProfile}
-                onPointerDown={onPointerDown(handleDeleteProfile)}
-                disabled={profile.protected || isLoading}
+                disabled={profile.protected || isLoading || isDeleting}
               >
                 Delete
               </button>
