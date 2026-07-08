@@ -40,9 +40,11 @@ unsafe extern "C" fn macos_quit_cleanup() {
         eprintln!("[mHost] macos_quit_cleanup: no app handle stored, skipping");
         return;
     }
-    // SAFETY: pointer was stored in setup() from a valid AppHandle, and we
-    // know the app is still alive (we're inside applicationShouldTerminate:).
-    let handle = &*(handle_ptr as *const tauri::AppHandle<tauri::Wry>);
+    // SAFETY: the pointer was set in setup() via `Box::leak(Box::new(handle))`.
+    // Box::leak gives a `&'static T`, so the heap address is valid for the
+    // program's lifetime. We only ever read, never write.
+    let handle_box = handle_ptr as *const Box<tauri::AppHandle<tauri::Wry>>;
+    let handle: &tauri::AppHandle<tauri::Wry> = &*handle_box;
     if let Some(state) = handle.try_state::<AppState>() {
         let result = tauri::async_runtime::block_on(async move {
             commands::dns::cleanup_dns_on_exit(state.inner(), true).await
@@ -149,9 +151,15 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             {
                 // **fix issue #100**: store app handle + install Cmd-Q interceptor
-                let handle_ptr = app.handle().clone();
-                MACOS_QUIT_CLEANUP_HANDLE
-                    .store(&handle_ptr as *const _ as *mut (), Ordering::Release);
+                //
+                // Use `Box::leak` to put the AppHandle on the heap with a
+                // stable address for the program's lifetime. Storing a
+                // reference to a stack local (`&handle`) would dangle once
+                // `setup` returns — that's what caused the SIGSEGV crash
+                // reported by the user.
+                let handle_box = Box::new(app.handle().clone());
+                let handle_ptr = Box::into_raw(handle_box);
+                MACOS_QUIT_CLEANUP_HANDLE.store(handle_ptr as *mut (), Ordering::Release);
                 crate::platform::macos::install_quit_handler(macos_quit_cleanup);
 
                 if let Err(e) = crate::tray::build_tray(app.handle()) {
