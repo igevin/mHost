@@ -287,6 +287,35 @@ describe("ProfileView", () => {
     expect(confirm).toHaveBeenCalled();
   });
 
+  // Regression test for issue #100: Delete was double-bound to both
+  // `onClick` and `onPointerDown`, so one physical click fired the handler
+  // twice — producing two confirmation dialogs and a `ProfileNotFound` error
+  // on the second IPC call. After the fix, a `pointerDown` followed by a
+  // `click` must result in exactly one `confirm` call.
+  it("Delete fires confirm only once when both pointerDown and click are dispatched", async () => {
+    const { confirm } = await import("@tauri-apps/plugin-dialog");
+    vi.mocked(confirm).mockClear();
+    vi.mocked(confirm).mockResolvedValue(true);
+
+    const profile = makeProfile({ id: "p1", protected: false });
+    const store = getDefaultStore();
+    store.set(profilesAtom, [profile]);
+
+    renderWithRouter("/profiles/p1");
+
+    const deleteButton = screen.getByText("Delete");
+
+    await act(async () => {
+      fireEvent.pointerDown(deleteButton, { button: 0 });
+      fireEvent.click(deleteButton);
+      // Flush microtasks so the first handler's `await confirm(...)` resolves
+      // before any second-invocation effects propagate.
+      await Promise.resolve();
+    });
+
+    expect(confirm).toHaveBeenCalledTimes(1);
+  });
+
   // ---- DNS mode tests ----
 
   it("renders empty state for DNS mode when no profiles", () => {

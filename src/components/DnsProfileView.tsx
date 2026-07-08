@@ -1,4 +1,4 @@
-import { useState, useCallback, useMemo } from "react";
+import { useState, useCallback, useMemo, useRef } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { useAtomValue, useSetAtom } from "jotai";
 import { save } from "@tauri-apps/plugin-dialog";
@@ -54,6 +54,8 @@ export default function DnsProfileView() {
   const [isEditingInfo, setIsEditingInfo] = useState(false);
   const [isSavingInfo, setIsSavingInfo] = useState(false);
   const [showCreateDialog, setShowCreateDialog] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
+  const isDeletingRef = useRef(false);
 
   // Rules editing state（镜像 HostsProfileView）
   const [isEditing, setIsEditing] = useState(false);
@@ -145,14 +147,19 @@ export default function DnsProfileView() {
   }, [profile, id]);
 
   const handleDeleteProfile = useCallback(async () => {
-    if (!profile || !id || profile.protected) return;
+    if (!profile || !id || profile.protected || isDeletingRef.current) return;
     const confirmed = window.confirm(`Delete profile "${profile.name}"?`);
     if (!confirmed) return;
+    isDeletingRef.current = true;
+    setIsDeleting(true);
     try {
       await deleteProfileAction(id);
       navigate("/dns-profiles");
     } catch (err: unknown) {
       setError(extractErrorMessage(err));
+    } finally {
+      isDeletingRef.current = false;
+      setIsDeleting(false);
     }
   }, [profile, id, deleteProfileAction, navigate]);
 
@@ -464,8 +471,7 @@ export default function DnsProfileView() {
               <button
                 className="btn btn-danger btn-sm"
                 onClick={handleDeleteProfile}
-                onPointerDown={onPointerDown(handleDeleteProfile)}
-                disabled={profile.protected || isLoading}
+                disabled={profile.protected || isLoading || isDeleting}
               >
                 Delete
               </button>
