@@ -92,12 +92,15 @@ All IPC handlers are registered in `src-tauri/src/lib.rs::run()`. Roughly six gr
 
 ## Exit / DNS cleanup contract
 
-`src-tauri/src/lib.rs` defends DNS cleanup with **two independent paths**:
+`src-tauri/src/lib.rs` defends DNS cleanup with **three independent paths**:
 
-- **Path A**: Tauri `RunEvent::ExitRequested` hook → covers tray quit / Cmd-Q.
-- **Path B**: tokio SIGINT/SIGTERM handler spawned in `setup()` → covers Ctrl+C, `kill`, OS shutdown (Tauri's ExitRequested often doesn't fire in these cases).
+- **Tray Quit** (`src-tauri/src/tray.rs`): direct synchronous call to `commands::dns::cleanup_dns_on_exit(state, interactive=true)` before `app.exit(0)`. The `interactive=true` lets the proxy-self-restore timeout branch pop sudo when the privileged proxy is dead.
+- **macOS Cmd-Q / NSApplication terminate** (`src-tauri/src/platform/macos.rs::install_quit_handler`): a runtime-built `MhostQuitHandlerDelegate` (via `objc2::declare::ClassBuilder`) overrides `applicationShouldTerminate:` to run cleanup synchronously and then return `NSTerminateNow`. Tauri's `RunEvent::ExitRequested` is **not** fired on macOS Cmd-Q (tao's NSApplicationDelegate returns NSTerminateNow directly), so this OS-level hook is the only way to catch Cmd-Q. The handle is leaked to the heap via `Box::leak(Box::new(app.handle().clone()))` and the raw `*mut AppHandle<Wry>` is stored in a global `AtomicPtr` so the `extern "C" fn` callback (which can't capture) can reach it. **Don't** store the AppHandle as `*const Box<AppHandle>` — `Box::into_raw` returns `*mut T` directly; the extra layer reads the Arc pointer as a Box pointer and panics with `misaligned_pointer_dereference`.
+- **SIGINT / SIGTERM** (`src-tauri/src/lib.rs::setup`): tokio signal handlers in a `tauri::async_runtime::spawn(async move { … })` task; awaits `cleanup_dns_on_exit(state, interactive=true)` directly. Interactive sudo is still preferred here for Ctrl+C in dev (`pnpm tauri dev`), at the cost of a brief no-op sudo prompt during OS shutdown if no user is present.
 
-Both call `commands::dns::cleanup_dns_on_exit` (idempotent — `dns_enabled=false` is a no-op). A force-exit fallback kills the process after 400 ms if `handle.exit(0)` doesn't terminate (known issue in some tao versions). Any new code that may terminate the process must keep this DNS-cleanup guarantee — leaks leave the system pointing at `127.0.0.1` with no way to recover the user's original DNS.
+All three call `commands::dns::cleanup_dns_on_exit(state, interactive)` (idempotent — `dns_enabled=false` is a no-op). A force-exit fallback kills the process after 400 ms if `handle.exit(0)` doesn't terminate (known issue in some tao versions). Any new code that may terminate the process must keep this DNS-cleanup guarantee — leaks leave the system pointing at `127.0.0.1` with no way to recover the user's original DNS.
+
+> **Do NOT** try to handle Cmd-Q by hooking Tauri `RunEvent::ExitRequested` — Tauri 2 on macOS does not fire it for `applicationShouldTerminate:`. If you add a new exit path, hook the right OS-level event for the platform.
 
 ## Security boundaries already enforced
 
