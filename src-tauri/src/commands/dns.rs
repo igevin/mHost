@@ -455,18 +455,23 @@ mod tests {
             dns_lock: ApplyLock::new(),
         };
 
-        // 第一次 cleanup（模拟 tray Quit → interactive=true）：跑 disable 路径
-        let r1 = cleanup_dns_on_exit(&state, true).await;
+        // 第一次 cleanup：跑 disable 路径。注意必须用 interactive=false
+        // —— interactive=true 会在 proxy 不在时走 `osascript_restore`
+        // 弹 sudo 密码框，CI 无人点击会永远卡住。`cleanup_dns_on_exit`
+        // 入口 (line 321) 已经在调 `set_dns_mode_disable` 之前把
+        // `dns_enabled` 标 false，所以 disable 走 non-interactive
+        // 分支（返回 Err）也满足幂等性测试的核心断言。
+        let r1 = cleanup_dns_on_exit(&state, false).await;
         assert!(r1.is_ok());
         assert!(
             !state.dns_enabled.load(Ordering::Relaxed),
             "first cleanup must clear dns_enabled"
         );
 
-        // 第二次 cleanup（模拟 Path A/B 同时触发 → interactive=false）：
+        // 第二次 cleanup（模拟 Path A/B 同时触发 → interactive=true）：
         // dns_enabled 已被标 false，必须 no-op，不能再去碰 set_dns_mode_disable
         // （那里会再次 save_manifest + 调 networksetup）。
-        let r2 = cleanup_dns_on_exit(&state, false).await;
+        let r2 = cleanup_dns_on_exit(&state, true).await;
         assert!(
             r2.is_ok(),
             "second cleanup must be a no-op (idempotency for double-exit paths)"
@@ -477,7 +482,7 @@ mod tests {
         );
 
         // 第三次（同样）
-        let r3 = cleanup_dns_on_exit(&state, true).await;
+        let r3 = cleanup_dns_on_exit(&state, false).await;
         assert!(r3.is_ok(), "third cleanup must also be a no-op");
     }
 }
