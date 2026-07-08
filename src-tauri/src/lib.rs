@@ -5,7 +5,7 @@ pub mod state;
 pub mod tray;
 pub mod tray_logic;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 use commands::{apply::*, dns::*, profile::*, profile_io::*, snapshot::*, validate::*};
 use state::AppState;
@@ -17,6 +17,43 @@ use tauri::{Manager, RunEvent};
 /// 死循环，stderr 刷几百条「exit: Tauri ExitRequested」。首次 ExitRequested
 /// 把这个标志置 true，后续直接 bail（仍然 prevent_exit()）。
 static EXIT_CLEANUP_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// **fix issue #100**: macOS Cmd-Q quit interception
+///
+/// `applicationShouldTerminate:` (called by NSApp on Cmd-Q) doesn't fire
+/// `RunEvent::ExitRequested`. Tauri's tao delegate returns NSTerminateNow
+/// immediately. So we install a custom NSApplicationDelegate (via objc2
+/// in `platform::macos::install_quit_handler`) that calls this cleanup
+/// function synchronously, then returns NSTerminateNow.
+///
+/// `extern "C" fn` so it can be passed across the FFI boundary. Stores
+/// the Tauri AppHandle pointer in `MACOS_QUIT_CLEANUP_HANDLE` at setup
+/// time and reads it here.
+#[cfg(target_os = "macos")]
+static MACOS_QUIT_CLEANUP_HANDLE: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn macos_quit_cleanup() {
+    eprintln!("[mHost] macos_quit_cleanup: running DNS cleanup before terminate");
+    let handle_ptr = MACOS_QUIT_CLEANUP_HANDLE.load(Ordering::Acquire);
+    if handle_ptr.is_null() {
+        eprintln!("[mHost] macos_quit_cleanup: no app handle stored, skipping");
+        return;
+    }
+    // SAFETY: pointer was stored in setup() from a valid AppHandle, and we
+    // know the app is still alive (we're inside applicationShouldTerminate:).
+    let handle = &*(handle_ptr as *const tauri::AppHandle<tauri::Wry>);
+    if let Some(state) = handle.try_state::<AppState>() {
+        let result = tauri::async_runtime::block_on(async move {
+            commands::dns::cleanup_dns_on_exit(state.inner(), true).await
+        });
+        if let Err(e) = result {
+            eprintln!("[mHost] macos_quit_cleanup: cleanup failed: {}", e);
+        }
+    } else {
+        eprintln!("[mHost] macos_quit_cleanup: AppState not found, skipping");
+    }
+}
 
 /// App 退出时的统一清理入口（fix: 用户反馈"关闭 app 后系统 DNS 没还原"）。
 ///
@@ -110,8 +147,16 @@ pub fn run() {
         ])
         .setup(|app| {
             #[cfg(target_os = "macos")]
-            if let Err(e) = crate::tray::build_tray(app.handle()) {
-                eprintln!("[mHost] Failed to build tray: {}", e);
+            {
+                // **fix issue #100**: store app handle + install Cmd-Q interceptor
+                let handle_ptr = app.handle().clone();
+                MACOS_QUIT_CLEANUP_HANDLE
+                    .store(&handle_ptr as *const _ as *mut (), Ordering::Release);
+                crate::platform::macos::install_quit_handler(macos_quit_cleanup);
+
+                if let Err(e) = crate::tray::build_tray(app.handle()) {
+                    eprintln!("[mHost] Failed to build tray: {}", e);
+                }
             }
 
             // 独立 signal handler —— 覆盖 Ctrl+C / kill / OS 关机等
@@ -185,16 +230,11 @@ pub fn run() {
             });
 
             // Intercept window close to hide instead of exit.
-            // **fix (Cmd-Q hot-reload)**: do NOT switch activation policy to Accessory
-            // on window hide. Tauri 2 in Accessory mode does not fire
-            // `RunEvent::ExitRequested` on macOS Cmd-Q (the app terminates immediately
-            // via NSApp.terminate, bypassing Tauri's hook). Keeping the app in Regular
-            // mode means Cmd-Q goes through Tauri's ExitRequested handler (which now
-            // runs cleanup on a dedicated std::thread). Trade-off: the app keeps a
-            // Dock icon even when the main window is hidden. The tray icon still works.
-            // **TODO (issue #100)**: re-enable Accessory mode once we install a custom
-            // NSApplicationDelegate via objc2 to intercept applicationShouldTerminate:
-            // (so cleanup runs even when Tauri doesn't fire ExitRequested).
+            // **fix issue #100**: with `install_quit_handler` installed above
+            // (custom NSApplicationDelegate via objc2 that intercepts
+            // applicationShouldTerminate: synchronously), Cmd-Q cleanup
+            // works regardless of activation policy. We can re-enable
+            // Accessory mode on window hide so the app stays tray-only.
             if let Some(window) = app.get_webview_window("main") {
                 let handle = app.handle().clone();
                 window.on_window_event(move |event| {
@@ -202,8 +242,8 @@ pub fn run() {
                         api.prevent_close();
                         if let Some(window) = handle.get_webview_window("main") {
                             let _ = window.hide();
-                            // **fix issue #100**: skip set_activation_policy_accessory.
-                            // crate::platform::macos::set_activation_policy_accessory();
+                            #[cfg(target_os = "macos")]
+                            crate::platform::macos::set_activation_policy_accessory();
                         }
                     }
                 });
