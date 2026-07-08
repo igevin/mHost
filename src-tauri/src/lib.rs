@@ -221,7 +221,7 @@ pub fn run() {
     //
     // 两条路径 cleanup_dns_on_exit 内部幂等（dns_enabled=false 是
     // no-op），重复触发不会出问题。
-    app.run(|_app_handle, event| {
+    app.run(|app_handle, event| {
         if let RunEvent::ExitRequested { api, .. } = event {
             // **fix issue #67 bug 3**: 防止 ExitRequested 递归。第一次
             // ExitRequested 进来 swap 到 true 并跑 cleanup；cleanup 调
@@ -231,25 +231,48 @@ pub fn run() {
                 api.prevent_exit();
                 return;
             }
-            eprintln!("[mHost] exit: Tauri ExitRequested → forwarding to SIGTERM handler");
+            eprintln!("[mHost] exit: Tauri ExitRequested, cleaning up DNS on std::thread");
             api.prevent_exit();
-            // **fix (Cmd-Q 也要走 spawn+await 路径)**：
+            // **fix (Cmd-Q + tray Quit + 所有 ExitRequested 路径)**：
             //
-            // 用户实测发现 Path A 用 `tauri::async_runtime::block_on` 不工作
-            // （Cmd-Q 后 DNS 还原不了），但 SIGINT/SIGTERM handler（Path B）
-            // 用 `tauri::async_runtime::spawn(async move { .await })` 工作
-            // 正常（Ctrl+C 后 DNS 能还原）。
+            // 之前两版尝试都不工作：
+            //   - `tauri::async_runtime::block_on(cleanup_and_exit)` 在
+            //     Cmd-Q 路径下不跑完（怀疑 tao 主线程 + tokio runtime
+            //     race，或 macOS tray-only 模式下 prevent_exit 被忽略）。
+            //   - `libc::kill(self, SIGTERM)` 转发到 SIGINT/SIGTERM handler：
+            //     Ctrl+C 路径下因为 handle.exit(0) 二次触发 ExitRequested
+            //     才走这条路径，所以"看起来"工作了；Cmd-Q 路径下 SIGTERM
+            //     转发可能不可靠。
             //
-            // 怀疑原因：block_on 在 tao 主线程 + Tauri event callback 上下文
-            // 里有 race condition（runtime worker 与 tao loop 互相等待）。
-            //
-            // 解决：forwarding 到 SIGTERM handler（已验证可靠），让 cleanup
-            // 走 spawn + .await 的路径。SIGTERM 会触发 setup() 里 spawn 的
-            // tokio signal handler，运行 cleanup_dns_on_exit → handle.exit(0)，
-            // 后者再触发 ExitRequested → 递归守卫拦住。
-            unsafe {
-                libc::kill(std::process::id() as libc::pid_t, libc::SIGTERM);
-            }
+            // 现在用 std::thread::spawn 在独立 OS 线程上跑 cleanup：
+            //   - 完全脱离 tao 主线程 + Tauri runtime
+            //   - 用 tauri::async_runtime::block_on 跑 async cleanup
+            //     （与 tray Quit 同一机制，但不在 tao 线程上调用）
+            //   - cleanup 完成后 handle.exit(0) → 触发 ExitRequested 二次
+            //     → 递归守卫拦 → 400ms watchdog 兜底
+            let handle = app_handle.clone();
+            std::thread::spawn(move || {
+                eprintln!("[mHost] cleanup thread started");
+                let cleanup_handle = handle.clone();
+                let result = tauri::async_runtime::block_on(async move {
+                    if let Some(state) = cleanup_handle.try_state::<AppState>() {
+                        commands::dns::cleanup_dns_on_exit(state.inner(), true).await
+                    } else {
+                        Ok(())
+                    }
+                });
+                if let Err(e) = result {
+                    eprintln!("[mHost] DNS cleanup on Tauri exit failed: {}", e);
+                }
+                eprintln!("[mHost] cleanup thread done, calling handle.exit(0)");
+                // 400ms watchdog：handle.exit(0) 在某些 tao 版本下不真正终止进程
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                    eprintln!("[mHost] graceful exit timed out, force-exiting process");
+                    std::process::exit(0);
+                });
+                handle.exit(0);
+            });
         }
     });
 }
