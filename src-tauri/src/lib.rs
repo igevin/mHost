@@ -184,7 +184,17 @@ pub fn run() {
                 }
             });
 
-            // Intercept window close to hide instead of exit
+            // Intercept window close to hide instead of exit.
+            // **fix (Cmd-Q hot-reload)**: do NOT switch activation policy to Accessory
+            // on window hide. Tauri 2 in Accessory mode does not fire
+            // `RunEvent::ExitRequested` on macOS Cmd-Q (the app terminates immediately
+            // via NSApp.terminate, bypassing Tauri's hook). Keeping the app in Regular
+            // mode means Cmd-Q goes through Tauri's ExitRequested handler (which now
+            // runs cleanup on a dedicated std::thread). Trade-off: the app keeps a
+            // Dock icon even when the main window is hidden. The tray icon still works.
+            // **TODO (issue #100)**: re-enable Accessory mode once we install a custom
+            // NSApplicationDelegate via objc2 to intercept applicationShouldTerminate:
+            // (so cleanup runs even when Tauri doesn't fire ExitRequested).
             if let Some(window) = app.get_webview_window("main") {
                 let handle = app.handle().clone();
                 window.on_window_event(move |event| {
@@ -192,8 +202,8 @@ pub fn run() {
                         api.prevent_close();
                         if let Some(window) = handle.get_webview_window("main") {
                             let _ = window.hide();
-                            #[cfg(target_os = "macos")]
-                            crate::platform::macos::set_activation_policy_accessory();
+                            // **fix issue #100**: skip set_activation_policy_accessory.
+                            // crate::platform::macos::set_activation_policy_accessory();
                         }
                     }
                 });
@@ -252,7 +262,6 @@ pub fn run() {
             //     → 递归守卫拦 → 400ms watchdog 兜底
             let handle = app_handle.clone();
             std::thread::spawn(move || {
-                eprintln!("[mHost] cleanup thread started");
                 let cleanup_handle = handle.clone();
                 let result = tauri::async_runtime::block_on(async move {
                     if let Some(state) = cleanup_handle.try_state::<AppState>() {
@@ -264,7 +273,6 @@ pub fn run() {
                 if let Err(e) = result {
                     eprintln!("[mHost] DNS cleanup on Tauri exit failed: {}", e);
                 }
-                eprintln!("[mHost] cleanup thread done, calling handle.exit(0)");
                 // 400ms watchdog：handle.exit(0) 在某些 tao 版本下不真正终止进程
                 std::thread::spawn(move || {
                     std::thread::sleep(std::time::Duration::from_millis(400));
