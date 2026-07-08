@@ -44,7 +44,8 @@ unsafe extern "C" fn macos_quit_cleanup() {
     // `Box::into_raw` returns `*mut T` (not `*mut Box<T>`), so the pointer
     // directly addresses an `AppHandle<Wry>` value, properly aligned and
     // valid for the program's lifetime.
-    let handle: &tauri::AppHandle<tauri::Wry> = &*(handle_ptr as *const tauri::AppHandle<tauri::Wry>);
+    let handle: &tauri::AppHandle<tauri::Wry> =
+        &*(handle_ptr as *const tauri::AppHandle<tauri::Wry>);
     if let Some(state) = handle.try_state::<AppState>() {
         let result = tauri::async_runtime::block_on(async move {
             commands::dns::cleanup_dns_on_exit(state.inner(), true).await
