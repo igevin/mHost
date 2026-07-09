@@ -47,7 +47,13 @@ type CacheEntry = (Vec<Record>, Instant);
 /// **fix（disabling-after-network-switch）**：DhcpEmpty snapshot 启用
 /// refresh_upstream 时，每 `UPSTREAM_REFRESH_INTERVAL` 重新解析一次上游；
 /// 变化才 hot-swap，不变化是 no-op。
-const UPSTREAM_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+///
+/// **fix（issue #103 follow-up）**：从 60s 降到 15s，减少切换 WiFi 后
+/// 上游 hot-swap 的最坏等待时间。每次 tick 调用 `networksetup` +
+/// `ipconfig` 共 4 个 shell 命令，加起来 < 10ms，对 CPU / 电量影响可忽略。
+/// 更短的间隔（< 5s）没意义且会增加空轮询开销。如果未来需要近实时
+/// 跟随（< 1s），考虑 SCDynamicStore 事件驱动，参考跟踪 issue。
+const UPSTREAM_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 
 /// DNS 服务核心。
 /// TODO: TCP 监听支持计划在后续迭代中添加。
@@ -152,12 +158,18 @@ impl DnsServer {
         }
 
         let rule_engine = self.rule_engine.clone();
-        // **fix (P-R14, issue #90)**: TokioAsyncResolver 内部已用 Arc；
-        // 这里只做一次 Arc clone 传给 spawn，每查询零锁。
+        // **fix (P-R14, issue #90) + fix (issue #103 follow-up)**：
+        // 注意！之前这行 `let resolver = self.resolver.read().clone()` 只是
+        // 在 start() 时刻 clone 一次内层 Arc 整段 move 进 spawn 任务，
+        // 后续 `run_upstream_refresh_loop` 写 `self.resolver.write()` 时
+        // 这个 UDP 任务根本不会再读，hot-swap 对实际查询无效。
         //
-        // **fix（disabling-after-network-switch）**：resolver 在 RwLock 里，
-        // 取读锁 + clone 内层 Arc（原子 ref bump），让后台上游刷新能 hot-swap。
-        let resolver = self.resolver.read().clone();
+        // 修复：把 **slot**（Arc<PlRwLock<Arc<TokioAsyncResolver>>>）
+        // move 进 spawn 任务，循环里每次查询重新 `read().clone()` 拿
+        // 最新 inner Arc。parking_lot 的 RwLockReadGuard 在 statement
+        // 结束时 drop（ref 计数原子增加是常数时间），不阻塞 .await，
+        // 也不阻塞 refresh task 的 write 锁。
+        let resolver_slot = Arc::clone(&self.resolver);
         let cache = self.cache.clone();
 
         let handle = tokio::spawn(async move {
@@ -170,6 +182,8 @@ impl DnsServer {
                             .map_err(|e| DnsError::Server(format!("recv failed: {}", e)))?;
 
                         let request_data = &buf[..len];
+                        // 每次查询重新读 slot —— 让 refresh 任务的 hot-swap 真正生效。
+                        let resolver = resolver_slot.read().clone();
                         let response_data = match handle_dns_request(
                             request_data,
                             &rule_engine,
@@ -672,6 +686,11 @@ fn build_resolver(upstream: &[String], timeout_ms: u64) -> Result<TokioAsyncReso
 /// 重建 resolver 并 hot-swap 通过 `RwLock::write`。
 ///
 /// Manual snapshot 不进这里（`start()` 判断 `config.refresh_upstream`）。
+///
+/// **fix issue #103 (debug follow-up)**：加 verbose 日志，每次 tick 都
+/// 打印「current → new」和「无变化」的结果，方便在 `pnpm tauri dev`
+/// 跑起来后用 `RUST_LOG=mhost_dns=debug` 看到 polling 是否真的在跑、
+/// Tier 1 过滤是否生效、最终 new upstream 到底是什么。
 async fn run_upstream_refresh_loop(
     resolver: Arc<PlRwLock<Arc<TokioAsyncResolver>>>,
     current_upstream: Arc<PlRwLock<Vec<String>>>,
@@ -682,6 +701,10 @@ async fn run_upstream_refresh_loop(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // 第一次 tick 立即到 —— 跳过一次避免启动时的瞬时抢锁。
     ticker.tick().await;
+    tracing::debug!(
+        "DNS upstream refresh loop started (interval={:?})",
+        UPSTREAM_REFRESH_INTERVAL
+    );
 
     loop {
         tokio::select! {
@@ -692,12 +715,21 @@ async fn run_upstream_refresh_loop(
             }
         }
 
-        let new_upstream = crate::platform::get_upstream_resolvers();
+        let (new_upstream, _new_source) = crate::platform::get_upstream_resolvers();
         let current: Vec<String> = current_upstream.read().clone();
         if new_upstream == current {
+            tracing::debug!(
+                "DNS upstream refresh tick: no change (current={:?})",
+                current
+            );
             continue;
         }
 
+        tracing::info!(
+            "DNS upstream refresh tick: change detected {:?} -> {:?}",
+            current,
+            new_upstream
+        );
         match build_resolver(&new_upstream, timeout_ms) {
             Ok(new_resolver) => {
                 {
@@ -706,7 +738,7 @@ async fn run_upstream_refresh_loop(
                 }
                 *current_upstream.write() = new_upstream.clone();
                 tracing::info!(
-                    "DNS server upstream refreshed: {:?} -> {:?} (network change detected)",
+                    "DNS server upstream hot-swapped: {:?} -> {:?} (network change applied)",
                     current,
                     new_upstream
                 );

@@ -59,6 +59,11 @@ async fn set_dns_mode_enable(state: &AppState) -> Result<(), MhostError> {
     //    只作为 upstream 的 fallback —— 见 get_upstream_resolvers）。
     let original = mhost_dns::platform::capture_dns_state()
         .map_err(|e| MhostError::InvalidInput(format!("capture dns state failed: {}", e)))?;
+    tracing::info!(
+        "set_dns_mode_enable: captured OriginalDns = {:?} \
+         (Manual = user-configured in System Settings; DhcpEmpty = no manual DNS, will track network changes)",
+        original
+    );
 
     // 2. 决定 upstream 初始值 + 是否启用 mid-session 上游刷新。
     //    Manual(servers)    → upstream = servers（用户意图，session 内不变）；
@@ -67,11 +72,26 @@ async fn set_dns_mode_enable(state: &AppState) -> Result<(), MhostError> {
     //                         Tier 3 兜底）；refresh_upstream = true
     //                         （mid-session 跨网络时由 DnsServer 后台 task
     //                         重新调用 get_upstream_resolvers 并 hot-swap）
-    let (upstream, refresh_upstream) = match &original {
-        OriginalDns::Manual(servers) => (servers.clone(), false),
-        OriginalDns::DhcpEmpty => (mhost_dns::platform::get_upstream_resolvers(), true),
+    let (upstream, upstream_source, refresh_upstream) = match &original {
+        OriginalDns::Manual(servers) => (
+            servers.clone(),
+            mhost_dns::UpstreamTier::Networksetup,
+            false,
+        ),
+        OriginalDns::DhcpEmpty => {
+            let (s, src) = mhost_dns::platform::get_upstream_resolvers();
+            (s, src, true)
+        }
     };
-    if upstream == vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()] {
+    tracing::info!(
+        "set_dns_mode_enable: initial upstream = {:?}, source = {:?}, refresh_upstream = {}",
+        upstream,
+        upstream_source,
+        refresh_upstream
+    );
+    // fix issue #103 (review follow-up): 用 source 而非值比较，避免用户手编
+    // [8.8.8.8, 1.1.1.1] / DHCP 恰好推送同样列表时误报。
+    if upstream_source == mhost_dns::UpstreamTier::Public {
         eprintln!(
             "[mHost] no system DNS detected (networksetup empty + ipconfig empty); \
              using public fallback as upstream only (snapshot = DhcpEmpty). \

@@ -104,6 +104,16 @@ async fn cleanup_and_exit<R: tauri::Runtime>(app_handle: &tauri::AppHandle<R>, i
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // **fix issue #103 (debug follow-up)**: 让 `tracing::info!` / `warn!`
+    // 之类的日志能落到 stderr。RUST_LOG 没设时给个默认 `info`，要排查
+    // upstream 刷新这种细节可以 `RUST_LOG=mhost_dns=debug` 跑。
+    // `.with_test_writer()` 是不需要的——这是 main 入口不是 cargo test。
+    use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+    let _ = tracing_subscriber::registry()
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with(fmt::layer().with_writer(std::io::stderr).with_target(true))
+        .try_init();
+
     let app_state = match tauri::async_runtime::block_on(AppState::new()) {
         Ok(state) => state,
         Err(e) => {
