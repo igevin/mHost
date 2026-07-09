@@ -76,3 +76,7 @@ dist/
 
 # Attribution files (do not ignore skill assets)
 # concept/mHost/_shared/ — kept
+
+# Claude Code agent worktrees (created by subagents in isolated worktrees;
+# these are scratch directories, not source).
+.claude/worktrees/

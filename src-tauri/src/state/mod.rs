@@ -197,9 +197,16 @@ impl AppState {
         //     里配的，session 内不变）；refresh_upstream = false
         //   - DhcpEmpty        → upstream = 当前系统能解析到的（Tier 3 兜底
         //     包括在内），refresh_upstream = true（mid-session 跨网络会自动跟随）
-        let (upstream, refresh_upstream) = match &original {
-            OriginalDns::Manual(servers) => (servers.clone(), false),
-            OriginalDns::DhcpEmpty => (mhost_dns::platform::get_upstream_resolvers(), true),
+        let (upstream, _upstream_source, refresh_upstream) = match &original {
+            OriginalDns::Manual(servers) => (
+                servers.clone(),
+                mhost_dns::UpstreamTier::Networksetup,
+                false,
+            ),
+            OriginalDns::DhcpEmpty => {
+                let (s, src) = mhost_dns::platform::get_upstream_resolvers();
+                (s, src, true)
+            }
         };
         let dns_port = mhost_dns::MHOST_DNS_PORT;
         let config = mhost_dns::DnsConfig {

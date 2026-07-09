@@ -232,20 +232,38 @@ pub fn capture_dns_state() -> Result<OriginalDns, PlatformError> {
 /// 绝不是「用户原本的状态」——调用方 get_upstream_resolvers 的调用者应
 /// 在返回为 Tier 3 时打 warning log。
 ///
-/// **fix (issue #103)**：Tier 1 拿到结果后会过滤掉本机 loopback /
+/// 上游 DNS 的来源。`get_upstream_resolvers()` 返回此 enum 让上层能
+/// 区分「用户配的 / DHCP 推的 / 公共 fallback」三种情况（例如打 warning）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpstreamTier {
+    /// Tier 1：`networksetup -getdnsservers` —— 用户在 System Settings
+    /// 里手动配的 DNS。
+    Networksetup,
+    /// Tier 2：`ipconfig getoption <device> domain_name_server` ——
+    /// DHCP 推的 DNS。
+    Ipconfig,
+    /// Tier 3：Tier 1 / Tier 2 都拿不到结果时的公共 fallback。
+    Public,
+}
+
+/// **fix (issue #103)**：Tier 1 / Tier 2 拿到结果后会过滤掉本机 loopback /
 /// unspecified 地址。DNS 模式启用后系统 DNS 被改成 `127.0.0.1`
 ///（见 `enable_dns_mode`），不剔除会导致 `run_upstream_refresh_loop`
 /// 把 upstream hot-swap 成 `[127.0.0.1]`，DNS 服务器开始向自己递归
 /// 转发，切换 WiFi 后也永远拿不到新网络的 DHCP DNS。
 ///
 /// **fix issue #103 (debug follow-up)**：每个 tier 命中的瞬间都打
-/// `tracing::debug!`，包括 Tier 1 过滤前后的差异。配合
+/// `tracing::debug!`，包括 Tier 1 / Tier 2 过滤前后的差异。配合
 /// `RUST_LOG=mhost_dns=debug` 即可看到：
-///   - networksetup 实际返回什么（启用 DNS 模式后应是 `[127.0.0.1]`）
+///   - networksetup / ipconfig 实际返回什么
 ///   - 哪些条目被 `is_local_resolver` 过滤掉
-///   - Tier 2 fallback 时 ipconfig 实际返回什么（DHCP-pushed DNS）
 ///   - 最终选中的 tier 是哪一个
-pub fn get_upstream_resolvers() -> Vec<String> {
+///
+/// 同时返回 `UpstreamTier`，调用方可以根据 source 区分「用户配置的
+/// upstream」和「公共 DNS fallback」，避免对恰好等于 fallback 列表的
+/// 合法配置（如用户在 System Settings 里手编 `[8.8.8.8, 1.1.1.1]`）
+/// 误报"没拿到系统 DNS"。
+pub fn get_upstream_resolvers() -> (Vec<String>, UpstreamTier) {
     let port = match get_active_network_interface() {
         Ok(p) => {
             tracing::debug!("get_upstream_resolvers: active interface port = {:?}", p);
@@ -256,64 +274,75 @@ pub fn get_upstream_resolvers() -> Vec<String> {
                 "get_upstream_resolvers: get_active_network_interface failed ({}), falling back to Tier 3",
                 e
             );
-            return tier3_fallback();
+            return (tier3_fallback(), UpstreamTier::Public);
         }
     };
 
-    if let Ok(servers) = networksetup_get_dns(&port) {
+    let tier1 = networksetup_get_dns(&port).unwrap_or_default();
+    if !tier1.is_empty() {
         tracing::debug!(
             "get_upstream_resolvers: Tier 1 (networksetup -getdnsservers {:?}) raw = {:?}",
             port,
-            servers
-        );
-        // fix (issue #103): 过滤掉本机 loopback / unspecified（见 `is_local_resolver`）。
-        // 过滤后为空 → 继续走 Tier 2 / Tier 3，而不是把 [127.0.0.1] 当 upstream。
-        let external: Vec<String> = servers
-            .into_iter()
-            .filter(|s| !is_local_resolver(s))
-            .collect();
-        if !external.is_empty() {
-            tracing::debug!(
-                "get_upstream_resolvers: Tier 1 after loopback filter = {:?} (returning)",
-                external
-            );
-            return external;
-        }
-        tracing::debug!(
-            "get_upstream_resolvers: Tier 1 empty after loopback filter, falling through to Tier 2"
+            tier1
         );
     } else {
-        tracing::debug!(
-            "get_upstream_resolvers: Tier 1 (networksetup) failed, falling through to Tier 2"
-        );
+        tracing::debug!("get_upstream_resolvers: Tier 1 (networksetup) empty/failed");
     }
-    if let Some(device) = get_active_network_device() {
-        tracing::debug!(
-            "get_upstream_resolvers: Tier 2 querying ipconfig on device {:?}",
-            device
-        );
-        if let Ok(servers) = ipconfig_get_dns(&device) {
+
+    let tier2 = get_active_network_device()
+        .as_deref()
+        .and_then(|dev| {
             tracing::debug!(
-                "get_upstream_resolvers: Tier 2 (ipconfig getoption {:?}) = {:?}",
-                device,
-                servers
+                "get_upstream_resolvers: Tier 2 querying ipconfig on device {:?}",
+                dev
             );
-            if !servers.is_empty() {
-                return servers;
-            }
-        } else {
-            tracing::debug!(
-                "get_upstream_resolvers: Tier 2 (ipconfig getoption {:?}) returned empty/failed",
-                device
-            );
-        }
+            ipconfig_get_dns(dev).ok()
+        })
+        .unwrap_or_default();
+    if !tier2.is_empty() {
+        tracing::debug!("get_upstream_resolvers: Tier 2 (ipconfig) = {:?}", tier2);
     } else {
-        tracing::debug!(
-            "get_upstream_resolvers: get_active_network_device returned None, skipping Tier 2"
-        );
+        tracing::debug!("get_upstream_resolvers: Tier 2 (ipconfig) empty/failed");
     }
-    tracing::debug!("get_upstream_resolvers: returning Tier 3 fallback [8.8.8.8, 1.1.1.1]");
-    tier3_fallback()
+
+    let (result, source) = select_upstream(tier1, tier2);
+    tracing::debug!(
+        "get_upstream_resolvers: selected tier={:?} result={:?}",
+        source,
+        result
+    );
+    (result, source)
+}
+
+/// 给定 Tier 1 / Tier 2 原始结果，挑出该用的 upstream 并报告来源。
+///
+/// 规则：
+/// 1. Tier 1 过滤 loopback 后非空 → 用 Tier 1（用户意图优先）
+/// 2. Tier 2 过滤 loopback 后非空 → 用 Tier 2（DHCP-pushed）
+/// 3. 两者都空 → Tier 3 公共 fallback
+///
+/// **fix (issue #103)**：loopback 过滤对 Tier 1 / Tier 2 都应用（不仅
+/// Tier 1），保证不会因为 `ipconfig getoption` 偶尔返回 `127.0.0.1`
+/// 而把 self-loop 写回 upstream。
+///
+/// 这个函数是纯函数，方便单测；`get_upstream_resolvers()` 只是
+/// shell 调用 + 调它的薄壳。
+pub fn select_upstream(tier1: Vec<String>, tier2: Vec<String>) -> (Vec<String>, UpstreamTier) {
+    let tier1_filtered: Vec<String> = tier1
+        .into_iter()
+        .filter(|s| !is_local_resolver(s))
+        .collect();
+    if !tier1_filtered.is_empty() {
+        return (tier1_filtered, UpstreamTier::Networksetup);
+    }
+    let tier2_filtered: Vec<String> = tier2
+        .into_iter()
+        .filter(|s| !is_local_resolver(s))
+        .collect();
+    if !tier2_filtered.is_empty() {
+        return (tier2_filtered, UpstreamTier::Ipconfig);
+    }
+    (tier3_fallback(), UpstreamTier::Public)
 }
 
 /// **fix (issue #103)**：判断一个 resolver 字符串是否是「指向本机」的
@@ -1226,6 +1255,88 @@ Device: en0
             .filter(|s| !is_local_resolver(s))
             .collect();
         assert!(filtered_empty.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // select_upstream 集成测试（fix issue #103 — Tier 选择路径）
+    //
+    // 覆盖 `get_upstream_resolvers()` 的核心 fall-through 逻辑：
+    //   - Tier 1 external → 用 Tier 1，source=Networksetup
+    //   - Tier 1 全是 loopback → fall through 到 Tier 2，source=Ipconfig
+    //   - Tier 2 也是 loopback → fall through 到 Tier 3，source=Public
+    //   - Tier 1 部分 loopback（混合）→ 过滤后保留外部条目
+    //   - 两 tier 都空 → 直接走 Tier 3
+    //
+    // 这是 issue #103 的核心回归路径：Tier 1 = [127.0.0.1] 时必须能
+    // 走到 Tier 2 而不是直接返回 self-loop。
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_select_upstream_tier1_external_returns_tier1() {
+        let (result, source) =
+            select_upstream(vec!["8.8.8.8".to_string()], vec!["192.168.1.1".to_string()]);
+        assert_eq!(result, vec!["8.8.8.8".to_string()]);
+        assert_eq!(source, UpstreamTier::Networksetup);
+    }
+
+    #[test]
+    fn test_select_upstream_tier1_loopback_falls_to_tier2() {
+        // 这是 issue #103 的核心场景：Tier 1 = [127.0.0.1]（mHost 自己的代理）
+        // → 不能用，必须 fall through 到 Tier 2 (ipconfig DHCP-pushed)。
+        let (result, source) = select_upstream(
+            vec!["127.0.0.1".to_string()],
+            vec!["192.168.1.1".to_string()],
+        );
+        assert_eq!(result, vec!["192.168.1.1".to_string()]);
+        assert_eq!(source, UpstreamTier::Ipconfig);
+    }
+
+    #[test]
+    fn test_select_upstream_tier2_loopback_falls_to_tier3() {
+        // Tier 1 和 Tier 2 都是 loopback（防御性，正常情况不会出现）
+        // → 走公共 fallback。
+        let (result, source) =
+            select_upstream(vec!["127.0.0.1".to_string()], vec!["0.0.0.0".to_string()]);
+        assert_eq!(result, tier3_fallback());
+        assert_eq!(source, UpstreamTier::Public);
+    }
+
+    #[test]
+    fn test_select_upstream_tier1_partial_loopback_keeps_external() {
+        // Tier 1 混合了 mHost 自己的 [127.0.0.1] 和真正的外部 DNS
+        // （比如 WiFi 切换瞬间 networksetup 返回了旧 127.0.0.1 + 新 DHCP）
+        // → 过滤掉 loopback，保留外部条目。
+        let (result, source) =
+            select_upstream(vec!["127.0.0.1".to_string(), "8.8.8.8".to_string()], vec![]);
+        assert_eq!(result, vec!["8.8.8.8".to_string()]);
+        assert_eq!(source, UpstreamTier::Networksetup);
+    }
+
+    #[test]
+    fn test_select_upstream_both_empty_returns_tier3() {
+        let (result, source) = select_upstream(vec![], vec![]);
+        assert_eq!(result, tier3_fallback());
+        assert_eq!(source, UpstreamTier::Public);
+    }
+
+    #[test]
+    fn test_select_upstream_tier1_empty_falls_to_tier2() {
+        // networksetup 失败 / 没接口 → Tier 1 空；用 Tier 2。
+        let (result, source) =
+            select_upstream(vec![], vec!["10.0.0.1".to_string(), "10.0.0.2".to_string()]);
+        assert_eq!(result, vec!["10.0.0.1".to_string(), "10.0.0.2".to_string()]);
+        assert_eq!(source, UpstreamTier::Ipconfig);
+    }
+
+    #[test]
+    fn test_select_upstream_tier2_partial_loopback_keeps_external() {
+        // Tier 1 空，Tier 2 混合 loopback 和外部 → 过滤掉 loopback，保留外部。
+        let (result, source) = select_upstream(
+            vec![],
+            vec!["127.0.0.1".to_string(), "192.168.0.1".to_string()],
+        );
+        assert_eq!(result, vec!["192.168.0.1".to_string()]);
+        assert_eq!(source, UpstreamTier::Ipconfig);
     }
 
     // -----------------------------------------------------------------------

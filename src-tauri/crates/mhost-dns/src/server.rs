@@ -152,12 +152,18 @@ impl DnsServer {
         }
 
         let rule_engine = self.rule_engine.clone();
-        // **fix (P-R14, issue #90)**: TokioAsyncResolver 内部已用 Arc；
-        // 这里只做一次 Arc clone 传给 spawn，每查询零锁。
+        // **fix (P-R14, issue #90) + fix (issue #103 follow-up)**：
+        // 注意！之前这行 `let resolver = self.resolver.read().clone()` 只是
+        // 在 start() 时刻 clone 一次内层 Arc 整段 move 进 spawn 任务，
+        // 后续 `run_upstream_refresh_loop` 写 `self.resolver.write()` 时
+        // 这个 UDP 任务根本不会再读，hot-swap 对实际查询无效。
         //
-        // **fix（disabling-after-network-switch）**：resolver 在 RwLock 里，
-        // 取读锁 + clone 内层 Arc（原子 ref bump），让后台上游刷新能 hot-swap。
-        let resolver = self.resolver.read().clone();
+        // 修复：把 **slot**（Arc<PlRwLock<Arc<TokioAsyncResolver>>>）
+        // move 进 spawn 任务，循环里每次查询重新 `read().clone()` 拿
+        // 最新 inner Arc。parking_lot 的 RwLockReadGuard 在 statement
+        // 结束时 drop（ref 计数原子增加是常数时间），不阻塞 .await，
+        // 也不阻塞 refresh task 的 write 锁。
+        let resolver_slot = Arc::clone(&self.resolver);
         let cache = self.cache.clone();
 
         let handle = tokio::spawn(async move {
@@ -170,6 +176,8 @@ impl DnsServer {
                             .map_err(|e| DnsError::Server(format!("recv failed: {}", e)))?;
 
                         let request_data = &buf[..len];
+                        // 每次查询重新读 slot —— 让 refresh 任务的 hot-swap 真正生效。
+                        let resolver = resolver_slot.read().clone();
                         let response_data = match handle_dns_request(
                             request_data,
                             &rule_engine,
@@ -701,7 +709,7 @@ async fn run_upstream_refresh_loop(
             }
         }
 
-        let new_upstream = crate::platform::get_upstream_resolvers();
+        let (new_upstream, _new_source) = crate::platform::get_upstream_resolvers();
         let current: Vec<String> = current_upstream.read().clone();
         if new_upstream == current {
             tracing::debug!(
