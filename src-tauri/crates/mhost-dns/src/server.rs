@@ -756,6 +756,7 @@ async fn run_upstream_refresh_loop(
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv4Addr;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -800,6 +801,74 @@ mod tests {
         })
         .await
         .expect("server should start within timeout");
+    }
+
+    /// Spawn a tiny mock DNS server bound to 127.0.0.1 on a random port.
+    /// Replies to any A query with `response_ip` (query name is ignored —
+    /// the goal is just to tell "which upstream did this query reach").
+    ///
+    /// Returns the local socket address the mock is listening on; callers
+    /// use it as the upstream in `DnsConfig.upstream`. The mock runs until
+    /// the test process exits; queries after the DnsServer stops just sit
+    /// in the socket buffer and get dropped.
+    async fn spawn_mock_upstream(response_ip: std::net::Ipv4Addr) -> SocketAddr {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 512];
+            loop {
+                let Ok((len, src)) = socket.recv_from(&mut buf).await else {
+                    break;
+                };
+                let Ok(request) = Message::from_bytes(&buf[..len]) else {
+                    continue;
+                };
+
+                let mut response = Message::new();
+                response.set_id(request.id());
+                response.set_message_type(MessageType::Response);
+                response.set_op_code(OpCode::Query);
+                response.set_recursion_desired(true);
+                response.set_recursion_available(true);
+                response.set_response_code(ResponseCode::NoError);
+
+                for q in request.queries().iter() {
+                    response.add_query(q.clone());
+                    if q.query_type() == RecordType::A {
+                        let record =
+                            Record::from_rdata(q.name().clone(), 60, RData::A(A(response_ip)));
+                        response.add_answer(record);
+                    }
+                }
+
+                if let Ok(bytes) = response.to_bytes() {
+                    let _ = socket.send_to(&bytes, src).await;
+                }
+            }
+        });
+        addr
+    }
+
+    /// Send a single A query to `server_addr` and return the raw response
+    /// bytes. Caller parses with `Message::from_bytes`.
+    async fn send_a_query(server_addr: SocketAddr, name: &str) -> Vec<u8> {
+        let query_name = Name::from_utf8(name).unwrap();
+        let query = Query::query(query_name, RecordType::A);
+        let mut request = Message::new();
+        request.set_id(0x1234);
+        request.set_recursion_desired(true);
+        request.add_query(query);
+
+        let request_bytes = request.to_bytes().unwrap();
+        let client = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        client.send_to(&request_bytes, server_addr).await.unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let (len, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+            .await
+            .expect("server response timeout")
+            .expect("recv_from failed");
+        buf[..len].to_vec()
     }
 
     #[tokio::test]
@@ -1615,6 +1684,83 @@ mod tests {
             stop_elapsed < Duration::from_secs(2),
             "stop() 应快速退出（{stop_elapsed:?}）"
         );
+        let _ = h.await;
+    }
+
+    // -----------------------------------------------------------------------
+    // 上游 hot-swap 端到端回归测试
+    //
+    // 锁住 code review 暴露的 bug：start() 必须每次查询重新读 resolver
+    // slot，而不是在 start() 时刻 snapshot 一次。否则 run_upstream_refresh_loop
+    // 的 hot-swap 对实际查询无效（issue #103 在这一点上险些没修好）。
+    //
+    // 策略：
+    //   1. 起两个 mock 上游，A 永远回 10.0.0.1，B 永远回 10.0.0.2
+    //   2. DnsServer 用 upstream=[A] 启动
+    //   3. 查一个域名 → 应得 10.0.0.1
+    //   4. set_upstream_for_test([B]) 模拟 refresh loop 的 hot-swap
+    //   5. 查另一个域名（绕过 LRU cache）→ 应得 10.0.0.2
+    //
+    // 如果 start() 把 resolver snapshot 进 spawn task 而非 share slot，
+    // 步骤 5 仍会得到 10.0.0.1（snapshot 还是 A），assertion 立刻 fail。
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_dns_server_hot_swap_takes_effect_per_query() {
+        let mock_a_ip = Ipv4Addr::new(10, 0, 0, 1);
+        let mock_b_ip = Ipv4Addr::new(10, 0, 0, 2);
+        let mock_a = spawn_mock_upstream(mock_a_ip).await;
+        let mock_b = spawn_mock_upstream(mock_b_ip).await;
+
+        let server_port: u16 = 1073;
+        let server_addr = SocketAddr::from(([127, 0, 0, 1], server_port));
+
+        let config = DnsConfig {
+            port: server_port,
+            // refresh_upstream=false：避免后台 polling tick 在测试中途
+            // 干扰。我们用 set_upstream_for_test 显式触发 swap。
+            upstream: vec![mock_a.to_string()],
+            refresh_upstream: false,
+            timeout_ms: 1000,
+            ..Default::default()
+        };
+        let server = Arc::new(DnsServer::new(config).unwrap());
+
+        let s = Arc::clone(&server);
+        let h = tokio::spawn(async move { s.start().await });
+        wait_for_server_running(&server, 1000).await;
+
+        // 第一次查询：应走 upstream A，返回 mock_a_ip
+        let resp_a_bytes = send_a_query(server_addr, "first.example.com.").await;
+        let msg_a = Message::from_bytes(&resp_a_bytes).unwrap();
+        assert_eq!(msg_a.answer_count(), 1, "first query 应命中 upstream A");
+        let first_ip: Ipv4Addr = match msg_a.answers().first().and_then(|r| r.data()) {
+            Some(RData::A(a)) => a.0, // A 是 newtype 包 Ipv4Addr，.0 取内层
+            other => panic!("first query 应返回 A 记录，实际 {:?}", other),
+        };
+        assert_eq!(first_ip, mock_a_ip, "first query 应解析到 upstream A 的 IP");
+
+        // Hot-swap 到 mock B（与 run_upstream_refresh_loop 内部走同一条路径：
+        // build_resolver + write slot + write current_upstream）
+        server
+            .set_upstream_for_test(vec![mock_b.to_string()])
+            .unwrap();
+
+        // 第二次查询：用不同域名绕过 LRU cache（否则会拿到 step 3 的缓存响应）
+        let resp_b_bytes = send_a_query(server_addr, "second.example.com.").await;
+        let msg_b = Message::from_bytes(&resp_b_bytes).unwrap();
+        assert_eq!(msg_b.answer_count(), 1, "second query 应命中 upstream B");
+        let second_ip: Ipv4Addr = match msg_b.answers().first().and_then(|r| r.data()) {
+            Some(RData::A(a)) => a.0,
+            other => panic!("second query 应返回 A 记录，实际 {:?}", other),
+        };
+        assert_eq!(
+            second_ip, mock_b_ip,
+            "post-hot-swap query 应解析到 upstream B 的 IP；\
+             如果仍然得到 {first_ip:?}，说明 start() 把 resolver snapshot 进了 \
+             spawn 任务，hot-swap 路径对实际查询无效（issue #103 review #1 的回归）"
+        );
+
+        server.stop().await.unwrap();
         let _ = h.await;
     }
 }
