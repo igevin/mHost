@@ -6,12 +6,62 @@ on:
   pull_request:
     branches: [master, dev]
 
+# Cancel in-progress runs on the same ref when a new commit is pushed.
+# Saves CI minutes and gives faster feedback on iterative PR pushes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
+  # Enable incremental compilation so clippy/test/coverage share the
+  # same incremental cache. Cuts several seconds off warm runs.
+  CARGO_INCREMENTAL: 1
 
 jobs:
+  # Decide which jobs need to run based on changed paths.
+  # Uses dorny/paths-filter to skip heavy jobs (e.g. tauri-build)
+  # for docs/spec-only changes — see PR for impact numbers.
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      frontend: ${{ steps.filter.outputs.frontend }}
+      tauri-build: ${{ steps.filter.outputs.tauri-build }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # fetch-depth: 0 so the path filter can diff against the base
+          # branch on PRs (default 1 only fetches the current commit).
+          fetch-depth: 0
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          # token not needed for public repos
+          filters: |
+            rust:
+              - 'src-tauri/**'
+              - 'src-tauri/Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/workflows/ci.yml'
+            frontend:
+              - 'src/**'
+              - 'package.json'
+              - 'pnpm-lock.yaml'
+              - '.github/workflows/ci.yml'
+            tauri-build:
+              - 'src-tauri/**'
+              - 'src/**'
+              - 'package.json'
+              - 'pnpm-lock.yaml'
+              - 'src-tauri/tauri.conf.json'
+              - '.github/workflows/ci.yml'
+
   rust-checks:
     name: Rust Checks
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v5
@@ -21,14 +71,14 @@ jobs:
         with:
           components: rustfmt, clippy, llvm-tools-preview
 
-      - name: Cache Cargo
-        uses: actions/cache@v5
+      # Swatinem/rust-cache understands Cargo.lock + source invalidation
+      # so it re-uses the target/ incremental artifacts much better than
+      # a hand-rolled actions/cache@v5 keyed only on Cargo.lock.
+      - name: Cache Rust toolchain and build artifacts
+        uses: Swatinem/rust-cache@v3
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            src-tauri/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+          workspaces: src-tauri -> target
+          shared-key: ${{ runner.os }}-rust
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -38,18 +88,26 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
         working-directory: src-tauri
 
-      - name: Run tests with verbose output
-        run: cargo test --all-features -- --nocapture
+      # `--nocapture` removed — it forces per-test stdout even when all
+      # pass, which adds I/O without value. Add it back locally if
+      # you need to debug a failing test.
+      - name: Run tests
+        run: cargo test --all-features --workspace
         working-directory: src-tauri
 
+      # Coverage is only useful for tracking main-branch coverage over
+      # time. Skip on PRs to keep PR feedback fast (~20s save per PR).
       - name: Install cargo-llvm-cov
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
         uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Generate coverage report
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
         run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
         working-directory: src-tauri
 
       - name: Upload coverage to Codecov
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
         uses: codecov/codecov-action@v5
         with:
           files: src-tauri/lcov.info
@@ -57,6 +115,8 @@ jobs:
 
   frontend-checks:
     name: Frontend Checks
+    needs: changes
+    if: needs.changes.outputs.frontend == 'true'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v5
@@ -85,18 +145,19 @@ jobs:
 
       - name: Build frontend
         run: pnpm build
-
-      - name: Upload frontend coverage
-        uses: actions/upload-artifact@v5
-        if: always()
-        with:
-          name: frontend-coverage
-          path: coverage/
+      # Note: vitest isn't currently invoked with --coverage, so we
+      # don't try to upload a frontend coverage artifact here. Add
+      # `--coverage` to the test command when frontend coverage is
+      # wanted.
 
   tauri-build:
     name: Tauri Build Smoke Test
+    needs: [changes, rust-checks, frontend-checks]
+    if: |
+      needs.changes.outputs.tauri-build == 'true' &&
+      (needs.rust-checks.result == 'success' || needs.rust-checks.result == 'skipped') &&
+      (needs.frontend-checks.result == 'success' || needs.frontend-checks.result == 'skipped')
     runs-on: macos-latest
-    needs: [rust-checks, frontend-checks]
     steps:
       - uses: actions/checkout@v5
 
@@ -113,14 +174,11 @@ jobs:
         with:
           version: 10
 
-      - name: Cache Cargo
-        uses: actions/cache@v5
+      - name: Cache Rust toolchain and build artifacts
+        uses: Swatinem/rust-cache@v3
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            src-tauri/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+          workspaces: src-tauri -> target
+          shared-key: ${{ runner.os }}-rust
 
       - name: Cache pnpm
         uses: actions/cache@v5
