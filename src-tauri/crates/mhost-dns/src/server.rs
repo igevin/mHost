@@ -47,7 +47,13 @@ type CacheEntry = (Vec<Record>, Instant);
 /// **fix（disabling-after-network-switch）**：DhcpEmpty snapshot 启用
 /// refresh_upstream 时，每 `UPSTREAM_REFRESH_INTERVAL` 重新解析一次上游；
 /// 变化才 hot-swap，不变化是 no-op。
-const UPSTREAM_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+///
+/// **fix（issue #103 follow-up）**：从 60s 降到 15s，减少切换 WiFi 后
+/// 上游 hot-swap 的最坏等待时间。每次 tick 调用 `networksetup` +
+/// `ipconfig` 共 4 个 shell 命令，加起来 < 10ms，对 CPU / 电量影响可忽略。
+/// 更短的间隔（< 5s）没意义且会增加空轮询开销。如果未来需要近实时
+/// 跟随（< 1s），考虑 SCDynamicStore 事件驱动，参考跟踪 issue。
+const UPSTREAM_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 
 /// DNS 服务核心。
 /// TODO: TCP 监听支持计划在后续迭代中添加。
