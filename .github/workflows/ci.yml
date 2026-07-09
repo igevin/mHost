@@ -75,7 +75,7 @@ jobs:
       # so it re-uses the target/ incremental artifacts much better than
       # a hand-rolled actions/cache@v5 keyed only on Cargo.lock.
       - name: Cache Rust toolchain and build artifacts
-        uses: Swatinem/rust-cache@v3
+        uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri -> target
           shared-key: ${{ runner.os }}-rust
@@ -175,7 +175,7 @@ jobs:
           version: 10
 
       - name: Cache Rust toolchain and build artifacts
-        uses: Swatinem/rust-cache@v3
+        uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri -> target
           shared-key: ${{ runner.os }}-rust
