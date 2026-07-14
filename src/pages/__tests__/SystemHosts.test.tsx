@@ -166,16 +166,24 @@ describe("SystemHosts", () => {
     renderSystemHosts();
     await waitForContent();
     fireEvent.keyDown(document, { key: "f", metaKey: true });
-    // Query matching 4 lines (each has an IP).
-    fireEvent.change(screen.getByTestId("search-input"), { target: { value: "1" } });
-    // Move to last match.
+    // "example" matches "example.com" and "example.org" → 2 matches.
+    fireEvent.change(screen.getByTestId("search-input"), { target: { value: "example" } });
+    // Advance currentMatchIndex from 0 → 1 (the second match).
     fireEvent.click(screen.getByTestId("next-button"));
-    fireEvent.click(screen.getByTestId("next-button"));
-    fireEvent.click(screen.getByTestId("next-button"));
-    fireEvent.click(screen.getByTestId("next-button"));
-    fireEvent.click(screen.getByTestId("next-button"));
-    // Now narrow the query to one match; currentMatchIndex must clamp to 0.
+    // Narrow the query to a single match; currentMatchIndex 1 must clamp to 0.
     fireEvent.change(screen.getByTestId("search-input"), { target: { value: "localhost" } });
     expect(screen.getByText("1/1")).toBeInTheDocument();
+  });
+
+  it("renders the pre block (not the loading state) when hosts file is empty", async () => {
+    mockReadSystemHosts.mockResolvedValue("");
+    renderSystemHosts();
+    // Wait one tick for the read to resolve and state to update.
+    expect(await screen.findByText(/System Hosts Preview/)).toBeInTheDocument();
+    // "Loading..." should be gone; <pre> should be present and empty.
+    expect(screen.queryByText("Loading...")).not.toBeInTheDocument();
+    const pre = document.querySelector("pre");
+    expect(pre).not.toBeNull();
+    expect(pre!.innerHTML).toBe("");
   });
 });

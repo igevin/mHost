@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useMemo } from "react";
 import { readSystemHosts } from "../lib/tauri";
 import { extractErrorMessage } from "../lib/error";
 import { findMatches } from "../lib/search";
+import type { MatchInfo } from "../lib/search";
 import SearchBar from "../components/SearchBar";
 import styles from "./SystemHosts.module.css";
 
@@ -22,7 +23,7 @@ function escapeHtml(text: string): string {
  */
 function highlightMatches(
   text: string,
-  matches: { start: number; end: number }[],
+  matches: MatchInfo[],
   activeMatchIndex: number,
 ): string {
   if (!text) return "";
@@ -110,7 +111,7 @@ function SystemHosts() {
   }, [currentMatchIndex, matches]);
 
   // Keyboard shortcuts: Cmd+F / Ctrl+F opens search bar; Esc outside the
-  // search input closes it and clears the query. Mirrors RuleEditor.tsx:393-418.
+  // search input closes it and clears the query. Mirrors RuleEditor.tsx:375-399.
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key === "f") {
