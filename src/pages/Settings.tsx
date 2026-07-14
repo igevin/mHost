@@ -1,4 +1,4 @@
-import { useCallback } from "react";
+import { useCallback, useState, useEffect } from "react";
 import { useAtomValue, useSetAtom } from "jotai";
 import {
   dnsEnabledAtom,
@@ -8,6 +8,8 @@ import {
   dnsErrorAtom,
 } from "../stores/profiles";
 import { useWebKitPointerDown } from "../hooks/useWebKitPointerDown";
+import { checkUpdate } from "../lib/tauri";
+import type { LatestRelease } from "../lib/tauri";
 import styles from "./Settings.module.css";
 
 function Settings() {
@@ -17,6 +19,35 @@ function Settings() {
   const dnsError = useAtomValue(dnsErrorAtom);
   const toggleDnsMode = useSetAtom(toggleDnsModeAtom);
   const { onPointerDown } = useWebKitPointerDown();
+
+  // Update check state
+  const [updateStatus, setUpdateStatus] = useState<"idle" | "checking" | "available" | "up-to-date" | "error">("idle");
+  const [latestRelease, setLatestRelease] = useState<LatestRelease | null>(null);
+  const [updateError, setUpdateError] = useState<string | null>(null);
+
+  const doCheckUpdate = useCallback(async () => {
+    setUpdateStatus("checking");
+    setUpdateError(null);
+    try {
+      const release = await checkUpdate(__APP_VERSION__);
+      setLatestRelease(release);
+      setUpdateStatus("available");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg === "already_up_to_date") {
+        setLatestRelease(null);
+        setUpdateStatus("up-to-date");
+      } else {
+        setUpdateError(msg);
+        setUpdateStatus("error");
+      }
+    }
+  }, []);
+
+  // Check for updates on mount (best-effort, non-blocking)
+  useEffect(() => {
+    doCheckUpdate();
+  }, [doCheckUpdate]);
 
   const handleToggleDns = useCallback(
     (enabled: boolean) => {
@@ -47,6 +78,42 @@ function Settings() {
               <div className={styles.label}>Platform</div>
               <div className={styles.value}>macOS</div>
             </div>
+          </div>
+
+          {/* Update check */}
+          <div className={styles.updateSection}>
+            {updateStatus === "checking" && (
+              <span className={styles.updateChecking}>Checking for updates...</span>
+            )}
+            {updateStatus === "up-to-date" && (
+              <span className={styles.updateUpToDate}>You&#39;re up to date!</span>
+            )}
+            {updateStatus === "available" && latestRelease && (
+              <span className={styles.updateAvailable}>
+                {latestRelease.title || latestRelease.tag} is available.{" "}
+                <a
+                  href={latestRelease.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className={styles.updateLink}
+                >
+                  Download
+                </a>
+              </span>
+            )}
+            {updateStatus === "error" && (
+              <span className={styles.updateError}>
+                Update check failed: {updateError}
+              </span>
+            )}
+            {(updateStatus === "idle" || updateStatus === "up-to-date" || updateStatus === "error" || updateStatus === "available") && (
+              <button
+                className={`btn btn-secondary ${styles.updateBtn}`}
+                onClick={doCheckUpdate}
+              >
+                Check for Updates
+              </button>
+            )}
           </div>
         </div>
 
