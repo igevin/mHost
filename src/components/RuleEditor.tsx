@@ -2,6 +2,8 @@ import { useState, useEffect, useRef, useCallback, useMemo, useDeferredValue } f
 import type { HostRule, ValidateResult } from "../types";
 import { validateHostsText } from "../lib/tauri";
 import { extractErrorMessage } from "../lib/error";
+import { findMatches } from "../lib/search";
+import type { MatchInfo } from "../lib/search";
 import SearchBar from "./SearchBar";
 import styles from "./RuleEditor.module.css";
 
@@ -10,12 +12,6 @@ interface RuleEditorProps {
   onChange: (rules: HostRule[]) => void;
   onErrorChange?: (hasErrors: boolean) => void;
   readOnly?: boolean;
-}
-
-interface MatchInfo {
-  start: number;
-  end: number;
-  lineIndex: number;
 }
 
 /** Convert HostRule[] to hosts file text format */
@@ -108,20 +104,6 @@ function highlightLine(line: string): string {
   }
 
   return html;
-}
-
-/** Find all case-insensitive literal matches in text */
-function findMatches(text: string, query: string): MatchInfo[] {
-  if (!query || !text) return [];
-  const matches: MatchInfo[] = [];
-  const escaped = query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const regex = new RegExp(escaped, "gi");
-  let match: RegExpExecArray | null;
-  while ((match = regex.exec(text)) !== null) {
-    const lineIndex = text.slice(0, match.index).split("\n").length - 1;
-    matches.push({ start: match.index, end: match.index + match[0].length, lineIndex });
-  }
-  return matches;
 }
 
 /** Parse text into HTML with syntax highlighting and search marks */
