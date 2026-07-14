@@ -220,3 +220,55 @@
   margin-top: 2px;
   color: var(--color-text);
 }
+
+/* ---- Update Section (in About Card) ---- */
+
+.updateSection {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--color-border);
+}
+
+.updateChecking,
+.updateUpToDate,
+.updateAvailable,
+.updateError {
+  font-size: 13px;
+  text-align: center;
+}
+
+.updateChecking {
+  color: var(--color-text-secondary);
+}
+
+.updateUpToDate {
+  color: var(--color-success);
+}
+
+.updateAvailable {
+  color: var(--color-text);
+}
+
+.updateError {
+  color: var(--color-error);
+  font-size: 12px;
+}
+
+.updateLink {
+  color: var(--color-primary);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.updateLink:hover {
+  text-decoration: underline;
+}
+
+.updateBtn {
+  font-size: 12px;
+  padding: 4px 12px;
+}

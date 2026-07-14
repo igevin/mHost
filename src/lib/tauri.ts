@@ -148,3 +148,16 @@ export async function getDnsStatus(): Promise<DnsStatus> {
 export async function listDnsProfiles(): Promise<Profile[]> {
   return invoke("list_dns_profiles");
 }
+
+// ---- Update commands ----
+
+export interface LatestRelease {
+  tag: string;
+  url: string;
+  title: string | null;
+  body: string | null;
+}
+
+export async function checkUpdate(currentVersion: string): Promise<LatestRelease | null> {
+  return invoke<LatestRelease | null>("check_update", { currentVersion });
+}

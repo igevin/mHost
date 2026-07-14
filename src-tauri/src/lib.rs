@@ -7,7 +7,7 @@ pub mod tray_logic;
 
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
-use commands::{apply::*, dns::*, profile::*, profile_io::*, snapshot::*, validate::*};
+use commands::{apply::*, dns::*, profile::*, profile_io::*, snapshot::*, update::*, validate::*};
 use state::AppState;
 use tauri::{Manager, RunEvent};
 
@@ -157,6 +157,7 @@ pub fn run() {
             reload_dns_rules,
             get_dns_status,
             list_dns_profiles,
+            check_update,
         ])
         .setup(|app| {
             #[cfg(target_os = "macos")]

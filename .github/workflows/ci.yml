@@ -154,6 +154,7 @@ jobs:
     name: Tauri Build Smoke Test
     needs: [changes, rust-checks, frontend-checks]
     if: |
+      github.event_name == 'push' && github.ref == 'refs/heads/master' &&
       needs.changes.outputs.tauri-build == 'true' &&
       (needs.rust-checks.result == 'success' || needs.rust-checks.result == 'skipped') &&
       (needs.frontend-checks.result == 'success' || needs.frontend-checks.result == 'skipped')
