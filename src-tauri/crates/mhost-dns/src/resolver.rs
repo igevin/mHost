@@ -80,15 +80,13 @@ impl RuleEngine {
     pub fn resolve(&self, domain: &str) -> Option<IpAddr> {
         let lookup = |map: &HashMap<String, IpAddr>| -> Option<IpAddr> {
             let mut current = domain;
-            loop {
+            while let Some(pos) = current.find('.') {
                 if let Some(ip) = map.get(current) {
                     return Some(*ip);
                 }
-                match current.find('.') {
-                    Some(pos) => current = &current[pos + 1..],
-                    None => return None,
-                }
+                current = &current[pos + 1..];
             }
+            map.get(current).copied()
         };
         match self.rules.read() {
             Ok(guard) => lookup(&guard),
