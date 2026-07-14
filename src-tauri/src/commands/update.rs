@@ -27,18 +27,20 @@ pub struct LatestRelease {
 /// Check whether a newer mHost release exists on GitHub.
 ///
 /// Compares `current_version` against the `tag_name` of the latest GitHub
-/// release. Returns the release if a newer version exists, or an error if
-/// already up-to-date or if the check failed.
+/// release. Returns `Some(latest)` if a newer version exists, `None` if the
+/// current version is already up-to-date, or an error if the network/check
+/// failed.
 #[tauri::command]
-pub async fn check_update(current_version: String) -> Result<LatestRelease, MhostError> {
-    let latest = tauri::async_runtime::spawn_blocking(move || fetch_latest(current_version))
+pub async fn check_update(current_version: String) -> Result<Option<LatestRelease>, MhostError> {
+    let handle = tauri::async_runtime::spawn_blocking(move || fetch_latest(current_version));
+    let result = handle
         .await
         .map_err(|e| MhostError::InvalidInput(e.to_string()))?;
-    latest
+    result
 }
 
 /// Fetches the latest GitHub release (runs in blocking thread).
-fn fetch_latest(current_version: String) -> Result<LatestRelease, MhostError> {
+fn fetch_latest(current_version: String) -> Result<Option<LatestRelease>, MhostError> {
     let client = reqwest::blocking::Client::builder()
         .user_agent("mHost-Desktop/1.0")
         .build()
@@ -73,25 +75,23 @@ fn fetch_latest(current_version: String) -> Result<LatestRelease, MhostError> {
     // Strip leading "v" prefix for comparison.
     let latest_version = latest.tag.trim_start_matches('v');
     if is_newer(&current_version, latest_version) {
-        Ok(latest)
+        Ok(Some(latest))
     } else {
-        Err(MhostError::InvalidInput("already_up_to_date".to_string()))
+        Ok(None)
     }
 }
 
 /// Returns true if `latest` is strictly greater than `current`.
+/// Both strings are already stripped of any leading "v" prefix.
 fn is_newer(current: &str, latest: &str) -> bool {
-    let current = current.trim_start_matches('v');
-    let latest = latest.trim_start_matches('v');
-
     let mut current_parts = current.split('.').fuse();
     let mut latest_parts = latest.split('.').fuse();
 
     loop {
         match (current_parts.next(), latest_parts.next()) {
-            (None, None) => return false,
-            (None, Some(_)) => return false,
-            (Some(_), None) => return true,
+            (None, None) => return false,    // equal
+            (None, Some(_)) => return false, // current shorter → e.g. "1.0" vs "1.0.1" → not newer
+            (Some(_), None) => return true,  // current longer → e.g. "1.0.1" vs "1.0" → newer
             (Some(c), Some(l)) => {
                 let c: u64 = c.parse().unwrap_or(0);
                 let l: u64 = l.parse().unwrap_or(0);
@@ -100,5 +100,28 @@ fn is_newer(current: &str, latest: &str) -> bool {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_newer() {
+        // Equal
+        assert!(!is_newer("0.3.2", "0.3.2"));
+        assert!(!is_newer("v0.3.2", "v0.3.2"));
+
+        // Major/minor/patch increases
+        assert!(is_newer("0.3.2", "0.3.3"));
+        assert!(is_newer("0.3.2", "0.4.0"));
+        assert!(is_newer("0.3.2", "1.0.0"));
+        assert!(!is_newer("0.3.3", "0.3.2"));
+        assert!(!is_newer("0.4.0", "0.3.2"));
+
+        // Unequal length (real-world GitHub tags are always 3-part: x.y.z)
+        assert!(!is_newer("0.3", "0.3.1")); // current shorter → not newer
+        assert!(is_newer("0.3.1", "0.3")); // current longer → newer
     }
 }

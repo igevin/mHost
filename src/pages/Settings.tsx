@@ -30,17 +30,16 @@ function Settings() {
     setUpdateError(null);
     try {
       const release = await checkUpdate(__APP_VERSION__);
-      setLatestRelease(release);
-      setUpdateStatus("available");
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (msg === "already_up_to_date") {
+      if (release) {
+        setLatestRelease(release);
+        setUpdateStatus("available");
+      } else {
         setLatestRelease(null);
         setUpdateStatus("up-to-date");
-      } else {
-        setUpdateError(msg);
-        setUpdateStatus("error");
       }
+    } catch (err) {
+      setUpdateError(err instanceof Error ? err.message : String(err));
+      setUpdateStatus("error");
     }
   }, []);
 

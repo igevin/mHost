@@ -158,6 +158,6 @@ export interface LatestRelease {
   body: string | null;
 }
 
-export async function checkUpdate(currentVersion: string): Promise<LatestRelease> {
-  return invoke<LatestRelease>("check_update", { currentVersion });
+export async function checkUpdate(currentVersion: string): Promise<LatestRelease | null> {
+  return invoke<LatestRelease | null>("check_update", { currentVersion });
 }
