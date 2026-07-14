@@ -87,6 +87,21 @@ function SystemHosts() {
     [hostsContent, searchQuery],
   );
 
+  // Total line count of the hosts file — used to render "Line N of M" next to
+  // the search bar. Memoized because re-splitting on every keystroke is wasteful.
+  const totalLines = useMemo(
+    () => (hostsContent ? hostsContent.split("\n").length : 0),
+    [hostsContent],
+  );
+
+  // Active match's 1-based line number, or null if there's no active match to show.
+  const activeLineNumber =
+    searchBarVisible &&
+    matches.length > 0 &&
+    currentMatchIndex < matches.length
+      ? matches[currentMatchIndex].lineIndex + 1
+      : null;
+
   // Clamp currentMatchIndex when the match set shrinks (e.g. user shortens
   // the query). Mirrors RuleEditor.tsx behavior.
   useEffect(() => {
@@ -165,21 +180,33 @@ function SystemHosts() {
 
       <div className={`card ${styles.hostsCard}`}>
         <h3 className="card-title">System Hosts Preview</h3>
-        <SearchBar
-          visible={searchBarVisible}
-          onClose={handleClose}
-          query={searchQuery}
-          onQueryChange={setSearchQuery}
-          replaceText=""
-          onReplaceTextChange={() => {}}
-          matchCount={matches.length}
-          currentMatchIndex={currentMatchIndex}
-          onPrev={handlePrev}
-          onNext={handleNext}
-          onReplace={() => {}}
-          onReplaceAll={() => {}}
-          readOnly
-        />
+        <div className={styles.searchRow}>
+          <SearchBar
+            visible={searchBarVisible}
+            onClose={handleClose}
+            query={searchQuery}
+            onQueryChange={setSearchQuery}
+            replaceText=""
+            onReplaceTextChange={() => {}}
+            matchCount={matches.length}
+            currentMatchIndex={currentMatchIndex}
+            onPrev={handlePrev}
+            onNext={handleNext}
+            onReplace={() => {}}
+            onReplaceAll={() => {}}
+            readOnly
+          />
+          {activeLineNumber !== null && (
+            <span
+              className={styles.lineInfo}
+              data-testid="active-line-info"
+              data-active-line={activeLineNumber}
+              data-total-lines={totalLines}
+            >
+              Line {activeLineNumber} of {totalLines}
+            </span>
+          )}
+        </div>
         {hostsError ? (
           <div className="alert alert-error">{hostsError}</div>
         ) : hostsContent === null ? (

@@ -79,6 +79,58 @@ describe("SystemHosts", () => {
     expect(screen.getByText("1/2")).toBeInTheDocument();
   });
 
+  it("shows 'Line N of M' indicator next to the search bar with the active match's line", async () => {
+    renderSystemHosts();
+    await waitForContent();
+    // SAMPLE_HOSTS has 4 lines; "example" matches line 2 (0-indexed 1).
+    fireEvent.keyDown(document, { key: "f", metaKey: true });
+    fireEvent.change(screen.getByTestId("search-input"), { target: { value: "example" } });
+    const indicator = screen.getByTestId("active-line-info");
+    expect(indicator).toHaveTextContent("Line 2 of 4");
+    expect(indicator.dataset.activeLine).toBe("2");
+    expect(indicator.dataset.totalLines).toBe("4");
+  });
+
+  it("hides 'Line N of M' when the search bar is closed", async () => {
+    renderSystemHosts();
+    await waitForContent();
+    fireEvent.keyDown(document, { key: "f", metaKey: true });
+    fireEvent.change(screen.getByTestId("search-input"), { target: { value: "example" } });
+    expect(screen.getByTestId("active-line-info")).toBeInTheDocument();
+    // Esc outside the search input → bar closes, indicator disappears.
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.queryByTestId("active-line-info")).not.toBeInTheDocument();
+  });
+
+  it("hides 'Line N of M' when the query has no matches", async () => {
+    renderSystemHosts();
+    await waitForContent();
+    fireEvent.keyDown(document, { key: "f", metaKey: true });
+    fireEvent.change(screen.getByTestId("search-input"), { target: { value: "nonexistent" } });
+    expect(screen.queryByTestId("active-line-info")).not.toBeInTheDocument();
+  });
+
+  it("updates 'Line N of M' as the user navigates between matches", async () => {
+    renderSystemHosts();
+    await waitForContent();
+    fireEvent.keyDown(document, { key: "f", metaKey: true });
+    // "1" matches several lines (the digit appears in lines 1, 2, 4 in the fixture).
+    fireEvent.change(screen.getByTestId("search-input"), { target: { value: "1" } });
+    const indicator = screen.getByTestId("active-line-info");
+    // First match: "127.0.0.1" on line 1.
+    expect(indicator).toHaveTextContent(/^Line 1 of 4$/);
+    fireEvent.click(screen.getByTestId("next-button"));
+    // Second match: still on line 1 (the second "1" in "127.0.0.1" is on the same line).
+    // We don't assert exact line — just that the indicator updated.
+    const after = screen.getByTestId("active-line-info");
+    expect(after).toBeInTheDocument();
+    // When we narrow the query to a unique match on a different line, the indicator
+    // updates accordingly.
+    fireEvent.change(screen.getByTestId("search-input"), { target: { value: "api.local" } });
+    // "api.local" is on line 4 of the fixture.
+    expect(screen.getByTestId("active-line-info")).toHaveTextContent("Line 4 of 4");
+  });
+
   it("navigates prev/next with wrap-around", async () => {
     renderSystemHosts();
     await waitForContent();

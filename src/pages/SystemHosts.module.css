@@ -42,3 +42,23 @@
 .searchMatchActive {
   background: rgba(255, 140, 0, 0.5);
 }
+
+/* ---- Active Line Indicator ----
+ * Shows "Line N of M" next to the search bar when a search is active.
+ * Hidden by default; rendered as a sibling to SearchBar in a flex row. */
+
+.searchRow {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.lineInfo {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+  color: var(--color-text-muted);
+  white-space: nowrap;
+  /* Push the indicator to the right edge of the row when there's spare space. */
+  margin-left: auto;
+}
