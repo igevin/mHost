@@ -84,10 +84,8 @@ impl RuleEngine {
                 if let Some(ip) = map.get(current) {
                     return Some(*ip);
                 }
-                match current.find('.') {
-                    Some(pos) => current = &current[pos + 1..],
-                    None => return None,
-                }
+                let pos = current.find('.')?;
+                current = &current[pos + 1..];
             }
         };
         match self.rules.read() {
