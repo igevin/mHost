@@ -32,19 +32,15 @@ pub struct LatestRelease {
 /// failed.
 #[tauri::command]
 pub async fn check_update(current_version: String) -> Result<Option<LatestRelease>, MhostError> {
-    let handle = tauri::async_runtime::spawn_blocking(move || fetch_latest(current_version));
-    let result = handle
-        .await
-        .map_err(|e| MhostError::InvalidInput(e.to_string()))?;
-    result
+    fetch_latest(current_version).await
 }
 
-/// Fetches the latest GitHub release (runs in blocking thread).
-fn fetch_latest(current_version: String) -> Result<Option<LatestRelease>, MhostError> {
-    let client = reqwest::blocking::Client::builder()
+/// Fetches the latest GitHub release.
+async fn fetch_latest(current_version: String) -> Result<Option<LatestRelease>, MhostError> {
+    let client = reqwest::Client::builder()
         .user_agent("mHost-Desktop/1.0")
         .build()
-        .map_err(|e| MhostError::InvalidInput(format!("reqwest build error: {}", e)))?;
+        .map_err(|e| MhostError::Network(format!("reqwest build error: {}", e)))?;
 
     let url = "https://api.github.com/repos/igevin/mHost/releases/latest";
     let resp = client
@@ -52,10 +48,11 @@ fn fetch_latest(current_version: String) -> Result<Option<LatestRelease>, MhostE
         .header("Accept", "application/vnd.github+json")
         .header("X-GitHub-Api-Version", "2022-11-28")
         .send()
-        .map_err(|e| MhostError::InvalidInput(format!("network error: {}", e)))?;
+        .await
+        .map_err(|e| MhostError::Network(format!("network error: {}", e)))?;
 
     if !resp.status().is_success() {
-        return Err(MhostError::InvalidInput(format!(
+        return Err(MhostError::ExternalApi(format!(
             "GitHub API error: {}",
             resp.status()
         )));
@@ -63,7 +60,8 @@ fn fetch_latest(current_version: String) -> Result<Option<LatestRelease>, MhostE
 
     let gh: GithubReleaseResponse = resp
         .json()
-        .map_err(|e| MhostError::InvalidInput(format!("failed to parse GitHub response: {}", e)))?;
+        .await
+        .map_err(|e| MhostError::ExternalApi(format!("failed to parse GitHub response: {}", e)))?;
 
     let latest = LatestRelease {
         tag: gh.tag_name,

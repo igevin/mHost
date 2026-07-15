@@ -115,7 +115,16 @@ function SystemHosts() {
   // Scroll the active match into view on navigation. scrollIntoView handles
   // wrapped lines + variable line heights without us hardcoding lineHeight.
   // Guard for jsdom / non-browser environments where scrollIntoView is absent.
+  //
+  // `matches` is in the deps because the effect reads `matches.length`, but it
+  // gets a new array reference on every keystroke (it's a useMemo over the
+  // query). We gate on the *index* actually changing via prevIndexRef so that
+  // typing a query does not trigger a smooth-scroll — only ↑/↓/Enter navigation
+  // does (issue #109). Mirrors the RuleEditor navigation pattern.
+  const prevIndexRef = useRef(currentMatchIndex);
   useEffect(() => {
+    if (prevIndexRef.current === currentMatchIndex) return;
+    prevIndexRef.current = currentMatchIndex;
     if (!previewRef.current || matches.length === 0) return;
     const active = previewRef.current.querySelector<HTMLElement>(
       `[data-match-index="${currentMatchIndex}"]`,

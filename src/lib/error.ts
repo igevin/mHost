@@ -7,6 +7,8 @@
  *
  *   MhostError::Io { kind, message }      → { Io: { kind, message } }
  *   MhostError::InvalidInput(String)      → { InvalidInput: "…" }
+ *   MhostError::Network(String)           → { Network: "…" }
+ *   MhostError::ExternalApi(String)       → { ExternalApi: "…" }
  *   MhostError::Parse(ParseError)         → { Parse: { <variant>: <payload> } }
  *   MhostError::Apply(ApplyError)         → { Apply: { <variant>: <payload> } }
  *   MhostError::Storage(StorageError)     → { Storage: { <variant>: <payload> } }
@@ -40,6 +42,16 @@ export function extractErrorMessage(err: unknown): string {
     // MhostError::InvalidInput(String)
     if (typeof obj.InvalidInput === "string") {
       return `invalid input: ${obj.InvalidInput}`;
+    }
+
+    // MhostError::Network(String)
+    if (typeof obj.Network === "string") {
+      return `network error: ${obj.Network}`;
+    }
+
+    // MhostError::ExternalApi(String)
+    if (typeof obj.ExternalApi === "string") {
+      return `external API error: ${obj.ExternalApi}`;
     }
 
     // MhostError variants whose payload is a nested tagged enum.

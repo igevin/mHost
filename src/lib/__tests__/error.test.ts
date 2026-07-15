@@ -23,6 +23,18 @@ describe("extractErrorMessage", () => {
     );
   });
 
+  it("returns string-payload Network variant (no raw JSON)", () => {
+    const result = extractErrorMessage({ Network: "connection refused" });
+    expect(result).not.toContain("{");
+    expect(result).toBe("network error: connection refused");
+  });
+
+  it("returns string-payload ExternalApi variant (no raw JSON)", () => {
+    const result = extractErrorMessage({ ExternalApi: "GitHub API error: 403" });
+    expect(result).not.toContain("{");
+    expect(result).toBe("external API error: GitHub API error: 403");
+  });
+
   it("returns human message for ProfileNotFound (no raw JSON)", () => {
     // Regression guard for issue #100: the user used to see the raw JSON
     // envelope. The output must never contain `{` and must surface the
