@@ -238,4 +238,56 @@ describe("SystemHosts", () => {
     expect(pre).not.toBeNull();
     expect(pre!.innerHTML).toBe("");
   });
+
+  // Regression for issue #109: scrollIntoView must only fire when the active
+  // match *index* changes (navigation), not on every keystroke. The `matches`
+  // array gets a new reference on each query change, so the naive effect used
+  // to re-fire the smooth-scroll animation while typing.
+  it("does NOT call scrollIntoView while typing a query", async () => {
+    // jsdom does not implement scrollIntoView, so define it as a mock. The
+    // component guards on `typeof active.scrollIntoView === "function"`, which
+    // this satisfies.
+    const scrollSpy = vi.fn();
+    const original = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = scrollSpy;
+    try {
+      renderSystemHosts();
+      await waitForContent();
+      fireEvent.keyDown(document, { key: "f", metaKey: true });
+      // Type the query character-by-character. The active index stays at 0
+      // throughout, so no scroll should occur.
+      const input = screen.getByTestId("search-input");
+      fireEvent.change(input, { target: { value: "e" } });
+      fireEvent.change(input, { target: { value: "ex" } });
+      fireEvent.change(input, { target: { value: "exa" } });
+      fireEvent.change(input, { target: { value: "example" } });
+      expect(scrollSpy).not.toHaveBeenCalled();
+    } finally {
+      Element.prototype.scrollIntoView = original;
+    }
+  });
+
+  it("calls scrollIntoView when navigating with ↑ / ↓", async () => {
+    const scrollSpy = vi.fn();
+    const original = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = scrollSpy;
+    try {
+      renderSystemHosts();
+      await waitForContent();
+      fireEvent.keyDown(document, { key: "f", metaKey: true });
+      // Two matches: "example.com" and "example.org". Typing must not scroll.
+      fireEvent.change(screen.getByTestId("search-input"), {
+        target: { value: "example" },
+      });
+      expect(scrollSpy).not.toHaveBeenCalled();
+      // Navigating to the next match changes the index → scroll fires once.
+      fireEvent.click(screen.getByTestId("next-button"));
+      expect(scrollSpy).toHaveBeenCalledTimes(1);
+      // Back to the previous match → another scroll.
+      fireEvent.click(screen.getByTestId("prev-button"));
+      expect(scrollSpy).toHaveBeenCalledTimes(2);
+    } finally {
+      Element.prototype.scrollIntoView = original;
+    }
+  });
 });
