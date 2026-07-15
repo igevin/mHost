@@ -21,6 +21,12 @@ pub enum MhostError {
     #[error("io error ({kind}): {message}")]
     Io { kind: String, message: String },
 
+    #[error("network error: {0}")]
+    Network(String),
+
+    #[error("external API error: {0}")]
+    ExternalApi(String),
+
     #[error("invalid input: {0}")]
     InvalidInput(String),
 }
@@ -192,6 +198,16 @@ mod tests {
                 MhostError::InvalidInput("bad args".to_string()),
                 "invalid input",
             ),
+            (
+                "network",
+                MhostError::Network("connection refused".to_string()),
+                "network error",
+            ),
+            (
+                "external_api",
+                MhostError::ExternalApi("GitHub API error: 403".to_string()),
+                "external API error",
+            ),
         ];
 
         for (name, err, expected_substring) in cases {
@@ -269,6 +285,11 @@ mod tests {
                 MhostError::Storage(StorageError::Io("bad".to_string())),
             ),
             ("invalid_input", MhostError::InvalidInput("bad".to_string())),
+            ("network", MhostError::Network("timeout".to_string())),
+            (
+                "external_api",
+                MhostError::ExternalApi("rate limited".to_string()),
+            ),
         ];
 
         for (name, err) in cases {

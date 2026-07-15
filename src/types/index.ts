@@ -75,6 +75,8 @@ export type AppError =
   | { type: "Apply"; message: string }
   | { type: "Storage"; message: string }
   | { type: "Io"; message: string }
+  | { type: "Network"; message: string }
+  | { type: "ExternalApi"; message: string }
   | { type: "InvalidInput"; message: string };
 
 export interface ParseErrorAtLine {
