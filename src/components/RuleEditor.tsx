@@ -4,6 +4,7 @@ import { validateHostsText } from "../lib/tauri";
 import { extractErrorMessage } from "../lib/error";
 import { findMatches } from "../lib/search";
 import type { MatchInfo } from "../lib/search";
+import { escapeHtml } from "../lib/escape";
 import SearchBar from "./SearchBar";
 import styles from "./RuleEditor.module.css";
 
@@ -30,14 +31,6 @@ function rulesToText(rules: HostRule[]): string {
       return prefix + line;
     })
     .join("\n");
-}
-
-/** Escape HTML special chars for safe rendering in highlight layer */
-function escapeHtml(text: string): string {
-  return text
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
 }
 
 /** Single-line syntax highlighting (no search marks) */

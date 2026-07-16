@@ -3,16 +3,9 @@ import { readSystemHosts } from "../lib/tauri";
 import { extractErrorMessage } from "../lib/error";
 import { findMatches } from "../lib/search";
 import type { MatchInfo } from "../lib/search";
+import { escapeHtml } from "../lib/escape";
 import SearchBar from "../components/SearchBar";
 import styles from "./SystemHosts.module.css";
-
-/** Escape HTML special chars for safe rendering via dangerouslySetInnerHTML. */
-function escapeHtml(text: string): string {
-  return text
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
 
 /**
  * Wrap case-insensitive literal matches in `<mark>` tags. No syntax
