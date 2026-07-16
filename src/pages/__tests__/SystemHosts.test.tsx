@@ -79,56 +79,96 @@ describe("SystemHosts", () => {
     expect(screen.getByText("1/2")).toBeInTheDocument();
   });
 
-  it("shows 'Line N of M' indicator next to the search bar with the active match's line", async () => {
+  it("renders one row per line in the gutter (issue #111)", async () => {
     renderSystemHosts();
     await waitForContent();
-    // SAMPLE_HOSTS has 4 lines; "example" matches line 2 (0-indexed 1).
-    fireEvent.keyDown(document, { key: "f", metaKey: true });
-    fireEvent.change(screen.getByTestId("search-input"), { target: { value: "example" } });
-    const indicator = screen.getByTestId("active-line-info");
-    expect(indicator).toHaveTextContent("Line 2 of 4");
-    expect(indicator.dataset.activeLine).toBe("2");
-    expect(indicator.dataset.totalLines).toBe("4");
+    // SAMPLE_HOSTS has 4 lines → 4 numbered rows.
+    const rows = screen.getAllByTestId("line-number");
+    expect(rows).toHaveLength(4);
+    expect(rows.map((r) => r.dataset.lineNumber)).toEqual(["1", "2", "3", "4"]);
+    // Row 1 should contain the literal "1", row 4 should contain "4".
+    expect(rows[0]).toHaveTextContent("1");
+    expect(rows[3]).toHaveTextContent("4");
   });
 
-  it("hides 'Line N of M' when the search bar is closed", async () => {
+  it("highlights the active match's line in the gutter", async () => {
+    renderSystemHosts();
+    await waitForContent();
+    // SAMPLE_HOSTS has 4 lines; "example" first appears on line 2.
+    fireEvent.keyDown(document, { key: "f", metaKey: true });
+    fireEvent.change(screen.getByTestId("search-input"), { target: { value: "example" } });
+
+    const rows = screen.getAllByTestId("line-number");
+    const line2 = rows.find((r) => r.dataset.lineNumber === "2");
+    expect(line2).toBeDefined();
+    expect(line2!.className).toMatch(/lineNumberActive/);
+
+    // Other rows are NOT highlighted.
+    const other = rows.filter((r) => r.dataset.lineNumber !== "2");
+    for (const r of other) {
+      expect(r.className).not.toMatch(/lineNumberActive/);
+    }
+  });
+
+  it("removes the active-line gutter highlight when the search bar is closed", async () => {
     renderSystemHosts();
     await waitForContent();
     fireEvent.keyDown(document, { key: "f", metaKey: true });
     fireEvent.change(screen.getByTestId("search-input"), { target: { value: "example" } });
-    expect(screen.getByTestId("active-line-info")).toBeInTheDocument();
-    // Esc outside the search input → bar closes, indicator disappears.
+    const rows = screen.getAllByTestId("line-number");
+    expect(rows.some((r) => r.className.includes("lineNumberActive"))).toBe(true);
+
     fireEvent.keyDown(document, { key: "Escape" });
-    expect(screen.queryByTestId("active-line-info")).not.toBeInTheDocument();
+    const afterClose = screen.getAllByTestId("line-number");
+    expect(afterClose.some((r) => r.className.includes("lineNumberActive"))).toBe(false);
   });
 
-  it("hides 'Line N of M' when the query has no matches", async () => {
+  it("removes the active-line gutter highlight when the query has no matches", async () => {
     renderSystemHosts();
     await waitForContent();
     fireEvent.keyDown(document, { key: "f", metaKey: true });
     fireEvent.change(screen.getByTestId("search-input"), { target: { value: "nonexistent" } });
-    expect(screen.queryByTestId("active-line-info")).not.toBeInTheDocument();
+    const rows = screen.getAllByTestId("line-number");
+    expect(rows.some((r) => r.className.includes("lineNumberActive"))).toBe(false);
   });
 
-  it("updates 'Line N of M' as the user navigates between matches", async () => {
+  it("updates the active-line gutter highlight as the user navigates between matches", async () => {
     renderSystemHosts();
     await waitForContent();
     fireEvent.keyDown(document, { key: "f", metaKey: true });
-    // "1" matches several lines (the digit appears in lines 1, 2, 4 in the fixture).
-    fireEvent.change(screen.getByTestId("search-input"), { target: { value: "1" } });
-    const indicator = screen.getByTestId("active-line-info");
-    // First match: "127.0.0.1" on line 1.
-    expect(indicator).toHaveTextContent(/^Line 1 of 4$/);
-    fireEvent.click(screen.getByTestId("next-button"));
-    // Second match: still on line 1 (the second "1" in "127.0.0.1" is on the same line).
-    // We don't assert exact line — just that the indicator updated.
-    const after = screen.getByTestId("active-line-info");
-    expect(after).toBeInTheDocument();
-    // When we narrow the query to a unique match on a different line, the indicator
-    // updates accordingly.
+    // "api.local" lives on line 4 — unique match → highlight is on row 4.
     fireEvent.change(screen.getByTestId("search-input"), { target: { value: "api.local" } });
-    // "api.local" is on line 4 of the fixture.
-    expect(screen.getByTestId("active-line-info")).toHaveTextContent("Line 4 of 4");
+    let rows = screen.getAllByTestId("line-number");
+    const activeRowNumbers = () =>
+      rows
+        .filter((r) => r.className.includes("lineNumberActive"))
+        .map((r) => r.dataset.lineNumber);
+    expect(activeRowNumbers()).toEqual(["4"]);
+
+    // Narrow the query to "1" — first match is on line 1.
+    fireEvent.change(screen.getByTestId("search-input"), { target: { value: "1" } });
+    rows = screen.getAllByTestId("line-number");
+    expect(activeRowNumbers()).toEqual(["1"]);
+
+    // Navigate to the next match (line 1 → could stay on 1 if the next "1"
+    // is in the same line, but the *index* advanced — navigation itself is
+    // the contract). The active row must remain the single highlighted row.
+    fireEvent.click(screen.getByTestId("next-button"));
+    rows = screen.getAllByTestId("line-number");
+    expect(activeRowNumbers()).toHaveLength(1);
+  });
+
+  it("syncs gutter.scrollTop with the preview's scroll position", async () => {
+    renderSystemHosts();
+    await waitForContent();
+    const pre = document.querySelector("pre") as HTMLPreElement;
+    const gutter = screen.getByTestId("line-numbers");
+    // jsdom doesn't implement scroll layout, so set scrollTop directly and
+    // dispatch a scroll event — the component's onScroll handler must copy
+    // the value across to the gutter.
+    Object.defineProperty(pre, "scrollTop", { value: 42, configurable: true, writable: true });
+    fireEvent.scroll(pre);
+    expect((gutter as HTMLDivElement).scrollTop).toBe(42);
   });
 
   it("navigates prev/next with wrap-around", async () => {

@@ -6,16 +6,75 @@
   margin-bottom: 0;
 }
 
-.hostsPreview {
-  background: var(--color-readonly-bg);
+/* ---- Editor Wrapper: line-number gutter + hosts preview ----
+ * Mirrors RuleEditor.module.css — duplicated here so the read-only viewer
+ * doesn't reach into RuleEditor's CSS module scope (rule of three). */
+
+.editorWrapper {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  overflow: hidden;
   border: 1px solid var(--color-border);
   border-radius: var(--radius-sm);
+  background: var(--color-readonly-bg);
+}
+
+.lineNumbers {
+  position: absolute;
+  top: 0;
+  left: 0;
+  bottom: 0;
+  width: 44px;
+  padding: 12px 6px 12px 0;
+  background: var(--color-readonly-bg);
+  border-right: 1px solid var(--color-border);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--color-text-muted);
+  text-align: right;
+  /* The content (line-number divs) overflows vertically; we sync scrollTop
+   * from the <pre> element so the gutter tracks the visible range without
+   * showing its own scrollbar (issue #111). */
+  overflow: hidden;
+  z-index: 3;
+  user-select: none;
+  /* Don't intercept clicks — the gutter is purely informational for now
+   * (no click-to-jump; explicitly out of scope for #111). */
+  pointer-events: none;
+}
+
+.lineNumber {
+  /* Match hostsPreview's font-size × line-height (12px × 1.6 = 19.2px,
+   * rounded for sub-pixel). Each line number reserves one row of vertical
+   * space so the gutter aligns with the rendered content. */
+  min-height: 19.2px;
+}
+
+.lineNumberActive {
+  /* Active search match — bold + primary colour so users can spot
+   * "which line am I on" at a glance (issue #111 acceptance criteria). */
+  color: var(--color-primary);
+  font-weight: 600;
+}
+
+.hostsPreview {
+  position: absolute;
+  top: 0;
+  left: 44px;
+  right: 0;
+  bottom: 0;
   padding: 12px;
+  margin: 0;
+  /* Wrapper provides border + background + radius; keep pre transparent
+   * so the two layers share a continuous read-only surface. */
+  border: none;
+  border-radius: 0;
+  background: transparent;
   font-size: 12px;
   line-height: 1.6;
   overflow: auto;
-  flex: 1;
-  min-height: 0;
   white-space: pre-wrap;
   word-break: break-word;
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
@@ -43,22 +102,14 @@
   background: rgba(255, 140, 0, 0.5);
 }
 
-/* ---- Active Line Indicator ----
- * Shows "Line N of M" next to the search bar when a search is active.
- * Hidden by default; rendered as a sibling to SearchBar in a flex row. */
+/* ---- Search Bar Row ----
+ * Hosts the SearchBar component. The "Line N of M" badge that used to live
+ * here was removed once the line-number gutter (#111) became the primary
+ * affordance for "which line is this on?". */
 
 .searchRow {
   display: flex;
   align-items: center;
   gap: 12px;
   flex-wrap: wrap;
-}
-
-.lineInfo {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  font-size: 12px;
-  color: var(--color-text-muted);
-  white-space: nowrap;
-  /* Push the indicator to the right edge of the row when there's spare space. */
-  margin-left: auto;
 }
