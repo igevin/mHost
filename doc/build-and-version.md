@@ -2,17 +2,81 @@
 
 ## 版本号配置位置
 
-出包文件名中的版本号由 **`src-tauri/tauri.conf.json`** 的 `version` 字段决定：
+mHost 有三个地方写着版本号，它们各自影响不同的东西：
 
-```json
-{
-  "productName": "mHost",
-  "version": "0.1.0",   // ← 改这里
-  ...
-}
+| 文件 | 字段 | 当前版本 | 用途 | 影响出包名 | 影响 check_update |
+|-----|------|---------|------|-----------|-------------------|
+| `src-tauri/tauri.conf.json` | `version` | `0.3.2` | Tauri 应用版本（出包文件名） | **是** | 否 |
+| `package.json` | `version` | `0.3.2` | 前端版本，通过 `vite.config.ts` 注入为 `__APP_VERSION__` | 否 | **是** |
+| `src-tauri/Cargo.toml` | `version` | `0.1.0` | Rust crate 版本 | 否 | 否 |
+
+### `__APP_VERSION__` 的版本来源
+
+`__APP_VERSION__` 在前端代码里充当全局常量，值来自 `package.json`（在 `vite.config.ts:13-22` 通过 `define` 注入）。它在 **Settings 页面** 有两处消费点：
+
+| 消费点 | 作用 | 位置 |
+|--------|------|------|
+| **About 卡片** | 常驻显示当前版本号 | `src/pages/Settings.tsx:70` `<div className={styles.aboutVersion}>Version {__APP_VERSION__}</div>` |
+| **检查更新按钮** | 与 GitHub Releases 最新 tag 比对 | `src/pages/Settings.tsx:32` `await checkUpdate(__APP_VERSION__)` → IPC → `src-tauri/src/commands/update.rs:34` `check_update(current_version)` |
+
+数据流：
+
+```
+package.json → vite.config.ts (define) → __APP_VERSION__ → Settings.tsx
+                                                │
+                                                ├──► About 卡片(显示)
+                                                └─► checkUpdate() → Rust check_update → GitHub Releases API
 ```
 
-当前配置路径：`src-tauri/tauri.conf.json:4`
+> - `__APP_VERSION__` 在 `src/css.d.ts:8` 通过 `declare const __APP_VERSION__: string;` 声明为 TS 全局类型。
+> - 测试 (`src/pages/__tests__/Settings.test.tsx:11-12`) 通过 `globalThis.__APP_VERSION__ = "0.2.0"` stub 一个固定版本，避免快照/断言随 `package.json` 偶发变动。
+
+因此 **`package.json` 的 version 必须与实际发版号一致**——否则 About 卡片会显示旧版本号，check_update 会误判当前版本（导致永远提示"有新版本"或永远看不到更新提示）。
+
+## 修改版本号步骤
+
+### 1. 修改 `src-tauri/tauri.conf.json`（必须）
+
+影响出包文件名。
+
+```diff
+- "version": "0.3.2",
++ "version": "0.3.3",
+```
+
+### 2. 同步修改 `package.json`（必须）
+
+影响 check_update 的版本比较。**必须与 tauri.conf.json 保持一致。**
+
+```diff
+- "version": "0.3.2",
++ "version": "0.3.3",
+```
+
+### 3. 发版时打 git tag 并推送（触发 CI 自动构建）
+
+```bash
+git tag v0.3.3
+git push origin v0.3.3
+```
+
+推送 `v*` 格式的 tag 后，GitHub Actions 会自动触发 Release 构建（见下方 CI 自动构建章节）。
+
+### 关于 Cargo.toml
+
+工程里有 6 个 `Cargo.toml`，每个 `version` 字段都是 **Rust crate 自身的版本号**（在 workspace 内的依赖解析时使用），**不影响出包文件名，也不影响 check_update**。发版时不需要同步修改它们。具体路径如下：
+
+```
+src-tauri/Cargo.toml                           (workspace root)
+src-tauri/crates/mhost-core/Cargo.toml
+src-tauri/crates/mhost-hosts/Cargo.toml
+src-tauri/crates/mhost-storage/Cargo.toml
+src-tauri/crates/mhost-apply/Cargo.toml
+src-tauri/crates/mhost-dns/Cargo.toml
+```
+
+> 如果未来要把 `mhost-*` 子 crate 发布到 crates.io，或因为依赖 API 不兼容需要打破 semver，
+> 那时再为它们单独 bump version。当前（v0.3.x 阶段）保持 `0.1.0` 即可。
 
 ## 出包命名规则
 
@@ -20,50 +84,16 @@ Tauri 2 bundler 模板：
 
 ```
 {productName}_{version}_{target-triple}
-└── mHost     └── 0.1.0 └── aarch64-apple-darwin (简写 aarch64)
+└── mHost     └── 0.3.3 └── aarch64-apple-darwin (简写 aarch64)
 ```
 
-示例：`mHost_0.1.0_aarch64`
+示例：`mHost_0.3.3_aarch64.dmg`
 
 | 组成部分 | 值 | 说明 |
 |---------|---|------|
 | productName | `mHost` | tauri.conf.json 中的 productName |
-| version | `0.1.0` | tauri.conf.json 中的 version |
+| version | `0.3.3` | tauri.conf.json 中的 version |
 | target | `aarch64` | Apple Silicon (aarch64-apple-darwin) |
-
-## 修改版本号步骤
-
-### 1. 修改主版本号（必须）
-
-编辑 `src-tauri/tauri.conf.json`：
-
-```diff
-- "version": "0.1.0",
-+ "version": "0.2.0",
-```
-
-### 2. 同步修改 package.json（建议）
-
-编辑根目录 `package.json`：
-
-```diff
-- "version": "0.1.0",
-+ "version": "0.2.0",
-```
-
-### 3. 发版时打 git tag 并推送（触发 CI 自动构建）
-
-```bash
-git tag v0.2.0
-git push origin v0.2.0
-```
-
-推送 `v*` 格式的 tag 后，GitHub Actions 会自动触发 Release 构建（见下方 CI 自动构建章节）。
-
-## 注意事项
-
-- **不要改 Cargo.toml 的 version 来控制出包名称**：工作空间根 `src-tauri/Cargo.toml` 及各 crate（mhost-core、mhost-apply 等）的 `Cargo.toml` 也有 version 字段，但那是 Rust crate 的版本号，不影响 Tauri 出包文件名。
-- **只需改 `src-tauri/tauri.conf.json` 的 version**，build 出的镜像名称就会随之变化。
 
 ## 打包编译命令
 
@@ -100,20 +130,24 @@ pnpm tauri build
 推送 `v*` 格式的 git tag 时自动触发，例如：
 
 ```bash
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.3.3
+git push origin v0.3.3
 ```
 
 配置文件：`.github/workflows/release.yml`
 
 ### 构建矩阵
 
-push tag 后会**并行**触发两个构建 job：
+push tag 后会**并行**触发两个构建 job（同一份 `tauri-action` 配置 + 两组 `--target`）：
 
-| Job | Runner | Target | 产物 |
-|-----|--------|--------|------|
-| macOS ARM | `macos-latest` (M1) | `aarch64-apple-darwin` | `.dmg` / `.app` |
-| macOS Intel | `macos-latest` (M1) | `x86_64-apple-darwin` | `.dmg` / `.app` |
+| Job 步骤 | Runner | 构建参数（`args`） | 产物 |
+|---------|--------|------------------|------|
+| `build-arm` | `macos-latest`（M1） | `--target aarch64-apple-darwin` | `.dmg` / `.app` |
+| `build-x86_64` | `macos-latest`（M1） | `--target x86_64-apple-darwin` | `.dmg` / `.app` |
+
+> 两个 job 的 runner **都是 `macos-latest`**（当前指向 Apple Silicon / M1 镜像），
+> 区别仅在 `--target` 参数。M1 runner 上做交叉编译即可产出 x86_64 安装包，
+> 因此无需单独的 Intel runner。
 
 两个 job 的产物会自动上传到**同一个 GitHub Release** 中。
 
@@ -126,25 +160,38 @@ push tag 后会**并行**触发两个构建 job：
 ### 发版完整流程
 
 ```bash
-# 1. 修改版本号（tauri.conf.json + package.json）
-# 2. 提交并推送
-git add .
-git commit -m "chore: bump version to 0.2.0"
+# 1. 确保在 master 分支且工作区干净
+git checkout master
+git pull origin master
+
+# 2. 跑全量测试确认发版就绪
+cd src-tauri && cargo test --all-features && cargo clippy --all-targets --all-features -- -D warnings && cargo fmt --all -- --check && cd ..
+pnpm test && pnpm build
+
+# 3. 修改版本号（两个文件必须同步）
+#    - src-tauri/tauri.conf.json: "version": "0.3.3"
+#    - package.json: "version": "0.3.3"
+
+# 4. 提交并推送
+git add src-tauri/tauri.conf.json package.json
+git commit -m "chore: bump version to 0.3.3"
 git push
 
-# 3. 打 tag 并推送（触发 CI 构建）
-git tag v0.2.0
-git push origin v0.2.0
+# 5. 打 tag 并推送（触发 CI 构建）
+git tag v0.3.3
+git push origin v0.3.3
 
-# 4. 等待 CI 完成，在 GitHub Releases 页面检查 draft release
-# 5. 确认无误后，手动发布 release
+# 6. 等待 CI 完成，在 GitHub Releases 页面检查 draft release
+# 7. 确认无误后，手动发布 release
 ```
 
-## 项目版本号一览
+### 发版前检查清单
 
-| 文件 | 字段 | 用途 | 是否影响出包名 |
-|-----|------|------|-------------|
-| `src-tauri/tauri.conf.json` | `version` | Tauri 应用版本 | **是（主要）** |
-| `package.json` | `version` | 前端 npm 包版本 | 否，但建议同步 |
-| `src-tauri/Cargo.toml` | `version` | Rust crate 版本 | 否 |
-| `src-tauri/crates/*/Cargo.toml` | `version` | 子 crate 版本 | 否 |
+- [ ] `cargo test --all-features` 全部通过（在 `src-tauri/` 下运行，自动涵盖 workspace 所有成员 crate；与 `CLAUDE.md` 的命令一致）
+- [ ] `cargo clippy --all-targets --all-features -- -D warnings` 无 warning
+- [ ] `cargo fmt --all -- --check` 干净
+- [ ] `pnpm test` 全部通过
+- [ ] `pnpm build` 干净
+- [ ] 没有 open bug issue
+- [ ] `tauri.conf.json` 和 `package.json` 的 version 已同步修改
+- [ ] git tag 号与 version 一致（`v0.3.3` 对应 `0.3.3`）
