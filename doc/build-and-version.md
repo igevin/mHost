@@ -165,7 +165,7 @@ git checkout master
 git pull origin master
 
 # 2. 跑全量测试确认发版就绪
-cd src-tauri && cargo test --all-features && cargo clippy --all-targets --all-features -- -D warnings && cargo fmt --all -- --check && cd ..
+cd src-tauri && cargo test --workspace --all-features && cargo clippy --all-targets --all-features -- -D warnings && cargo fmt --all -- --check && cd ..
 pnpm test && pnpm build
 
 # 3. 修改版本号（两个文件必须同步）
@@ -187,7 +187,7 @@ git push origin v0.3.3
 
 ### 发版前检查清单
 
-- [ ] `cargo test --all-features` 全部通过（在 `src-tauri/` 下运行，自动涵盖 workspace 所有成员 crate；与 `CLAUDE.md` 的命令一致）
+- [ ] `cargo test --workspace --all-features` 全部通过（在 `src-tauri/` 下运行，显式覆盖全部成员 crate；`--workspace` 不可省略 — 裸 `cargo test` 默认只跑当前根 crate，会漏掉 `mhost-*` 子 crate 的测试）
 - [ ] `cargo clippy --all-targets --all-features -- -D warnings` 无 warning
 - [ ] `cargo fmt --all -- --check` 干净
 - [ ] `pnpm test` 全部通过
