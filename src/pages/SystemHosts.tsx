@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useMemo } from "react";
+import { useState, useEffect, useRef, useMemo, useCallback } from "react";
 import { readSystemHosts } from "../lib/tauri";
 import { extractErrorMessage } from "../lib/error";
 import { findMatches } from "../lib/search";
@@ -60,6 +60,7 @@ function SystemHosts() {
   const [searchBarVisible, setSearchBarVisible] = useState(false);
   const [currentMatchIndex, setCurrentMatchIndex] = useState(0);
   const previewRef = useRef<HTMLPreElement>(null);
+  const gutterRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     let mounted = true;
@@ -80,14 +81,27 @@ function SystemHosts() {
     [hostsContent, searchQuery],
   );
 
-  // Total line count of the hosts file — used to render "Line N of M" next to
-  // the search bar. Memoized because re-splitting on every keystroke is wasteful.
+  // Total line count of the hosts file. Memoized because re-splitting on
+  // every keystroke is wasteful. Used for the line-number gutter (issue
+  // #111): `Array.from({ length: totalLines })` produces the gutter rows.
   const totalLines = useMemo(
     () => (hostsContent ? hostsContent.split("\n").length : 0),
     [hostsContent],
   );
 
-  // Active match's 1-based line number, or null if there's no active match to show.
+  // 1-based numbers for every line in the file. The gutter renders one
+  // <div class="lineNumber"> per entry. Memoized on `[totalLines]` so
+  // typing a search query (which only changes `matches`, not `totalLines`)
+  // does not rebuild this array — perf fix from issue #111 (mirrors the
+  // line-numbers memo pattern in RuleEditor.tsx).
+  const lineNumbers = useMemo(
+    () => Array.from({ length: totalLines }, (_, i) => i + 1),
+    [totalLines],
+  );
+
+  // 1-based line number of the currently active match, or null when no
+  // match is active. Drives the gutter's highlighted line (no separate
+  // badge anymore — #111 made the gutter the primary affordance).
   const activeLineNumber =
     searchBarVisible &&
     matches.length > 0 &&
@@ -126,6 +140,17 @@ function SystemHosts() {
       active.scrollIntoView({ block: "center", behavior: "smooth" });
     }
   }, [currentMatchIndex, matches]);
+
+  // Sync gutter scroll position with the preview (issue #111). The gutter
+  // is `overflow: hidden`, so its scrollbars never show — but setting
+  // scrollTop still moves the inner content, which is how we make the
+  // gutter track the visible range. Mirrors RuleEditor.tsx's
+  // textarea→lineNumbers sync on scroll.
+  const handlePreviewScroll = useCallback(() => {
+    if (previewRef.current && gutterRef.current) {
+      gutterRef.current.scrollTop = previewRef.current.scrollTop;
+    }
+  }, []);
 
   // Keyboard shortcuts: Cmd+F / Ctrl+F opens search bar; Esc outside the
   // search input closes it and clears the query. Mirrors RuleEditor.tsx:375-399.
@@ -198,27 +223,47 @@ function SystemHosts() {
             onReplaceAll={() => {}}
             readOnly
           />
-          {activeLineNumber !== null && (
-            <span
-              className={styles.lineInfo}
-              data-testid="active-line-info"
-              data-active-line={activeLineNumber}
-              data-total-lines={totalLines}
-            >
-              Line {activeLineNumber} of {totalLines}
-            </span>
-          )}
         </div>
         {hostsError ? (
           <div className="alert alert-error">{hostsError}</div>
         ) : hostsContent === null ? (
           <div className="loading">Loading...</div>
         ) : (
-          <pre
-            ref={previewRef}
-            className={styles.hostsPreview}
-            dangerouslySetInnerHTML={{ __html: highlightedHtml }}
-          />
+          <div
+            className={styles.editorWrapper}
+            data-testid="system-hosts-editor-wrapper"
+          >
+            {/* Line-number gutter (issue #111). Always rendered once the
+                hosts content has loaded; the active match's line is
+                visually emphasised via `lineNumberActive`. */}
+            <div
+              ref={gutterRef}
+              className={styles.lineNumbers}
+              data-testid="line-numbers"
+              aria-hidden="true"
+            >
+              {lineNumbers.map((n) => (
+                <div
+                  key={n}
+                  className={
+                    n === activeLineNumber
+                      ? `${styles.lineNumber} ${styles.lineNumberActive}`
+                      : styles.lineNumber
+                  }
+                  data-testid="line-number"
+                  data-line-number={n}
+                >
+                  {n}
+                </div>
+              ))}
+            </div>
+            <pre
+              ref={previewRef}
+              className={styles.hostsPreview}
+              onScroll={handlePreviewScroll}
+              dangerouslySetInnerHTML={{ __html: highlightedHtml }}
+            />
+          </div>
         )}
       </div>
     </div>
