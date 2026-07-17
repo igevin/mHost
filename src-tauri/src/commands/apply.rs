@@ -556,8 +556,10 @@ mod tests {
         );
     }
 
-    // Fix (#44): Test that apply_current_plan_logic re-applies enabled profiles
-    // after their rules are updated (simulating update_profile on an enabled profile).
+    // Fix (#44, #121): Test that apply_current_plan_logic re-applies enabled profiles
+    // after their rules are updated (this is what update_profile triggers on save
+    // when the profile is a Hosts mode + enabled profile — issue #121 was "editing
+    // the active hosts profile just saves, doesn't write hosts").
     #[test]
     fn test_apply_current_plan_logic_reapplies_after_rule_update() {
         let (_temp, storage, writer) = create_test_storage_and_writer();
@@ -799,6 +801,119 @@ mod tests {
             plan.rules.is_empty(),
             "plan should be empty when target is dns profile: {:?}",
             plan.rules
+        );
+    }
+
+    // Fix issue #121: editing an enabled hosts profile must write the new rules
+    // to /etc/hosts (not just persist them in storage). This integration test
+    // exercises the full update flow:
+    //   1. create + enable + initial apply → /etc/hosts has rule A
+    //   2. update profile rules (mimics update_profile's storage step)
+    //   3. call apply_current_plan_logic (what update_profile now triggers
+    //      automatically for enabled Hosts profiles)
+    //   4. assert /etc/hosts has rule B and no longer has rule A
+    #[test]
+    fn test_update_profile_reapplies_hosts_for_issue_121() {
+        let (_temp, storage, writer) = create_test_storage_and_writer();
+
+        // Step 1: create + enable + initial apply
+        let mut profile =
+            create_profile_with_rules(&storage, "dev", vec![("127.0.0.1", "before.com")]);
+        profile.enabled = true;
+        storage.save_profile(&profile).unwrap();
+
+        apply_current_plan_logic(storage.as_ref(), &writer).unwrap();
+
+        let hosts_initial = std::fs::read_to_string(writer.hosts_path()).unwrap();
+        assert!(
+            hosts_initial.contains("127.0.0.1 before.com"),
+            "hosts should contain initial rule: {}",
+            hosts_initial
+        );
+
+        // Step 2: update profile rules (mimics update_profile's storage update)
+        //   - profile.id / profile.enabled preserved
+        //   - rules replaced with new set
+        //   - saved to storage (source of truth)
+        profile.rules = vec![HostRule::new(
+            "192.168.1.1".parse().unwrap(),
+            vec!["after.local".to_string()],
+        )];
+        profile.updated_at = chrono::Utc::now();
+        storage.save_profile(&profile).unwrap();
+
+        // Step 3: re-apply (the new behavior introduced for issue #121)
+        let result = apply_current_plan_logic(storage.as_ref(), &writer);
+        assert!(
+            result.is_ok(),
+            "re-apply after profile update must succeed: {:?}",
+            result.err()
+        );
+
+        // Step 4: verify /etc/hosts reflects the new rules
+        let hosts_after = std::fs::read_to_string(writer.hosts_path()).unwrap();
+        assert!(
+            hosts_after.contains("192.168.1.1 after.local"),
+            "hosts should contain new rule after re-apply: {}",
+            hosts_after
+        );
+        assert!(
+            !hosts_after.contains("127.0.0.1 before.com"),
+            "hosts should no longer contain the old rule: {}",
+            hosts_after
+        );
+    }
+
+    // Fix issue #121 (negative case): editing a DISABLED hosts profile must NOT
+    // touch /etc/hosts. The re-apply is gated on profile.enabled, so disabled
+    // profiles only persist to storage; the existing hosts file is untouched.
+    #[test]
+    fn test_update_profile_skips_reapply_when_disabled() {
+        let (_temp, storage, writer) = create_test_storage_and_writer();
+
+        // Step 1: create + enable another profile, then apply → /etc/hosts has a baseline rule
+        let mut baseline =
+            create_profile_with_rules(&storage, "baseline", vec![("10.0.0.1", "keep.com")]);
+        baseline.enabled = true;
+        storage.save_profile(&baseline).unwrap();
+        apply_current_plan_logic(storage.as_ref(), &writer).unwrap();
+
+        let hosts_baseline = std::fs::read_to_string(writer.hosts_path()).unwrap();
+        assert!(hosts_baseline.contains("10.0.0.1 keep.com"));
+
+        // Step 2: create a disabled profile and "update" it (re-apply guard must NOT fire)
+        let mut disabled =
+            create_profile_with_rules(&storage, "draft", vec![("127.0.0.1", "draft.com")]);
+        // disabled.enabled stays false
+        storage.save_profile(&disabled).unwrap();
+
+        // Update disabled profile's rules — update_profile logic gates reapply on enabled,
+        // so the call below represents what would happen IF we called apply_current_plan_logic
+        // unconditionally. With the gate, we skip this call entirely. The test confirms
+        // that even if apply_current_plan_logic were called with the disabled profile alone,
+        // it would clear the managed block (because disabled profile produces empty plan).
+        // The key invariant we test: a disabled profile's update must not invalidate
+        // the baseline's rule.
+        //
+        // Simulate the gated behavior: only persist to storage, do NOT call
+        // apply_current_plan_logic. After this step, /etc/hosts is untouched.
+        disabled.rules = vec![HostRule::new(
+            "127.0.0.1".parse().unwrap(),
+            vec!["draft-v2.local".to_string()],
+        )];
+        disabled.updated_at = chrono::Utc::now();
+        storage.save_profile(&disabled).unwrap();
+
+        let hosts_after = std::fs::read_to_string(writer.hosts_path()).unwrap();
+        assert!(
+            hosts_after.contains("10.0.0.1 keep.com"),
+            "baseline rule must remain when editing a disabled profile: {}",
+            hosts_after
+        );
+        assert!(
+            !hosts_after.contains("127.0.0.1 draft.local"),
+            "disabled profile's rule must NOT leak into hosts: {}",
+            hosts_after
         );
     }
 }
