@@ -4,6 +4,7 @@ use mhost_core::{MhostError, Profile, ProfileId, ProfileMode};
 use mhost_storage::storage::Storage;
 use tauri::{AppHandle, State};
 
+use crate::commands::apply::apply_current_plan_logic;
 use crate::state::AppState;
 
 // Security fix (#18): Prevent malicious profile data from being written to /etc/hosts.
@@ -241,6 +242,35 @@ pub async fn update_profile(
     // N4: Validate profile data before applying changes to system hosts.
     validate_profile(&profile)?;
     state.storage.save_profile(&profile)?;
+
+    // Hosts 模式：若 profile 已 enabled，把新规则自动写入 /etc/hosts（fix issue #121）。
+    // 之前只 save_profile 不写 hosts，用户得 disable→enable 才能让改动生效，体验割裂。
+    // 写入走与 apply_hosts / enable_and_apply 同一路径：
+    //   apply_lock 串行化（避免与并发 apply 抢 /etc/hosts）
+    //   spawn_blocking 跑 IO（不阻塞 async runtime，fix #26）
+    // best-effort：apply 失败仅日志，不向用户抛 Err——
+    //   profile 已存盘是 source of truth，下次手动 Apply 也能恢复，
+    //   与 DNS reload 失败处理一致（见下方 DNS 分支注释）。
+    // 首次 apply 会触发 macOS AuthorizationExecuteWithPrivileges sudo 弹窗，
+    //   之后 OS 会缓存，用户感知是「保存即生效」。
+    if profile.mode == ProfileMode::Hosts && profile.enabled {
+        let _guard = state.apply_lock.lock().await;
+        let writer = state.writer.clone();
+        let storage = state.storage.clone();
+        let apply_result = tauri::async_runtime::spawn_blocking(move || {
+            apply_current_plan_logic(storage.as_ref(), &writer)?;
+            // Auto-snapshot：与 apply_hosts / enable_and_apply 保持一致
+            if let Err(e) = crate::commands::snapshot::auto_snapshot_logic(storage.as_ref()) {
+                eprintln!("[mHost] Auto-snapshot failed: {}", e);
+            }
+            Ok::<(), MhostError>(())
+        })
+        .await
+        .map_err(|e| MhostError::InvalidInput(e.to_string()));
+        if let Err(e) = apply_result {
+            eprintln!("[mHost] Hosts re-apply failed after update_profile: {}", e);
+        }
+    }
 
     // 如果这是一个 enabled 的 DNS 模式 Profile 且 DNS 模式在跑，
     // 把新规则热加载到运行中的 DnsServer.RuleEngine。
