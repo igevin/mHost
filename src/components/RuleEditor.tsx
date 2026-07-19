@@ -319,6 +319,19 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEd
     }
   }, []);
 
+  // Track the line the caret is on — used to highlight the active row in the gutter.
+  // Derives from textarea.selectionStart so it works for both keyboard nav and clicks.
+  const [activeLineNumber, setActiveLineNumber] = useState(0);
+
+  const handleActiveLineUpdate = useCallback(() => {
+    const ta = textareaRef.current;
+    if (!ta) return;
+    const uptoCaret = ta.value.slice(0, ta.selectionStart);
+    // Lines are 0-indexed internally; the gutter renders 1-indexed.
+    const lineIdx = uptoCaret.split("\n").length - 1;
+    setActiveLineNumber((prev) => (prev === lineIdx ? prev : lineIdx));
+  }, []);
+
   // Scroll to a specific line in the textarea
   const scrollToMatch = useCallback((lineIndex: number) => {
     if (textareaRef.current) {
@@ -438,9 +451,18 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEd
       <div className={`${styles.editorWrapper} ${editorHasBlockingIssues ? styles.editorWrapperHasErrors : ""}`}>
         {/* Line Numbers */}
         <div ref={lineNumbersRef} className={styles.lineNumbers}>
-          {lineNumbers.map((num) => (
-            <div key={num} className={styles.lineNumber}>{num}</div>
-          ))}
+          {lineNumbers.map((num) => {
+            const lineIdx = num - 1;
+            const isActive = !readOnly && lineIdx === activeLineNumber;
+            return (
+              <div
+                key={num}
+                className={`${styles.lineNumber} ${isActive ? styles.lineNumberActive : ""}`}
+              >
+                {num}
+              </div>
+            );
+          })}
         </div>
 
         {/* Highlight Layer */}
@@ -458,6 +480,9 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEd
           value={text}
           onChange={handleChange}
           onScroll={handleScroll}
+          onSelect={handleActiveLineUpdate}
+          onKeyUp={handleActiveLineUpdate}
+          onClick={handleActiveLineUpdate}
           readOnly={readOnly}
           spellCheck={false}
           placeholder="Enter hosts rules, one per line:&#10;127.0.0.1 localhost # local dev&#10;192.168.1.100 api.dev.local # API server"
