@@ -1,6 +1,6 @@
 /* =====================================================================
  * mHost — Global tokens & primitives
- * Design language: "Terminal Native" — warm paper + ink + orange accent.
+ * Design language: "Terminal Native" — warm paper + ink + blue accent.
  * Mono for data, sans for chrome. Code editor is the hero.
  * =====================================================================
  */
@@ -29,6 +29,14 @@
   font-weight: 400;
   font-style: normal;
   font-display: swap;
+  /* (issue #125 review): project system-mono metrics onto JetBrains Mono's
+   * box so the swap-in doesn't reflow the textarea caret. Without these
+   * overrides SF Mono (macOS ui-monospace fallback) renders ~5-8% narrower
+   * than JetBrains Mono, causing a visible caret jump on first paint. */
+  size-adjust: 105%;
+  ascent-override: 90%;
+  descent-override: 22%;
+  line-gap-override: 0%;
 }
 
 @font-face {
@@ -37,6 +45,12 @@
   font-weight: 500;
   font-style: normal;
   font-display: swap;
+  /* Match the Regular weight's metrics so the caret doesn't shift when
+   * a bold rule is highlighted in the gutter. */
+  size-adjust: 105%;
+  ascent-override: 90%;
+  descent-override: 22%;
+  line-gap-override: 0%;
 }
 
 /* =====================================================================
@@ -143,7 +157,9 @@
   --red-light: var(--danger-soft);
   --yellow: var(--warning);
   --yellow-light: var(--warning-soft);
-  --orange: var(--accent);
+  /* (issue #125 review): removed `--orange: var(--accent)` alias. It was
+   * never referenced by any module CSS, and mapping "orange" → blue
+   * silently broke any future caller that wanted a literal orange. */
   --purple-light: var(--purple-soft);
 }
 
@@ -165,6 +181,10 @@
     --accent: #5e85ff;
     --accent-hover: #7d9cff;
     --accent-soft: rgba(59, 108, 255, 0.18);
+    /* (issue #125 review): the lighter accent needs a dark contrast color
+     * — #FFFFFF on #5e85ff is only 1.04:1, button text would smear. Use
+     * paper so primary buttons stay readable. */
+    --accent-contrast: #0F0E0D;
 
     --danger: #E55525;
     --danger-soft: rgba(229, 85, 37, 0.14);
