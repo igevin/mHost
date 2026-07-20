@@ -8,40 +8,49 @@
   gap: 8px;
 }
 
-/* ---- Editor Wrapper: textarea + highlight layer ---- */
+/* ---- Editor Wrapper: textarea + highlight layer ----
+ * Edge-to-edge: no border, no radius — title bar lives in ProfileView.
+ * The top edge fades to a 1px rule only when there are blocking errors. */
 
 .editorWrapper {
   flex: 1;
   position: relative;
   min-height: 0;
   overflow: hidden;
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-sm);
+  border-top: 1px solid var(--rule-soft);
+  background: var(--surface);
 }
 
-/* ---- Highlight Layer (underneath textarea) ---- */
+/* ---- Gutter (line numbers) ---- */
 
 .lineNumbers {
   position: absolute;
   top: 0;
   left: 0;
   bottom: 0;
-  width: 44px;
-  padding: 10px 6px 10px 0;
-  background: var(--color-readonly-bg);
-  border-right: 1px solid var(--color-border);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  font-size: 13px;
+  width: 48px;
+  padding: 12px 10px 12px 0;
+  background: var(--sidebar-bg);
+  border-right: 1px solid var(--rule-soft);
+  font-family: var(--font-mono);
+  font-size: 12px;
   line-height: 1.6;
-  color: var(--color-text-muted);
+  color: var(--ink-muted);
   text-align: right;
   overflow: hidden;
   z-index: 3;
   user-select: none;
+  font-variant-numeric: tabular-nums;
 }
 
 .lineNumber {
-  min-height: 20.8px;
+  min-height: 19.2px;
+  padding-right: 2px;
+}
+
+.lineNumberActive {
+  color: var(--accent);
+  font-weight: 600;
 }
 
 /* ---- Highlight Layer (underneath textarea) ---- */
@@ -49,15 +58,15 @@
 .highlightLayer {
   position: absolute;
   top: 0;
-  left: 44px;
+  left: 48px;
   right: 0;
   bottom: 0;
-  padding: 10px 12px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  padding: 12px 14px;
+  font-family: var(--font-mono);
   font-size: 13px;
   line-height: 1.6;
-  color: var(--color-text);
-  background: var(--color-surface);
+  color: var(--ink);
+  background: transparent;
   white-space: pre-wrap;
   word-wrap: break-word;
   tab-size: 4;
@@ -71,19 +80,19 @@
 .textarea {
   position: absolute;
   top: 0;
-  left: 44px;
+  left: 48px;
   right: 0;
   bottom: 0;
-  width: 100%;
-  height: 100%;
-  padding: 10px 12px;
+  width: auto;
+  height: auto;
+  padding: 12px 14px;
   border: none;
   outline: none;
   resize: none;
   background: transparent;
   color: transparent;
-  caret-color: var(--color-text);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  caret-color: var(--ink);
+  font-family: var(--font-mono);
   font-size: 13px;
   line-height: 1.6;
   white-space: pre-wrap;
@@ -94,7 +103,7 @@
 }
 
 .textarea::selection {
-  background: rgba(59, 108, 255, 0.2);
+  background: var(--accent-soft);
 }
 
 .textarea:focus {
@@ -106,23 +115,23 @@
 }
 
 .editorWrapperHasErrors {
-  border-color: var(--color-danger) !important;
+  border-top-color: var(--danger) !important;
 }
 
 /* Token Colors (used in highlight layer) */
 
 .tokenIp {
-  color: var(--color-primary);
+  color: var(--accent);
   font-weight: 600;
 }
 
 .tokenDomain {
-  color: var(--green);
+  color: var(--success);
   font-weight: 500;
 }
 
 .tokenComment {
-  color: var(--color-text-muted);
+  color: var(--ink-muted);
   font-style: italic;
 }
 
@@ -130,8 +139,9 @@
 
 .validating {
   font-size: 12px;
-  color: var(--color-text-muted);
+  color: var(--ink-muted);
   flex-shrink: 0;
+  font-family: var(--font-mono);
 }
 
 .errorList {
@@ -143,20 +153,22 @@
 
 .errorItem {
   font-size: 12px;
-  color: var(--color-danger);
-  background: var(--color-error-bg);
-  border: 1px solid var(--color-error-border);
+  color: var(--danger);
+  background: var(--danger-soft);
+  border: 1px solid var(--danger-soft);
   border-radius: var(--radius-sm);
   padding: 4px 8px;
+  font-family: var(--font-mono);
 }
 
 .warningItem {
   font-size: 12px;
-  color: var(--color-warning);
-  background: var(--color-warning-bg);
-  border: 1px solid var(--color-warning-border);
+  color: var(--warning);
+  background: var(--warning-soft);
+  border: 1px solid var(--warning-soft);
   border-radius: var(--radius-sm);
   padding: 4px 8px;
+  font-family: var(--font-mono);
 }
 
 /* ---- Search Match Highlights ---- */
@@ -171,9 +183,9 @@
 }
 
 .searchMatch {
-  background: rgba(255, 215, 0, 0.4);
+  background: rgba(232, 168, 56, 0.35); /* amber — functional indicator */
 }
 
 .searchMatchActive {
-  background: rgba(255, 140, 0, 0.5);
+  background: rgba(232, 168, 56, 0.6);
 }
