@@ -117,8 +117,9 @@ function Sidebar({ toolNavItems, onOpenManagement }: SidebarProps) {
         )}
       </div>
 
-      {/* Profiles Section */}
-      <div className={styles.sidebarSection}>
+      {/* Profiles Section — flex-grows to fill available sidebar height
+          (issue #125 review); profileList scrolls internally. */}
+      <div className={`${styles.sidebarSection} ${styles.profilesSection}`}>
         <div className={styles.sidebarSectionTitleRow}>
           <span className={styles.sidebarSectionTitle}>Profiles</span>
           <button className={styles.manageLink} onClick={onOpenManagement}>

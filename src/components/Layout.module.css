@@ -129,12 +129,30 @@
   opacity: 1;
 }
 
-/* ---- Profile List ---- */
+/* ---- Profile List ----
+ * Layout (issue #125 review): previously had `max-height: 280px` to bound
+ * the scroll. The Terminal Native pass removed it for visual reasons, but
+ * without a constraint the list pushes the Tools section and StatusBar
+ * off-screen whenever there are many profiles. We restore a *structural*
+ * boundary: the Profiles sidebar section grows to fill the available
+ * height, and the list itself scrolls internally. Tools + StatusBar stay
+ * pinned to the bottom of the sidebar. */
+
+/* The Profiles section is the only sidebarSection that should grow.
+ * Tools keeps its auto height so it sits flush above the StatusBar. */
+.profilesSection {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 0;
+  min-height: 0;
+}
 
 .profileList {
   display: flex;
   flex-direction: column;
   gap: 1px;
+  flex: 1 1 0;
+  min-height: 0;
   overflow-y: auto;
 }
 

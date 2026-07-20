@@ -321,14 +321,39 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEd
 
   // Track the line the caret is on — used to highlight the active row in the gutter.
   // Derives from textarea.selectionStart so it works for both keyboard nav and clicks.
+  //
+  // Perf (issue #125 review): the previous implementation did
+  //   value.slice(0, selectionStart).split("\n").length - 1
+  // on every keystroke, re-scanning the prefix from char 0 every time. For a
+  // 5k-line file with the caret at line 3000, that's 3000 char-codes per
+  // keystroke. We now keep a (lastSel, lastLine) cache and walk only the
+  // *delta* between selections — O(diff), typically 1 char. The fast path
+  // (sel unchanged) returns immediately, and the equality guard on the
+  // setState prevents re-renders when the line index didn't change.
   const [activeLineNumber, setActiveLineNumber] = useState(0);
+  const lastSelRef = useRef(0);
+  const lastLineRef = useRef(0);
 
   const handleActiveLineUpdate = useCallback(() => {
     const ta = textareaRef.current;
     if (!ta) return;
-    const uptoCaret = ta.value.slice(0, ta.selectionStart);
-    // Lines are 0-indexed internally; the gutter renders 1-indexed.
-    const lineIdx = uptoCaret.split("\n").length - 1;
+    const sel = ta.selectionStart;
+    if (sel === lastSelRef.current) return; // fast path
+
+    const lastSel = lastSelRef.current;
+    const lastLine = lastLineRef.current;
+    const lo = Math.min(sel, lastSel);
+    const hi = Math.max(sel, lastSel);
+    let delta = 0;
+    // \n = charCode 10. Walking the delta (not the full prefix) makes this
+    // O(diff): 1 for a keystroke, N for a paste of N chars.
+    for (let i = lo; i < hi; i++) {
+      if (ta.value.charCodeAt(i) === 10) delta++;
+    }
+    const lineIdx = sel > lastSel ? lastLine + delta : lastLine - delta;
+
+    lastSelRef.current = sel;
+    lastLineRef.current = lineIdx;
     setActiveLineNumber((prev) => (prev === lineIdx ? prev : lineIdx));
   }, []);
 
@@ -480,9 +505,10 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEd
           value={text}
           onChange={handleChange}
           onScroll={handleScroll}
+          // onSelect alone covers clicks, arrow keys, Home/End, and Shift+arrow
+          // extends (the browser fires `select` whenever the selection changes).
+          // Adding onClick/onKeyUp on top only causes redundant re-renders.
           onSelect={handleActiveLineUpdate}
-          onKeyUp={handleActiveLineUpdate}
-          onClick={handleActiveLineUpdate}
           readOnly={readOnly}
           spellCheck={false}
           placeholder="Enter hosts rules, one per line:&#10;127.0.0.1 localhost # local dev&#10;192.168.1.100 api.dev.local # API server"
