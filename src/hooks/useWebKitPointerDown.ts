@@ -1,6 +1,12 @@
+
 import { useRef, useCallback } from "react";
 
-const RESET_DELAY_MS = 50;
+/**
+ * Public alias for the pointerdown↔click debounce window. Re-exported so
+ * consumers that drive `fire()` themselves (e.g. sync toggles) can share
+ * the same value the wrapper uses internally.
+ */
+export const POINTER_DOWN_DEBOUNCE_MS = 50;
 
 /**
  * Workaround for a WebKit/Tauri WebView quirk where the first click on a button
@@ -8,16 +14,24 @@ const RESET_DELAY_MS = 50;
  * transfer. Bind `onPointerDown` alongside `onClick`; the pointerdown event
  * fires reliably and the click fallback ensures accessibility/testing compatibility.
  *
+ * The wrapped handler receives the original `PointerEvent` so callers can
+ * read modifiers (`metaKey`, `altKey`) — e.g. issue #123's Quick Apply
+ * override that holds Cmd/Option to force the Preview dialog.
+ *
  * Usage:
  *   const { fire, release, onPointerDown } = useWebKitPointerDown();
  *
- *   // Sync handler (button onPointerDown)
- *   <button onPointerDown={onPointerDown(handleCancel)} />
+ *   <button onPointerDown={onPointerDown((e) => handleCancel(e.metaKey))} />
  *
- *   // Async handler – guard with fire() and release() in finally
- *   const handleCreate = async () => {
+ *   // Sync toggles guarded from double-fire (issue #123). Both `onClick`
+ *   // and `onPointerDown` feed `handleToggle()`, which calls `fire()` +
+ *   // `releaseSoon()` itself. The wrapper is **not** used here — that
+ *   // would double-consume `firedRef` (the wrapper calls `fire()` before
+ *   // dispatching the handler) and drop every gesture on the floor.
+ *   const handleToggle = () => {
  *     if (!fire()) return;
- *     try { ... } finally { release(); }
+ *     releaseSoon();
+ *     doWork();
  *   };
  */
 export function useWebKitPointerDown() {
@@ -33,15 +47,25 @@ export function useWebKitPointerDown() {
     firedRef.current = false;
   }, []);
 
+  /**
+   * Schedule `release()` after POINTER_DOWN_DEBOUNCE_MS. Mirrors the
+   * setTimeout the wrapper uses internally so callers driving `fire()`
+   * from their own click/pointerdown pair stay in sync with the wrapper.
+   */
+  const releaseSoon = useCallback(() => {
+    setTimeout(release, POINTER_DOWN_DEBOUNCE_MS);
+  }, [release]);
+
   const onPointerDown = useCallback(
-    (handler: () => void) => (e: React.PointerEvent) => {
+    (handler: (e: React.PointerEvent) => void) =>
+      (e: React.PointerEvent) => {
       if (e.button !== 0) return;
       if (!fire()) return;
-      handler();
-      setTimeout(release, RESET_DELAY_MS);
+      handler(e);
+      setTimeout(release, POINTER_DOWN_DEBOUNCE_MS);
     },
     [fire, release],
   );
 
-  return { fire, release, onPointerDown };
+  return { fire, release, releaseSoon, onPointerDown };
 }

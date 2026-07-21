@@ -22,6 +22,7 @@ export {
   dnsErrorAtom,
   enabledDnsProfilesAtom,
   dnsRuleCountAtom,
+  quickApplyOnToggleAtom,
 } from "./state";
 
 // ---- Async action atoms ----
@@ -47,4 +48,5 @@ export {
   updateDnsProfileAtom,
   deleteDnsProfileAtom,
   toggleDnsProfileEnabledAtom,
+  quickApplyToggleAtom,
 } from "./actions";

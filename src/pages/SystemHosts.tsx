@@ -3,52 +3,89 @@ import { readSystemHosts } from "../lib/tauri";
 import { extractErrorMessage } from "../lib/error";
 import { findMatches } from "../lib/search";
 import type { MatchInfo } from "../lib/search";
-import { escapeHtml } from "../lib/escape";
+import { highlightHostsLine } from "../lib/highlightHosts";
 import SearchBar from "../components/SearchBar";
 import styles from "./SystemHosts.module.css";
 
 /**
- * Wrap case-insensitive literal matches in `<mark>` tags. No syntax
- * highlighting — SystemHosts is plain text, so each segment is just
- * escaped HTML with optional mark wrapping. The active match gets a
- * different class and a `data-match-index` attribute so callers can
- * scroll it into view.
+ * Per-line hosts-syntax highlighting + search-match wrapping (issue #126).
+ * Mirrors RuleEditor's `highlightText` exactly so a user inspecting
+ * /etc/hosts sees the same IP / domain / comment colors as in the
+ * profile editor. The active match gets a different class and a
+ * `data-match-index` attribute so callers can scroll it into view.
  */
-function highlightMatches(
+function highlightHosts(
   text: string,
   matches: MatchInfo[],
   activeMatchIndex: number,
 ): string {
   if (!text) return "";
-  if (matches.length === 0) return escapeHtml(text);
-
-  const segments: { text: string; isMatch: boolean; matchIndex: number }[] = [];
-  let currentPos = 0;
-  for (let i = 0; i < matches.length; i++) {
-    const m = matches[i];
-    if (m.start > currentPos) {
-      segments.push({ text: text.slice(currentPos, m.start), isMatch: false, matchIndex: -1 });
-    }
-    if (m.end > m.start) {
-      segments.push({ text: text.slice(m.start, m.end), isMatch: true, matchIndex: i });
-    }
-    currentPos = Math.max(currentPos, m.end);
-  }
-  if (currentPos < text.length) {
-    segments.push({ text: text.slice(currentPos), isMatch: false, matchIndex: -1 });
+  const lines = text.split("\n");
+  const lineStarts: number[] = [];
+  let offset = 0;
+  for (let i = 0; i < lines.length; i++) {
+    lineStarts.push(offset);
+    offset += lines[i].length + 1;
   }
 
-  return segments
-    .map((seg) => {
-      const html = escapeHtml(seg.text);
-      if (seg.isMatch) {
-        const isActive = seg.matchIndex === activeMatchIndex;
-        const cls = isActive ? styles.searchMatchActive : styles.searchMatch;
-        return `<mark class="${cls}" data-match-index="${seg.matchIndex}">${html}</mark>`;
+  return lines
+    .map((line, lineIdx) => {
+      const lineStart = lineStarts[lineIdx];
+      const lineEnd = lineStart + line.length;
+      const lineMatches = matches
+        .map((m, idx) => ({ ...m, matchIndex: idx }))
+        .filter((m) => m.start < lineEnd && m.end > lineStart);
+
+      if (lineMatches.length === 0) {
+        return highlightHostsLine(line);
       }
-      return html;
+
+      const segments: { text: string; isMatch: boolean; matchIndex: number }[] = [];
+      let currentPos = 0;
+
+      for (const match of lineMatches) {
+        const matchStartInLine = Math.max(0, match.start - lineStart);
+        const matchEndInLine = Math.min(line.length, match.end - lineStart);
+
+        if (matchStartInLine > currentPos) {
+          segments.push({
+            text: line.slice(currentPos, matchStartInLine),
+            isMatch: false,
+            matchIndex: -1,
+          });
+        }
+
+        if (matchEndInLine > matchStartInLine) {
+          segments.push({
+            text: line.slice(matchStartInLine, matchEndInLine),
+            isMatch: true,
+            matchIndex: match.matchIndex,
+          });
+        }
+        currentPos = Math.max(currentPos, matchEndInLine);
+      }
+
+      if (currentPos < line.length) {
+        segments.push({
+          text: line.slice(currentPos),
+          isMatch: false,
+          matchIndex: -1,
+        });
+      }
+
+      return segments
+        .map((seg) => {
+          const segHtml = highlightHostsLine(seg.text);
+          if (seg.isMatch) {
+            const isActive = seg.matchIndex === activeMatchIndex;
+            const cls = isActive ? styles.searchMatchActive : styles.searchMatch;
+            return `<mark class="${cls}" data-match-index="${seg.matchIndex}">${segHtml}</mark>`;
+          }
+          return segHtml;
+        })
+        .join("");
     })
-    .join("");
+    .join("\n");
 }
 
 function SystemHosts() {
@@ -180,7 +217,7 @@ function SystemHosts() {
   }, [searchBarVisible]);
 
   const highlightedHtml = useMemo(
-    () => (hostsContent ? highlightMatches(hostsContent, matches, currentMatchIndex) : ""),
+    () => (hostsContent ? highlightHosts(hostsContent, matches, currentMatchIndex) : ""),
     [hostsContent, matches, currentMatchIndex],
   );
 

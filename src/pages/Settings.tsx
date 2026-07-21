@@ -6,6 +6,7 @@ import {
   isDnsLoadingAtom,
   toggleDnsModeAtom,
   dnsErrorAtom,
+  quickApplyOnToggleAtom,
 } from "../stores/profiles";
 import { useWebKitPointerDown } from "../hooks/useWebKitPointerDown";
 import { checkUpdate } from "../lib/tauri";
@@ -18,6 +19,9 @@ function Settings() {
   const isDnsLoading = useAtomValue(isDnsLoadingAtom);
   const dnsError = useAtomValue(dnsErrorAtom);
   const toggleDnsMode = useSetAtom(toggleDnsModeAtom);
+  // issue #123: persisted Quick Apply preference (localStorage-backed atom).
+  const quickApplyOnToggle = useAtomValue(quickApplyOnToggleAtom);
+  const setQuickApplyOnToggle = useSetAtom(quickApplyOnToggleAtom);
   const { onPointerDown } = useWebKitPointerDown();
 
   // Update check state
@@ -130,6 +134,36 @@ function Settings() {
           <div className={styles.infoRow}>
             <span className={styles.infoLabel}>Backups</span>
             <span className={styles.infoValue}>backups/</span>
+          </div>
+        </div>
+
+        {/* Apply Card (issue #123) */}
+        <div className="card">
+          <h3 className="card-title">Apply</h3>
+          <div className={styles.settingRow}>
+            <div className={styles.settingInfo}>
+              <div className={styles.settingLabel}>
+                Quick Apply on profile toggle
+              </div>
+              <div className={styles.settingDesc}>
+                Skip the Apply Preview dialog when toggling Hosts profiles.
+                Hold Cmd or Option while toggling to force the Preview
+                dialog. DNS profile toggles are not affected.
+              </div>
+            </div>
+            <label
+              className={styles.toggleSwitch}
+              title="Toggle Quick Apply"
+              data-testid="quick-apply-toggle"
+            >
+              <input
+                type="checkbox"
+                role="switch"
+                checked={quickApplyOnToggle}
+                onChange={(e) => setQuickApplyOnToggle(e.target.checked)}
+              />
+              <span className={styles.toggleSlider} />
+            </label>
           </div>
         </div>
 

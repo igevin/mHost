@@ -81,6 +81,57 @@
   margin-top: 2px;
 }
 
+/* ---- Toggle Switch (issue #123) ----
+ * Compact iOS-style switch used inside a `.settingRow`. Visually consistent
+ * with the sidebar / drawer toggles but lives in the settings card. */
+.toggleSwitch {
+  position: relative;
+  width: 36px;
+  height: 20px;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+
+.toggleSwitch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+  position: absolute;
+}
+
+.toggleSlider {
+  position: absolute;
+  inset: 0;
+  background: var(--color-border);
+  border-radius: 10px;
+  transition: background var(--transition-fast);
+}
+
+.toggleSlider::before {
+  content: "";
+  position: absolute;
+  height: 14px;
+  width: 14px;
+  left: 3px;
+  bottom: 3px;
+  background: var(--color-primary-contrast);
+  border-radius: 50%;
+  transition: transform var(--transition-fast);
+}
+
+.toggleSwitch input:checked + .toggleSlider {
+  background: var(--color-primary);
+}
+
+.toggleSwitch input:checked + .toggleSlider::before {
+  transform: translateX(16px);
+}
+
+.toggleSwitch input:focus-visible + .toggleSlider {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+}
+
 /* ---- Info Row ---- */
 
 .infoRow {

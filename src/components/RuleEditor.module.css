@@ -118,22 +118,9 @@
   border-top-color: var(--danger) !important;
 }
 
-/* Token Colors (used in highlight layer) */
-
-.tokenIp {
-  color: var(--accent);
-  font-weight: 600;
-}
-
-.tokenDomain {
-  color: var(--success);
-  font-weight: 500;
-}
-
-.tokenComment {
-  color: var(--ink-muted);
-  font-style: italic;
-}
+/* Token colors (issue #126) moved to src/styles/hostsHighlight.css as
+ * `.hosts-token-*` so the same classes back both RuleEditor and
+ * SystemHosts. This file keeps only search-match + per-page layout. */
 
 /* ---- Validation & Errors ---- */
 

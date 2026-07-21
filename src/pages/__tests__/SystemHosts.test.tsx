@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { BrowserRouter } from "react-router-dom";
 
 const mockReadSystemHosts = vi.fn();
@@ -21,6 +21,13 @@ const SAMPLE_HOSTS = [
   "10.0.0.1 api.local",
 ].join("\n");
 
+/** Returns the rendered <pre> innerHTML. After issue #126 each hosts line
+ *  is split into token spans, so we assert against the HTML directly
+ *  instead of looking for a single text node. */
+function preHtml(): string {
+  return (document.querySelector("pre") as HTMLPreElement | null)?.innerHTML ?? "";
+}
+
 function renderSystemHosts() {
   return render(
     <BrowserRouter>
@@ -31,7 +38,13 @@ function renderSystemHosts() {
 
 async function waitForContent() {
   // Loading state shows "Loading..." until readSystemHosts resolves.
-  expect(await screen.findByText(/127\.0\.0\.1 localhost/)).toBeInTheDocument();
+  // Post-#126 we wait for any hosts-token span to appear, so this
+  // helper works for both the default fixture and tests that mock
+  // a different hosts file.
+  await waitFor(() => {
+    const html = preHtml();
+    expect(html).toMatch(/hosts-token-/);
+  });
 }
 
 describe("SystemHosts", () => {
@@ -43,10 +56,69 @@ describe("SystemHosts", () => {
   it("renders hosts content after async load", async () => {
     renderSystemHosts();
     await waitForContent();
-    // All four fixture lines should be visible in the preview.
-    expect(screen.getByText(/192\.168\.1\.1 example\.com example\.org/)).toBeInTheDocument();
-    expect(screen.getByText(/# A comment line/)).toBeInTheDocument();
-    expect(screen.getByText(/10\.0\.0\.1 api\.local/)).toBeInTheDocument();
+    // issue #126: all four fixture lines should produce the expected
+    // token spans — IPs / domains / comments get dedicated classes.
+    const html = preHtml();
+    expect(html).toMatch(/hosts-token-ip[^>]*>192\.168\.1\.1</);
+    expect(html).toMatch(/hosts-token-domain[^>]*>example\.com</);
+    expect(html).toMatch(/hosts-token-domain[^>]*>example\.org</);
+    expect(html).toMatch(/hosts-token-comment[^>]*># A comment line</);
+    expect(html).toMatch(/hosts-token-ip[^>]*>10\.0\.0\.1</);
+    expect(html).toMatch(/hosts-token-domain[^>]*>api\.local</);
+  });
+
+  // ---- issue #126: token colors in SystemHosts ----
+
+  it("tokenises an IPv4 rule into ip + domain spans", async () => {
+    mockReadSystemHosts.mockResolvedValue("10.0.0.1 api.local\n");
+    renderSystemHosts();
+    await waitForContent();
+    const html = preHtml();
+    expect(html).toContain('<span class="hosts-token-ip">10.0.0.1</span>');
+    expect(html).toContain('<span class="hosts-token-domain">api.local</span>');
+    // Single space between tokens is preserved as escaped text.
+    expect(html).toContain(" ");
+  });
+
+  it("tokenises an IPv6 rule into an ip span + domain spans", async () => {
+    // Whole-line `#`-prefix lines are treated as comments per the hosts
+    // convention (and that takes precedence over the disabled-prefix
+    // span path) — so we exercise the ip-only branch with a plain IPv6
+    // rule instead of a "disabled" one.
+    mockReadSystemHosts.mockResolvedValue("::1 ip6-localhost\n");
+    renderSystemHosts();
+    await waitForContent();
+    const html = preHtml();
+    expect(html).toContain('<span class="hosts-token-ip">::1</span>');
+    expect(html).toContain('<span class="hosts-token-domain">ip6-localhost</span>');
+  });
+
+  it("tokenises an inline comment as a trailing comment span", async () => {
+    mockReadSystemHosts.mockResolvedValue("127.0.0.1 localhost # local\n");
+    renderSystemHosts();
+    await waitForContent();
+    const html = preHtml();
+    expect(html).toContain('<span class="hosts-token-ip">127.0.0.1</span>');
+    expect(html).toContain('<span class="hosts-token-domain">localhost</span>');
+    expect(html).toContain('<span class="hosts-token-comment"> # local</span>');
+  });
+
+  it("tokenises a full-line comment as a single comment span", async () => {
+    mockReadSystemHosts.mockResolvedValue("# header line\n");
+    renderSystemHosts();
+    await waitFor(() => {
+      expect(preHtml()).toContain('<span class="hosts-token-comment"># header line</span>');
+    });
+  });
+
+  it("escapes special characters in hosts content", async () => {
+    mockReadSystemHosts.mockResolvedValue("127.0.0.1 <weird>.dev\n");
+    renderSystemHosts();
+    await waitFor(() => {
+      const html = preHtml();
+      expect(html).toContain("&lt;weird&gt;.dev");
+      expect(html).not.toMatch(/<weird>/);
+    });
   });
 
   it("renders error state when readSystemHosts rejects", async () => {
