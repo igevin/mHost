@@ -9,11 +9,11 @@ interface DrawerProfileCardProps {
   duplicatingId: string | null;
   deletingId: string | null;
   onEdit: (id: string) => void;
-  onToggle: (id: string, enabled: boolean) => void;
+  /** issue #123: `forcePreview=true` skips Quick Apply for this click. */
+  onToggle: (id: string, enabled: boolean, forcePreview: boolean) => void;
   onDuplicate: (profile: Profile) => void;
   onExport: (profile: Profile) => void;
   onDelete: (id: string) => void;
-  onPointerDownToggle: (handler: () => void) => (e: React.PointerEvent) => void;
   formatDate: (isoDate: string) => string;
 }
 
@@ -27,6 +27,15 @@ interface DrawerProfileCardProps {
  *     （例如 apply dialog 状态变化）所有卡片都跑完整 O(N) + 重新创建 handlers。
  *   - `useMemo` 缓存 ruleCount。
  *   - 所有 handler 通过 props 传入（useCallback'd in parent）。
+ *
+ * **fix (issue #123 Quick Apply)**: the Enable/Disable button used to
+ * route `onPointerDown` through the `useWebKitPointerDown` wrapper. That
+ * wrapper calls `fire()` itself, but `onToggle` (= `handleToggle` in
+ * ManagementDrawer) also calls `fire()` for click↔pointerdown dedupe —
+ * pairing the two meant every WebKit duplicate event dropped on the
+ * floor (no action at all). Now the wrapper prop is gone: both event
+ * handlers feed `onToggle` directly with an inline `e.button !== 0`
+ * filter.
  */
 function DrawerProfileCard({
   profile,
@@ -38,7 +47,6 @@ function DrawerProfileCard({
   onDuplicate,
   onExport,
   onDelete,
-  onPointerDownToggle,
   formatDate,
 }: DrawerProfileCardProps) {
   const ruleCount = useMemo(() => countRealRules(profile.rules), [profile.rules]);
@@ -100,10 +108,13 @@ function DrawerProfileCard({
         </button>
         <button
           className="btn btn-ghost btn-sm"
-          onClick={() => onToggle(profile.id, profile.enabled)}
-          onPointerDown={onPointerDownToggle(() =>
-            onToggle(profile.id, profile.enabled),
-          )}
+          onClick={(e) =>
+            onToggle(profile.id, profile.enabled, e.metaKey || e.altKey)
+          }
+          onPointerDown={(e) => {
+            if (e.button !== 0) return;
+            onToggle(profile.id, profile.enabled, e.metaKey || e.altKey)
+          }}
           disabled={isApplying}
         >
           {profile.enabled ? "Disable" : "Enable"}

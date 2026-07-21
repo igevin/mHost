@@ -1,6 +1,7 @@
 import { atom } from "jotai";
 import type { Profile, DnsStatus, AdBlockState } from "../../types";
 import { countRealRules } from "../../lib/rules";
+import { atomWithLocalStorage } from "../../lib/atomWithLocalStorage";
 
 // ---- Base atoms ----
 
@@ -80,3 +81,12 @@ export const adBlockHasErrorsAtom = atom((get) => {
   if (!state) return false;
   return state.sources.some((s) => s.last_error !== null);
 });
+
+// ---- User preferences (persisted to localStorage) ----
+// issue #123: Quick Apply is opt-in. Default OFF preserves the existing
+// preview-everywhere behavior so users don't see a behavior change on first
+// run after upgrade.
+export const quickApplyOnToggleAtom = atomWithLocalStorage<boolean>(
+  "mhost.quickApplyOnToggle",
+  false,
+);

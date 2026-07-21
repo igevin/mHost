@@ -18,6 +18,8 @@ import {
   executeApplyAtom,
   closeApplyConfirmAtom,
   rollbackHostsActionAtom,
+  quickApplyOnToggleAtom,
+  quickApplyToggleAtom,
 } from "../stores/profiles";
 import { countRealRules } from "../lib/rules";
 import { exportProfileToFile, duplicateProfile } from "../lib/tauri";
@@ -46,6 +48,9 @@ function ManagementDrawer({ open, onClose }: ManagementDrawerProps) {
   const isLoading = useAtomValue(isLoadingAtom);
 
   const previewApply = useSetAtom(previewApplyAtom);
+  const quickApplyToggle = useSetAtom(quickApplyToggleAtom);
+  // issue #123: same Quick Apply opt-in as the sidebar.
+  const quickApplyEnabled = useAtomValue(quickApplyOnToggleAtom);
   const executeApply = useSetAtom(executeApplyAtom);
   const closeApplyConfirm = useSetAtom(closeApplyConfirmAtom);
   const rollbackHostsAction = useSetAtom(rollbackHostsActionAtom);
@@ -54,7 +59,7 @@ function ManagementDrawer({ open, onClose }: ManagementDrawerProps) {
   const applyResult = useAtomValue(applyResultAtom);
   const applyError = useAtomValue(applyErrorAtom);
   const isApplying = useAtomValue(isApplyingAtom);
-  const { onPointerDown } = useWebKitPointerDown();
+  const { fire, releaseSoon } = useWebKitPointerDown();
 
   // Import dialog state -- hooks must be called unconditionally before any early return
   const [showImport, setShowImport] = useState(false);
@@ -182,11 +187,27 @@ function ManagementDrawer({ open, onClose }: ManagementDrawerProps) {
     [deletingId, deleteProfile, setError],
   );
 
+  // issue #123: Quick Apply routes Hosts toggles straight to
+  // `enable_and_apply`. The drawer version mirrors the sidebar's fire()
+  // guard so WebKit's pointerdown+click pair only invokes the action once.
+  //
+   // The wrapper contract would call `fire()` itself; we deliberately
+   // drive `fire()` + `releaseSoon()` directly here so the wrapping
+   // `onPointerDown` doesn't double-consume the dedupe ref. The
+   // Enable/Disable button in DrawerProfileCard also routes through
+   // this handler (with the same inline `button !== 0` filter) — the
+   // `onPointerDownToggle` prop was retired.
   const handleToggle = useCallback(
-    (id: string, enabled: boolean) => {
-      previewApply({ id, enabled: !enabled });
+    (id: string, enabled: boolean, forcePreview: boolean) => {
+      if (!fire()) return;
+      releaseSoon();
+      if (quickApplyEnabled && !forcePreview) {
+        quickApplyToggle({ id, enabled: !enabled });
+      } else {
+        previewApply({ id, enabled: !enabled });
+      }
     },
-    [previewApply],
+    [fire, releaseSoon, previewApply, quickApplyToggle, quickApplyEnabled],
   );
 
   const handleImported = useCallback(async (profile: Profile) => {
@@ -263,7 +284,6 @@ function ManagementDrawer({ open, onClose }: ManagementDrawerProps) {
                 onDuplicate={handleDuplicate}
                 onExport={(p) => handleExport(p, "hosts")}
                 onDelete={handleDelete}
-                onPointerDownToggle={onPointerDown}
                 formatDate={formatDate}
               />
             ))}
