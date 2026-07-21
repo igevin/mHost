@@ -11,6 +11,8 @@ import {
   createProfileAtom,
   previewApplyAtom,
   applyErrorAtom,
+  quickApplyOnToggleAtom,
+  quickApplyToggleAtom,
 } from "../stores/profiles";
 import { extractErrorMessage } from "../lib/error";
 import { useWebKitPointerDown } from "../hooks/useWebKitPointerDown";
@@ -56,9 +58,13 @@ function Sidebar({ toolNavItems, onOpenManagement }: SidebarProps) {
 
   const createProfile = useSetAtom(createProfileAtom);
   const previewApply = useSetAtom(previewApplyAtom);
+  const quickApplyToggle = useSetAtom(quickApplyToggleAtom);
+  // issue #123: when ON, Hosts profile toggles skip the preview dialog
+  // and call `enable_and_apply` directly. Cmd/Option always forces Preview.
+  const quickApplyEnabled = useAtomValue(quickApplyOnToggleAtom);
   const setError = useSetAtom(errorAtom);
   const setApplyError = useSetAtom(applyErrorAtom);
-  const { onPointerDown } = useWebKitPointerDown();
+  const { fire, releaseSoon } = useWebKitPointerDown();
 
   const [showCreateDialog, setShowCreateDialog] = useState(false);
 
@@ -69,12 +75,30 @@ function Sidebar({ toolNavItems, onOpenManagement }: SidebarProps) {
     [navigate],
   );
 
+  // issue #123: the Quick Apply preference routes Hosts profile toggles
+  // straight to `enable_and_apply`. Both `onClick` and `onPointerDown`
+  // share `fire()` so the WebKit duplicate event is dropped — without
+  // this guard a Quick Apply would run `enable_and_apply` twice, doing
+  // two backups and two writes to /etc/hosts per single user click.
+  //
+   // We deliberately do **not** use the `useWebKitPointerDown.onPointerDown`
+   // wrapper here. The wrapper itself calls `fire()` before dispatching
+   // the handler; pairing it with handleToggle's own `fire()` check would
+   // double-consume `firedRef` and drop every gesture. Instead both
+   // event handlers route through `handleToggle`, which is the single
+   // owner of the dedupe state via `fire()` + `releaseSoon()`.
   const handleToggle = useCallback(
-    (id: string, enabled: boolean) => {
+    (id: string, enabled: boolean, forcePreview: boolean) => {
+      if (!fire()) return;
+      releaseSoon();
       setApplyError(null);
-      previewApply({ id, enabled: !enabled });
+      if (quickApplyEnabled && !forcePreview) {
+        quickApplyToggle({ id, enabled: !enabled });
+      } else {
+        previewApply({ id, enabled: !enabled });
+      }
     },
-    [previewApply, setApplyError],
+    [fire, releaseSoon, previewApply, quickApplyToggle, quickApplyEnabled, setApplyError],
   );
 
   const handleNewProfile = useCallback(() => {
@@ -167,11 +191,20 @@ function Sidebar({ toolNavItems, onOpenManagement }: SidebarProps) {
                   onClick={(e) => {
                     e.stopPropagation();
                     e.preventDefault();
-                    handleToggle(profile.id, profile.enabled);
+                    handleToggle(
+                      profile.id,
+                      profile.enabled,
+                      e.metaKey || e.altKey,
+                    );
                   }}
-                  onPointerDown={onPointerDown(() => {
-                    handleToggle(profile.id, profile.enabled);
-                  })}
+                  onPointerDown={(e) => {
+                    if (e.button !== 0) return;
+                    handleToggle(
+                      profile.id,
+                      profile.enabled,
+                      e.metaKey || e.altKey,
+                    );
+                  }}
                 >
                   <input
                     type="checkbox"

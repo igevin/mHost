@@ -187,6 +187,37 @@ export const closeApplyConfirmAtom = atom(null, (_get, set) => {
   set(applyTargetAtom, null);
 });
 
+// issue #123: Quick Apply path for Hosts profile toggles. Reuses the same
+// Rust `enable_and_apply` command as `executeApplyAtom`; the only difference
+// is that we skip the preview dialog and write directly when the user has
+// the Quick Apply preference enabled.
+//
+// Surface state mirrors `executeApplyAtom` on purpose: errors land in
+// `applyErrorAtom` and success in `applyResultAtom` so the existing
+// ApplyConfirmDialog / ApplyStatus wiring lights up without any
+// component-level changes. We deliberately reuse the standard apply
+// feedback rather than introducing a new toast/result UI — the follow-up
+// issue #127 will revisit structured feedback once real usage is in.
+export const quickApplyToggleAtom = atom(
+  null,
+  async (_get, set, { id, enabled }: { id: string; enabled: boolean }) => {
+    set(isApplyingAtom, true);
+    set(applyResultAtom, null);
+    set(applyErrorAtom, null);
+    try {
+      await enableAndApply(id, enabled);
+      set(applyResultAtom, "success");
+      const profiles = await listProfiles();
+      set(profilesAtom, profiles);
+    } catch (err) {
+      set(applyResultAtom, "error");
+      set(applyErrorAtom, extractErrorMessage(err));
+    } finally {
+      set(isApplyingAtom, false);
+    }
+  },
+);
+
 // ---- Snapshot action atoms ----
 
 export const fetchSnapshotsAtom = atom(null, async (_get, set) => {

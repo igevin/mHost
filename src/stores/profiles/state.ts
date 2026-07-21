@@ -1,6 +1,7 @@
 import { atom } from "jotai";
 import type { Profile, DnsStatus } from "../../types";
 import { countRealRules } from "../../lib/rules";
+import { atomWithLocalStorage } from "../../lib/atomWithLocalStorage";
 
 // ---- Base atoms ----
 
@@ -60,3 +61,12 @@ export const applyTargetAtom = atom<{ id: string; enabled: boolean } | null>(nul
 export const snapshotsAtom = atom<import("../../types").SnapshotMeta[]>([]);
 export const isLoadingSnapshotsAtom = atom(false);
 export const snapshotErrorAtom = atom<string | null>(null);
+
+// ---- User preferences (persisted to localStorage) ----
+// issue #123: Quick Apply is opt-in. Default OFF preserves the existing
+// preview-everywhere behavior so users don't see a behavior change on first
+// run after upgrade.
+export const quickApplyOnToggleAtom = atomWithLocalStorage<boolean>(
+  "mhost.quickApplyOnToggle",
+  false,
+);

@@ -6,6 +6,7 @@ import {
   dnsEnabledAtom,
   dnsStatusAtom,
   isDnsLoadingAtom,
+  quickApplyOnToggleAtom,
 } from "../../stores/profiles";
 
 // Define global __APP_VERSION__ for tests
@@ -147,5 +148,32 @@ describe("Settings", () => {
     });
 
     expect(mockSetDnsMode).toHaveBeenCalledWith(false);
+  });
+
+  // ---- issue #123: Quick Apply toggle on Settings page ----
+
+  it("renders the Quick Apply card with the toggle defaults to off", () => {
+    renderWithProviders(<Settings />);
+    const toggle = screen.getByTestId("quick-apply-toggle") as HTMLLabelElement;
+    const input = toggle.querySelector("input") as HTMLInputElement;
+    expect(input).toBeInTheDocument();
+    expect(input.checked).toBe(false);
+  });
+
+  it("clicking the Quick Apply toggle flips the persisted atom + checkbox", async () => {
+    const store = getDefaultStore();
+    store.set(quickApplyOnToggleAtom, false);
+    renderWithProviders(<Settings />);
+    const toggle = screen.getByTestId("quick-apply-toggle") as HTMLLabelElement;
+    const input = toggle.querySelector("input") as HTMLInputElement;
+
+    await act(async () => {
+      fireEvent.click(input);
+    });
+
+    // Clicking the input directly toggles the native checkbox.
+    expect(input.checked).toBe(true);
+    // The atom has also been updated through useSetAtom.
+    expect(store.get(quickApplyOnToggleAtom)).toBe(true);
   });
 });

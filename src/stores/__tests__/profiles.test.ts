@@ -1,12 +1,41 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
 import { getDefaultStore } from "jotai";
+import type { Profile } from "../../types";
 import {
   profilesAtom,
   selectedProfileIdAtom,
   isApplyingAtom,
   errorAtom,
+  applyResultAtom,
+  applyErrorAtom,
+  quickApplyToggleAtom,
 } from "../profiles";
 
+// Mock the Tauri binding so `quickApplyToggleAtom` can run end-to-end
+// against deterministic `enableAndApply` / `listProfiles` responses.
+// Each test overrides the per-call behavior via the spy's `.mock*` API.
+vi.mock("../../lib/tauri", () => ({
+  enableAndApply: vi.fn().mockResolvedValue(undefined),
+  listProfiles: vi.fn().mockResolvedValue([]),
+}));
+
+import { enableAndApply, listProfiles } from "../../lib/tauri";
+
+function makeProfile(overrides: Partial<Profile> = {}): Profile {
+  return {
+    id: "p1",
+    name: "dev",
+    description: null,
+    enabled: false,
+    protected: false,
+    tags: [],
+    rules: [],
+    mode: "hosts",
+    created_at: "2024-01-01T00:00:00Z",
+    updated_at: "2024-01-01T00:00:00Z",
+    ...overrides,
+  };
+}
 describe("Profile store atoms", () => {
   const store = getDefaultStore();
 
@@ -66,5 +95,62 @@ describe("Profile store atoms", () => {
     const testError = "Storage: test error";
     store.set(errorAtom, testError);
     expect(store.get(errorAtom)).toEqual(testError);
+  });
+});
+
+describe("quickApplyToggleAtom (issue #123)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    const store = getDefaultStore();
+    store.set(profilesAtom, []);
+    store.set(isApplyingAtom, false);
+    store.set(applyResultAtom, null);
+    store.set(applyErrorAtom, null);
+  });
+
+  // Happy path mirrors `executeApplyAtom` — surface state transitions
+  // (`isApplyingAtom` → true, `applyResultAtom` → 'success',
+  // `profilesAtom` re-read via `listProfiles`) must all land after
+  // `enable_and_apply` resolves.
+  it("happy path: enableAndApply then listProfiles refreshes atoms", async () => {
+    const store = getDefaultStore();
+    const profile = makeProfile({ id: "p1", enabled: false });
+    store.set(profilesAtom, [profile]);
+    (enableAndApply as unknown as { mockResolvedValueOnce: (v: unknown) => void })
+      .mockResolvedValueOnce(undefined);
+    const refreshed = makeProfile({ id: "p1", enabled: true });
+    (listProfiles as unknown as { mockResolvedValueOnce: (v: Profile[]) => void })
+      .mockResolvedValueOnce([refreshed]);
+
+    await store.set(quickApplyToggleAtom, { id: "p1", enabled: true });
+
+    expect(enableAndApply).toHaveBeenCalledWith("p1", true);
+    expect(listProfiles).toHaveBeenCalledTimes(1);
+    expect(store.get(applyResultAtom)).toBe("success");
+    expect(store.get(applyErrorAtom)).toBeNull();
+    expect(store.get(isApplyingAtom)).toBe(false);
+    expect(store.get(profilesAtom)).toEqual([refreshed]);
+  });
+
+  // Error path: any rejection from `enable_and_apply` must be caught,
+  // surface as `applyResultAtom = 'error'` + `applyErrorAtom` carrying
+  // the message, and `isApplyingAtom` must reset in `finally` so the UI
+  // doesn't get stuck on a spinner.
+  it("error path: enableAndApply rejects -> error state", async () => {
+    const store = getDefaultStore();
+    const profile = makeProfile({ id: "p1", enabled: false });
+    store.set(profilesAtom, [profile]);
+    (enableAndApply as unknown as { mockRejectedValueOnce: (v: unknown) => void })
+      .mockRejectedValueOnce(new Error("permission denied"));
+
+    await store.set(quickApplyToggleAtom, { id: "p1", enabled: true });
+
+    expect(enableAndApply).toHaveBeenCalledWith("p1", true);
+    expect(listProfiles).not.toHaveBeenCalled();
+    expect(store.get(applyResultAtom)).toBe("error");
+    expect(store.get(applyErrorAtom)).toBe("permission denied");
+    expect(store.get(isApplyingAtom)).toBe(false);
+    // profiles are untouched on failure.
+    expect(store.get(profilesAtom)).toEqual([profile]);
   });
 });
