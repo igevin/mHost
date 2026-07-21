@@ -4,7 +4,7 @@ import { validateHostsText } from "../lib/tauri";
 import { extractErrorMessage } from "../lib/error";
 import { findMatches } from "../lib/search";
 import type { MatchInfo } from "../lib/search";
-import { escapeHtml } from "../lib/escape";
+import { highlightHostsLine } from "../lib/highlightHosts";
 import SearchBar from "./SearchBar";
 import styles from "./RuleEditor.module.css";
 
@@ -33,71 +33,9 @@ function rulesToText(rules: HostRule[]): string {
     .join("\n");
 }
 
-/** Single-line syntax highlighting (no search marks) */
-function highlightLine(line: string): string {
-  const trimmed = line.trim();
-
-  if (trimmed === "") {
-    return "";
-  }
-
-  // Full line comment
-  if (trimmed.startsWith("#")) {
-    return `<span class="${styles.tokenComment}">${escapeHtml(line)}</span>`;
-  }
-
-  let remaining = line;
-  let html = "";
-
-  // Disabled prefix
-  if (remaining.startsWith("# ")) {
-    html += `<span class="${styles.tokenComment}">${escapeHtml("# ")}</span>`;
-    remaining = remaining.slice(2);
-  }
-
-  // IP address (IPv4 or IPv6)
-  const ipv4Match = remaining.match(/^(\d+\.\d+\.\d+\.\d+)/);
-  const ipv6Match = remaining.match(/^([0-9a-fA-F:]+)/);
-  if (ipv4Match) {
-    html += `<span class="${styles.tokenIp}">${escapeHtml(ipv4Match[1])}</span>`;
-    remaining = remaining.slice(ipv4Match[1].length);
-  } else if (ipv6Match && ipv6Match[1].includes(":")) {
-    html += `<span class="${styles.tokenIp}">${escapeHtml(ipv6Match[1])}</span>`;
-    remaining = remaining.slice(ipv6Match[1].length);
-  }
-
-  // Remaining: spaces, domains, inline comment
-  const commentIdx = remaining.indexOf(" #");
-  if (commentIdx >= 0) {
-    const beforeComment = remaining.slice(0, commentIdx);
-    const comment = remaining.slice(commentIdx);
-
-    // Tokenize before comment
-    const parts = beforeComment.split(/(\s+)/);
-    for (const part of parts) {
-      if (part === "") continue;
-      if (/^\s+$/.test(part)) {
-        html += escapeHtml(part); // spaces as-is
-      } else {
-        html += `<span class="${styles.tokenDomain}">${escapeHtml(part)}</span>`;
-      }
-    }
-
-    html += `<span class="${styles.tokenComment}">${escapeHtml(comment)}</span>`;
-  } else {
-    const parts = remaining.split(/(\s+)/);
-    for (const part of parts) {
-      if (part === "") continue;
-      if (/^\s+$/.test(part)) {
-        html += escapeHtml(part);
-      } else {
-        html += `<span class="${styles.tokenDomain}">${escapeHtml(part)}</span>`;
-      }
-    }
-  }
-
-  return html;
-}
+// issue #126: per-line highlighting is delegated to the shared helper so
+// RuleEditor and SystemHosts render identical token colors.
+const highlightLine = highlightHostsLine;
 
 /** Parse text into HTML with syntax highlighting and search marks */
 function highlightText(
