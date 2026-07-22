@@ -7,7 +7,7 @@ use mhost_storage::storage::Storage;
 use tauri::{AppHandle, State};
 
 use crate::commands::profile::disable_other_profiles;
-use crate::state::AppState;
+use crate::state::{lock_or_recover, AppState};
 
 #[tauri::command]
 pub async fn generate_apply_plan(state: State<'_, AppState>) -> Result<ApplyPlan, MhostError> {
@@ -265,18 +265,8 @@ pub async fn enable_and_apply(
             let profiles = state.storage.list_profiles_by_mode(ProfileMode::Dns)?;
             let enabled_profiles: Vec<_> = profiles.into_iter().filter(|p| p.enabled).collect();
 
-            match state.dns_server.lock() {
-                Ok(guard) => {
-                    if let Some(server) = guard.as_ref() {
-                        server.reload_rules(&enabled_profiles);
-                    }
-                }
-                Err(poisoned) => {
-                    let guard = poisoned.into_inner();
-                    if let Some(server) = guard.as_ref() {
-                        server.reload_rules(&enabled_profiles);
-                    }
-                }
+            if let Some(server) = lock_or_recover(&state.dns_server).as_ref() {
+                server.reload_rules(&enabled_profiles);
             }
         }
     }

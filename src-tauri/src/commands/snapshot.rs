@@ -5,7 +5,7 @@ use mhost_storage::storage::Storage;
 use serde::Deserialize;
 use tauri::{AppHandle, State};
 
-use crate::state::AppState;
+use crate::state::{lock_or_recover, AppState};
 
 const MAX_SNAPSHOTS: usize = 20;
 const MAX_SNAPSHOT_NAME_LENGTH: usize = 100;
@@ -298,18 +298,8 @@ pub async fn load_snapshot(
             .map_err(MhostError::from)?;
         let enabled_profiles: Vec<_> = profiles.into_iter().filter(|p| p.enabled).collect();
 
-        match state.dns_server.lock() {
-            Ok(guard) => {
-                if let Some(server) = guard.as_ref() {
-                    server.reload_rules(&enabled_profiles);
-                }
-            }
-            Err(poisoned) => {
-                let guard = poisoned.into_inner();
-                if let Some(server) = guard.as_ref() {
-                    server.reload_rules(&enabled_profiles);
-                }
-            }
+        if let Some(server) = lock_or_recover(&state.dns_server).as_ref() {
+            server.reload_rules(&enabled_profiles);
         }
     }
 
