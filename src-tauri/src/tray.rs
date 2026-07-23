@@ -169,7 +169,7 @@ pub fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::Men
                 };
 
                 match enable_and_apply_logic(&profile_id, target_enabled, storage, writer) {
-                    Ok(()) => {
+                    Ok(_outcome) => {
                         let _ = update_tray_checkmark(&app_clone);
                         let _ = app_clone.emit(TRAY_PROFILES_UPDATED_EVENT, ());
                     }

@@ -275,15 +275,25 @@ pub fn apply_current_plan_logic(
 
 /// Core logic: enable a hosts-mode profile and immediately apply its rules to the system hosts file.
 ///
-/// Testable without Tauri `State`.
-/// Only for hosts mode profiles. DNS mode profiles should use DNS reload instead.
+/// Returns `(disabled_profile_ids, backup_path)`:
+/// - `disabled_profile_ids`: profile IDs that were auto-disabled because the
+///   target was being enabled. Empty when `enabled=false`.
+/// - `backup_path`: `Some(path)` if a backup was created by the writer.
+///
+/// Testable without Tauri `State`. Only for hosts mode profiles. DNS mode
+/// profiles should use DNS reload instead.
 pub fn enable_and_apply_logic(
     id: &ProfileId,
     enabled: bool,
     storage: &(dyn Storage + Send + Sync),
     writer: &HostsWriter,
-) -> Result<(), MhostError> {
-    // 1. Toggle enabled state in storage (same logic as set_profile_enabled)
+) -> Result<(Vec<String>, Option<std::path::PathBuf>), MhostError> {
+    // 1. Compute disabled IDs BEFORE mutation so the result matches what
+    //    `disable_other_profiles` is about to disable. (Same read-then-mutate
+    //    race that `compute_disabled_ids_logic` already documents.)
+    let disabled_ids = compute_disabled_ids_logic(id, enabled, storage)?;
+
+    // 2. Toggle enabled state in storage (same logic as set_profile_enabled)
     if enabled {
         disable_other_profiles(storage, id)?;
     }
@@ -292,10 +302,10 @@ pub fn enable_and_apply_logic(
     profile.updated_at = chrono::Utc::now();
     storage.save_profile(&profile)?;
 
-    // 2. Apply current plan (hosts mode only)
-    apply_current_plan_logic(storage, writer)?;
+    // 3. Apply current plan (hosts mode only)
+    let backup_path = apply_current_plan_logic(storage, writer)?;
 
-    Ok(())
+    Ok((disabled_ids, backup_path))
 }
 
 /// Read-only IPC: compute what an `enable_and_apply(id, enabled)` call would
@@ -333,34 +343,60 @@ pub async fn preview_apply_outcome(
 /// For dns mode: toggles the profile and reloads DNS rules if DNS mode is enabled.
 /// Security fix (#16): Uses apply_lock to prevent concurrent writes.
 /// Perf fix (#26): Async with spawn_blocking to avoid blocking executor.
+/// Refs (#127): Returns `ApplyOutcome` so the frontend can surface
+/// structured feedback (counts / disabled IDs / snapshot id / backup path)
+/// to the Quick Apply toast.
 #[tauri::command]
 pub async fn enable_and_apply(
     id: String,
     enabled: bool,
     state: State<'_, AppState>,
     app_handle: AppHandle,
-) -> Result<(), MhostError> {
+) -> Result<ApplyOutcome, MhostError> {
     let profile_id = ProfileId::from_str(&id)?;
     let profile = state.storage.load_profile(&profile_id)?;
 
-    if profile.mode == ProfileMode::Hosts {
+    let outcome = if profile.mode == ProfileMode::Hosts {
         let _guard = state.apply_lock.lock().await;
         let writer = state.writer.clone();
         let storage = state.storage.clone();
         tauri::async_runtime::spawn_blocking(move || {
-            enable_and_apply_logic(&profile_id, enabled, storage.as_ref(), &writer)?;
+            let (disabled_ids, backup_path) =
+                enable_and_apply_logic(&profile_id, enabled, storage.as_ref(), &writer)?;
 
-            // Auto-snapshot after successful apply
-            if let Err(e) = crate::commands::snapshot::auto_snapshot_logic(storage.as_ref()) {
-                eprintln!("[mHost] Auto-snapshot failed: {}", e);
-            }
+            // Auto-snapshot: capture id so the toast can mention it.
+            let snapshot_id = crate::commands::snapshot::auto_snapshot_logic(storage.as_ref())
+                .ok()
+                .flatten()
+                .map(|m| m.id);
 
-            Ok::<(), MhostError>(())
+            // Re-derive the post-apply plan to populate ApplyOutcome.plan.
+            // Cost is one extra generate_plan (one read + one diff) — cheap.
+            // Cheaper refactor than threading the plan back out of
+            // `apply_current_plan_logic`.
+            let plan = post_apply_plan(storage.as_ref(), &writer).unwrap_or_else(|_| ApplyPlan {
+                rules: vec![],
+                conflicts: vec![],
+                diff: mhost_core::HostsDiff {
+                    added: vec![],
+                    removed: vec![],
+                    unchanged: vec![],
+                },
+                backup_required: false,
+            });
+
+            Ok::<ApplyOutcome, MhostError>(ApplyOutcome::from_parts(
+                plan,
+                disabled_ids,
+                snapshot_id,
+                backup_path,
+            ))
         })
         .await
-        .map_err(|e| MhostError::InvalidInput(e.to_string()))??;
+        .map_err(|e| MhostError::InvalidInput(e.to_string()))??
     } else {
-        // DNS 模式：直接启用/禁用，然后热重载规则
+        // DNS 模式：直接启用/禁用，然后热重载规则。apply 不写 /etc/hosts，
+        // 所以返回 empty outcome（无 diff、无 snapshot、无 backup、无 disabled）。
         let mut profile = profile;
         profile.enabled = enabled;
         profile.updated_at = chrono::Utc::now();
@@ -374,11 +410,29 @@ pub async fn enable_and_apply(
                 server.reload_rules(&enabled_profiles);
             }
         }
-    }
+        ApplyOutcome::empty()
+    };
 
     #[cfg(target_os = "macos")]
     crate::tray::update_tray_menu(&app_handle);
-    Ok(())
+    Ok(outcome)
+}
+
+/// Helper: re-read profiles + hosts and re-derive the post-apply `ApplyPlan`.
+/// Used by `enable_and_apply` to populate `ApplyOutcome.plan` for the toast.
+/// If anything fails (e.g. hosts file disappeared), the caller falls back to
+/// an empty plan — losing the diff display but keeping the apply outcome.
+fn post_apply_plan(
+    storage: &(dyn Storage + Send + Sync),
+    writer: &HostsWriter,
+) -> Result<ApplyPlan, MhostError> {
+    let profiles = storage.list_profiles_by_mode(ProfileMode::Hosts)?;
+    let current_hosts = match std::fs::read_to_string(writer.hosts_path()) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e.into()),
+    };
+    generate_plan(&profiles, &current_hosts)
 }
 
 #[tauri::command]
