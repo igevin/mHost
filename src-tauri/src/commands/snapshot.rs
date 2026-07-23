@@ -226,7 +226,9 @@ pub fn load_snapshot_logic(
     }
 
     // Apply current plan
-    crate::commands::apply::apply_current_plan_logic(storage, writer)?;
+    // `apply_current_plan_logic` now returns `Option<PathBuf>` (backup path);
+    // snapshot loading doesn't surface it, so discard.
+    let _ = crate::commands::apply::apply_current_plan_logic(storage, writer)?;
 
     Ok(())
 }

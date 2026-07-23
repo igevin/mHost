@@ -147,7 +147,9 @@ pub async fn apply_hosts(state: State<'_, AppState>) -> Result<(), MhostError> {
 
         // **fix (P-R8, issue #90)**: pass current_hosts through so writer
         // doesn't re-read /etc/hosts (was happening twice per apply).
-        writer.apply_with_content(&plan, &current_hosts)?;
+        // The writer now returns `Option<PathBuf>` (backup path if created);
+        // `apply_hosts` doesn't surface it, so discard.
+        let _ = writer.apply_with_content(&plan, &current_hosts)?;
 
         // Write last_applied timestamp only on success
         write_last_applied(storage.root())?;
@@ -169,10 +171,15 @@ pub async fn apply_hosts(state: State<'_, AppState>) -> Result<(), MhostError> {
 /// Fix (#44): Extracted as a reusable function so `update_profile` can re-apply
 /// when saving an enabled profile.
 /// Perf fix (P-R8, issue #90): Same single-read pattern as `apply_hosts`.
+///
+/// Returns `Some(path)` if the writer created a backup (i.e. the plan's
+/// `backup_required` was true). `enable_and_apply` (issue #127) threads this
+/// through as `ApplyOutcome::backup_path`; `apply_hosts` and `load_snapshot_logic`
+/// discard it via `?` and don't need to change callers.
 pub fn apply_current_plan_logic(
     storage: &(dyn Storage + Send + Sync),
     writer: &HostsWriter,
-) -> Result<(), MhostError> {
+) -> Result<Option<std::path::PathBuf>, MhostError> {
     let profiles = storage.list_profiles_by_mode(ProfileMode::Hosts)?;
     let current_hosts = match std::fs::read_to_string(writer.hosts_path()) {
         Ok(content) => content,
@@ -189,12 +196,12 @@ pub fn apply_current_plan_logic(
     // This is intentionally NOT rejected here; rejection of empty plans is the
     // responsibility of the `apply_hosts` command (issue #2-N1) to avoid writing
     // an empty managed block when the user explicitly clicks "Apply".
-    writer.apply_with_content(&plan, &current_hosts)?;
+    let backup_path = writer.apply_with_content(&plan, &current_hosts)?;
 
     // Record timestamp (only after successful apply)
     write_last_applied(storage.root())?;
 
-    Ok(())
+    Ok(backup_path)
 }
 
 /// Core logic: enable a hosts-mode profile and immediately apply its rules to the system hosts file.
