@@ -10,9 +10,11 @@ import {
   executeApplyAtom,
   closeApplyConfirmAtom,
   rollbackHostsActionAtom,
+  profilesAtom,
 } from "../stores/profiles";
 import ManagementDrawer from "./ManagementDrawer";
 import ApplyConfirmDialog from "./ApplyConfirmDialog";
+import QuickApplyToast from "./QuickApplyToast";
 import Sidebar, { type NavItem } from "./Sidebar";
 import styles from "./Layout.module.css";
 
@@ -167,6 +169,9 @@ function Layout() {
   const rollbackHostsAction = useSetAtom(rollbackHostsActionAtom);
   const setApplyError = useSetAtom(applyErrorAtom);
 
+  // Refs #127: profiles needed by QuickApplyToast to resolve disabled IDs to display names.
+  const profiles = useAtomValue(profilesAtom);
+
   // **fix (P-F1, issue #90)**: useCallback 保持 onOpenManagement 引用稳定，
   // 否则 inline arrow 会让 Sidebar 的 React.memo 失效（每次 Layout 渲染
   // 都看到新 props）。
@@ -212,6 +217,8 @@ function Layout() {
         applyError={applyError}
         onRollback={() => rollbackHostsAction()}
       />
+
+      <QuickApplyToast profiles={profiles} />
     </div>
   );
 }
