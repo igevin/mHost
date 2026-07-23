@@ -135,6 +135,7 @@ pub fn run() {
             set_profile_enabled,
             enable_and_apply,
             generate_preview_plan,
+            preview_apply_outcome,
             generate_apply_plan,
             apply_hosts,
             rollback_hosts,

@@ -2,12 +2,81 @@ use std::str::FromStr;
 
 use mhost_apply::writer::HostsWriter;
 use mhost_apply::{generate_plan, ApplyPlan};
-use mhost_core::{MhostError, ProfileId, ProfileMode};
+use mhost_core::{ApplyMode, ApplyOutcome, MhostError, ProfileId, ProfileMode};
 use mhost_storage::storage::Storage;
 use tauri::{AppHandle, State};
 
 use crate::commands::profile::disable_other_profiles;
 use crate::state::{lock_or_recover, AppState};
+
+/// Threshold above which a quick apply is rejected in favour of preview.
+///
+/// "Bulk changes" of more than this many add/remove operations deserve an
+/// explicit preview pass. Tunable in code for now — not user-configurable
+/// (issue #127 follow-up).
+pub const DESTRUCTIVE_THRESHOLD: usize = 100;
+
+/// Pure decision function: should the apply go straight to `/etc/hosts`
+/// (`QuickApply`) or open the preview dialog (`RequirePreview`)?
+///
+/// Rules (in order; first match wins):
+/// 1. `outcome.has_conflicts` → `RequirePreview`. Non-negotiable: the merge
+///    silently drops conflicting rules from `plan.rules`. The user must
+///    explicitly see the conflict list before applying.
+/// 2. `!outcome.disabled_profile_ids.is_empty()` → `RequirePreview`. Enabling
+///    a hosts profile in single-enabled mode disables every other hosts
+///    profile; this is a destructive side effect the user should confirm.
+/// 3. `added_count + removed_count > DESTRUCTIVE_THRESHOLD` → `RequirePreview`.
+///    Bulk writes to `/etc/hosts` deserve eyeballs.
+///
+/// All other cases → `QuickApply`.
+///
+/// **Future work, not in #127**: detect external `/etc/hosts` changes —
+/// i.e., distinguish "user toggled 200 rules via mHost" from "another tool
+/// rewrote `/etc/hosts` without our involvement". `backup_required` fires
+/// on any add/remove regardless of source, so we cannot disambiguate today.
+pub fn decide_apply_mode(outcome: &ApplyOutcome) -> ApplyMode {
+    if outcome.has_conflicts {
+        return ApplyMode::RequirePreview;
+    }
+    if !outcome.disabled_profile_ids.is_empty() {
+        return ApplyMode::RequirePreview;
+    }
+    let total_changes = outcome.added_count + outcome.removed_count;
+    if total_changes > DESTRUCTIVE_THRESHOLD {
+        return ApplyMode::RequirePreview;
+    }
+    ApplyMode::QuickApply
+}
+
+/// Pure helper: compute the profile IDs that WOULD be disabled if the toggle
+/// were applied. Mirrors `disable_other_profiles` in `profile.rs` but does
+/// NOT mutate storage. Used by `preview_apply_outcome` so the frontend can
+/// gate the decision on "is this a destructive side effect?".
+///
+/// For `enabled == false`, returns an empty `Vec` (disabling doesn't disable
+/// other profiles).
+///
+/// **Known caveat**: there is a brief window between reading the profile list
+/// and the apply write during which another concurrent mutation could
+/// change `enabled` flags. `disable_other_profiles` already has the same
+/// race; we don't make it worse. The list is captured under
+/// `enable_and_apply_logic`'s `apply_lock` at write time.
+pub fn compute_disabled_ids_logic(
+    id: &ProfileId,
+    enabled: bool,
+    storage: &dyn Storage,
+) -> Result<Vec<String>, MhostError> {
+    if !enabled {
+        return Ok(Vec::new());
+    }
+    let profiles = storage.list_profiles_by_mode(ProfileMode::Hosts)?;
+    Ok(profiles
+        .into_iter()
+        .filter(|p| p.enabled && p.id != *id)
+        .map(|p| p.id.to_string())
+        .collect())
+}
 
 #[tauri::command]
 pub async fn generate_apply_plan(state: State<'_, AppState>) -> Result<ApplyPlan, MhostError> {
@@ -229,6 +298,35 @@ pub fn enable_and_apply_logic(
     Ok(())
 }
 
+/// Read-only IPC: compute what an `enable_and_apply(id, enabled)` call would
+/// produce, **without** writing anything. Returns an `ApplyOutcome` carrying
+/// the plan, derived counts, and disabled-profile IDs — exactly what the
+/// frontend's `decideApplyMode` policy consumes.
+///
+/// `snapshot_id` and `backup_path` are always `None` because no write
+/// occurred.
+///
+/// **No `apply_lock` is acquired** — `generate_preview_plan_logic` only
+/// reads storage, and `compute_disabled_ids_logic` is a pure read. Locking
+/// happens in `enable_and_apply` (the write path) only.
+#[tauri::command]
+pub async fn preview_apply_outcome(
+    id: String,
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> Result<ApplyOutcome, MhostError> {
+    let storage = state.storage.clone();
+    let writer = state.writer.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let profile_id = ProfileId::from_str(&id)?;
+        let plan = generate_preview_plan_logic(&profile_id, enabled, storage.as_ref(), &writer)?;
+        let disabled_ids = compute_disabled_ids_logic(&profile_id, enabled, storage.as_ref())?;
+        Ok::<ApplyOutcome, MhostError>(ApplyOutcome::from_parts(plan, disabled_ids, None, None))
+    })
+    .await
+    .map_err(|e| MhostError::InvalidInput(e.to_string()))?
+}
+
 /// Enable a profile and immediately apply its rules.
 ///
 /// For hosts mode: toggles the profile and applies to /etc/hosts.
@@ -371,10 +469,11 @@ fn write_last_applied(root: &std::path::Path) -> Result<(), MhostError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mhost_core::{HostRule, Profile};
+    use mhost_core::{HostRule, HostsDiff, Profile, RuleConflict};
     use mhost_storage::storage::{FileStorage, Storage};
     use std::sync::Arc;
     use tempfile::TempDir;
+    use uuid::Uuid;
 
     fn create_test_storage_and_writer() -> (TempDir, Arc<dyn Storage + Send + Sync>, HostsWriter) {
         let temp_dir = TempDir::new().unwrap();
@@ -912,5 +1011,220 @@ mod tests {
             "disabled profile's rule must NOT leak into hosts: {}",
             hosts_after
         );
+    }
+
+    // ---- decide_apply_mode (Refs #127) ----
+
+    fn outcome_with_conflicts() -> ApplyOutcome {
+        let plan = ApplyPlan {
+            rules: vec![],
+            conflicts: vec![RuleConflict {
+                domain: "x.example".into(),
+                rules: vec![],
+            }],
+            diff: HostsDiff {
+                added: vec!["1.1.1.1 x.example".into()],
+                removed: vec![],
+                unchanged: vec![],
+            },
+            backup_required: false,
+        };
+        ApplyOutcome::from_parts(plan, vec![], None, None)
+    }
+
+    fn outcome_with_disabled_ids() -> ApplyOutcome {
+        let plan = ApplyPlan {
+            rules: vec![],
+            conflicts: vec![],
+            diff: HostsDiff {
+                added: vec!["1.1.1.1 a".into()],
+                removed: vec![],
+                unchanged: vec![],
+            },
+            backup_required: false,
+        };
+        ApplyOutcome::from_parts(plan, vec!["other-id".into()], None, None)
+    }
+
+    fn outcome_with_n_added(n: usize) -> ApplyOutcome {
+        let added: Vec<String> = (0..n)
+            .map(|i| format!("1.1.1.{} a.example", i + 1))
+            .collect();
+        let plan = ApplyPlan {
+            rules: vec![],
+            conflicts: vec![],
+            diff: HostsDiff {
+                added,
+                removed: vec![],
+                unchanged: vec![],
+            },
+            backup_required: n > 0,
+        };
+        ApplyOutcome::from_parts(plan, vec![], None, None)
+    }
+
+    #[test]
+    fn test_decide_apply_mode_conflicts_require_preview() {
+        let outcome = outcome_with_conflicts();
+        assert_eq!(decide_apply_mode(&outcome), ApplyMode::RequirePreview);
+    }
+
+    #[test]
+    fn test_decide_apply_mode_disabled_ids_require_preview() {
+        let outcome = outcome_with_disabled_ids();
+        assert_eq!(decide_apply_mode(&outcome), ApplyMode::RequirePreview);
+    }
+
+    #[test]
+    fn test_decide_apply_mode_above_threshold_require_preview() {
+        let outcome = outcome_with_n_added(DESTRUCTIVE_THRESHOLD + 1);
+        assert_eq!(decide_apply_mode(&outcome), ApplyMode::RequirePreview);
+    }
+
+    #[test]
+    fn test_decide_apply_mode_at_threshold_quick() {
+        // exactly at threshold = not above = QuickApply
+        let outcome = outcome_with_n_added(DESTRUCTIVE_THRESHOLD);
+        assert_eq!(decide_apply_mode(&outcome), ApplyMode::QuickApply);
+    }
+
+    #[test]
+    fn test_decide_apply_mode_zero_changes_quick() {
+        let outcome = ApplyOutcome::empty();
+        assert_eq!(decide_apply_mode(&outcome), ApplyMode::QuickApply);
+    }
+
+    #[test]
+    fn test_decide_apply_mode_combined_rules_first_match_wins() {
+        // conflicts + disabled + bulk — conflicts gate fires first
+        let outcome = outcome_with_conflicts();
+        assert_eq!(decide_apply_mode(&outcome), ApplyMode::RequirePreview);
+
+        // no conflicts, disabled + bulk — disabled gate fires
+        let outcome = outcome_with_disabled_ids();
+        assert_eq!(decide_apply_mode(&outcome), ApplyMode::RequirePreview);
+    }
+
+    // ---- compute_disabled_ids_logic (Refs #127) ----
+
+    #[test]
+    fn test_compute_disabled_ids_logic_disabling_returns_empty() {
+        let (_tmp, storage, _writer) = create_test_storage_and_writer();
+        let any_id = ProfileId(Uuid::new_v4());
+        let result = compute_disabled_ids_logic(&any_id, false, storage.as_ref()).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_compute_disabled_ids_logic_enabling_lists_other_enabled_hosts() {
+        let (_tmp, storage, _writer) = create_test_storage_and_writer();
+        let mut p_a = Profile::new("a");
+        p_a.mode = ProfileMode::Hosts;
+        p_a.enabled = true;
+        storage.save_profile(&p_a).unwrap();
+        let mut p_b = Profile::new("b");
+        p_b.mode = ProfileMode::Hosts;
+        p_b.enabled = false;
+        storage.save_profile(&p_b).unwrap();
+        let mut p_c = Profile::new("c");
+        p_c.mode = ProfileMode::Hosts;
+        p_c.enabled = true;
+        storage.save_profile(&p_c).unwrap();
+        let mut p_dns = Profile::new("d");
+        p_dns.mode = ProfileMode::Dns;
+        p_dns.enabled = true;
+        storage.save_profile(&p_dns).unwrap();
+
+        let ids = compute_disabled_ids_logic(&p_a.id, true, storage.as_ref()).unwrap();
+        // Should include C (enabled hosts other than A). Should NOT include B
+        // (disabled) or DNS profile D.
+        assert_eq!(ids.len(), 1, "expected only p_c, got {:?}", ids);
+        assert_eq!(ids[0], p_c.id.to_string());
+    }
+
+    #[test]
+    fn test_compute_disabled_ids_logic_does_not_mutate_storage() {
+        let (_tmp, storage, _writer) = create_test_storage_and_writer();
+        let mut p = Profile::new("only");
+        p.mode = ProfileMode::Hosts;
+        p.enabled = false;
+        storage.save_profile(&p).unwrap();
+        let original_id = p.id.to_string();
+
+        let _ = compute_disabled_ids_logic(&p.id, true, storage.as_ref()).unwrap();
+        let after = storage.load_profile(&p.id).unwrap();
+        assert!(!after.enabled, "compute_disabled_ids_logic must not mutate");
+        assert_eq!(after.id.to_string(), original_id);
+    }
+
+    // ---- preview_apply_outcome (Refs #127) ----
+
+    fn preview_apply_outcome_logic(
+        id: ProfileId,
+        enabled: bool,
+        storage: &(dyn Storage + Send + Sync),
+        writer: &HostsWriter,
+    ) -> Result<ApplyOutcome, MhostError> {
+        let plan = generate_preview_plan_logic(&id, enabled, storage, writer)?;
+        let disabled_ids = compute_disabled_ids_logic(&id, enabled, storage)?;
+        Ok(ApplyOutcome::from_parts(plan, disabled_ids, None, None))
+    }
+
+    #[test]
+    fn test_preview_apply_outcome_does_not_write_hosts_or_storage() {
+        let (_tmp, storage, writer) = create_test_storage_and_writer();
+        let mut p = Profile::new("preview-only");
+        p.mode = ProfileMode::Hosts;
+        p.enabled = true;
+        storage.save_profile(&p).unwrap();
+
+        let outcome = preview_apply_outcome_logic(p.id.clone(), true, storage.as_ref(), &writer)
+            .expect("preview must succeed");
+
+        assert!(outcome.snapshot_id.is_none(), "preview never writes");
+        assert!(outcome.backup_path.is_none(), "preview never writes");
+        let reloaded = storage.load_profile(&p.id).unwrap();
+        assert!(
+            reloaded.enabled,
+            "preview must not change the persisted enabled flag"
+        );
+        let hosts_now = std::fs::read_to_string(writer.hosts_path()).unwrap_or_default();
+        assert!(
+            !hosts_now.contains(p.name.as_str()) || hosts_now.is_empty(),
+            "preview must not write profile name into hosts; got: {}",
+            hosts_now
+        );
+    }
+
+    #[test]
+    fn test_preview_apply_outcome_carries_disabled_ids() {
+        let (_tmp, storage, writer) = create_test_storage_and_writer();
+        let mut target = Profile::new("target");
+        target.mode = ProfileMode::Hosts;
+        target.enabled = false;
+        storage.save_profile(&target).unwrap();
+        let mut other = Profile::new("other");
+        other.mode = ProfileMode::Hosts;
+        other.enabled = true;
+        storage.save_profile(&other).unwrap();
+
+        let outcome =
+            preview_apply_outcome_logic(target.id.clone(), true, storage.as_ref(), &writer)
+                .expect("preview must succeed");
+        assert_eq!(outcome.disabled_profile_ids, vec![other.id.to_string()]);
+        assert!(!outcome.has_conflicts);
+    }
+
+    #[test]
+    fn test_preview_apply_outcome_snapshot_and_backup_are_none() {
+        let (_tmp, storage, writer) = create_test_storage_and_writer();
+        let mut p = Profile::new("p");
+        p.mode = ProfileMode::Hosts;
+        p.enabled = true;
+        storage.save_profile(&p).unwrap();
+
+        let outcome = preview_apply_outcome_logic(p.id, true, storage.as_ref(), &writer).unwrap();
+        assert!(outcome.snapshot_id.is_none());
+        assert!(outcome.backup_path.is_none());
     }
 }
