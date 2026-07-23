@@ -1,0 +1,102 @@
+/* Extracted from ApplyConfirmDialog.module.css so the QuickApplyToast can
+ * render the same diff + conflict blocks. Keep the class names and the
+ * key-stability invariant in DiffView.tsx intact.
+ */
+
+.diffSection {
+  margin: 16px 0;
+}
+
+.diffPreview {
+  font-family: var(--font-mono, ui-monospace, "SF Mono", Menlo, monospace);
+  font-size: 12px;
+  background: var(--color-surface-muted);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm, 4px);
+  padding: 8px;
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.diffLine {
+  padding: 2px 4px;
+  white-space: pre;
+  line-height: 1.4;
+}
+
+.diffAdded {
+  color: var(--color-success, #28a745);
+  background: rgba(40, 167, 69, 0.08);
+}
+
+.diffRemoved {
+  color: var(--color-danger, #dc3545);
+  background: rgba(220, 53, 69, 0.08);
+}
+
+.diffUnchanged {
+  color: var(--color-text-muted, #888);
+}
+
+.diffUnchangedCollapsed {
+  display: block;
+  width: 100%;
+  margin-top: 4px;
+  padding: 4px;
+  background: transparent;
+  border: 1px dashed var(--color-border);
+  border-radius: var(--radius-sm, 4px);
+  color: var(--color-text-muted, #888);
+  font-family: var(--font-mono, ui-monospace, "SF Mono", Menlo, monospace);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.diffUnchangedCollapsed:hover {
+  background: var(--color-surface);
+  color: var(--color-text);
+}
+
+.diffEmpty {
+  font-family: var(--font-mono, ui-monospace, "SF Mono", Menlo, monospace);
+  font-size: 12px;
+  color: var(--color-text-muted, #888);
+  padding: 12px;
+  text-align: center;
+  background: var(--color-surface-muted);
+  border: 1px dashed var(--color-border);
+  border-radius: var(--radius-sm, 4px);
+}
+
+.conflictSection {
+  margin-top: 12px;
+  padding: 8px 12px;
+  background: rgba(220, 53, 69, 0.08);
+  border: 1px solid var(--color-danger, #dc3545);
+  border-radius: var(--radius-sm, 4px);
+}
+
+.conflictWarning {
+  font-weight: 600;
+  color: var(--color-danger, #dc3545);
+  margin-bottom: 6px;
+  font-size: 13px;
+}
+
+.conflictList {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--color-text);
+}
+
+.conflictItem {
+  display: flex;
+  gap: 8px;
+}
+
+.conflictDomain {
+  font-family: var(--font-mono, ui-monospace, "SF Mono", Menlo, monospace);
+  font-weight: 500;
+}
