@@ -60,6 +60,14 @@ describe("decideApplyMode (Refs #127)", () => {
     expect(decideApplyMode(outcomeWith({}))).toBe("quick_apply");
   });
 
+  // Cross-language contract (Refs #127): must equal Rust
+  // `DESTRUCTIVE_THRESHOLD` in commands/apply.rs (asserted there by
+  // test_destructive_threshold_contract_value). If these drift, the
+  // client-side fast path and the server-side guard disagree.
+  it("DESTRUCTIVE_THRESHOLD matches the Rust contract value", () => {
+    expect(DESTRUCTIVE_THRESHOLD).toBe(100);
+  });
+
   it("combined rules: conflicts gate wins first", () => {
     // has_conflicts=true AND disabled AND 5 changes -> conflicts wins
     expect(

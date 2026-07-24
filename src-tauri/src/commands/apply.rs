@@ -70,6 +70,16 @@ pub fn compute_disabled_ids_logic(
     if !enabled {
         return Ok(Vec::new());
     }
+    // Parity fix (Refs #127): a DNS-mode profile never disables other profiles
+    // (DNS allows multi-active) and enabling it does not touch the Hosts set.
+    // `generate_preview_plan_logic` already short-circuits DNS to an empty
+    // plan; without this a DNS target would wrongly report enabled Hosts
+    // profiles as "would be disabled", disagreeing with the empty plan.
+    // (Unreachable via the current UI — DNS toggles use `set_profile_enabled`
+    // — but kept consistent so a future wiring can't silently misclassify.)
+    if storage.load_profile(id)?.mode != ProfileMode::Hosts {
+        return Ok(Vec::new());
+    }
     let profiles = storage.list_profiles_by_mode(ProfileMode::Hosts)?;
     Ok(profiles
         .into_iter()
@@ -241,14 +251,21 @@ pub async fn apply_hosts(state: State<'_, AppState>) -> Result<(), MhostError> {
 /// when saving an enabled profile.
 /// Perf fix (P-R8, issue #90): Same single-read pattern as `apply_hosts`.
 ///
-/// Returns `Some(path)` if the writer created a backup (i.e. the plan's
-/// `backup_required` was true). `enable_and_apply` (issue #127) threads this
-/// through as `ApplyOutcome::backup_path`; `apply_hosts` and `load_snapshot_logic`
-/// discard it via `?` and don't need to change callers.
+/// Returns `(applied_plan, backup_path)`:
+/// - `applied_plan`: the plan generated from the current enabled profiles and
+///   applied to `/etc/hosts`. This is the **pre-apply** diff (what changed),
+///   so `enable_and_apply` (issue #127) can surface real add/remove counts to
+///   the toast. Re-reading hosts *after* the write would yield an empty diff
+///   (the managed block already reflects the profiles) — bug H2.
+/// - `backup_path`: `Some(path)` if the writer created a backup (i.e. the
+///   plan's `backup_required` was true).
+///
+/// `apply_hosts` and `load_snapshot_logic` discard both via `?` and don't
+/// need to change.
 pub fn apply_current_plan_logic(
     storage: &(dyn Storage + Send + Sync),
     writer: &HostsWriter,
-) -> Result<Option<std::path::PathBuf>, MhostError> {
+) -> Result<(ApplyPlan, Option<std::path::PathBuf>), MhostError> {
     let profiles = storage.list_profiles_by_mode(ProfileMode::Hosts)?;
     let current_hosts = match std::fs::read_to_string(writer.hosts_path()) {
         Ok(content) => content,
@@ -270,14 +287,15 @@ pub fn apply_current_plan_logic(
     // Record timestamp (only after successful apply)
     write_last_applied(storage.root())?;
 
-    Ok(backup_path)
+    Ok((plan, backup_path))
 }
 
 /// Core logic: enable a hosts-mode profile and immediately apply its rules to the system hosts file.
 ///
-/// Returns `(disabled_profile_ids, backup_path)`:
+/// Returns `(disabled_profile_ids, applied_plan, backup_path)`:
 /// - `disabled_profile_ids`: profile IDs that were auto-disabled because the
 ///   target was being enabled. Empty when `enabled=false`.
+/// - `applied_plan`: the pre-apply plan that was written (real diff/counts).
 /// - `backup_path`: `Some(path)` if a backup was created by the writer.
 ///
 /// Testable without Tauri `State`. Only for hosts mode profiles. DNS mode
@@ -287,7 +305,7 @@ pub fn enable_and_apply_logic(
     enabled: bool,
     storage: &(dyn Storage + Send + Sync),
     writer: &HostsWriter,
-) -> Result<(Vec<String>, Option<std::path::PathBuf>), MhostError> {
+) -> Result<(Vec<String>, ApplyPlan, Option<std::path::PathBuf>), MhostError> {
     // 1. Compute disabled IDs BEFORE mutation so the result matches what
     //    `disable_other_profiles` is about to disable. (Same read-then-mutate
     //    race that `compute_disabled_ids_logic` already documents.)
@@ -302,10 +320,11 @@ pub fn enable_and_apply_logic(
     profile.updated_at = chrono::Utc::now();
     storage.save_profile(&profile)?;
 
-    // 3. Apply current plan (hosts mode only)
-    let backup_path = apply_current_plan_logic(storage, writer)?;
+    // 3. Apply current plan (hosts mode only). Returns the pre-apply plan so
+    //    the outcome carries the real diff/counts (bug H2 fix).
+    let (plan, backup_path) = apply_current_plan_logic(storage, writer)?;
 
-    Ok((disabled_ids, backup_path))
+    Ok((disabled_ids, plan, backup_path))
 }
 
 /// Read-only IPC: compute what an `enable_and_apply(id, enabled)` call would
@@ -351,6 +370,19 @@ pub fn preview_outcome_logic(
 /// change destructive between preview and write. The frontend still
 /// pre-checks (fast path: destructive toggles open the dialog without a
 /// write attempt); this guard is the authoritative backstop.
+///
+/// **Residual window (known, Refs #127):** the guard and the subsequent
+/// `enable_and_apply_logic` write run in the same synchronous closure, so
+/// they are atomic against any other `apply_lock` holder. They are NOT
+/// serialized against mutators that skip `apply_lock` — `set_profile_enabled`
+/// and `update_profile` save profile changes without it, and external tools
+/// can rewrite `/etc/hosts` at the OS level (the latter explicitly
+/// out-of-scope for #127). A change landing in the sub-ms window between the
+/// guard's read and the writer's read could be written without preview. This
+/// is far narrower than the pre-M1 window (a full JS↔Rust round-trip) and is
+/// fully recoverable (backup + rollback). Closing it entirely needs either
+/// single-read-under-lock consolidation or making those mutators take
+/// `apply_lock`.
 pub fn enforce_quick_apply_policy(
     id: &ProfileId,
     enabled: bool,
@@ -423,6 +455,17 @@ pub async fn enable_and_apply(
         let writer = state.writer.clone();
         let storage = state.storage.clone();
         tauri::async_runtime::spawn_blocking(move || {
+            // Refs #127: `profile.mode` was read before the lock, and mode is
+            // mutable via `update_profile`. Re-assert under the lock that the
+            // target is still a Hosts profile before running the Hosts write
+            // path, so a concurrent mode flip can't route a now-DNS profile
+            // through the hosts apply. Cheap (one load) and defensive.
+            if storage.load_profile(&profile_id)?.mode != ProfileMode::Hosts {
+                return Err(MhostError::InvalidInput(
+                    "profile mode changed concurrently; please retry".to_string(),
+                ));
+            }
+
             // Refs #127: enforce the quick-apply policy UNDER the lock, before
             // any mutation, so the decision and the write are atomic. No-op
             // when `require_safe` is false (dialog-confirmed path).
@@ -434,7 +477,10 @@ pub async fn enable_and_apply(
                 require_safe,
             )?;
 
-            let (disabled_ids, backup_path) =
+            // `enable_and_apply_logic` returns the pre-apply plan (the actual
+            // diff being applied) so the outcome carries real add/remove
+            // counts — the toast summary and inline diff depend on it (H2).
+            let (disabled_ids, plan, backup_path) =
                 enable_and_apply_logic(&profile_id, enabled, storage.as_ref(), &writer)?;
 
             // Auto-snapshot: capture id so the toast can mention it.
@@ -442,21 +488,6 @@ pub async fn enable_and_apply(
                 .ok()
                 .flatten()
                 .map(|m| m.id);
-
-            // Re-derive the post-apply plan to populate ApplyOutcome.plan.
-            // Cost is one extra generate_plan (one read + one diff) — cheap.
-            // Cheaper refactor than threading the plan back out of
-            // `apply_current_plan_logic`.
-            let plan = post_apply_plan(storage.as_ref(), &writer).unwrap_or_else(|_| ApplyPlan {
-                rules: vec![],
-                conflicts: vec![],
-                diff: mhost_core::HostsDiff {
-                    added: vec![],
-                    removed: vec![],
-                    unchanged: vec![],
-                },
-                backup_required: false,
-            });
 
             Ok::<ApplyOutcome, MhostError>(ApplyOutcome::from_parts(
                 plan,
@@ -489,23 +520,6 @@ pub async fn enable_and_apply(
     #[cfg(target_os = "macos")]
     crate::tray::update_tray_menu(&app_handle);
     Ok(outcome)
-}
-
-/// Helper: re-read profiles + hosts and re-derive the post-apply `ApplyPlan`.
-/// Used by `enable_and_apply` to populate `ApplyOutcome.plan` for the toast.
-/// If anything fails (e.g. hosts file disappeared), the caller falls back to
-/// an empty plan — losing the diff display but keeping the apply outcome.
-fn post_apply_plan(
-    storage: &(dyn Storage + Send + Sync),
-    writer: &HostsWriter,
-) -> Result<ApplyPlan, MhostError> {
-    let profiles = storage.list_profiles_by_mode(ProfileMode::Hosts)?;
-    let current_hosts = match std::fs::read_to_string(writer.hosts_path()) {
-        Ok(content) => content,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(e.into()),
-    };
-    generate_plan(&profiles, &current_hosts)
 }
 
 #[tauri::command]
@@ -1284,6 +1298,30 @@ mod tests {
         assert_eq!(after.id.to_string(), original_id);
     }
 
+    #[test]
+    fn test_compute_disabled_ids_logic_dns_target_returns_empty() {
+        // Parity fix (Refs #127): enabling a DNS profile must not report any
+        // Hosts profiles as "would be disabled" — the DNS apply path never
+        // disables Hosts profiles, and generate_preview_plan_logic returns an
+        // empty plan for DNS. The two must agree.
+        let (_tmp, storage, _writer) = create_test_storage_and_writer();
+        let mut enabled_host = Profile::new("host");
+        enabled_host.mode = ProfileMode::Hosts;
+        enabled_host.enabled = true;
+        storage.save_profile(&enabled_host).unwrap();
+        let mut dns = Profile::new("dns");
+        dns.mode = ProfileMode::Dns;
+        dns.enabled = false;
+        storage.save_profile(&dns).unwrap();
+
+        let ids = compute_disabled_ids_logic(&dns.id, true, storage.as_ref()).unwrap();
+        assert!(
+            ids.is_empty(),
+            "enabling a DNS profile must not disable Hosts profiles, got {:?}",
+            ids
+        );
+    }
+
     // ---- preview_apply_outcome (Refs #127) ----
     // Tests call the promoted `preview_outcome_logic` (shared by the IPC and
     // the server-side guard) directly.
@@ -1429,5 +1467,64 @@ mod tests {
             "expected PreviewRequired for bulk change, got {:?}",
             err
         );
+    }
+
+    #[test]
+    fn test_preview_outcome_logic_dns_is_quick_and_carries_no_disabled_ids() {
+        // End-to-end parity for a DNS target: empty plan + no disabled IDs +
+        // classified as quick_apply. Guards the `preview_outcome_logic`
+        // identical-outcome contract that a future DNS wiring would rely on.
+        let (_tmp, storage, writer) = create_test_storage_and_writer();
+        let mut enabled_host = Profile::new("host");
+        enabled_host.mode = ProfileMode::Hosts;
+        enabled_host.enabled = true;
+        storage.save_profile(&enabled_host).unwrap();
+        let mut dns = Profile::new("dns");
+        dns.mode = ProfileMode::Dns;
+        dns.enabled = false;
+        storage.save_profile(&dns).unwrap();
+
+        let outcome = preview_outcome_logic(&dns.id, true, storage.as_ref(), &writer).unwrap();
+        assert!(outcome.disabled_profile_ids.is_empty());
+        assert!(!outcome.has_conflicts);
+        assert_eq!(outcome.added_count, 0);
+        assert_eq!(decide_apply_mode(&outcome), ApplyMode::QuickApply);
+    }
+
+    #[test]
+    fn test_enable_and_apply_logic_returns_pre_apply_plan_with_real_counts() {
+        // Bug H2: the outcome plan must be the PRE-apply diff (real counts),
+        // not a re-read after the write (which would be empty). Enabling a
+        // profile with 2 rules must yield added_count == 2.
+        let (_tmp, storage, writer) = create_test_storage_and_writer();
+        let mut p = create_profile_with_rules(
+            &storage,
+            "dev",
+            vec![("127.0.0.1", "a.local"), ("127.0.0.2", "b.local")],
+        );
+        p.enabled = false;
+        storage.save_profile(&p).unwrap();
+
+        let (_disabled, plan, _backup) =
+            enable_and_apply_logic(&p.id, true, storage.as_ref(), &writer).unwrap();
+        assert_eq!(
+            plan.diff.added.len(),
+            2,
+            "applied plan must carry the real added count, got {:?}",
+            plan.diff.added
+        );
+        // And the derived outcome exposes the same non-zero count for the toast.
+        let outcome = ApplyOutcome::from_parts(plan, vec![], None, None);
+        assert_eq!(outcome.added_count, 2);
+    }
+
+    #[test]
+    fn test_destructive_threshold_contract_value() {
+        // Cross-language contract (Refs #127): the TS mirror
+        // `src/lib/applyPolicy.ts` hard-codes DESTRUCTIVE_THRESHOLD = 100 and
+        // `src/lib/__tests__/applyPolicy.test.ts` asserts the same. If this
+        // value changes, update both sides or the client/server policy
+        // decisions diverge.
+        assert_eq!(DESTRUCTIVE_THRESHOLD, 100);
     }
 }

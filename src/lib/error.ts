@@ -44,6 +44,13 @@ export function extractErrorMessage(err: unknown): string {
       return `invalid input: ${obj.InvalidInput}`;
     }
 
+    // MhostError::PreviewRequired(String) — normally intercepted by
+    // isPreviewRequired() before reaching here; handled defensively so an
+    // unexpected path never leaks the raw JSON envelope to the UI.
+    if (typeof obj.PreviewRequired === "string") {
+      return `preview required: ${obj.PreviewRequired}`;
+    }
+
     // MhostError::Network(String)
     if (typeof obj.Network === "string") {
       return `network error: ${obj.Network}`;

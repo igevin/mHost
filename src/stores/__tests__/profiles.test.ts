@@ -338,4 +338,49 @@ describe("quickApplyToggleAtom (issue #127)", () => {
     expect(store.get(isQuickApplyToastOpenAtom)).toBe(false);
     expect(store.get(isApplyingAtom)).toBe(false);
   });
+
+  // PreviewRequired fallback but the refetch itself fails → surface an error,
+  // don't get stuck applying.
+  it("PreviewRequired then refetch failure -> error state, isApplying reset", async () => {
+    const store = getDefaultStore();
+    store.set(profilesAtom, [makeProfile({ id: "p1", enabled: false })]);
+
+    const previewMock = previewApplyOutcome as unknown as {
+      mockResolvedValueOnce: (v: unknown) => typeof previewMock;
+      mockRejectedValueOnce: (v: unknown) => typeof previewMock;
+    };
+    previewMock.mockResolvedValueOnce(safeOutcome); // pre-write preview: safe
+    previewMock.mockRejectedValueOnce(new Error("refetch boom")); // refetch fails
+    (enableAndApply as unknown as { mockRejectedValueOnce: (v: unknown) => void })
+      .mockRejectedValueOnce({ PreviewRequired: "conflicts detected" });
+
+    await store.set(quickApplyToggleAtom, { id: "p1", enabled: true });
+
+    expect(store.get(applyConfirmOpenAtom)).toBe(false);
+    expect(store.get(applyResultAtom)).toBe("error");
+    expect(store.get(applyErrorAtom)).toBe("refetch boom");
+    expect(store.get(isApplyingAtom)).toBe(false);
+  });
+
+  // M2: opening the preview dialog (require_preview path) must dismiss any
+  // lingering toast so it can't overlay the dialog.
+  it("dismisses a stale toast when the preview path opens the dialog", async () => {
+    const store = getDefaultStore();
+    store.set(profilesAtom, [makeProfile({ id: "p1", enabled: false })]);
+    // Simulate a leftover open toast from a previous quick apply.
+    store.set(isQuickApplyToastOpenAtom, true);
+
+    const conflictOutcome: ApplyOutcome = {
+      ...safeOutcome,
+      has_conflicts: true,
+      plan: { ...safePlan, conflicts: [{ domain: "x.example", rules: [] }] },
+    };
+    (previewApplyOutcome as unknown as { mockResolvedValueOnce: (v: unknown) => void })
+      .mockResolvedValueOnce(conflictOutcome);
+
+    await store.set(quickApplyToggleAtom, { id: "p1", enabled: true });
+
+    expect(store.get(applyConfirmOpenAtom)).toBe(true);
+    expect(store.get(isQuickApplyToastOpenAtom)).toBe(false);
+  });
 });

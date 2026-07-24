@@ -224,6 +224,9 @@ export const quickApplyToggleAtom = atom(
     set(isApplyingAtom, true);
     set(applyResultAtom, null);
     set(applyErrorAtom, null);
+    // Dismiss any lingering toast from a previous quick apply so it can't
+    // overlay the preview dialog we may open below (toast z-index > dialog).
+    set(isQuickApplyToastOpenAtom, false);
     try {
       const preview = await previewApplyOutcome(id, enabled);
       const mode = decideApplyMode(preview);
