@@ -11,7 +11,7 @@ use tauri::{
 };
 
 use crate::commands::apply::enable_and_apply_logic;
-use crate::state::AppState;
+use crate::state::{lock_or_recover, AppState};
 use crate::tray_logic;
 use mhost_core::ProfileId;
 
@@ -67,11 +67,10 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>) -> Result<Menu<R>, Box<dyn std::er
     let state = app.state::<AppState>();
     let profiles = state.storage.list_profiles()?;
 
-    // Perf fix (#29): Track last rendered profile IDs
+    // Perf fix (#29): Track last rendered profile IDs.
+    // lock_or_recover: std::sync::Mutex poisoning is recovered transparently.
     let profile_ids: Vec<String> = profiles.iter().map(|p| p.id.to_string()).collect();
-    if let Ok(mut last) = state.last_profile_ids.lock() {
-        *last = profile_ids;
-    }
+    *lock_or_recover(&state.last_profile_ids) = profile_ids;
 
     // Build profile check menu items
     let mut profile_items: Vec<CheckMenuItem<R>> = Vec::new();
@@ -170,7 +169,7 @@ pub fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::Men
                 };
 
                 match enable_and_apply_logic(&profile_id, target_enabled, storage, writer) {
-                    Ok(()) => {
+                    Ok(_outcome) => {
                         let _ = update_tray_checkmark(&app_clone);
                         let _ = app_clone.emit(TRAY_PROFILES_UPDATED_EVENT, ());
                     }
@@ -296,6 +295,8 @@ fn get_current_profile_ids_from_menu<R: Runtime>(
     app: &AppHandle<R>,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let state = app.state::<AppState>();
-    let ids = state.last_profile_ids.lock().map_err(|e| e.to_string())?;
-    Ok(ids.clone())
+    // lock_or_recover: std::sync::Mutex poisoning is recovered transparently.
+    // The Result is preserved for API stability with callers using `?`.
+    let ids = lock_or_recover(&state.last_profile_ids).clone();
+    Ok(ids)
 }

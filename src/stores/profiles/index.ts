@@ -23,6 +23,8 @@ export {
   enabledDnsProfilesAtom,
   dnsRuleCountAtom,
   quickApplyOnToggleAtom,
+  quickApplyOutcomeAtom,
+  isQuickApplyToastOpenAtom,
 } from "./state";
 
 // ---- Async action atoms ----

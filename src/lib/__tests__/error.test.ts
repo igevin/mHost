@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { extractErrorMessage } from "../error";
+import { extractErrorMessage, isPreviewRequired } from "../error";
 
 describe("extractErrorMessage", () => {
   it("returns string verbatim", () => {
@@ -80,5 +80,30 @@ describe("extractErrorMessage", () => {
     const result = extractErrorMessage({ Apply: { HostsFileNotFound: null } });
     expect(result).not.toContain("{");
     expect(result).toContain("hosts file not found");
+  });
+
+  it("returns string-payload PreviewRequired variant (no raw JSON)", () => {
+    const result = extractErrorMessage({ PreviewRequired: "conflicts detected" });
+    expect(result).not.toContain("{");
+    expect(result).toBe("preview required: conflicts detected");
+  });
+});
+
+describe("isPreviewRequired (Refs #127)", () => {
+  it("true for a { PreviewRequired: string } envelope", () => {
+    expect(isPreviewRequired({ PreviewRequired: "conflicts detected" })).toBe(true);
+  });
+
+  it("false for other MhostError shapes", () => {
+    expect(isPreviewRequired({ InvalidInput: "bad" })).toBe(false);
+    expect(isPreviewRequired({ Io: { kind: "NotFound", message: "x" } })).toBe(false);
+    expect(isPreviewRequired({ Apply: { PermissionDenied: "no sudo" } })).toBe(false);
+  });
+
+  it("false for non-object / non-string-payload values", () => {
+    expect(isPreviewRequired(null)).toBe(false);
+    expect(isPreviewRequired("PreviewRequired")).toBe(false);
+    expect(isPreviewRequired(new Error("boom"))).toBe(false);
+    expect(isPreviewRequired({ PreviewRequired: 123 })).toBe(false);
   });
 });

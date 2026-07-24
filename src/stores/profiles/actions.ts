@@ -8,8 +8,8 @@ import {
   deleteProfile,
   setProfileEnabled,
   enableAndApply,
+  previewApplyOutcome,
   rollbackHosts,
-  generatePreviewPlan,
   saveSnapshot,
   listSnapshots,
   loadSnapshot,
@@ -20,7 +20,8 @@ import {
   reloadDnsRules,
   listDnsProfiles,
 } from "../../lib/tauri";
-import { extractErrorMessage } from "../../lib/error";
+import { extractErrorMessage, isPreviewRequired } from "../../lib/error";
+import { decideApplyMode } from "../../lib/applyPolicy";
 import {
   profilesAtom,
   selectedProfileIdAtom,
@@ -40,6 +41,8 @@ import {
   dnsStatusAtom,
   isDnsLoadingAtom,
   dnsErrorAtom,
+  quickApplyOutcomeAtom,
+  isQuickApplyToastOpenAtom,
 } from "./state";
 
 // ---- Async action atoms ----
@@ -148,8 +151,8 @@ export const previewApplyAtom = atom(
     set(applyResultAtom, null);
     set(applyErrorAtom, null);
     try {
-      const plan = await generatePreviewPlan(id, enabled);
-      set(applyPlanAtom, plan);
+      const outcome = await previewApplyOutcome(id, enabled);
+      set(applyPlanAtom, outcome.plan);
       set(applyTargetAtom, { id, enabled });
       set(applyConfirmOpenAtom, true);
     } catch (err) {
@@ -167,8 +170,11 @@ export const executeApplyAtom = atom(null, async (get, set) => {
   set(applyResultAtom, null);
   set(applyErrorAtom, null);
   try {
-    await enableAndApply(id, enabled);
+    const outcome = await enableAndApply(id, enabled);
     set(applyResultAtom, "success");
+    // Refs #127: surface outcome to QuickApplyToast for summary + View Diff + Rollback.
+    set(quickApplyOutcomeAtom, outcome);
+    set(isQuickApplyToastOpenAtom, true);
     const profiles = await listProfiles();
     set(profilesAtom, profiles);
   } catch (err) {
@@ -187,29 +193,75 @@ export const closeApplyConfirmAtom = atom(null, (_get, set) => {
   set(applyTargetAtom, null);
 });
 
-// issue #123: Quick Apply path for Hosts profile toggles. Reuses the same
-// Rust `enable_and_apply` command as `executeApplyAtom`; the only difference
-// is that we skip the preview dialog and write directly when the user has
-// the Quick Apply preference enabled.
+// Refs #127: Quick Apply hosts toggle. Preview → decide → write OR dialog.
 //
-// Surface state mirrors `executeApplyAtom` on purpose: errors land in
-// `applyErrorAtom` and success in `applyResultAtom` so the existing
-// ApplyConfirmDialog / ApplyStatus wiring lights up without any
-// component-level changes. We deliberately reuse the standard apply
-// feedback rather than introducing a new toast/result UI — the follow-up
-// issue #127 will revisit structured feedback once real usage is in.
+// 1. Always call `previewApplyOutcome` first (read-only, no /etc/hosts write).
+// 2. Run client-side `decideApplyMode` to classify the outcome (fast path:
+//    destructive toggles open the dialog WITHOUT attempting a write).
+// 3. If `require_preview`, or if the user held Cmd/Option (forcePreview),
+//    open the existing preview dialog with the plan — the user confirms
+//    via `executeApplyAtom`.
+// 4. Otherwise, call `enableAndApply(id, enabled, requireSafe=true)`. The
+//    Rust side re-checks the policy UNDER the apply lock; if state changed
+//    since the unlocked preview (concurrent tray toggle, external
+//    /etc/hosts edit) it rejects with `PreviewRequired`, and we fall back
+//    to the dialog with a freshly-fetched plan. This closes the
+//    preview/apply TOCTOU while keeping the common path a single write.
+//
+// Surface state mirrors `executeApplyAtom` so the existing
+// ApplyConfirmDialog / ApplyStatus wiring still lights up.
 export const quickApplyToggleAtom = atom(
   null,
-  async (_get, set, { id, enabled }: { id: string; enabled: boolean }) => {
+  async (
+    _get,
+    set,
+    {
+      id,
+      enabled,
+      forcePreview = false,
+    }: { id: string; enabled: boolean; forcePreview?: boolean },
+  ) => {
     set(isApplyingAtom, true);
     set(applyResultAtom, null);
     set(applyErrorAtom, null);
+    // Dismiss any lingering toast from a previous quick apply so it can't
+    // overlay the preview dialog we may open below (toast z-index > dialog).
+    set(isQuickApplyToastOpenAtom, false);
     try {
-      await enableAndApply(id, enabled);
+      const preview = await previewApplyOutcome(id, enabled);
+      const mode = decideApplyMode(preview);
+
+      if (mode === "require_preview" || forcePreview) {
+        // Open the preview dialog. User confirms → executeApplyAtom writes
+        // (which also surfaces the outcome to the toast).
+        set(applyPlanAtom, preview.plan);
+        set(applyTargetAtom, { id, enabled });
+        set(applyConfirmOpenAtom, true);
+        return;
+      }
+
+      // QuickApply path: write directly (server re-checks policy under lock).
+      const outcome = await enableAndApply(id, enabled, true);
       set(applyResultAtom, "success");
+      set(quickApplyOutcomeAtom, outcome);
+      set(isQuickApplyToastOpenAtom, true);
       const profiles = await listProfiles();
       set(profilesAtom, profiles);
     } catch (err) {
+      if (isPreviewRequired(err)) {
+        // Server rejected the quick apply under the lock (state changed since
+        // the unlocked preview). Fall back to the dialog with a fresh plan.
+        try {
+          const fresh = await previewApplyOutcome(id, enabled);
+          set(applyPlanAtom, fresh.plan);
+          set(applyTargetAtom, { id, enabled });
+          set(applyConfirmOpenAtom, true);
+        } catch (refetchErr) {
+          set(applyResultAtom, "error");
+          set(applyErrorAtom, extractErrorMessage(refetchErr));
+        }
+        return;
+      }
       set(applyResultAtom, "error");
       set(applyErrorAtom, extractErrorMessage(err));
     } finally {

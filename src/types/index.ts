@@ -70,6 +70,22 @@ export interface HostsDiff {
   unchanged: string[];
 }
 
+/// Strongly typed result of an apply (or previewed apply).
+/// Mirrors Rust `mhost_core::ApplyOutcome` — keep these in sync.
+export interface ApplyOutcome {
+  plan: ApplyPlan;
+  added_count: number;
+  removed_count: number;
+  unchanged_count: number;
+  disabled_profile_ids: string[];
+  has_conflicts: boolean;
+  snapshot_id: string | null;
+  backup_path: string | null;
+}
+
+/// Mirrors Rust `mhost_core::ApplyMode` (snake_case wire format).
+export type ApplyMode = "quick_apply" | "require_preview";
+
 export type AppError =
   | { type: "Parse"; message: string }
   | { type: "Apply"; message: string }

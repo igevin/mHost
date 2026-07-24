@@ -7,10 +7,12 @@ use std::sync::{Arc, Mutex};
 
 /// Async mutex to serialize apply operations and prevent concurrent writes to /etc/hosts.
 /// Security fix (#16): Prevents race conditions when user rapidly toggles profiles.
-/// Perf fix (#26): Changed to tokio::sync::Mutex to allow holding across await points.
-/// Note: tokio::sync::Mutex does not have poison recovery like std::sync::Mutex.
-/// If a spawn_blocking task panics while holding the lock, the lock is released
-/// automatically (tokio::sync::Mutex is not poisoned), so recovery is implicit.
+/// Perf fix (#26): Changed to `tokio::sync::Mutex` to allow holding across await points.
+///
+/// Poisoning note: `tokio::sync::Mutex` does NOT poison — when a guard is
+/// dropped (including via panic), the lock is released automatically. So
+/// `ApplyLock` callers can use `.lock().await` directly without recovery.
+/// Use [`lock_or_recover`] for `std::sync::Mutex` poisoning scenarios.
 pub struct ApplyLock(pub tokio::sync::Mutex<()>);
 
 impl Default for ApplyLock {
@@ -32,6 +34,25 @@ impl ApplyLock {
     /// Acquire the lock in a blocking context (e.g., `spawn_blocking`).
     pub fn blocking_lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.0.blocking_lock()
+    }
+}
+
+/// Acquire a `std::sync::Mutex` guard, recovering transparently from poison.
+///
+/// `std::sync::Mutex` enters a poisoned state when a thread panics while
+/// holding the lock — subsequent `.lock()` calls return `Err(PoisonError)`.
+/// Rather than crash the whole app and leave the user with an unrecoverable
+/// profile/DNS state, we accept the (rare) partial-write scenario as the
+/// lesser evil: in-memory state may be briefly stale, but the next successful
+/// apply/save corrects it. Users would rather see a working app than a
+/// crash dialog after a stray panic during an IPC handler.
+///
+/// Only use this for `std::sync::Mutex`. `tokio::sync::Mutex` (used by
+/// `ApplyLock`) does not poison and does not need recovery.
+pub(crate) fn lock_or_recover<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
     }
 }
 
@@ -243,5 +264,60 @@ impl AppState {
         }
 
         Ok((server, original))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn lock_or_recover_returns_guard_on_normal_lock() {
+        let m = Mutex::new(42u32);
+        {
+            let guard = lock_or_recover(&m);
+            assert_eq!(*guard, 42);
+        }
+        // lock is released; subsequent lock succeeds
+        *lock_or_recover(&m) = 100;
+        assert_eq!(*lock_or_recover(&m), 100);
+    }
+
+    #[test]
+    fn lock_or_recover_recovers_from_poison() {
+        let m = Arc::new(Mutex::new(String::from("before-panic")));
+        let m2 = m.clone();
+
+        // Poison the mutex by panicking while holding it.
+        let join = std::thread::spawn(move || {
+            let mut g = m2.lock().unwrap();
+            g.push_str("-partial");
+            panic!("simulated panic while holding lock");
+        });
+        let _ = join.join(); // Err is expected — the thread panicked.
+
+        // Sanity check: the underlying mutex is now poisoned.
+        assert!(m.lock().is_err(), "mutex should be poisoned");
+
+        // The helper must transparently recover.
+        let guard = lock_or_recover(&m);
+        assert_eq!(guard.as_str(), "before-panic-partial");
+    }
+
+    #[test]
+    fn lock_or_recover_allows_mutation_after_recovery() {
+        let m = Arc::new(Mutex::new(0u32));
+        let m2 = m.clone();
+
+        let join = std::thread::spawn(move || {
+            let _g = m2.lock().unwrap();
+            panic!("simulated panic");
+        });
+        let _ = join.join();
+
+        // After recovery, the helper should hand out a writable guard.
+        *lock_or_recover(&m) = 999;
+        assert_eq!(*lock_or_recover(&m), 999);
     }
 }

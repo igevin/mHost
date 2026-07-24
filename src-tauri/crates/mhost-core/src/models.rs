@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::net::IpAddr;
+use std::path::PathBuf;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -232,6 +233,99 @@ pub struct HostsDiff {
     pub added: Vec<String>,
     pub removed: Vec<String>,
     pub unchanged: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// ApplyOutcome / ApplyMode  (issue #127)
+// ---------------------------------------------------------------------------
+
+/// Structured result of an apply (or a previewed apply).
+///
+/// Returned by both `preview_apply_outcome` (read-only) and `enable_and_apply`
+/// (after writing). The shape is identical so the frontend can hand the same
+/// value to `decide_apply_mode` regardless of whether the write happened.
+///
+/// `plan` is the hosts-mode `ApplyPlan` that was applied (or previewed).
+/// For DNS-mode profiles, `plan` is an empty `ApplyPlan` because DNS apply
+/// does not touch `/etc/hosts`.
+///
+/// `disabled_profile_ids`:
+/// - Preview path: profile IDs that **will be** auto-disabled if the toggle
+///   is applied (because the target was being enabled with another hosts
+///   profile already enabled).
+/// - Apply path: profile IDs that **were** auto-disabled by the write.
+///
+/// `snapshot_id` / `backup_path` are always `None` for preview and for
+/// DNS-mode apply — neither runs `auto_snapshot_logic` nor writes a
+/// `.bak` file.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApplyOutcome {
+    pub plan: ApplyPlan,
+    pub added_count: usize,
+    pub removed_count: usize,
+    pub unchanged_count: usize,
+    pub disabled_profile_ids: Vec<String>,
+    pub has_conflicts: bool,
+    pub snapshot_id: Option<String>,
+    pub backup_path: Option<String>,
+}
+
+/// Whether a toggle should apply directly or open the preview dialog.
+///
+/// `QuickApply` — the change is safe enough to apply without preview.
+/// `RequirePreview` — the user must see the diff and confirm explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplyMode {
+    QuickApply,
+    RequirePreview,
+}
+
+impl ApplyOutcome {
+    /// Construct an empty outcome (DNS-mode apply or uninitialized state).
+    pub fn empty() -> Self {
+        Self {
+            plan: ApplyPlan {
+                rules: vec![],
+                conflicts: vec![],
+                diff: HostsDiff {
+                    added: vec![],
+                    removed: vec![],
+                    unchanged: vec![],
+                },
+                backup_required: false,
+            },
+            added_count: 0,
+            removed_count: 0,
+            unchanged_count: 0,
+            disabled_profile_ids: vec![],
+            has_conflicts: false,
+            snapshot_id: None,
+            backup_path: None,
+        }
+    }
+
+    /// Build an outcome from a (preview or applied) plan plus apply-side
+    /// context. Centralizes the "compute counts from diff" rule so the
+    /// `decide_apply_mode` policy can rely on stable invariants.
+    pub fn from_parts(
+        plan: ApplyPlan,
+        disabled_profile_ids: Vec<String>,
+        snapshot_id: Option<String>,
+        backup_path: Option<PathBuf>,
+    ) -> Self {
+        let has_conflicts = !plan.conflicts.is_empty();
+        Self {
+            added_count: plan.diff.added.len(),
+            removed_count: plan.diff.removed.len(),
+            unchanged_count: plan.diff.unchanged.len(),
+            plan,
+            disabled_profile_ids,
+            has_conflicts,
+            snapshot_id,
+            backup_path: backup_path.map(|p| p.to_string_lossy().into_owned()),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -771,5 +865,121 @@ mod tests {
         let json = r#"{"kind":"dhcp_empty"}"#;
         let restored: OriginalDns = serde_json::from_str(json).unwrap();
         assert_eq!(restored, OriginalDns::DhcpEmpty);
+    }
+
+    // ---- ApplyOutcome (issue #127) ----
+
+    fn fixture_plan_with_diff_and_conflict() -> ApplyPlan {
+        let conflict_rule_a = ResolvedRule {
+            ip: "127.0.0.1".parse().unwrap(),
+            domain: "conflict.example".into(),
+            source_profile_id: ProfileId(Uuid::new_v4()),
+            source_profile_name: "profile-a".into(),
+        };
+        let conflict_rule_b = ResolvedRule {
+            ip: "10.0.0.1".parse().unwrap(),
+            domain: "conflict.example".into(),
+            source_profile_id: ProfileId(Uuid::new_v4()),
+            source_profile_name: "profile-b".into(),
+        };
+        ApplyPlan {
+            rules: vec![],
+            conflicts: vec![RuleConflict {
+                domain: "conflict.example".into(),
+                rules: vec![conflict_rule_a, conflict_rule_b],
+            }],
+            diff: HostsDiff {
+                added: vec![
+                    "1.1.1.1 a.example".into(),
+                    "2.2.2.2 b.example".into(),
+                    "3.3.3.3 c.example".into(),
+                ],
+                removed: vec!["4.4.4.4 old.example".into(), "5.5.5.5 older.example".into()],
+                unchanged: (0..5)
+                    .map(|i| format!("10.0.0.{} stable.example", i))
+                    .collect(),
+            },
+            backup_required: true,
+        }
+    }
+
+    #[test]
+    fn apply_outcome_empty_has_zero_counts_and_no_conflicts() {
+        let outcome = ApplyOutcome::empty();
+        assert_eq!(outcome.added_count, 0);
+        assert_eq!(outcome.removed_count, 0);
+        assert_eq!(outcome.unchanged_count, 0);
+        assert!(outcome.disabled_profile_ids.is_empty());
+        assert!(!outcome.has_conflicts);
+        assert!(outcome.snapshot_id.is_none());
+        assert!(outcome.backup_path.is_none());
+        assert!(outcome.plan.rules.is_empty());
+        assert!(outcome.plan.conflicts.is_empty());
+        assert!(!outcome.plan.backup_required);
+    }
+
+    #[test]
+    fn apply_outcome_from_parts_computes_counts_and_has_conflicts() {
+        let plan = fixture_plan_with_diff_and_conflict();
+        let outcome = ApplyOutcome::from_parts(plan, vec![], Some("snap-1".into()), None);
+        assert_eq!(outcome.added_count, 3);
+        assert_eq!(outcome.removed_count, 2);
+        assert_eq!(outcome.unchanged_count, 5);
+        assert!(
+            outcome.has_conflicts,
+            "should derive true from non-empty conflicts"
+        );
+        assert_eq!(outcome.snapshot_id.as_deref(), Some("snap-1"));
+        assert!(outcome.backup_path.is_none());
+    }
+
+    #[test]
+    fn apply_outcome_from_parts_handles_backup_path() {
+        let plan = ApplyPlan {
+            rules: vec![],
+            conflicts: vec![],
+            diff: HostsDiff {
+                added: vec!["1.1.1.1 x".into()],
+                removed: vec![],
+                unchanged: vec![],
+            },
+            backup_required: true,
+        };
+        let path = PathBuf::from("/tmp/mhost-test/backups/hosts-20260101_120000.bak");
+        let outcome = ApplyOutcome::from_parts(plan, vec![], None, Some(path.clone()));
+        assert_eq!(
+            outcome.backup_path.as_deref(),
+            Some(path.to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    fn apply_outcome_serde_roundtrip() {
+        let plan = fixture_plan_with_diff_and_conflict();
+        let original = ApplyOutcome::from_parts(
+            plan,
+            vec!["disabled-1".into(), "disabled-2".into()],
+            Some("snap-xyz".into()),
+            Some(PathBuf::from("/var/backups/hosts.bak")),
+        );
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: ApplyOutcome = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, restored);
+    }
+
+    #[test]
+    fn apply_mode_serde_roundtrip() {
+        assert_eq!(
+            serde_json::to_string(&ApplyMode::QuickApply).unwrap(),
+            "\"quick_apply\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ApplyMode::RequirePreview).unwrap(),
+            "\"require_preview\""
+        );
+        let q: ApplyMode = serde_json::from_str("\"quick_apply\"").unwrap();
+        let r: ApplyMode = serde_json::from_str("\"require_preview\"").unwrap();
+        assert_eq!(q, ApplyMode::QuickApply);
+        assert_eq!(r, ApplyMode::RequirePreview);
     }
 }

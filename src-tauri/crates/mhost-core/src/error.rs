@@ -29,6 +29,20 @@ pub enum MhostError {
 
     #[error("invalid input: {0}")]
     InvalidInput(String),
+
+    /// A quick apply requested with `require_safe` was rejected because the
+    /// change is destructive (conflicts, would disable another profile, or a
+    /// bulk change over the threshold). The caller must fall back to the
+    /// preview dialog.
+    ///
+    /// Refs #127: server-side enforcement of the quick-apply policy under the
+    /// apply lock. This closes the preview/apply TOCTOU — the frontend's
+    /// decision is made from an unlocked preview, so state may have changed
+    /// before the write. The payload is a short human-readable reason (which
+    /// gate fired); the frontend re-fetches a fresh preview to populate the
+    /// dialog rather than trusting a payload-carried plan.
+    #[error("preview required: {0}")]
+    PreviewRequired(String),
 }
 
 impl From<std::io::Error> for MhostError {
@@ -208,6 +222,11 @@ mod tests {
                 MhostError::ExternalApi("GitHub API error: 403".to_string()),
                 "external API error",
             ),
+            (
+                "preview_required",
+                MhostError::PreviewRequired("conflicts detected".to_string()),
+                "preview required",
+            ),
         ];
 
         for (name, err, expected_substring) in cases {
@@ -289,6 +308,10 @@ mod tests {
             (
                 "external_api",
                 MhostError::ExternalApi("rate limited".to_string()),
+            ),
+            (
+                "preview_required",
+                MhostError::PreviewRequired("would disable another profile".to_string()),
             ),
         ];
 
