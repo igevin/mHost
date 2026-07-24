@@ -202,7 +202,7 @@ function ManagementDrawer({ open, onClose }: ManagementDrawerProps) {
       if (!fire()) return;
       releaseSoon();
       if (quickApplyEnabled && !forcePreview) {
-        quickApplyToggle({ id, enabled: !enabled });
+        quickApplyToggle({ id, enabled: !enabled, forcePreview });
       } else {
         previewApply({ id, enabled: !enabled });
       }

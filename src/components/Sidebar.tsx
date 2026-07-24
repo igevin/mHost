@@ -93,7 +93,7 @@ function Sidebar({ toolNavItems, onOpenManagement }: SidebarProps) {
       releaseSoon();
       setApplyError(null);
       if (quickApplyEnabled && !forcePreview) {
-        quickApplyToggle({ id, enabled: !enabled });
+        quickApplyToggle({ id, enabled: !enabled, forcePreview });
       } else {
         previewApply({ id, enabled: !enabled });
       }

@@ -28,6 +28,8 @@ export {
   adBlockRuleCountAtom,
   adBlockHasErrorsAtom,
   quickApplyOnToggleAtom,
+  quickApplyOutcomeAtom,
+  isQuickApplyToastOpenAtom,
 } from "./state";
 
 // ---- Async action atoms ----

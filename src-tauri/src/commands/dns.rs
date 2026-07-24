@@ -1,6 +1,7 @@
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
+use crate::state::lock_or_recover;
 use mhost_core::{MhostError, OriginalDns, ProfileMode};
 use tauri::State;
 use tokio::task::JoinHandle;
@@ -305,18 +306,10 @@ async fn set_dns_mode_enable(
     }
 
     // 8. manifest 已成功落盘，现在才允许修改 in-memory state。
-    match state.original_dns.lock() {
-        Ok(mut guard) => *guard = original,
-        Err(poisoned) => {
-            *poisoned.into_inner() = original;
-        }
-    }
-    match state.dns_server.lock() {
-        Ok(mut guard) => *guard = Some(server),
-        Err(poisoned) => {
-            *poisoned.into_inner() = Some(server);
-        }
-    }
+    // lock_or_recover: std::sync::Mutex poisoning is recovered transparently
+    // (see state::lock_or_recover docs).
+    *lock_or_recover(&state.original_dns) = original;
+    *lock_or_recover(&state.dns_server) = Some(server);
     state.dns_enabled.store(true, Ordering::Relaxed);
 
     // 9. 广告屏蔽（issue #130）：启用 DNS 后立即把当前 ad-block 状态
@@ -366,10 +359,7 @@ async fn set_dns_mode_disable(
     cancel: Option<&CancellationToken>,
 ) -> Result<(), MhostError> {
     // 1. 读取 in-memory original_dns（由 enable 路径写入）
-    let original = match state.original_dns.lock() {
-        Ok(guard) => guard.clone(),
-        Err(poisoned) => poisoned.into_inner().clone(),
-    };
+    let original = lock_or_recover(&state.original_dns).clone();
 
     // fix (bug 1, disable-mode refuses on empty snapshot):
     //   之前在 `state.original_dns` 为空 且 当前系统 DNS 含 127.0.0.1 时拒绝
@@ -426,10 +416,7 @@ async fn set_dns_mode_disable(
     }
 
     // 4. 停 server（清空 in-memory dns_server）
-    let server_opt = match state.dns_server.lock() {
-        Ok(mut guard) => guard.take(),
-        Err(poisoned) => poisoned.into_inner().take(),
-    };
+    let server_opt = lock_or_recover(&state.dns_server).take();
     if let Some(server) = server_opt {
         if let Err(e) = server.stop().await {
             // server 已 stop 失败（端口占用？），但 manifest 已标 false，
@@ -476,18 +463,8 @@ pub async fn reload_dns_rules(state: State<'_, AppState>) -> Result<(), MhostErr
         .map_err(MhostError::from)?;
     let enabled_profiles: Vec<_> = profiles.into_iter().filter(|p| p.enabled).collect();
 
-    match state.dns_server.lock() {
-        Ok(guard) => {
-            if let Some(server) = guard.as_ref() {
-                server.reload_rules(&enabled_profiles);
-            }
-        }
-        Err(poisoned) => {
-            let guard = poisoned.into_inner();
-            if let Some(server) = guard.as_ref() {
-                server.reload_rules(&enabled_profiles);
-            }
-        }
+    if let Some(server) = lock_or_recover(&state.dns_server).as_ref() {
+        server.reload_rules(&enabled_profiles);
     }
 
     Ok(())
@@ -836,10 +813,7 @@ mod tests {
 pub async fn get_dns_status(
     state: State<'_, AppState>,
 ) -> Result<mhost_core::DnsStatus, MhostError> {
-    let original_dns = match state.original_dns.lock() {
-        Ok(guard) => guard.clone(),
-        Err(poisoned) => poisoned.into_inner().clone(),
-    };
+    let original_dns = lock_or_recover(&state.original_dns).clone();
     fn build(
         server: Option<&mhost_dns::DnsServer>,
         original_dns: OriginalDns,
@@ -864,10 +838,7 @@ pub async fn get_dns_status(
         }
     }
 
-    let status = match state.dns_server.lock() {
-        Ok(guard) => build(guard.as_ref(), original_dns),
-        Err(poisoned) => build(poisoned.into_inner().as_ref(), original_dns),
-    };
+    let status = build(lock_or_recover(&state.dns_server).as_ref(), original_dns);
     Ok(status)
 }
 /// Abort the periodic ad-block refresh task if one is registered.

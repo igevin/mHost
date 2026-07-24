@@ -44,6 +44,13 @@ export function extractErrorMessage(err: unknown): string {
       return `invalid input: ${obj.InvalidInput}`;
     }
 
+    // MhostError::PreviewRequired(String) — normally intercepted by
+    // isPreviewRequired() before reaching here; handled defensively so an
+    // unexpected path never leaks the raw JSON envelope to the UI.
+    if (typeof obj.PreviewRequired === "string") {
+      return `preview required: ${obj.PreviewRequired}`;
+    }
+
     // MhostError::Network(String)
     if (typeof obj.Network === "string") {
       return `network error: ${obj.Network}`;
@@ -76,6 +83,19 @@ export function extractErrorMessage(err: unknown): string {
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+/**
+ * Detect a `MhostError::PreviewRequired(String)` returned from a quick-apply
+ * `enable_and_apply` call. Serializes as `{ PreviewRequired: "<reason>" }`.
+ *
+ * Refs #127: the server enforces the quick-apply policy under `apply_lock`.
+ * When the change turned destructive between the frontend's unlocked preview
+ * and the actual write, the command rejects with this variant so the caller
+ * falls back to the preview dialog instead of writing.
+ */
+export function isPreviewRequired(err: unknown): boolean {
+  return isPlainObject(err) && typeof err.PreviewRequired === "string";
 }
 
 /**

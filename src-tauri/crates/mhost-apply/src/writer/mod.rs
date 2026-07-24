@@ -156,7 +156,18 @@ impl HostsWriter {
     ///
     /// `backup_required` mirrors `ApplyPlan::backup_required` — taken as a
     /// separate param because the caller already destructured the plan.
-    pub fn apply_with_content(&self, plan: &ApplyPlan, current: &str) -> Result<(), MhostError> {
+    ///
+    /// Returns `Some(path)` if a backup was created (i.e. `backup_required` was
+    /// true at call time), `None` otherwise. The caller — `enable_and_apply`
+    /// — surfaces this path as `ApplyOutcome::backup_path` so the Quick Apply
+    /// toast can mention "snapshot saved" and offer rollback. Existing callers
+    /// that don't care about the path can simply `?` the `Result<_, _>` and
+    /// drop the inner `Option`.
+    pub fn apply_with_content(
+        &self,
+        plan: &ApplyPlan,
+        current: &str,
+    ) -> Result<Option<PathBuf>, MhostError> {
         ensure_regular_file(&self.hosts_path)?;
 
         let backup_path = if plan.backup_required {
@@ -196,7 +207,7 @@ impl HostsWriter {
             );
         }
 
-        Ok(())
+        Ok(backup_path)
     }
 
     /// Rollback to the most recent backup.

@@ -1,5 +1,10 @@
 import { atom } from "jotai";
-import type { Profile, DnsStatus, AdBlockState } from "../../types";
+import type {
+  Profile,
+  DnsStatus,
+  AdBlockState,
+  ApplyOutcome,
+} from "../../types";
 import { countRealRules } from "../../lib/rules";
 import { atomWithLocalStorage } from "../../lib/atomWithLocalStorage";
 
@@ -90,3 +95,14 @@ export const quickApplyOnToggleAtom = atomWithLocalStorage<boolean>(
   "mhost.quickApplyOnToggle",
   false,
 );
+
+// ---- Quick Apply feedback atoms (Refs #127) ----
+
+/** The most recent `ApplyOutcome` from `enable_and_apply` or
+ *  `preview_apply_outcome`. QuickApplyToast reads this to render the
+ *  summary + View Diff + Rollback affordances. */
+export const quickApplyOutcomeAtom = atom<ApplyOutcome | null>(null);
+
+/** Visibility gate for QuickApplyToast. Mounted in Layout at all times
+ *  but renders `null` when closed. */
+export const isQuickApplyToastOpenAtom = atom(false);

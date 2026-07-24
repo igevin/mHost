@@ -18,7 +18,7 @@ vi.mock("./lib/tauri", () => ({
   createProfile: vi.fn(),
   updateProfile: vi.fn(),
   deleteProfile: vi.fn(),
-  enableAndApply: vi.fn(),
+  enableAndApply: vi.fn().mockResolvedValue(undefined),
   rollbackHosts: vi.fn(),
   exportProfileToFile: vi.fn(),
   duplicateProfile: vi.fn(),

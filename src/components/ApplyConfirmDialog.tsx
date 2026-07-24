@@ -1,7 +1,8 @@
-import { useState, useCallback, useRef, useEffect } from "react";
+import { useCallback, useRef, useEffect } from "react";
 import { createPortal } from "react-dom";
 import type { ApplyPlan } from "../types";
 import { useWebKitPointerDown } from "../hooks/useWebKitPointerDown";
+import DiffView from "./DiffView";
 import styles from "./ApplyConfirmDialog.module.css";
 
 interface ApplyConfirmDialogProps {
@@ -26,7 +27,6 @@ function ApplyConfirmDialog({
   onRollback,
 }: ApplyConfirmDialogProps) {
   const { onPointerDown } = useWebKitPointerDown();
-  const [showUnchanged, setShowUnchanged] = useState(false);
   const confirmedRef = useRef(false);
   const cancelledRef = useRef(false);
   const rolledBackRef = useRef(false);
@@ -71,7 +71,6 @@ function ApplyConfirmDialog({
 
   const isPreview = !isApplying && !applyResult && !!plan;
   const hasConflicts = plan && plan.conflicts.length > 0;
-  const diffEmpty = plan && plan.diff.added.length === 0 && plan.diff.removed.length === 0;
 
   return createPortal(
     <div
@@ -89,81 +88,8 @@ function ApplyConfirmDialog({
         {/* Preview state */}
         {isPreview && (
           <>
-            {/* Diff preview */}
-            <div className={styles.diffSection}>
-              {diffEmpty ? (
-                <div className={styles.diffEmpty}>No changes detected</div>
-              ) : (
-                <div className={styles.diffPreview}>
-                  {/* **fix (P-F10, issue #90)**: keys were array indices.
-                   * Toggling "show unchanged" reuses DOM nodes with the same
-                   * index but different content — React reuses nodes that
-                   * no longer match, causing wrong line displayed in wrong
-                   * color slot. Use line content as key (each diff line is
-                   * unique within added/removed/unchanged). */}
-                  {plan.diff.added.map((line) => (
-                    <div key={`+${line}`} className={`${styles.diffLine} ${styles.diffAdded}`}>
-                      + {line}
-                    </div>
-                  ))}
-                  {plan.diff.removed.map((line) => (
-                    <div key={`-${line}`} className={`${styles.diffLine} ${styles.diffRemoved}`}>
-                      - {line}
-                    </div>
-                  ))}
-                  {plan.diff.unchanged.length > 0 && (
-                    <>
-                      {!showUnchanged ? (
-                        <button
-                          className={styles.diffUnchangedCollapsed}
-                          onClick={() => setShowUnchanged(true)}
-                        >
-                          ...{plan.diff.unchanged.length} unchanged lines...
-                        </button>
-                      ) : (
-                        <>
-                          {plan.diff.unchanged.map((line) => (
-                            <div
-                              key={`u${line}`}
-                              className={`${styles.diffLine} ${styles.diffUnchanged}`}
-                            >
-                              {`  ${line}`}
-                            </div>
-                          ))}
-                          <button
-                            className={styles.diffUnchangedCollapsed}
-                            onClick={() => setShowUnchanged(false)}
-                          >
-                            Collapse unchanged lines
-                          </button>
-                        </>
-                      )}
-                    </>
-                  )}
-                </div>
-              )}
-            </div>
-
-            {/* Conflicts */}
-            {hasConflicts && (
-              <div className={styles.conflictSection}>
-                <div className={styles.conflictWarning}>
-                  Warning: {plan.conflicts.length} conflict(s) detected
-                </div>
-                <div className={styles.conflictList}>
-                  {/* **fix (P-F10, issue #90)**: conflict.domain is unique
-                   * across conflicts — stable key. */}
-                  {plan.conflicts.map((conflict) => (
-                    <div key={conflict.domain} className={styles.conflictItem}>
-                      <span className={styles.conflictDomain}>{conflict.domain}</span>
-                      <span>
-                        — {conflict.rules.map((r) => r.source_profile_name).join(", ")}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
+            {/* Diff preview (shared component with QuickApplyToast) */}
+            <DiffView plan={plan} />
 
             {/* Backup notice */}
             {plan.backup_required && (
