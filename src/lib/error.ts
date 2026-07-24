@@ -79,6 +79,19 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
 }
 
 /**
+ * Detect a `MhostError::PreviewRequired(String)` returned from a quick-apply
+ * `enable_and_apply` call. Serializes as `{ PreviewRequired: "<reason>" }`.
+ *
+ * Refs #127: the server enforces the quick-apply policy under `apply_lock`.
+ * When the change turned destructive between the frontend's unlocked preview
+ * and the actual write, the command rejects with this variant so the caller
+ * falls back to the preview dialog instead of writing.
+ */
+export function isPreviewRequired(err: unknown): boolean {
+  return isPlainObject(err) && typeof err.PreviewRequired === "string";
+}
+
+/**
  * Render a single-variant tagged enum (e.g. `{ ProfileNotFound: "uuid" }`).
  * Returns `null` if the payload has no recognizable shape.
  */

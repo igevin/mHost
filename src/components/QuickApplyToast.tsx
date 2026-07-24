@@ -1,15 +1,13 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { useAtomValue, useSetAtom } from "jotai";
 import {
   quickApplyOutcomeAtom,
   isQuickApplyToastOpenAtom,
-  applyPlanAtom,
-  applyTargetAtom,
-  applyConfirmOpenAtom,
   rollbackHostsActionAtom,
   applyErrorAtom,
 } from "../stores/profiles";
 import type { ApplyOutcome, Profile } from "../types";
+import DiffView from "./DiffView";
 import RollbackButton from "./RollbackButton";
 import styles from "./QuickApplyToast.module.css";
 
@@ -22,30 +20,35 @@ interface QuickApplyToastProps {
 
 /**
  * Renders a top-right toast after a successful Quick Apply hosts toggle.
- * Shows a structured summary of the change, View Diff button (opens the
- * ApplyConfirmDialog in read-only mode), and Rollback (filesystem backup
- * via `rollbackHostsActionAtom`). Auto-dismisses after 5 seconds.
+ * Shows a structured summary of the change, an inline (expandable) diff via
+ * the shared `<DiffView>`, and Rollback (filesystem backup via
+ * `rollbackHostsActionAtom`). Auto-dismisses after 5 seconds — the timer is
+ * paused while the diff is expanded so the user can read it.
  *
- * Refs #127.
+ * Refs #127. The diff is rendered read-only inside the toast rather than
+ * reopening the ApplyConfirmDialog (the apply already happened, so a
+ * confirm dialog with a live "Apply" button would be misleading).
  */
 function QuickApplyToast({ profiles }: QuickApplyToastProps) {
   const outcome = useAtomValue(quickApplyOutcomeAtom);
   const isOpen = useAtomValue(isQuickApplyToastOpenAtom);
   const setIsOpen = useSetAtom(isQuickApplyToastOpenAtom);
-  const setApplyPlan = useSetAtom(applyPlanAtom);
-  const setApplyTarget = useSetAtom(applyTargetAtom);
-  const setApplyConfirmOpen = useSetAtom(applyConfirmOpenAtom);
   const rollbackHostsAction = useSetAtom(rollbackHostsActionAtom);
   const setApplyError = useSetAtom(applyErrorAtom);
+  const [showDiff, setShowDiff] = useState(false);
 
-  // Reset the dismiss timer on each new outcome (snapshot_id is a stable
-  // identity for "this is a new apply"). Fall back to plan reference for
-  // cases where snapshot_id is None (DNS-mode apply).
+  // Reset the expanded diff whenever a new outcome arrives.
   useEffect(() => {
-    if (!isOpen) return;
+    setShowDiff(false);
+  }, [outcome]);
+
+  // Auto-dismiss after a delay, but not while the diff is expanded (the user
+  // is actively reading it).
+  useEffect(() => {
+    if (!isOpen || showDiff) return;
     const t = setTimeout(() => setIsOpen(false), AUTO_DISMISS_MS);
     return () => clearTimeout(t);
-  }, [isOpen, outcome?.snapshot_id, outcome, setIsOpen]);
+  }, [isOpen, outcome, showDiff, setIsOpen]);
 
   if (!isOpen || !outcome) return null;
 
@@ -54,17 +57,9 @@ function QuickApplyToast({ profiles }: QuickApplyToastProps) {
   );
 
   const summary = buildSummary(outcome, disabledNames);
-
-  const handleViewDiff = () => {
-    // Open the existing ApplyConfirmDialog with the plan. Leave
-    // applyTargetAtom = null so executeApplyAtom bails early (existing
-    // behavior at actions.ts:163) — the apply already happened, we
-    // just want the diff for context.
-    setApplyPlan(outcome.plan);
-    setApplyTarget(null);
-    setApplyConfirmOpen(true);
-    setIsOpen(false);
-  };
+  const diffEmpty =
+    outcome.plan.diff.added.length === 0 &&
+    outcome.plan.diff.removed.length === 0;
 
   const handleRollback = async () => {
     try {
@@ -87,13 +82,18 @@ function QuickApplyToast({ profiles }: QuickApplyToastProps) {
           ×
         </button>
       </div>
-      {outcome.snapshot_id && (
-        <div className={styles.meta}>Snapshot saved</div>
-      )}
+      {outcome.snapshot_id && <div className={styles.meta}>Snapshot saved</div>}
+      {showDiff && <DiffView plan={outcome.plan} compact />}
       <div className={styles.actions}>
-        <button className="btn btn-ghost" onClick={handleViewDiff}>
-          View Diff
-        </button>
+        {!diffEmpty && (
+          <button
+            className="btn btn-ghost"
+            onClick={() => setShowDiff((v) => !v)}
+            aria-expanded={showDiff}
+          >
+            {showDiff ? "Hide Diff" : "View Diff"}
+          </button>
+        )}
         <RollbackButton onRollback={handleRollback} />
       </div>
     </div>

@@ -319,6 +319,62 @@ pub fn enable_and_apply_logic(
 /// **No `apply_lock` is acquired** — `generate_preview_plan_logic` only
 /// reads storage, and `compute_disabled_ids_logic` is a pure read. Locking
 /// happens in `enable_and_apply` (the write path) only.
+/// Compute the `ApplyOutcome` a would-be `enable_and_apply(id, enabled)` call
+/// produces, **without writing anything**. Shared by the read-only
+/// `preview_apply_outcome` IPC and the server-side safety guard
+/// (`enforce_quick_apply_policy`) so both classify identical outcomes.
+///
+/// `snapshot_id` / `backup_path` are always `None` — no write occurred.
+pub fn preview_outcome_logic(
+    id: &ProfileId,
+    enabled: bool,
+    storage: &(dyn Storage + Send + Sync),
+    writer: &HostsWriter,
+) -> Result<ApplyOutcome, MhostError> {
+    let plan = generate_preview_plan_logic(id, enabled, storage, writer)?;
+    let disabled_ids = compute_disabled_ids_logic(id, enabled, storage)?;
+    Ok(ApplyOutcome::from_parts(plan, disabled_ids, None, None))
+}
+
+/// Server-side enforcement of the quick-apply policy. Refs #127.
+///
+/// When `require_safe` is true (the Quick Apply IPC path), re-derive the
+/// outcome and reject with `MhostError::PreviewRequired` if
+/// `decide_apply_mode` classifies it as `RequirePreview`. When false (the
+/// dialog-confirmed path via `executeApplyAtom`, where the user has already
+/// seen the diff), this is a no-op — conflicts may legitimately be applied.
+///
+/// **Must be called while holding `apply_lock`** so the decision and the
+/// subsequent write are atomic. This closes the preview/apply TOCTOU: the
+/// frontend's `decideApplyMode` runs on an *unlocked* preview, so a
+/// concurrent tray toggle or external `/etc/hosts` edit could make the
+/// change destructive between preview and write. The frontend still
+/// pre-checks (fast path: destructive toggles open the dialog without a
+/// write attempt); this guard is the authoritative backstop.
+pub fn enforce_quick_apply_policy(
+    id: &ProfileId,
+    enabled: bool,
+    storage: &(dyn Storage + Send + Sync),
+    writer: &HostsWriter,
+    require_safe: bool,
+) -> Result<(), MhostError> {
+    if !require_safe {
+        return Ok(());
+    }
+    let preview = preview_outcome_logic(id, enabled, storage, writer)?;
+    if decide_apply_mode(&preview) == ApplyMode::RequirePreview {
+        let reason = if preview.has_conflicts {
+            "conflicts detected"
+        } else if !preview.disabled_profile_ids.is_empty() {
+            "would disable another enabled profile"
+        } else {
+            "bulk change exceeds the quick-apply threshold"
+        };
+        return Err(MhostError::PreviewRequired(reason.to_string()));
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn preview_apply_outcome(
     id: String,
@@ -329,9 +385,7 @@ pub async fn preview_apply_outcome(
     let writer = state.writer.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let profile_id = ProfileId::from_str(&id)?;
-        let plan = generate_preview_plan_logic(&profile_id, enabled, storage.as_ref(), &writer)?;
-        let disabled_ids = compute_disabled_ids_logic(&profile_id, enabled, storage.as_ref())?;
-        Ok::<ApplyOutcome, MhostError>(ApplyOutcome::from_parts(plan, disabled_ids, None, None))
+        preview_outcome_logic(&profile_id, enabled, storage.as_ref(), &writer)
     })
     .await
     .map_err(|e| MhostError::InvalidInput(e.to_string()))?
@@ -346,10 +400,18 @@ pub async fn preview_apply_outcome(
 /// Refs (#127): Returns `ApplyOutcome` so the frontend can surface
 /// structured feedback (counts / disabled IDs / snapshot id / backup path)
 /// to the Quick Apply toast.
+///
+/// `require_safe` (Refs #127): when true, the quick-apply policy is enforced
+/// server-side under `apply_lock` — a destructive change (conflicts / would
+/// disable another profile / bulk) is rejected with
+/// `MhostError::PreviewRequired` instead of being written, and the frontend
+/// falls back to the preview dialog. The dialog-confirmed path passes
+/// `false` (the user already saw the diff).
 #[tauri::command]
 pub async fn enable_and_apply(
     id: String,
     enabled: bool,
+    require_safe: bool,
     state: State<'_, AppState>,
     app_handle: AppHandle,
 ) -> Result<ApplyOutcome, MhostError> {
@@ -361,6 +423,17 @@ pub async fn enable_and_apply(
         let writer = state.writer.clone();
         let storage = state.storage.clone();
         tauri::async_runtime::spawn_blocking(move || {
+            // Refs #127: enforce the quick-apply policy UNDER the lock, before
+            // any mutation, so the decision and the write are atomic. No-op
+            // when `require_safe` is false (dialog-confirmed path).
+            enforce_quick_apply_policy(
+                &profile_id,
+                enabled,
+                storage.as_ref(),
+                &writer,
+                require_safe,
+            )?;
+
             let (disabled_ids, backup_path) =
                 enable_and_apply_logic(&profile_id, enabled, storage.as_ref(), &writer)?;
 
@@ -1212,17 +1285,8 @@ mod tests {
     }
 
     // ---- preview_apply_outcome (Refs #127) ----
-
-    fn preview_apply_outcome_logic(
-        id: ProfileId,
-        enabled: bool,
-        storage: &(dyn Storage + Send + Sync),
-        writer: &HostsWriter,
-    ) -> Result<ApplyOutcome, MhostError> {
-        let plan = generate_preview_plan_logic(&id, enabled, storage, writer)?;
-        let disabled_ids = compute_disabled_ids_logic(&id, enabled, storage)?;
-        Ok(ApplyOutcome::from_parts(plan, disabled_ids, None, None))
-    }
+    // Tests call the promoted `preview_outcome_logic` (shared by the IPC and
+    // the server-side guard) directly.
 
     #[test]
     fn test_preview_apply_outcome_does_not_write_hosts_or_storage() {
@@ -1232,7 +1296,7 @@ mod tests {
         p.enabled = true;
         storage.save_profile(&p).unwrap();
 
-        let outcome = preview_apply_outcome_logic(p.id.clone(), true, storage.as_ref(), &writer)
+        let outcome = preview_outcome_logic(&p.id, true, storage.as_ref(), &writer)
             .expect("preview must succeed");
 
         assert!(outcome.snapshot_id.is_none(), "preview never writes");
@@ -1262,9 +1326,8 @@ mod tests {
         other.enabled = true;
         storage.save_profile(&other).unwrap();
 
-        let outcome =
-            preview_apply_outcome_logic(target.id.clone(), true, storage.as_ref(), &writer)
-                .expect("preview must succeed");
+        let outcome = preview_outcome_logic(&target.id, true, storage.as_ref(), &writer)
+            .expect("preview must succeed");
         assert_eq!(outcome.disabled_profile_ids, vec![other.id.to_string()]);
         assert!(!outcome.has_conflicts);
     }
@@ -1277,8 +1340,94 @@ mod tests {
         p.enabled = true;
         storage.save_profile(&p).unwrap();
 
-        let outcome = preview_apply_outcome_logic(p.id, true, storage.as_ref(), &writer).unwrap();
+        let outcome = preview_outcome_logic(&p.id, true, storage.as_ref(), &writer).unwrap();
         assert!(outcome.snapshot_id.is_none());
         assert!(outcome.backup_path.is_none());
+    }
+
+    // ---- enforce_quick_apply_policy (Refs #127) ----
+    // Server-side backstop for the quick-apply policy, run under `apply_lock`.
+
+    #[test]
+    fn test_enforce_policy_noop_when_require_safe_false() {
+        // Even a destructive change (would disable another enabled profile)
+        // passes when require_safe=false — the dialog-confirmed path.
+        let (_tmp, storage, writer) = create_test_storage_and_writer();
+        let mut target = Profile::new("target");
+        target.mode = ProfileMode::Hosts;
+        target.enabled = false;
+        storage.save_profile(&target).unwrap();
+        let mut other = Profile::new("other");
+        other.mode = ProfileMode::Hosts;
+        other.enabled = true;
+        storage.save_profile(&other).unwrap();
+
+        let result = enforce_quick_apply_policy(&target.id, true, storage.as_ref(), &writer, false);
+        assert!(result.is_ok(), "require_safe=false must never reject");
+    }
+
+    #[test]
+    fn test_enforce_policy_safe_change_is_allowed() {
+        // Single profile, small change, no conflicts → quick apply allowed.
+        let (_tmp, storage, writer) = create_test_storage_and_writer();
+        let mut p = create_profile_with_rules(&storage, "solo", vec![("127.0.0.1", "solo.local")]);
+        p.enabled = false;
+        storage.save_profile(&p).unwrap();
+
+        let result = enforce_quick_apply_policy(&p.id, true, storage.as_ref(), &writer, true);
+        assert!(
+            result.is_ok(),
+            "a safe change must pass under require_safe: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_enforce_policy_rejects_when_would_disable_another_profile() {
+        // Enabling `target` while `other` is enabled would auto-disable
+        // `other` — destructive side effect → PreviewRequired.
+        let (_tmp, storage, writer) = create_test_storage_and_writer();
+        let mut target =
+            create_profile_with_rules(&storage, "target", vec![("127.0.0.1", "t.local")]);
+        target.enabled = false;
+        storage.save_profile(&target).unwrap();
+        let mut other = create_profile_with_rules(&storage, "other", vec![("10.0.0.1", "o.local")]);
+        other.enabled = true;
+        storage.save_profile(&other).unwrap();
+
+        let err = enforce_quick_apply_policy(&target.id, true, storage.as_ref(), &writer, true)
+            .expect_err("enabling over another enabled profile must require preview");
+        match err {
+            MhostError::PreviewRequired(reason) => {
+                assert!(
+                    reason.contains("disable"),
+                    "reason should mention the disabled-profile gate, got: {}",
+                    reason
+                );
+            }
+            other => panic!("expected PreviewRequired, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_enforce_policy_rejects_bulk_change() {
+        // A single profile with > DESTRUCTIVE_THRESHOLD rules trips the bulk
+        // gate even with no conflicts and nothing to disable.
+        let (_tmp, storage, writer) = create_test_storage_and_writer();
+        let rules: Vec<(&str, String)> = (0..(DESTRUCTIVE_THRESHOLD + 5))
+            .map(|i| ("127.0.0.1", format!("bulk{}.local", i)))
+            .collect();
+        let rule_refs: Vec<(&str, &str)> = rules.iter().map(|(ip, d)| (*ip, d.as_str())).collect();
+        let mut p = create_profile_with_rules(&storage, "bulk", rule_refs);
+        p.enabled = false;
+        storage.save_profile(&p).unwrap();
+
+        let err = enforce_quick_apply_policy(&p.id, true, storage.as_ref(), &writer, true)
+            .expect_err("bulk change must require preview");
+        assert!(
+            matches!(err, MhostError::PreviewRequired(_)),
+            "expected PreviewRequired for bulk change, got {:?}",
+            err
+        );
     }
 }

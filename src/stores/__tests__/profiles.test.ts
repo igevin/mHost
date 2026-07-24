@@ -186,7 +186,7 @@ describe("quickApplyToggleAtom (issue #127)", () => {
     await store.set(quickApplyToggleAtom, { id: "p1", enabled: true });
 
     expect(previewApplyOutcome).toHaveBeenCalledWith("p1", true);
-    expect(enableAndApply).toHaveBeenCalledWith("p1", true);
+    expect(enableAndApply).toHaveBeenCalledWith("p1", true, true);
     expect(listProfiles).toHaveBeenCalledTimes(1);
     expect(store.get(applyResultAtom)).toBe("success");
     expect(store.get(applyErrorAtom)).toBeNull();
@@ -299,5 +299,43 @@ describe("quickApplyToggleAtom (issue #127)", () => {
     expect(enableAndApply).not.toHaveBeenCalled();
     expect(store.get(applyConfirmOpenAtom)).toBe(true);
     expect(store.get(applyTargetAtom)).toEqual({ id: "p1", enabled: true });
+  });
+
+  // Refs #127: server-side TOCTOU backstop. The unlocked preview looked
+  // safe (quick_apply), so enableAndApply is called — but the server
+  // re-checked under the lock, found the change destructive, and rejected
+  // with MhostError::PreviewRequired ({ PreviewRequired: "..." }). The atom
+  // must fall back to the dialog with a fresh preview, not surface an error.
+  it("server rejects with PreviewRequired -> refetches preview and opens dialog", async () => {
+    const store = getDefaultStore();
+    store.set(profilesAtom, [makeProfile({ id: "p1", enabled: false })]);
+
+    // First preview (pre-write) is safe → decideApplyMode returns quick_apply.
+    // Refetch (post-rejection) returns the now-conflicting outcome.
+    const conflictOutcome: ApplyOutcome = {
+      ...safeOutcome,
+      has_conflicts: true,
+      plan: { ...safePlan, conflicts: [{ domain: "x.example", rules: [] }] },
+    };
+    const previewMock = previewApplyOutcome as unknown as {
+      mockResolvedValueOnce: (v: unknown) => typeof previewMock;
+    };
+    previewMock.mockResolvedValueOnce(safeOutcome); // pre-write preview: safe
+    previewMock.mockResolvedValueOnce(conflictOutcome); // refetch after rejection
+    (enableAndApply as unknown as { mockRejectedValueOnce: (v: unknown) => void })
+      .mockRejectedValueOnce({ PreviewRequired: "conflicts detected" });
+
+    await store.set(quickApplyToggleAtom, { id: "p1", enabled: true });
+
+    expect(enableAndApply).toHaveBeenCalledWith("p1", true, true);
+    // Preview fetched twice: once pre-write, once after the rejection.
+    expect(previewApplyOutcome).toHaveBeenCalledTimes(2);
+    expect(store.get(applyConfirmOpenAtom)).toBe(true);
+    expect(store.get(applyPlanAtom)).toEqual(conflictOutcome.plan);
+    expect(store.get(applyTargetAtom)).toEqual({ id: "p1", enabled: true });
+    // Not surfaced as an error, and no success toast.
+    expect(store.get(applyErrorAtom)).toBeNull();
+    expect(store.get(isQuickApplyToastOpenAtom)).toBe(false);
+    expect(store.get(isApplyingAtom)).toBe(false);
   });
 });

@@ -54,8 +54,9 @@ export async function setProfileEnabled(
 export async function enableAndApply(
   id: string,
   enabled: boolean,
+  requireSafe = false,
 ): Promise<ApplyOutcome> {
-  return invoke<ApplyOutcome>("enable_and_apply", { id, enabled });
+  return invoke<ApplyOutcome>("enable_and_apply", { id, enabled, requireSafe });
 }
 
 /// Read-only IPC: compute what an `enableAndApply(id, enabled)` call would
