@@ -514,35 +514,35 @@ async fn handle_dns_request(
     }
 
     match handle_address_query(
-            name_str,
-            query.name(),
-            record_type,
-            rule_engine,
-            ad_block_engine,
-            resolver,
-        )
-        .await
-        {
-            QueryResult::Answer(record) => {
-                let ttl = record.ttl();
-                // **fix (P-R2, issue #90)**: `*record.clone()` 之前是 `clone Box + deref`
-                // （两次 alloc：Box 本身 + Box 内的 Record）。`record.as_ref().clone()`
-                // 只 alloc 一次（Record 本身），更高效。
-                let answer = record.as_ref().clone();
-                let response_bytes = build_answer_response(&request, &query, answer.clone());
+        name_str,
+        query.name(),
+        record_type,
+        rule_engine,
+        ad_block_engine,
+        resolver,
+    )
+    .await
+    {
+        QueryResult::Answer(record) => {
+            let ttl = record.ttl();
+            // **fix (P-R2, issue #90)**: `*record.clone()` 之前是 `clone Box + deref`
+            // （两次 alloc：Box 本身 + Box 内的 Record）。`record.as_ref().clone()`
+            // 只 alloc 一次（Record 本身），更高效。
+            let answer = record.as_ref().clone();
+            let response_bytes = build_answer_response(&request, &query, answer.clone());
 
-                // TTL=0 是合法 DNS 值（"不要缓存"），跳过 put 避免
-                // 浪费 LRU slot 且下次 peek 立刻过期被 pop。
-                if ttl > 0 {
-                    let expires_at = now + std::time::Duration::from_secs(ttl as u64);
-                    cache.lock().put(cache_key, (vec![answer], expires_at));
-                }
-                response_bytes
+            // TTL=0 是合法 DNS 值（"不要缓存"），跳过 put 避免
+            // 浪费 LRU slot 且下次 peek 立刻过期被 pop。
+            if ttl > 0 {
+                let expires_at = now + std::time::Duration::from_secs(ttl as u64);
+                cache.lock().put(cache_key, (vec![answer], expires_at));
             }
-            QueryResult::NoError => build_noerror_response(&request, &query),
-            QueryResult::NxDomain => build_nxdomain_response(&request, &query),
-            QueryResult::ServFail => build_servfail_response(&request, &query),
+            response_bytes
         }
+        QueryResult::NoError => build_noerror_response(&request, &query),
+        QueryResult::NxDomain => build_nxdomain_response(&request, &query),
+        QueryResult::ServFail => build_servfail_response(&request, &query),
+    }
 }
 
 /// 在持锁状态下构造缓存命中的响应字节（避免 `records.clone()`）。

@@ -327,8 +327,12 @@ fn spawn_ad_block_refresh_task(state: &AppState) {
             };
 
             for id in &ids {
-                if let Err(e) =
-                    crate::commands::adblock::fetch_and_cache_source_internal(&storage, &ad_block_state, id).await
+                if let Err(e) = crate::commands::adblock::fetch_and_cache_source_internal(
+                    &storage,
+                    &ad_block_state,
+                    id,
+                )
+                .await
                 {
                     let _ = crate::commands::adblock::record_fetch_error_internal(
                         &ad_block_state,
@@ -347,8 +351,7 @@ fn spawn_ad_block_refresh_task(state: &AppState) {
             if lock_or_recover(&dns_server).is_some() {
                 let snap = ad_block_state.read().await.clone();
                 let root = storage.root();
-                let (za, nx, wl) =
-                    crate::commands::adblock::classify_rules(&snap, root);
+                let (za, nx, wl) = crate::commands::adblock::classify_rules(&snap, root);
                 if let Some(server) = lock_or_recover(&dns_server).as_ref() {
                     server.reload_ad_block_rules(za, nx, wl);
                 }
@@ -465,9 +468,7 @@ mod tests {
             dns_enabled: AtomicBool::new(false),
             original_dns: Mutex::new(OriginalDns::DhcpEmpty),
             dns_lock: ApplyLock::new(),
-            ad_block_state: Arc::new(tokio::sync::RwLock::new(
-                mhost_core::AdBlockState::default(),
-            )),
+            ad_block_state: Arc::new(tokio::sync::RwLock::new(mhost_core::AdBlockState::default())),
             ad_block_refresh_task: Mutex::new(None),
         };
         // dns_enabled = false → cleanup 应直接返回 Ok
@@ -507,9 +508,7 @@ mod tests {
             dns_enabled: AtomicBool::new(true), // 假装启用 → cleanup 会走 disable 路径
             original_dns: Mutex::new(OriginalDns::DhcpEmpty), // DhcpEmpty → 写 Empty
             dns_lock: ApplyLock::new(),
-            ad_block_state: Arc::new(tokio::sync::RwLock::new(
-                mhost_core::AdBlockState::default(),
-            )),
+            ad_block_state: Arc::new(tokio::sync::RwLock::new(mhost_core::AdBlockState::default())),
             ad_block_refresh_task: Mutex::new(None),
         };
         // cleanup_dns_on_exit → set_dns_mode_disable(interactive=false)
@@ -562,9 +561,7 @@ mod tests {
             dns_enabled: AtomicBool::new(true),
             original_dns: Mutex::new(OriginalDns::DhcpEmpty),
             dns_lock: ApplyLock::new(),
-            ad_block_state: Arc::new(tokio::sync::RwLock::new(
-                mhost_core::AdBlockState::default(),
-            )),
+            ad_block_state: Arc::new(tokio::sync::RwLock::new(mhost_core::AdBlockState::default())),
             ad_block_refresh_task: Mutex::new(None),
         };
 

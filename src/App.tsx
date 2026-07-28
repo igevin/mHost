@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import { Routes, Route, Navigate } from "react-router-dom";
+import { Routes, Route, Navigate, useNavigate } from "react-router-dom";
 import { listen } from "@tauri-apps/api/event";
 import { useSetAtom } from "jotai";
 import Layout from "./components/Layout";
@@ -7,12 +7,20 @@ import ProfileView from "./pages/ProfileView";
 import Settings from "./pages/Settings";
 import SnapshotPage from "./pages/Snapshot";
 import SystemHosts from "./pages/SystemHosts";
-import { fetchProfilesAtom, fetchDnsProfilesAtom, fetchDnsModeAtom } from "./stores/profiles";
+import AdBlock from "./pages/AdBlock";
+import {
+  fetchProfilesAtom,
+  fetchDnsProfilesAtom,
+  fetchDnsModeAtom,
+  fetchAdBlockStateAtom,
+} from "./stores/profiles";
 
 function App() {
   const fetchProfiles = useSetAtom(fetchProfilesAtom);
   const fetchDnsProfiles = useSetAtom(fetchDnsProfilesAtom);
   const fetchDnsMode = useSetAtom(fetchDnsModeAtom);
+  const fetchAdBlock = useSetAtom(fetchAdBlockStateAtom);
+  const navigate = useNavigate();
 
   useEffect(() => {
     // Load profiles on app mount
@@ -25,14 +33,27 @@ function App() {
     fetchDnsMode().catch(() => {
       // Ignore: error is already stored in dnsErrorAtom
     });
+    fetchAdBlock().catch(() => {
+      // Ignore: error is already stored in adBlockErrorAtom
+    });
 
-    const unlisten = listen("tray:profiles-updated", () => {
+    const unlistenProfiles = listen("tray:profiles-updated", () => {
       fetchProfiles();
     });
+    // issue #130: tray "广告屏蔽" menu item emits this event with the
+    // target route. Lets the tray drive deep-linking to /ad-block (and any
+    // future route-driven tray entries) without coupling backend to router.
+    const unlistenNavigate = listen<string>("navigate", (event) => {
+      const target = event.payload;
+      if (typeof target === "string" && target.startsWith("/")) {
+        navigate(target);
+      }
+    });
     return () => {
-      unlisten.then((fn) => fn()).catch(() => {});
+      unlistenProfiles.then((fn) => fn()).catch(() => {});
+      unlistenNavigate.then((fn) => fn()).catch(() => {});
     };
-  }, [fetchProfiles, fetchDnsProfiles, fetchDnsMode]);
+  }, [fetchProfiles, fetchDnsProfiles, fetchDnsMode, fetchAdBlock, navigate]);
 
   return (
     <Routes>
@@ -45,6 +66,7 @@ function App() {
         <Route path="/settings" element={<Settings />} />
         <Route path="/snapshot" element={<SnapshotPage />} />
         <Route path="/hosts" element={<SystemHosts />} />
+        <Route path="/ad-block" element={<AdBlock />} />
       </Route>
     </Routes>
   );

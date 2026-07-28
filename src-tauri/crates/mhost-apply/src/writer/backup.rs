@@ -19,8 +19,8 @@ const MAX_BACKUPS: usize = 10;
 ///
 /// **fix（H2, issue #90）**：backup 文件用 `OpenOptions` + `mode(0o600)` 写，
 /// 不再用 `fs::write` 默认 umask（macOS 上是 0o644）。backups 可能含内部
-/// dev/staging 主机名 + ad-block patterns，多用户机器上其他本地用户可
-/// 能读取 → 收紧权限。
+/// dev/staging 主机名 + 用户自定义 hosts 重写规则，多用户机器上其他本地
+/// 用户可能读取 → 收紧权限。
 pub fn create_backup(backup_dir: &Path, content: &str) -> Result<PathBuf, MhostError> {
     use std::os::unix::fs::OpenOptionsExt;
     fs::create_dir_all(backup_dir)?;

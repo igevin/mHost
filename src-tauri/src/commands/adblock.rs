@@ -13,9 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
-use mhost_core::{
-    AdBlockResponse, AdBlockSource, AdBlockState, MhostError, SourceId,
-};
+use mhost_core::{AdBlockResponse, AdBlockSource, AdBlockState, MhostError, SourceId};
 use mhost_hosts::Parser;
 use mhost_storage::adblock as adblock_store;
 use tauri::State;
@@ -87,11 +85,7 @@ pub(crate) async fn persist_and_reload(state: &AppState) -> Result<(), MhostErro
 pub(crate) fn classify_rules(
     state: &AdBlockState,
     root: &std::path::Path,
-) -> (
-    HashMap<String, IpAddr>,
-    HashSet<String>,
-    HashSet<String>,
-) {
+) -> (HashMap<String, IpAddr>, HashSet<String>, HashSet<String>) {
     let mut zero_addr: HashMap<String, IpAddr> = HashMap::new();
     let mut nxdomain: HashSet<String> = HashSet::new();
 
@@ -210,9 +204,8 @@ pub(crate) async fn fetch_and_cache_source(
         .await
         .map_err(|e| MhostError::Network(format!("read body error: {}", e)))?;
 
-    let content_str = std::str::from_utf8(&body).map_err(|e| {
-        MhostError::InvalidInput(format!("response is not valid UTF-8: {}", e))
-    })?;
+    let content_str = std::str::from_utf8(&body)
+        .map_err(|e| MhostError::InvalidInput(format!("response is not valid UTF-8: {}", e)))?;
 
     // 3. Parse + enforce hard limit. Use spawn_blocking because the parser
     // is sync and the input can be large.
@@ -348,26 +341,25 @@ pub(crate) async fn fetch_and_cache_source_internal(
     let content_owned = content_str.to_string();
     let root = storage.root().to_path_buf();
     let id_owned = source_id.clone();
-    let parse_result: Result<usize, MhostError> =
-        tokio::task::spawn_blocking(move || {
-            let domains = parse_blocklist_domains(&content_owned);
-            if domains.len() > MAX_RULES_PER_SOURCE {
-                return Err(MhostError::InvalidInput(format!(
-                    "source produced {} rules (limit: {})",
-                    domains.len(),
-                    MAX_RULES_PER_SOURCE
-                )));
-            }
-            let canon = domains
-                .iter()
-                .map(|d| format!("0.0.0.0 {}", d))
-                .collect::<Vec<_>>()
-                .join("\n");
-            adblock_store::write_cache(&root, &id_owned, canon.as_bytes())?;
-            Ok(domains.len())
-        })
-        .await
-        .map_err(|e| MhostError::InvalidInput(format!("parse task failed: {}", e)))?;
+    let parse_result: Result<usize, MhostError> = tokio::task::spawn_blocking(move || {
+        let domains = parse_blocklist_domains(&content_owned);
+        if domains.len() > MAX_RULES_PER_SOURCE {
+            return Err(MhostError::InvalidInput(format!(
+                "source produced {} rules (limit: {})",
+                domains.len(),
+                MAX_RULES_PER_SOURCE
+            )));
+        }
+        let canon = domains
+            .iter()
+            .map(|d| format!("0.0.0.0 {}", d))
+            .collect::<Vec<_>>()
+            .join("\n");
+        adblock_store::write_cache(&root, &id_owned, canon.as_bytes())?;
+        Ok(domains.len())
+    })
+    .await
+    .map_err(|e| MhostError::InvalidInput(format!("parse task failed: {}", e)))?;
 
     let rule_count = match parse_result {
         Ok(n) => n,
@@ -513,9 +505,8 @@ pub async fn set_ad_block_source_enabled(
 ) -> Result<AdBlockSource, MhostError> {
     {
         let mut guard = state.ad_block_state.write().await;
-        let s = adblock_store::find_source_mut(&mut guard, &source_id).ok_or_else(|| {
-            MhostError::InvalidInput(format!("source not found: {}", source_id))
-        })?;
+        let s = adblock_store::find_source_mut(&mut guard, &source_id)
+            .ok_or_else(|| MhostError::InvalidInput(format!("source not found: {}", source_id)))?;
         s.enabled = enabled;
     }
     persist_and_reload(&state).await?;
@@ -533,9 +524,8 @@ pub async fn set_ad_block_source_response(
 ) -> Result<AdBlockSource, MhostError> {
     {
         let mut guard = state.ad_block_state.write().await;
-        let s = adblock_store::find_source_mut(&mut guard, &source_id).ok_or_else(|| {
-            MhostError::InvalidInput(format!("source not found: {}", source_id))
-        })?;
+        let s = adblock_store::find_source_mut(&mut guard, &source_id)
+            .ok_or_else(|| MhostError::InvalidInput(format!("source not found: {}", source_id)))?;
         s.response = response;
     }
     persist_and_reload(&state).await?;
@@ -642,8 +632,10 @@ mod tests {
     #[test]
     fn classify_rules_disabled_master_yields_empty() {
         let temp = tempfile::TempDir::new().unwrap();
-        let mut state = AdBlockState::default();
-        state.enabled = false;
+        let mut state = AdBlockState {
+            enabled: false,
+            ..Default::default()
+        };
         state.sources.push(AdBlockSource {
             source_id: SourceId(Uuid::new_v4()),
             name: "s".into(),
@@ -664,8 +656,6 @@ mod tests {
     #[test]
     fn classify_rules_partitions_by_response() {
         let temp = tempfile::TempDir::new().unwrap();
-        let mut state = AdBlockState::default();
-        state.enabled = true;
         let mk = |name: &str, response: AdBlockResponse, enabled: bool| AdBlockSource {
             source_id: SourceId(Uuid::new_v4()),
             name: name.into(),
@@ -677,13 +667,16 @@ mod tests {
             rule_count: 0,
             etag: None,
         };
-        // No cache files written — domains_for_source returns [] when cache
-        // is missing, but the partitioning + whitelist logic still runs.
-        state.sources.push(mk("za", AdBlockResponse::ZeroAddress, true));
-        state.sources.push(mk("nx", AdBlockResponse::NxDomain, true));
-        state.sources.push(mk("off", AdBlockResponse::ZeroAddress, false));
-        state.whitelist.push("trusted.com".into());
-
+        let state = AdBlockState {
+            enabled: true,
+            sources: vec![
+                mk("za", AdBlockResponse::ZeroAddress, true),
+                mk("nx", AdBlockResponse::NxDomain, true),
+                mk("off", AdBlockResponse::ZeroAddress, false),
+            ],
+            whitelist: vec!["trusted.com".to_string()],
+            ..Default::default()
+        };
         let (_z, _n, w) = classify_rules(&state, temp.path());
         assert_eq!(w.len(), 1);
     }

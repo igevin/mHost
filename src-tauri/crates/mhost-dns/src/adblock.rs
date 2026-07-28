@@ -205,7 +205,10 @@ mod tests {
     fn nxdomain_hit_returns_nxdomain() {
         let engine = AdBlockEngine::new();
         engine.rebuild(za(&[]), nx(&["tracker.example.com"]), wl(&[]));
-        assert_eq!(engine.check("tracker.example.com"), Some(AdBlockAction::NxDomain));
+        assert_eq!(
+            engine.check("tracker.example.com"),
+            Some(AdBlockAction::NxDomain)
+        );
     }
 
     #[test]
@@ -213,11 +216,7 @@ mod tests {
         // ad-blocker semantics: registering example.com hits *.example.com
         let engine = AdBlockEngine::new();
         engine.rebuild(za(&["example.com"]), nx(&[]), wl(&[]));
-        for d in [
-            "example.com",
-            "ad.example.com",
-            "deep.ad.example.com",
-        ] {
+        for d in ["example.com", "ad.example.com", "deep.ad.example.com"] {
             assert!(
                 matches!(engine.check(d), Some(AdBlockAction::ZeroAddress(_))),
                 "{} should hit",
@@ -287,13 +286,20 @@ mod tests {
         assert_eq!(engine.check("a.com"), None);
         assert_eq!(engine.check("b.com"), None);
         // New rule does hit
-        assert!(matches!(engine.check("d.com"), Some(AdBlockAction::ZeroAddress(_))));
+        assert!(matches!(
+            engine.check("d.com"),
+            Some(AdBlockAction::ZeroAddress(_))
+        ));
     }
 
     #[test]
     fn rule_count_sums_both_sets() {
         let engine = AdBlockEngine::new();
-        engine.rebuild(za(&["a.com", "b.com"]), nx(&["c.com", "d.com", "e.com"]), wl(&[]));
+        engine.rebuild(
+            za(&["a.com", "b.com"]),
+            nx(&["c.com", "d.com", "e.com"]),
+            wl(&[]),
+        );
         assert_eq!(engine.rule_count(), 5);
     }
 

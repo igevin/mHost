@@ -89,7 +89,15 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>) -> Result<Menu<R>, Box<dyn std::er
         Submenu::with_id_and_items(app, PROFILES_SUBMENU_ID, "环境配置", true, &profile_refs)?;
 
     let sep1 = PredefinedMenuItem::separator(app)?;
-    let adblock = MenuItem::with_id(app, "adblock", "广告屏蔽（即将推出）", false, None::<&str>)?;
+    // issue #130: ad block ships as DNS-mode-only. Clicking the menu item
+    // opens the main window; the frontend routes to /ad-block from there.
+    let adblock = MenuItem::with_id(
+        app,
+        "adblock",
+        "广告屏蔽（仅 DNS 模式）",
+        true,
+        None::<&str>,
+    )?;
     let sep2 = PredefinedMenuItem::separator(app)?;
     let refresh = MenuItem::with_id(app, "refresh_rules", "刷新远程规则", true, Some("CmdOrR"))?;
     let open_window = MenuItem::with_id(app, "open_window", "打开主窗口", true, Some("CmdOrO"))?;
@@ -211,7 +219,16 @@ pub fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::Men
             });
         }
         tray_logic::TrayMenuAction::AdBlock => {
-            // Placeholder: ad block is coming soon
+            // issue #130: open the main window and emit an event so the
+            // frontend routes to /ad-block. Avoids requiring the frontend
+            // to react to a window-only show.
+            if let Some(window) = app.get_webview_window("main") {
+                crate::platform::macos::set_activation_policy_regular();
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+                let _ = window.emit("navigate", "/ad-block");
+            }
         }
         tray_logic::TrayMenuAction::Unknown => {
             println!("[mHost] Unknown tray menu action: {:?}", event.id);

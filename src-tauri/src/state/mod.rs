@@ -161,8 +161,7 @@ impl AppState {
 
         // 广告屏蔽状态从 adblock.json 读；不存在则默认（issue #130）。
         // 在 struct 构造前 read_state — 此时 storage 还没被 move 进 AppState。
-        let ad_block_state = mhost_storage::adblock::read_state(storage.root())
-            .unwrap_or_default();
+        let ad_block_state = mhost_storage::adblock::read_state(storage.root()).unwrap_or_default();
 
         Ok(Self {
             storage,
