@@ -5,6 +5,8 @@ use std::sync::RwLock;
 use mhost_core::{Profile, ProfileMode};
 use tracing::warn;
 
+use crate::matcher::walk_parents;
+
 /// 规则引擎：维护域名到 IP 的映射表。
 pub struct RuleEngine {
     /// 域名 -> IP 映射（所有启用的 DNS 模式 Profile 规则的并集）
@@ -77,17 +79,11 @@ impl RuleEngine {
     /// 例如：注册 `example.com → 0.0.0.0` 后，
     /// `ad.example.com` / `tracker.example.com` / `example.com` 都会命中。
     /// `something.com` 不会命中（除非显式注册 `com`）。
+    ///
+    /// Suffix-walk 实现抽到 [`crate::matcher::walk_parents`]，
+    /// 与 [`crate::adblock::AdBlockEngine`] 共享（issue #130）。
     pub fn resolve(&self, domain: &str) -> Option<IpAddr> {
-        let lookup = |map: &HashMap<String, IpAddr>| -> Option<IpAddr> {
-            let mut current = domain;
-            loop {
-                if let Some(ip) = map.get(current) {
-                    return Some(*ip);
-                }
-                let pos = current.find('.')?;
-                current = &current[pos + 1..];
-            }
-        };
+        let lookup = |map: &HashMap<String, IpAddr>| walk_parents(domain, |d| map.get(d).copied());
         match self.rules.read() {
             Ok(guard) => lookup(&guard),
             Err(poisoned) => lookup(&poisoned.into_inner()),

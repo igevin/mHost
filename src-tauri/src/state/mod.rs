@@ -1,9 +1,10 @@
 use mhost_apply::writer::HostsWriter;
-use mhost_core::{MhostError, OriginalDns, ProfileMode};
+use mhost_core::{AdBlockState, MhostError, OriginalDns, ProfileMode};
 use mhost_storage::migration::migrate_v1_to_v2;
 use mhost_storage::storage::{FileStorage, Storage};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
+use tokio::task::JoinHandle;
 
 /// Async mutex to serialize apply operations and prevent concurrent writes to /etc/hosts.
 /// Security fix (#16): Prevents race conditions when user rapidly toggles profiles.
@@ -75,6 +76,12 @@ pub struct AppState {
     pub original_dns: Mutex<OriginalDns>,
     /// 串行化 DNS 模式切换操作。
     pub dns_lock: ApplyLock,
+    // 广告屏蔽 (issue #130)
+    /// 当前广告屏蔽状态。`tokio::sync::RwLock` 让热重载可以并发读。
+    /// 写操作集中在 `commands/adblock.rs`（原子写文件 + 内存 + 推引擎）。
+    pub ad_block_state: Arc<tokio::sync::RwLock<AdBlockState>>,
+    /// 后台定时刷新 task 句柄。DNS 模式启用时存在，禁用时被 abort。
+    pub ad_block_refresh_task: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl AppState {
@@ -152,6 +159,11 @@ impl AppState {
             }
         }
 
+        // 广告屏蔽状态从 adblock.json 读；不存在则默认（issue #130）。
+        // 在 struct 构造前 read_state — 此时 storage 还没被 move 进 AppState。
+        let ad_block_state = mhost_storage::adblock::read_state(storage.root())
+            .unwrap_or_default();
+
         Ok(Self {
             storage,
             writer,
@@ -162,6 +174,8 @@ impl AppState {
             dns_enabled: AtomicBool::new(dns_enabled),
             original_dns: Mutex::new(original_dns),
             dns_lock: ApplyLock(tokio::sync::Mutex::new(())),
+            ad_block_state: Arc::new(tokio::sync::RwLock::new(ad_block_state)),
+            ad_block_refresh_task: Mutex::new(None),
         })
     }
 

@@ -175,6 +175,14 @@ async fn set_dns_mode_enable(state: &AppState) -> Result<(), MhostError> {
     *lock_or_recover(&state.dns_server) = Some(server);
     state.dns_enabled.store(true, Ordering::Relaxed);
 
+    // 9. 广告屏蔽（issue #130）：启用 DNS 后立即把当前 ad-block 状态
+    //    hot-reload 到新 server，并启动定时刷新 task。task 在 disable
+    //    时被 abort。
+    //
+    //    这里复用了 commands::adblock 的 `classify_rules` + 重载路径的
+    //    等价逻辑（避免循环依赖和 IPC 边界），不经过 IPC handler。
+    spawn_ad_block_refresh_task(state);
+
     Ok(())
 }
 
@@ -252,7 +260,103 @@ async fn set_dns_mode_disable(state: &AppState, interactive: bool) -> Result<(),
     // 5. 清 in-memory dns_enabled
     state.dns_enabled.store(false, Ordering::Relaxed);
 
+    // 6. 终止广告屏蔽后台刷新 task（issue #130）。enable 时 spawn，
+    //    disable 必须 abort；不 abort 会让 task 继续跑并尝试 reload
+    //    已停的 server。
+    if let Some(handle) = lock_or_recover(&state.ad_block_refresh_task).take() {
+        handle.abort();
+    }
+
     Ok(())
+}
+
+/// Spawn the periodic ad-block refresh task (issue #130).
+///
+/// Called from `set_dns_mode_enable` after the DNS server is up. The task:
+///
+/// 1. Reads `refresh_interval_hours` from `ad_block_state`.
+/// 2. Sleeps for that interval.
+/// 3. Refreshes all enabled sources + hot-reloads the engine.
+/// 4. Aborts when the JoinHandle is taken (via `set_dns_mode_disable`).
+///
+/// `refresh_interval_hours == 0` or `auto_refresh_enabled == false` short-
+/// circuits — task is not spawned at all (callers don't need to abort it).
+fn spawn_ad_block_refresh_task(state: &AppState) {
+    let cfg = match state.ad_block_state.try_read() {
+        Ok(g) => (g.auto_refresh_enabled, g.refresh_interval_hours),
+        Err(_) => return,
+    };
+    if !cfg.0 || cfg.1 == 0 {
+        return;
+    }
+
+    // Clone the few Arcs we need into the task closure. We don't share the
+    // whole AppState (which contains unrelated Mutexes like snapshot_lock)
+    // to keep the lock-contention surface minimal.
+    let storage = state.storage.clone();
+    let ad_block_state = state.ad_block_state.clone();
+    let dns_server = state.dns_server.clone();
+
+    let interval_secs = (cfg.1 as u64).saturating_mul(3600).max(3600); // floor 1h
+    let handle = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
+
+            // Re-read config — user may have changed interval or disabled
+            // auto-refresh since the last tick.
+            let (auto, interval_h, enabled) = {
+                let Ok(g) = ad_block_state.try_read() else {
+                    continue;
+                };
+                (g.auto_refresh_enabled, g.refresh_interval_hours, g.enabled)
+            };
+            if !auto || interval_h == 0 || !enabled {
+                continue;
+            }
+
+            // Snapshot IDs (best-effort; failures logged not propagated).
+            let ids: Vec<mhost_core::SourceId> = {
+                let Ok(g) = ad_block_state.try_read() else {
+                    continue;
+                };
+                g.sources
+                    .iter()
+                    .filter(|s| s.enabled)
+                    .map(|s| s.source_id.clone())
+                    .collect()
+            };
+
+            for id in &ids {
+                if let Err(e) =
+                    crate::commands::adblock::fetch_and_cache_source_internal(&storage, &ad_block_state, id).await
+                {
+                    let _ = crate::commands::adblock::record_fetch_error_internal(
+                        &ad_block_state,
+                        id,
+                        &e.to_string(),
+                    )
+                    .await;
+                    eprintln!("[adblock] background refresh source {} failed: {}", id, e);
+                }
+            }
+
+            // Hot-reload engine if DNS still on. We use the dns_server
+            // slot as the proxy signal — `set_dns_mode_disable` takes the
+            // server out before clearing dns_enabled, so by the time the
+            // slot is None the refresh task should be aborted anyway.
+            if lock_or_recover(&dns_server).is_some() {
+                let snap = ad_block_state.read().await.clone();
+                let root = storage.root();
+                let (za, nx, wl) =
+                    crate::commands::adblock::classify_rules(&snap, root);
+                if let Some(server) = lock_or_recover(&dns_server).as_ref() {
+                    server.reload_ad_block_rules(za, nx, wl);
+                }
+            }
+        }
+    });
+
+    *lock_or_recover(&state.ad_block_refresh_task) = Some(handle);
 }
 
 /// 获取 DNS 模式状态。
@@ -361,6 +465,10 @@ mod tests {
             dns_enabled: AtomicBool::new(false),
             original_dns: Mutex::new(OriginalDns::DhcpEmpty),
             dns_lock: ApplyLock::new(),
+            ad_block_state: Arc::new(tokio::sync::RwLock::new(
+                mhost_core::AdBlockState::default(),
+            )),
+            ad_block_refresh_task: Mutex::new(None),
         };
         // dns_enabled = false → cleanup 应直接返回 Ok
         let result = cleanup_dns_on_exit(&state, false).await;
@@ -399,6 +507,10 @@ mod tests {
             dns_enabled: AtomicBool::new(true), // 假装启用 → cleanup 会走 disable 路径
             original_dns: Mutex::new(OriginalDns::DhcpEmpty), // DhcpEmpty → 写 Empty
             dns_lock: ApplyLock::new(),
+            ad_block_state: Arc::new(tokio::sync::RwLock::new(
+                mhost_core::AdBlockState::default(),
+            )),
+            ad_block_refresh_task: Mutex::new(None),
         };
         // cleanup_dns_on_exit → set_dns_mode_disable(interactive=false)
         //   - original 是 DhcpEmpty → 只打印 warning（不返回 Err，bug 1 修复）
@@ -450,6 +562,10 @@ mod tests {
             dns_enabled: AtomicBool::new(true),
             original_dns: Mutex::new(OriginalDns::DhcpEmpty),
             dns_lock: ApplyLock::new(),
+            ad_block_state: Arc::new(tokio::sync::RwLock::new(
+                mhost_core::AdBlockState::default(),
+            )),
+            ad_block_refresh_task: Mutex::new(None),
         };
 
         // 第一次 cleanup：跑 disable 路径。注意必须用 interactive=false

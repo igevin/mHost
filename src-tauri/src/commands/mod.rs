@@ -1,3 +1,4 @@
+pub mod adblock;
 pub mod apply;
 pub mod dns;
 #[cfg(test)]
