@@ -13,10 +13,12 @@
 //! `AdBlockState::default()` when the JSON is missing — ad block is opt-in
 //! so first run is fine with no file at all.
 
+use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use chrono::Utc;
 use mhost_core::{AdBlockSource, AdBlockState, SourceId};
 
 use super::storage::atomic_write;
@@ -48,6 +50,58 @@ pub fn read_state(root: &Path) -> io::Result<AdBlockState> {
     }
 }
 
+/// Read adblock state with a safety net against silent data loss.
+///
+/// If the file is missing, returns `AdBlockState::default()` (first run).
+/// If the file is corrupted (invalid JSON), the file is **renamed** to
+/// `adblock.json.corrupt-{YYYYMMDDhhmmssuuuuuu}` so the user/support can
+/// recover their previous whitelist + source list, and the default state
+/// is returned. Returning `AdBlockState::default()` unconditionally would
+/// rewrite the corrupt file with an empty state on the next save, silently
+/// wiping the user's configuration (PR #131 review, finding 0.2).
+pub fn read_state_or_default_with_backup(root: &Path) -> AdBlockState {
+    let path = root.join(STATE_FILE);
+    let raw = match fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return AdBlockState::default(),
+        Err(e) => {
+            eprintln!("[mHost] adblock.json unreadable: {}; using empty state", e);
+            return AdBlockState::default();
+        }
+    };
+    match serde_json::from_str::<AdBlockState>(&raw) {
+        Ok(s) => s,
+        Err(parse_err) => {
+            let stamp: BackupStamp = BackupStamp(Utc::now());
+            let backup = root.join(format!("adblock.json.corrupt-{}", stamp));
+            match fs::rename(&path, &backup) {
+                Ok(_) => eprintln!(
+                    "[mHost] adblock.json corrupted: {}. Backed up to {}; \
+                     falling back to empty state. Your whitelist and sources were lost — \
+                     re-add them via the Ad Block page (or restore from the backup file).",
+                    parse_err,
+                    backup.display()
+                ),
+                Err(rename_err) => eprintln!(
+                    "[mHost] adblock.json corrupted ({}); backup rename also failed ({}). \
+                     Next save will overwrite — falling back to empty state.",
+                    parse_err, rename_err
+                ),
+            }
+            AdBlockState::default()
+        }
+    }
+}
+
+struct BackupStamp(chrono::DateTime<chrono::Utc>);
+impl fmt::Display for BackupStamp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Microsecond precision so two corruptions in the same second
+        // still get distinct filenames.
+        write!(f, "{}", self.0.format("%Y%m%d%H%M%S%6f"))
+    }
+}
+
 /// Atomically write the ad block state.
 pub fn write_state(root: &Path, state: &AdBlockState) -> io::Result<()> {
     let path = root.join(STATE_FILE);
@@ -65,7 +119,16 @@ fn cache_dir(root: &Path) -> PathBuf {
 }
 
 fn cache_path(root: &Path, source_id: &SourceId) -> PathBuf {
-    cache_dir(root).join(format!("{}.txt", source_id))
+    let id_str = source_id.to_string();
+    // SourceId wraps a UUID; the rendered form is hex + dashes, so neither
+    // `/` nor `\` can appear. The assert is belt-and-suspenders against any
+    // future identifier type that might allow path-significant characters.
+    debug_assert!(
+        !id_str.contains('/') && !id_str.contains('\\'),
+        "SourceId rendered as `{}` — must not contain path separators",
+        id_str
+    );
+    cache_dir(root).join(format!("{}.txt", id_str))
 }
 
 /// Write the raw fetched blocklist content for a source. Atomic — partial
@@ -247,5 +310,75 @@ mod tests {
         let id = SourceId(uuid::Uuid::new_v4());
         write_cache(temp.path(), &id, b"x").unwrap();
         assert!(cache_dir(temp.path()).is_dir());
+    }
+
+    #[test]
+    fn read_state_or_default_missing_returns_default() {
+        let temp = TempDir::new().unwrap();
+        let state = read_state_or_default_with_backup(temp.path());
+        assert_eq!(state, AdBlockState::default());
+    }
+
+    /// PR #131 review finding 0.2: a corrupted adblock.json must not be
+    /// silently thrown away. `read_state_or_default_with_backup` renames
+    /// the bad file aside and returns the default state, so the user can
+    /// recover manually if needed.
+    #[test]
+    fn read_state_or_default_corrupt_backs_up_file_and_returns_default() {
+        let temp = TempDir::new().unwrap();
+        // Seed a deliberately broken file. Also inject real content so
+        // the user can tell what they lost.
+        let original = b"{not valid json";
+        fs::write(temp.path().join(STATE_FILE), original).unwrap();
+
+        let recovered = read_state_or_default_with_backup(temp.path());
+        assert_eq!(recovered, AdBlockState::default());
+
+        // The corrupted file must no longer be at the canonical path —
+        // otherwise the next save() would silently overwrite it.
+        let canonical = temp.path().join(STATE_FILE);
+        assert!(
+            !canonical.exists(),
+            "corrupt adblock.json should have been renamed away"
+        );
+
+        // ...and renamed to a `corrupt-{timestamp}` file (we don't pin the
+        // timestamp, just confirm at least one exists and carries the
+        // original bytes).
+        let backups: Vec<_> = fs::read_dir(temp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("adblock.json.corrupt-")
+            })
+            .collect();
+        assert_eq!(backups.len(), 1, "expected exactly one backup file");
+        let backup_contents = fs::read(backups[0].path()).unwrap();
+        assert_eq!(backup_contents, original, "backup preserves original bytes");
+    }
+
+    #[test]
+    fn read_state_or_default_valid_unchanged() {
+        let temp = TempDir::new().unwrap();
+        let mut state = AdBlockState::default();
+        state.enabled = true;
+        state.whitelist.push("a.com".to_string());
+        write_state(temp.path(), &state).unwrap();
+
+        let restored = read_state_or_default_with_backup(temp.path());
+        assert_eq!(restored, state);
+        // Sanity: no backup files created on a successful read.
+        let stray: Vec<_> = fs::read_dir(temp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("adblock.json.corrupt-")
+            })
+            .collect();
+        assert!(stray.is_empty(), "valid file must not be backed up");
     }
 }

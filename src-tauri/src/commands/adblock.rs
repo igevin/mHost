@@ -9,7 +9,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -35,7 +35,96 @@ const MAX_RULES_PER_SOURCE: usize = 100_000;
 /// 30 s is generous for typical hosts-format payloads.
 const FETCH_TIMEOUT_SECS: u64 = 30;
 
+/// Maximum response body size for an ad-block source (PR #131 review
+/// finding 1.8 — a malicious or unbounded-misconfigured source can still
+/// run for `FETCH_TIMEOUT_SECS` and start streaming bytes; cap the bytes).
+/// `MAX_RULES_PER_SOURCE × ~30 bytes ≈ 3 MB`; 16 MB headroom is enough for
+/// legitimate (well-annotated) lists.
+const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Concurrency cap for `refresh_all_ad_block_sources` and the periodic
+/// background refresh (PR #131 review finding 1.4 — refresh was a serial
+/// loop, blocking the UI for up to N × FETCH_TIMEOUT_SECS).
+pub(crate) const REFRESH_CONCURRENCY: usize = 4;
+
 const USER_AGENT: &str = "mHost-Desktop/1.0";
+
+// ---------------------------------------------------------------------------
+// Shared HTTP client (PR #131 review findings 1.8 + 1.9)
+// ---------------------------------------------------------------------------
+
+/// Process-wide shared `reqwest::Client`. Building a client is non-trivial
+/// (TLS keylog, DNS resolver, connection pool) and we were doing it on every
+/// fetch + every background refresh tick. Reusing one client also means
+/// HTTP keep-alive across fetches and a bounded connection pool.
+///
+/// `OnceLock::get_or_init` runs the closure synchronously on the first
+/// call; all subsequent calls return the same `&'static` handle. Safe
+/// because `reqwest::Client::build()` is sync.
+static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+fn http_client() -> &'static reqwest::Client {
+    HTTP_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .user_agent(USER_AGENT)
+            .timeout(Duration::from_secs(FETCH_TIMEOUT_SECS))
+            // reqwest 0.13 lacks `body_limit`; we enforce MAX_RESPONSE_BYTES
+            // explicitly via `fetch_source_content` (early reject via the
+            // Content-Length header + post-read size check).
+            .build()
+            .expect("reqwest client build must succeed with static config")
+    })
+}
+
+/// Fetch `url` via the shared client. Returns the raw body bytes plus the
+/// `ETag` header (if any), and rejects anything larger than
+/// `MAX_RESPONSE_BYTES`. Two-stage guard:
+///
+///   1. Server-advertised `Content-Length` → reject without downloading.
+///   2. Post-read size check → catches servers that lie about length.
+///
+/// PR #131 review finding 1.8 — a malicious or misconfigured source can
+/// otherwise stream arbitrary bytes for `FETCH_TIMEOUT_SECS` before our
+/// parser sees them.
+async fn fetch_source(url: &str) -> Result<(Vec<u8>, Option<String>), MhostError> {
+    let resp = http_client()
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| MhostError::Network(format!("network error: {}", e)))?;
+    if !resp.status().is_success() {
+        return Err(MhostError::ExternalApi(format!(
+            "fetch {} failed: HTTP {}",
+            url,
+            resp.status()
+        )));
+    }
+    let etag = resp
+        .headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    if let Some(len) = resp.content_length() {
+        if len > MAX_RESPONSE_BYTES as u64 {
+            return Err(MhostError::InvalidInput(format!(
+                "source body length {} exceeds limit {}",
+                len, MAX_RESPONSE_BYTES
+            )));
+        }
+    }
+    let body = resp
+        .bytes()
+        .await
+        .map_err(|e| MhostError::Network(format!("read body error: {}", e)))?;
+    if body.len() > MAX_RESPONSE_BYTES {
+        return Err(MhostError::InvalidInput(format!(
+            "source body received {} bytes, exceeds limit {}",
+            body.len(),
+            MAX_RESPONSE_BYTES
+        )));
+    }
+    Ok((body.to_vec(), etag))
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -171,39 +260,11 @@ pub(crate) async fn fetch_and_cache_source(
         }
     };
 
-    // 2. Fetch raw bytes via reqwest (per-call client, like update.rs).
+    // 2. Fetch raw bytes via the shared reqwest client (PR #131 review
+    // finding 1.9). The static client is built once; size enforcement
+    // happens inside `fetch_source` (PR #131 review finding 1.8).
     let url = source_clone.url.clone();
-    let client = reqwest::Client::builder()
-        .user_agent(USER_AGENT)
-        .timeout(Duration::from_secs(FETCH_TIMEOUT_SECS))
-        .build()
-        .map_err(|e| MhostError::Network(format!("reqwest build error: {}", e)))?;
-
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| MhostError::Network(format!("network error: {}", e)))?;
-
-    if !resp.status().is_success() {
-        return Err(MhostError::ExternalApi(format!(
-            "fetch {} failed: HTTP {}",
-            url,
-            resp.status()
-        )));
-    }
-
-    let etag = resp
-        .headers()
-        .get(reqwest::header::ETAG)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-
-    let body = resp
-        .bytes()
-        .await
-        .map_err(|e| MhostError::Network(format!("read body error: {}", e)))?;
-
+    let (body, etag) = fetch_source(&url).await?;
     let content_str = std::str::from_utf8(&body)
         .map_err(|e| MhostError::InvalidInput(format!("response is not valid UTF-8: {}", e)))?;
 
@@ -305,36 +366,7 @@ pub(crate) async fn fetch_and_cache_source_internal(
     };
 
     let url = source_clone.url.clone();
-    let client = reqwest::Client::builder()
-        .user_agent(USER_AGENT)
-        .timeout(Duration::from_secs(FETCH_TIMEOUT_SECS))
-        .build()
-        .map_err(|e| MhostError::Network(format!("reqwest build error: {}", e)))?;
-
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| MhostError::Network(format!("network error: {}", e)))?;
-
-    if !resp.status().is_success() {
-        return Err(MhostError::ExternalApi(format!(
-            "fetch {} failed: HTTP {}",
-            url,
-            resp.status()
-        )));
-    }
-
-    let etag = resp
-        .headers()
-        .get(reqwest::header::ETAG)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-
-    let body = resp
-        .bytes()
-        .await
-        .map_err(|e| MhostError::Network(format!("read body error: {}", e)))?;
+    let (body, etag) = fetch_source(&url).await?;
     let content_str = std::str::from_utf8(&body)
         .map_err(|e| MhostError::InvalidInput(format!("response is not valid UTF-8: {}", e)))?;
 
@@ -469,17 +501,25 @@ pub async fn add_ad_block_source(
         guard.sources.push(new_source.clone());
     }
 
-    // Fetch + persist. If fetch fails, we still keep the source record
-    // (with `last_error`) so the user can retry from the UI.
-    let _ = fetch_and_cache_source(&state, &new_id).await;
+    // Fetch + propagate errors. PR #131 review finding 1.5: the previous
+    // `let _ = …` discarded the error, leaving the UI with a successful
+    // toast and a "fetch failed" badge next to a brand-new source (the
+    // UX was confusing). Surface the error to the frontend toast; the
+    // source is still in `state.sources` with `last_error` populated so
+    // a later "Refresh" works as expected.
+    fetch_and_cache_source(&state, &new_id).await?;
 
-    // Return the (possibly errored) source back to the UI.
+    // Persist AFTER fetch so the disk file captures the fetched record
+    // (rule_count, last_fetched_at, etag, last_error) — not the empty
+    // initial state we just pushed.
+    persist_and_reload(&state).await?;
+
+    // Return the freshly-fetched source record to the UI.
     let snap = state.ad_block_state.read().await;
     let stored = adblock_store::find_source(&snap, &new_id)
         .cloned()
         .unwrap_or(new_source);
     drop(snap);
-    persist_and_reload(&state).await?;
     Ok(stored)
 }
 
@@ -536,6 +576,55 @@ pub async fn set_ad_block_source_response(
 }
 
 // ---------------------------------------------------------------------------
+// Refresh (concurrent)
+// ---------------------------------------------------------------------------
+
+/// Fan out `fetch_and_cache_source_internal` over `source_ids` with bounded
+/// concurrency. Per-source errors are recorded on `last_error` (preserving
+/// the existing semantics) so the caller doesn't have to propagate.
+///
+/// PR #131 review finding 1.4: the previous serial loop could block the UI
+/// for `N × FETCH_TIMEOUT_SECS` while `N` sources sequentially hit the
+/// network. With this helper, a typical 4-source list finishes in ~one
+/// timeout instead of four, and `isLoadingAtom` no longer lingers.
+pub(crate) async fn fetch_sources_concurrent(
+    storage: &Arc<dyn mhost_storage::storage::Storage + Send + Sync>,
+    ad_block_state: &Arc<tokio::sync::RwLock<AdBlockState>>,
+    source_ids: &[SourceId],
+    concurrency: usize,
+) {
+    if source_ids.is_empty() {
+        return;
+    }
+    let sem = Arc::new(tokio::sync::Semaphore::new(concurrency.max(1)));
+    let mut handles = Vec::with_capacity(source_ids.len());
+    for id in source_ids {
+        let permit = Arc::clone(&sem)
+            .acquire_owned()
+            .await
+            .expect("semaphore starts with positive permits and is never closed");
+        let storage = storage.clone();
+        let ad_block_state = ad_block_state.clone();
+        let id = id.clone();
+        handles.push(tokio::spawn(async move {
+            // Permit drops at end of task → slot released regardless of
+            // success/failure.
+            let _permit = permit;
+            if let Err(e) = fetch_and_cache_source_internal(&storage, &ad_block_state, &id).await {
+                let _ = record_fetch_error_internal(&ad_block_state, &id, &e.to_string()).await;
+                eprintln!("[adblock] concurrent refresh source {} failed: {}", id, e);
+            }
+        }));
+    }
+    // Drain in submission order so a slow source doesn't keep its permit
+    // forever if the user disables / deletes it mid-flight. We don't use
+    // the results; the spawn task already did the write.
+    for h in handles {
+        let _ = h.await;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Refresh
 // ---------------------------------------------------------------------------
 
@@ -565,13 +654,15 @@ pub async fn refresh_all_ad_block_sources(
             .map(|s| s.source_id.clone())
             .collect()
     };
-    for id in &ids {
-        // Best-effort: log + record_fetch_error on failure, keep going.
-        if let Err(e) = fetch_and_cache_source(&state, id).await {
-            let _ = record_fetch_error(&state, id, &e.to_string()).await;
-            eprintln!("[adblock] refresh source {} failed: {}", id, e);
-        }
-    }
+    // Concurrent fetch — bounded at REFRESH_CONCURRENCY. Per-source
+    // failures are recorded on `last_error` via the helper.
+    fetch_sources_concurrent(
+        &state.storage,
+        &state.ad_block_state,
+        &ids,
+        REFRESH_CONCURRENCY,
+    )
+    .await;
     persist_and_reload(&state).await?;
     Ok(state.ad_block_state.read().await.sources.clone())
 }

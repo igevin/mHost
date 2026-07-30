@@ -2,7 +2,7 @@ use mhost_apply::writer::HostsWriter;
 use mhost_core::{AdBlockState, MhostError, OriginalDns, ProfileMode};
 use mhost_storage::migration::migrate_v1_to_v2;
 use mhost_storage::storage::{FileStorage, Storage};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::task::JoinHandle;
 
@@ -161,21 +161,48 @@ impl AppState {
 
         // 广告屏蔽状态从 adblock.json 读；不存在则默认（issue #130）。
         // 在 struct 构造前 read_state — 此时 storage 还没被 move 进 AppState。
-        let ad_block_state = mhost_storage::adblock::read_state(storage.root()).unwrap_or_default();
+        //
+        // **fix (PR #131 review finding 0.2)**: use the back-up variant so
+        // a corrupted `adblock.json` is renamed aside instead of being
+        // silently overwritten with defaults on the next save.
+        let ad_block_state =
+            mhost_storage::adblock::read_state_or_default_with_backup(storage.root());
 
-        Ok(Self {
+        let ad_block_state_lock = Arc::new(tokio::sync::RwLock::new(ad_block_state));
+        let dns_server_slot: Arc<Mutex<Option<mhost_dns::DnsServer>>> =
+            Arc::new(Mutex::new(dns_server_opt));
+        let refresh_task_slot: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
+
+        let state = Self {
             storage,
             writer,
             apply_lock: ApplyLock(tokio::sync::Mutex::new(())),
             snapshot_lock: ApplyLock(tokio::sync::Mutex::new(())),
             last_profile_ids: Mutex::new(Vec::new()),
-            dns_server: Arc::new(Mutex::new(dns_server_opt)),
+            dns_server: dns_server_slot,
             dns_enabled: AtomicBool::new(dns_enabled),
             original_dns: Mutex::new(original_dns),
             dns_lock: ApplyLock(tokio::sync::Mutex::new(())),
-            ad_block_state: Arc::new(tokio::sync::RwLock::new(ad_block_state)),
-            ad_block_refresh_task: Mutex::new(None),
-        })
+            ad_block_state: ad_block_state_lock,
+            ad_block_refresh_task: refresh_task_slot,
+        };
+
+        // **fix (PR #131 review finding 0.1)**: `try_recover_dns` succeeded
+        // (so `dns_enabled=true` survived the restart), but the periodic
+        // ad-block refresh task is NOT spawned by `set_dns_mode_enable`
+        // (that path is user-driven only). Without this call, an
+        // auto-recovered session would permanently lose background refresh
+        // until the user toggled DNS off and on again.
+        if state.dns_enabled.load(Ordering::Relaxed) {
+            crate::commands::dns::spawn_ad_block_refresh_task(
+                &state.ad_block_refresh_task,
+                &state.ad_block_state,
+                &state.dns_server,
+                &state.storage,
+            );
+        }
+
+        Ok(state)
     }
 
     /// 尝试自动恢复 DNS 服务。

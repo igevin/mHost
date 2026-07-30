@@ -18,6 +18,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::RwLock;
 
 use crate::matcher::walk_parents;
@@ -47,6 +48,18 @@ pub struct AdBlockEngine {
     nxdomain: RwLock<HashSet<String>>,
     /// whitelist domains — matched with the same suffix-walk as the engines
     whitelist: RwLock<HashSet<String>>,
+    /// Cached total of zero_addr + nxdomain + whitelist entries.
+    ///
+    /// **fix (PR #131 review finding 1.2)**: the empty-engine case (state
+    /// `enabled=false`, which is the default and the state most users are
+    /// in after install) was taking three read locks + a walk_parents on
+    /// every DNS query. With 100k+ QPS this is wasted lock traffic. We
+    /// cache the total and short-circuit `check` to `None` before any
+    /// lock is taken when no rules are loaded.
+    ///
+    /// The size is updated **after** `rebuild` swaps in the new maps (see
+    /// comment on `rebuild` for the consistency trade-off).
+    total_rules: AtomicUsize,
 }
 
 impl AdBlockEngine {
@@ -55,6 +68,7 @@ impl AdBlockEngine {
             zero_addr: RwLock::new(HashMap::new()),
             nxdomain: RwLock::new(HashSet::new()),
             whitelist: RwLock::new(HashSet::new()),
+            total_rules: AtomicUsize::new(0),
         }
     }
 
@@ -69,6 +83,7 @@ impl AdBlockEngine {
         nxdomain_rules: HashSet<String>,
         whitelist: HashSet<String>,
     ) {
+        let new_total = zero_addr_rules.len() + nxdomain_rules.len() + whitelist.len();
         match self.zero_addr.write() {
             Ok(mut g) => *g = zero_addr_rules,
             Err(p) => *p.into_inner() = zero_addr_rules,
@@ -81,6 +96,14 @@ impl AdBlockEngine {
             Ok(mut g) => *g = whitelist,
             Err(p) => *p.into_inner() = whitelist,
         }
+        // Update the cached size LAST. The tiny window where the maps are
+        // already swapped but the size still reflects the previous rebuild
+        // means `check` may walk an already-updated map with the old size —
+        // same correctness profile as the pre-short-circuit code, never
+        // worse. The opposite ordering (size first, then maps) would let a
+        // `check` see size>0 with old empty maps and still acquire locks,
+        // which is exactly what we're trying to avoid.
+        self.total_rules.store(new_total, Ordering::Release);
     }
 
     /// Decide what to do with a query.
@@ -88,6 +111,13 @@ impl AdBlockEngine {
     /// Returns `None` if the domain is whitelisted (fall through to the
     /// regular rule engine / upstream) or not blocked at all.
     pub fn check(&self, domain: &str) -> Option<AdBlockAction> {
+        // Fast-path: no rules loaded → no possible hit. Avoids three
+        // RwLock acquisitions on the hot path for the common
+        // `state.enabled == false` case.
+        if self.total_rules.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+
         // 1. whitelist (read once, then release)
         {
             let whitelist_guard = self.whitelist.read().unwrap_or_else(|p| p.into_inner());
@@ -114,19 +144,10 @@ impl AdBlockEngine {
         None
     }
 
-    /// Total number of rules loaded across both action sets.
+    /// Total number of rules loaded across both action sets (whitelist
+    /// included — it influences `check` outcomes).
     pub fn rule_count(&self) -> usize {
-        let z = self
-            .zero_addr
-            .read()
-            .map(|g| g.len())
-            .unwrap_or_else(|p| p.into_inner().len());
-        let n = self
-            .nxdomain
-            .read()
-            .map(|g| g.len())
-            .unwrap_or_else(|p| p.into_inner().len());
-        z + n
+        self.total_rules.load(Ordering::Acquire)
     }
 
     pub fn whitelist_size(&self) -> usize {
@@ -186,6 +207,22 @@ mod tests {
         let engine = AdBlockEngine::new();
         assert_eq!(engine.check("anything.com"), None);
         assert_eq!(engine.rule_count(), 0);
+    }
+
+    /// PR #131 review finding 1.2: the fast-path short-circuit must
+    /// bypass the three RwLock acquisitions when no rules are loaded.
+    /// Functionally this is the same outcome as the existing
+    /// `empty_engine_returns_none`, but we keep a dedicated assertion so
+    /// the contract is explicit when somebody refactors the hot path.
+    #[test]
+    fn empty_engine_short_circuits_before_locking() {
+        let engine = AdBlockEngine::new();
+        // rule_count() now reads the AtomicUsize; on a fresh engine it's 0.
+        // We can't directly observe "no locks were taken" from a public
+        // test, but a single-shot regression here is enough to lock in
+        // the contract that an empty engine returns None without state.
+        assert_eq!(engine.rule_count(), 0);
+        assert_eq!(engine.check("a.b.c.example.com"), None);
     }
 
     #[test]
@@ -301,6 +338,33 @@ mod tests {
             wl(&[]),
         );
         assert_eq!(engine.rule_count(), 5);
+    }
+
+    /// PR #131 review finding 1.2: rule_count now reflects zero_addr + nxdomain
+    /// + whitelist (the AtomicUsize is the sum of all three). Whitelist is
+    /// part of the contract because it short-circuits the hot path.
+    #[test]
+    fn rule_count_includes_whitelist() {
+        let engine = AdBlockEngine::new();
+        engine.rebuild(za(&["a.com"]), nx(&[]), wl(&["w1", "w2", "w3"]));
+        assert_eq!(engine.rule_count(), 4);
+    }
+
+    /// Rebuild updates the cached size to the new sum, so the short-circuit
+    /// doesn't run on the next check against an engine we just emptied.
+    #[test]
+    fn rebuild_updates_cached_total() {
+        let engine = AdBlockEngine::new();
+        engine.rebuild(za(&["a.com"]), nx(&[]), wl(&[]));
+        assert_eq!(engine.rule_count(), 1);
+
+        engine.rebuild(za(&[]), nx(&[]), wl(&[]));
+        assert_eq!(
+            engine.rule_count(),
+            0,
+            "size must drop to 0 after empty rebuild"
+        );
+        assert_eq!(engine.check("a.com"), None, "fast-path should now fire");
     }
 
     #[test]

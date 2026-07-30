@@ -6,6 +6,8 @@ use tauri::State;
 
 use crate::state::AppState;
 
+use std::sync::Arc;
+
 /// 启动/停止 DNS 模式。
 ///
 /// # 状态机正确性（fix: systematic DNS logic review）
@@ -181,7 +183,12 @@ async fn set_dns_mode_enable(state: &AppState) -> Result<(), MhostError> {
     //
     //    这里复用了 commands::adblock 的 `classify_rules` + 重载路径的
     //    等价逻辑（避免循环依赖和 IPC 边界），不经过 IPC handler。
-    spawn_ad_block_refresh_task(state);
+    spawn_ad_block_refresh_task(
+        &state.ad_block_refresh_task,
+        &state.ad_block_state,
+        &state.dns_server,
+        &state.storage,
+    );
 
     Ok(())
 }
@@ -272,8 +279,18 @@ async fn set_dns_mode_disable(state: &AppState, interactive: bool) -> Result<(),
 
 /// Spawn the periodic ad-block refresh task (issue #130).
 ///
-/// Called from `set_dns_mode_enable` after the DNS server is up. The task:
+/// Called from two places:
+///   1. `set_dns_mode_enable` after the DNS server comes up — the
+///      "normal" hot path.
+///   2. `AppState::new` after `try_recover_dns` succeeds — PR #131
+///      review finding 0.1: previously, an auto-recovered DNS session
+///      lost its periodic refresh because the task was only spawned on
+///      the user-driven enable path.
 ///
+/// The function takes individual Arcs rather than `&AppState` so it can
+/// be invoked while `AppState` is being constructed (item 2).
+///
+/// The task:
 /// 1. Reads `refresh_interval_hours` from `ad_block_state`.
 /// 2. Sleeps for that interval.
 /// 3. Refreshes all enabled sources + hot-reloads the engine.
@@ -281,8 +298,13 @@ async fn set_dns_mode_disable(state: &AppState, interactive: bool) -> Result<(),
 ///
 /// `refresh_interval_hours == 0` or `auto_refresh_enabled == false` short-
 /// circuits — task is not spawned at all (callers don't need to abort it).
-fn spawn_ad_block_refresh_task(state: &AppState) {
-    let cfg = match state.ad_block_state.try_read() {
+pub(crate) fn spawn_ad_block_refresh_task(
+    task_slot: &std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    ad_block_state: &Arc<tokio::sync::RwLock<mhost_core::AdBlockState>>,
+    dns_server: &Arc<std::sync::Mutex<Option<mhost_dns::DnsServer>>>,
+    storage: &Arc<dyn mhost_storage::storage::Storage + Send + Sync>,
+) {
+    let cfg = match ad_block_state.try_read() {
         Ok(g) => (g.auto_refresh_enabled, g.refresh_interval_hours),
         Err(_) => return,
     };
@@ -293,9 +315,9 @@ fn spawn_ad_block_refresh_task(state: &AppState) {
     // Clone the few Arcs we need into the task closure. We don't share the
     // whole AppState (which contains unrelated Mutexes like snapshot_lock)
     // to keep the lock-contention surface minimal.
-    let storage = state.storage.clone();
-    let ad_block_state = state.ad_block_state.clone();
-    let dns_server = state.dns_server.clone();
+    let storage = storage.clone();
+    let ad_block_state = ad_block_state.clone();
+    let dns_server = dns_server.clone();
 
     let interval_secs = (cfg.1 as u64).saturating_mul(3600).max(3600); // floor 1h
     let handle = tokio::spawn(async move {
@@ -326,23 +348,17 @@ fn spawn_ad_block_refresh_task(state: &AppState) {
                     .collect()
             };
 
-            for id in &ids {
-                if let Err(e) = crate::commands::adblock::fetch_and_cache_source_internal(
-                    &storage,
-                    &ad_block_state,
-                    id,
-                )
-                .await
-                {
-                    let _ = crate::commands::adblock::record_fetch_error_internal(
-                        &ad_block_state,
-                        id,
-                        &e.to_string(),
-                    )
-                    .await;
-                    eprintln!("[adblock] background refresh source {} failed: {}", id, e);
-                }
-            }
+            // Concurrent fetch — bounded by REFRESH_CONCURRENCY. PR #131
+            // review finding 1.4: serial loop meant a multi-source list
+            // could block for `N × FETCH_TIMEOUT_SECS` while the next
+            // periodic tick waited its turn.
+            crate::commands::adblock::fetch_sources_concurrent(
+                &storage,
+                &ad_block_state,
+                &ids,
+                crate::commands::adblock::REFRESH_CONCURRENCY,
+            )
+            .await;
 
             // Hot-reload engine if DNS still on. We use the dns_server
             // slot as the proxy signal — `set_dns_mode_disable` takes the
@@ -359,7 +375,7 @@ fn spawn_ad_block_refresh_task(state: &AppState) {
         }
     });
 
-    *lock_or_recover(&state.ad_block_refresh_task) = Some(handle);
+    *lock_or_recover(task_slot) = Some(handle);
 }
 
 /// 获取 DNS 模式状态。
