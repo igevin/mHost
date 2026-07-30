@@ -611,6 +611,109 @@ mod tests {
         let r3 = cleanup_dns_on_exit(&state, false).await;
         assert!(r3.is_ok(), "third cleanup must also be a no-op");
     }
+
+    // -------------------------------------------------------------------
+    // PR #131 review finding 0.1 + self-review §1 — regression test for
+    // `spawn_ad_block_refresh_task`. The auto-recovery path in
+    // `AppState::new` calls this; a refactor that drops the call would
+    // silently regress back to "DNS auto-recovered but no background refresh".
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_spawn_ad_block_refresh_task_spawns_when_auto_enabled() {
+        // Default AdBlockState has auto_refresh_enabled=true and
+        // refresh_interval_hours=24 — both preconditions for spawning.
+        let temp = TempDir::new().unwrap();
+        let storage = Arc::new(FileStorage::new(temp.path()))
+            as Arc<dyn mhost_storage::storage::Storage + Send + Sync>;
+        let ad_block_state =
+            Arc::new(tokio::sync::RwLock::new(mhost_core::AdBlockState::default()));
+        let dns_server: Arc<std::sync::Mutex<Option<mhost_dns::DnsServer>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let task_slot: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>> =
+            std::sync::Mutex::new(None);
+
+        assert!(
+            lock_or_recover(&task_slot).is_none(),
+            "pre-condition: slot empty"
+        );
+
+        crate::commands::dns::spawn_ad_block_refresh_task(
+            &task_slot,
+            &ad_block_state,
+            &dns_server,
+            &storage,
+        );
+
+        // Slot must be populated.
+        let spawned = lock_or_recover(&task_slot).take();
+        assert!(
+            spawned.is_some(),
+            "task should spawn when auto_refresh_enabled=true and hours>0"
+        );
+        // Clean up the tokio task so it doesn't outlive the test.
+        if let Some(h) = spawned {
+            h.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_spawn_ad_block_refresh_task_skips_when_auto_disabled() {
+        let temp = TempDir::new().unwrap();
+        let storage = Arc::new(FileStorage::new(temp.path()))
+            as Arc<dyn mhost_storage::storage::Storage + Send + Sync>;
+        // user opted out — auto_refresh_enabled=false is the only field that matters
+        let state = mhost_core::AdBlockState {
+            auto_refresh_enabled: false,
+            ..Default::default()
+        };
+        let ad_block_state = Arc::new(tokio::sync::RwLock::new(state));
+        let dns_server: Arc<std::sync::Mutex<Option<mhost_dns::DnsServer>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let task_slot: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>> =
+            std::sync::Mutex::new(None);
+
+        crate::commands::dns::spawn_ad_block_refresh_task(
+            &task_slot,
+            &ad_block_state,
+            &dns_server,
+            &storage,
+        );
+
+        assert!(
+            lock_or_recover(&task_slot).is_none(),
+            "task should NOT spawn when auto_refresh_enabled=false"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_spawn_ad_block_refresh_task_skips_when_interval_zero() {
+        let temp = TempDir::new().unwrap();
+        let storage = Arc::new(FileStorage::new(temp.path()))
+            as Arc<dyn mhost_storage::storage::Storage + Send + Sync>;
+        // "manual only" — interval=0 disables background refresh
+        let state = mhost_core::AdBlockState {
+            refresh_interval_hours: 0,
+            ..Default::default()
+        };
+        let ad_block_state = Arc::new(tokio::sync::RwLock::new(state));
+        let dns_server: Arc<std::sync::Mutex<Option<mhost_dns::DnsServer>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let task_slot: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>> =
+            std::sync::Mutex::new(None);
+
+        crate::commands::dns::spawn_ad_block_refresh_task(
+            &task_slot,
+            &ad_block_state,
+            &dns_server,
+            &storage,
+        );
+
+        assert!(
+            lock_or_recover(&task_slot).is_none(),
+            "task should NOT spawn when refresh_interval_hours=0"
+        );
+    }
 }
 
 /// 获取 DNS 服务运行状态。

@@ -96,13 +96,26 @@ impl AdBlockEngine {
             Ok(mut g) => *g = whitelist,
             Err(p) => *p.into_inner() = whitelist,
         }
-        // Update the cached size LAST. The tiny window where the maps are
-        // already swapped but the size still reflects the previous rebuild
-        // means `check` may walk an already-updated map with the old size —
-        // same correctness profile as the pre-short-circuit code, never
-        // worse. The opposite ordering (size first, then maps) would let a
-        // `check` see size>0 with old empty maps and still acquire locks,
-        // which is exactly what we're trying to avoid.
+        // Update the cached size LAST. Two transition directions to think about:
+        //
+        //   - N → 0  (rebuild to empty): the brief window has new empty maps
+        //     but cached size still says N. `check` walks the empty maps
+        //     and correctly returns None — equivalent to the pre-short-circuit
+        //     behavior (which also walks empty maps). No regression.
+        //   - 0 → N  (rebuild from empty): the brief window has new loaded
+        //     maps but cached size still says 0. `check` short-circuits to
+        //     None and **leaks ad-block hits through** for the duration of
+        //     the rebuild. This is strictly worse than the pre-short-circuit
+        //     code, which would have correctly applied the new rules.
+        //
+        // This window is bounded by the time to populate the maps (sub-second
+        // for a 100k-rule list on commodity hardware). Acceptable trade-off
+        // for v1; a true fix is the `Arc::swap` pattern (single atomic
+        // publication, no multi-step inconsistency), tracked as a follow-up.
+        // The opposite ordering (size first, then maps) would let `check`
+        // walk the OLD maps while believing they're loaded — also bad in a
+        // different direction. Both orderings have transition windows; we
+        // picked the one whose downside is bounded by the rebuild latency.
         self.total_rules.store(new_total, Ordering::Release);
     }
 

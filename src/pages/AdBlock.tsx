@@ -98,7 +98,13 @@ function AdBlock() {
     );
   }
 
-  const disabled = !dnsEnabled;
+  // `dnsEnabled` flip controls whether the DNS engine actually applies
+  // ad-block rules. Configuration edits below are ALWAYS persisted to
+  // disk (and re-applied when DNS mode comes on), so the form is not
+  // disabled when DNS is off — users often configure sources + whitelist
+  // before enabling DNS mode for the first time. The banner below
+  // explains the effective state.
+  const dnsModeOff = !dnsEnabled;
 
   return (
     <div className="mhost-page">
@@ -111,9 +117,8 @@ function AdBlock() {
           <button
             className="btn btn-sm btn-ghost"
             onClick={() => refreshAll().catch(() => {})}
-            disabled={isLoading || disabled || state.sources.length === 0}
+            disabled={isLoading || state.sources.length === 0}
             onPointerDown={onPointerDown(() => {})}
-            title={disabled ? "Enable DNS mode to take effect" : undefined}
           >
             Refresh all
           </button>
@@ -122,11 +127,11 @@ function AdBlock() {
 
       {error && <div className="alert alert-error">{error}</div>}
 
-      {disabled && (
+      {dnsModeOff && (
         <div className={styles.banner}>
           <span>
-            DNS mode is off. Ad block sources and whitelist are visible but
-            inactive until you enable DNS mode.
+            DNS mode is off. Your edits below are saved and will apply the
+            next time you enable DNS mode.
           </span>
           <button
             className="btn btn-sm btn-primary"
@@ -163,8 +168,7 @@ function AdBlock() {
                 onChange={(e) =>
                   toggleEnabled(e.target.checked).catch(() => {})
                 }
-                disabled={isLoading || disabled}
-                title={disabled ? "Enable DNS mode to take effect" : undefined}
+                disabled={isLoading}
               />
               <span className="toggle-slider" />
             </label>
@@ -211,7 +215,7 @@ function AdBlock() {
                 value={newName}
                 placeholder="StevenBlack"
                 onChange={(e) => setNewName(e.target.value)}
-                disabled={isLoading || disabled}
+                disabled={isLoading}
               />
             </div>
             <div className="form-group">
@@ -222,7 +226,7 @@ function AdBlock() {
                 value={newUrl}
                 placeholder="https://example.com/hosts"
                 onChange={(e) => setNewUrl(e.target.value)}
-                disabled={isLoading || disabled}
+                disabled={isLoading}
               />
             </div>
             <div className="form-group">
@@ -233,7 +237,7 @@ function AdBlock() {
                 onChange={(e) =>
                   setNewResponse(e.target.value as AdBlockResponse)
                 }
-                disabled={isLoading || disabled}
+                disabled={isLoading}
               >
                 <option value="zero_address">0.0.0.0</option>
                 <option value="nx_domain">NXDOMAIN</option>
@@ -242,11 +246,8 @@ function AdBlock() {
             <button
               className="btn btn-primary btn-sm"
               onClick={handleAddSource}
-              disabled={
-                isLoading || disabled || !newName.trim() || !newUrl.trim()
-              }
+              disabled={isLoading || !newName.trim() || !newUrl.trim()}
               onPointerDown={onPointerDown(() => {})}
-              title={disabled ? "Enable DNS mode before adding sources" : undefined}
             >
               Add
             </button>
@@ -302,8 +303,7 @@ function AdBlock() {
                               enabled: e.target.checked,
                             }).catch(() => {})
                           }
-                          disabled={isLoading || disabled}
-                          title={disabled ? "Enable DNS mode to take effect" : undefined}
+                          disabled={isLoading}
                         />
                         <span className="toggle-slider" />
                       </label>
@@ -318,7 +318,7 @@ function AdBlock() {
                           }).catch(() => {})
                         }
                         style={{ fontSize: 12, padding: "2px 6px" }}
-                        disabled={isLoading || disabled}
+                        disabled={isLoading}
                       >
                         <option value="zero_address">0.0.0.0</option>
                         <option value="nx_domain">NXDOMAIN</option>
@@ -329,9 +329,8 @@ function AdBlock() {
                         onClick={() =>
                           refreshSource(src.source_id).catch(() => {})
                         }
-                        disabled={isLoading || disabled}
+                        disabled={isLoading}
                         onPointerDown={onPointerDown(() => {})}
-                        title={disabled ? "Enable DNS mode to take effect" : undefined}
                       >
                         Refresh
                       </button>
@@ -342,9 +341,8 @@ function AdBlock() {
                             removeSource(src.source_id).catch(() => {});
                           }
                         }}
-                        disabled={isLoading || disabled}
+                        disabled={isLoading}
                         onPointerDown={onPointerDown(() => {})}
-                        title={disabled ? "Enable DNS mode to take effect" : undefined}
                       >
                         Delete
                       </button>
@@ -375,14 +373,13 @@ function AdBlock() {
               onKeyDown={(e) => {
                 if (e.key === "Enter") handleAddWhitelist();
               }}
-              disabled={isLoading || disabled}
+              disabled={isLoading}
             />
             <button
               className="btn btn-primary btn-sm"
               onClick={handleAddWhitelist}
-              disabled={!newWhitelistDomain.trim() || disabled}
+              disabled={!newWhitelistDomain.trim() || isLoading}
               onPointerDown={onPointerDown(() => {})}
-              title={disabled ? "Enable DNS mode to take effect" : undefined}
             >
               Add
             </button>
@@ -399,8 +396,7 @@ function AdBlock() {
                     className={styles.removeBtn}
                     onClick={() => removeWhitelist(d).catch(() => {})}
                     aria-label={`Remove ${d}`}
-                    disabled={disabled}
-                    title={disabled ? "Enable DNS mode to take effect" : undefined}
+                    disabled={isLoading}
                   >
                     ×
                   </button>
@@ -428,8 +424,7 @@ function AdBlock() {
                 handleIntervalChange(parseInt(e.target.value, 10))
               }
               style={{ width: 120 }}
-              disabled={isLoading || disabled}
-              title={disabled ? "Enable DNS mode to take effect" : undefined}
+              disabled={isLoading}
             >
               <option value="0">Manual only</option>
               <option value="1">1 hour</option>
