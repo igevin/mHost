@@ -190,9 +190,20 @@ describe("Layout", () => {
     expect(screen.getByText("No profiles yet")).toBeInTheDocument();
   });
 
-  it("renders disabled tool items with 'Soon' badge", () => {
+  it("renders the 'Soon' badge on still-disabled tool items", () => {
+    // issue #130: Ad Block used to be one of the "Soon" placeholders but
+    // is now a real route (DNS-mode-only). Remote Rules is still upcoming.
     renderWithProviders(<Layout />);
-    expect(screen.getAllByText("Soon").length).toBeGreaterThanOrEqual(2);
+    expect(screen.getAllByText("Soon").length).toBeGreaterThanOrEqual(1);
+    // Ad Block is no longer disabled.
+    const adBlockLinks = screen.getAllByText("Ad Block");
+    expect(adBlockLinks.length).toBeGreaterThan(0);
+    // The ad-block link is rendered as a real anchor (not disabled).
+    const realLink = adBlockLinks.find((el) => {
+      const anchor = el.closest("a");
+      return anchor !== null && !anchor.hasAttribute("aria-disabled");
+    });
+    expect(realLink).toBeDefined();
   });
 
   it("navigates to profile page when profile item is clicked", async () => {

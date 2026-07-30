@@ -331,7 +331,7 @@ impl Storage for FileStorage {
 ///
 /// 使用 `NamedTempFile` 避免并发写入时的固定临时文件名竞态条件。
 /// 如果写入过程中发生错误，临时文件会自动清理。
-fn atomic_write(path: &Path, content: &[u8]) -> io::Result<()> {
+pub(super) fn atomic_write(path: &Path, content: &[u8]) -> io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let mut temp_file = tempfile::NamedTempFile::new_in(parent)?;
     temp_file.write_all(content)?;

@@ -49,9 +49,14 @@ describe("App", () => {
       );
     });
 
-    expect(listenMock).toHaveBeenCalledTimes(1);
+    // issue #130: App now also subscribes to "navigate" for tray-driven
+    // deep-linking to /ad-block. Both subscriptions should be active.
     expect(listenMock).toHaveBeenCalledWith(
       "tray:profiles-updated",
+      expect.any(Function),
+    );
+    expect(listenMock).toHaveBeenCalledWith(
+      "navigate",
       expect.any(Function),
     );
   });
@@ -67,7 +72,9 @@ describe("App", () => {
       );
     });
 
-    const [, handler] = listenMock.mock.calls[0];
+    const [, handler] = listenMock.mock.calls.find(
+      ([event]) => event === "tray:profiles-updated",
+    ) as [string, () => void];
     expect(handler).toBeDefined();
 
     await act(async () => {
@@ -93,7 +100,8 @@ describe("App", () => {
       unmountFn = unmount;
     });
 
-    expect(listenMock).toHaveBeenCalledTimes(1);
+    // Two subscriptions registered (tray + navigate), expect both to be torn down.
+    expect(listenMock).toHaveBeenCalledTimes(2);
 
     await act(async () => {
       unmountFn();

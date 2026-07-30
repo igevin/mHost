@@ -16,7 +16,7 @@ use mhost_hosts::Parser;
 /// **fix (P-R6, issue #90)**: was using `Parser::extract_managed_block`
 /// which returns **line indices**, then doing a second full-file scan with
 /// `current.lines().scan(0, ...).collect()` to convert to byte offsets —
-/// for a 5000-line ad-block hosts file this allocated a 5000-element Vec
+/// for a 5000-line managed hosts file this allocated a 5000-element Vec
 /// and walked every line just to look up 2 entries. Now uses
 /// `Parser::extract_managed_block_bytes` which returns byte offsets
 /// directly in a single pass. The full-file scan is gone.

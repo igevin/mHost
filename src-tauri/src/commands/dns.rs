@@ -6,6 +6,8 @@ use tauri::State;
 
 use crate::state::AppState;
 
+use std::sync::Arc;
+
 /// 启动/停止 DNS 模式。
 ///
 /// # 状态机正确性（fix: systematic DNS logic review）
@@ -119,6 +121,18 @@ async fn set_dns_mode_enable(state: &AppState) -> Result<(), MhostError> {
     let enabled_profiles: Vec<_> = profiles.into_iter().filter(|p| p.enabled).collect();
     server.reload_rules(&enabled_profiles);
 
+    // 4.1 广告屏蔽（issue #130）：启用 DNS 前把当前 ad-block 状态注入
+    //     新 server。PR #131 re-review P1-1：之前只 spawn 了周期刷新
+    //     task，而该 task 的首动作是 `sleep(interval)`（最少 1h），导致
+    //     `DnsServer::new` 里空的 AdBlockEngine 在启用后约 1 小时内
+    //     完全不拦截 —— 即使用户磁盘上已有缓存 blocklist。这里复用
+    //     `classify_rules`（与 persist_and_reload 同一份逻辑）做即时加载。
+    {
+        let snap = state.ad_block_state.read().await.clone();
+        let (za, nx, wl) = crate::commands::adblock::classify_rules(&snap, state.storage.root());
+        server.reload_ad_block_rules(za, nx, wl);
+    }
+
     // 5. 启动 server（绑定 1053）。失败时还没有副作用，仅回滚构造。
     if let Err(e) = server.start().await {
         return Err(MhostError::InvalidInput(format!(
@@ -174,6 +188,19 @@ async fn set_dns_mode_enable(state: &AppState) -> Result<(), MhostError> {
     *lock_or_recover(&state.original_dns) = original;
     *lock_or_recover(&state.dns_server) = Some(server);
     state.dns_enabled.store(true, Ordering::Relaxed);
+
+    // 9. 广告屏蔽（issue #130）：启用 DNS 后立即把当前 ad-block 状态
+    //    hot-reload 到新 server，并启动定时刷新 task。task 在 disable
+    //    时被 abort。
+    //
+    //    这里复用了 commands::adblock 的 `classify_rules` + 重载路径的
+    //    等价逻辑（避免循环依赖和 IPC 边界），不经过 IPC handler。
+    spawn_ad_block_refresh_task(
+        &state.ad_block_refresh_task,
+        &state.ad_block_state,
+        &state.dns_server,
+        &state.storage,
+    );
 
     Ok(())
 }
@@ -252,7 +279,115 @@ async fn set_dns_mode_disable(state: &AppState, interactive: bool) -> Result<(),
     // 5. 清 in-memory dns_enabled
     state.dns_enabled.store(false, Ordering::Relaxed);
 
+    // 6. 终止广告屏蔽后台刷新 task（issue #130）。enable 时 spawn，
+    //    disable 必须 abort；不 abort 会让 task 继续跑并尝试 reload
+    //    已停的 server。
+    if let Some(handle) = lock_or_recover(&state.ad_block_refresh_task).take() {
+        handle.abort();
+    }
+
     Ok(())
+}
+
+/// Spawn the periodic ad-block refresh task (issue #130).
+///
+/// Called from two places:
+///   1. `set_dns_mode_enable` after the DNS server comes up — the
+///      "normal" hot path.
+///   2. `AppState::new` after `try_recover_dns` succeeds — PR #131
+///      review finding 0.1: previously, an auto-recovered DNS session
+///      lost its periodic refresh because the task was only spawned on
+///      the user-driven enable path.
+///
+/// The function takes individual Arcs rather than `&AppState` so it can
+/// be invoked while `AppState` is being constructed (item 2).
+///
+/// The task:
+/// 1. Reads `refresh_interval_hours` from `ad_block_state`.
+/// 2. Sleeps for that interval.
+/// 3. Refreshes all enabled sources + hot-reloads the engine.
+/// 4. Aborts when the JoinHandle is taken (via `set_dns_mode_disable`).
+///
+/// `refresh_interval_hours == 0` or `auto_refresh_enabled == false` short-
+/// circuits — task is not spawned at all (callers don't need to abort it).
+pub(crate) fn spawn_ad_block_refresh_task(
+    task_slot: &std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    ad_block_state: &Arc<tokio::sync::RwLock<mhost_core::AdBlockState>>,
+    dns_server: &Arc<std::sync::Mutex<Option<mhost_dns::DnsServer>>>,
+    storage: &Arc<dyn mhost_storage::storage::Storage + Send + Sync>,
+) {
+    let cfg = match ad_block_state.try_read() {
+        Ok(g) => (g.auto_refresh_enabled, g.refresh_interval_hours),
+        Err(_) => return,
+    };
+    if !cfg.0 || cfg.1 == 0 {
+        return;
+    }
+
+    // Clone the few Arcs we need into the task closure. We don't share the
+    // whole AppState (which contains unrelated Mutexes like snapshot_lock)
+    // to keep the lock-contention surface minimal.
+    let storage = storage.clone();
+    let ad_block_state = ad_block_state.clone();
+    let dns_server = dns_server.clone();
+
+    let interval_secs = (cfg.1 as u64).saturating_mul(3600).max(3600); // floor 1h
+    let handle = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
+
+            // Re-read config — user may have changed interval or disabled
+            // auto-refresh since the last tick.
+            let (auto, interval_h, enabled) = {
+                let Ok(g) = ad_block_state.try_read() else {
+                    continue;
+                };
+                (g.auto_refresh_enabled, g.refresh_interval_hours, g.enabled)
+            };
+            if !auto || interval_h == 0 || !enabled {
+                continue;
+            }
+
+            // Snapshot IDs (best-effort; failures logged not propagated).
+            let ids: Vec<mhost_core::SourceId> = {
+                let Ok(g) = ad_block_state.try_read() else {
+                    continue;
+                };
+                g.sources
+                    .iter()
+                    .filter(|s| s.enabled)
+                    .map(|s| s.source_id.clone())
+                    .collect()
+            };
+
+            // Concurrent fetch — bounded by REFRESH_CONCURRENCY. PR #131
+            // review finding 1.4: serial loop meant a multi-source list
+            // could block for `N × FETCH_TIMEOUT_SECS` while the next
+            // periodic tick waited its turn.
+            crate::commands::adblock::fetch_sources_concurrent(
+                &storage,
+                &ad_block_state,
+                &ids,
+                crate::commands::adblock::REFRESH_CONCURRENCY,
+            )
+            .await;
+
+            // Hot-reload engine if DNS still on. We use the dns_server
+            // slot as the proxy signal — `set_dns_mode_disable` takes the
+            // server out before clearing dns_enabled, so by the time the
+            // slot is None the refresh task should be aborted anyway.
+            if lock_or_recover(&dns_server).is_some() {
+                let snap = ad_block_state.read().await.clone();
+                let root = storage.root();
+                let (za, nx, wl) = crate::commands::adblock::classify_rules(&snap, root);
+                if let Some(server) = lock_or_recover(&dns_server).as_ref() {
+                    server.reload_ad_block_rules(za, nx, wl);
+                }
+            }
+        }
+    });
+
+    *lock_or_recover(task_slot) = Some(handle);
 }
 
 /// 获取 DNS 模式状态。
@@ -361,6 +496,8 @@ mod tests {
             dns_enabled: AtomicBool::new(false),
             original_dns: Mutex::new(OriginalDns::DhcpEmpty),
             dns_lock: ApplyLock::new(),
+            ad_block_state: Arc::new(tokio::sync::RwLock::new(mhost_core::AdBlockState::default())),
+            ad_block_refresh_task: Mutex::new(None),
         };
         // dns_enabled = false → cleanup 应直接返回 Ok
         let result = cleanup_dns_on_exit(&state, false).await;
@@ -399,6 +536,8 @@ mod tests {
             dns_enabled: AtomicBool::new(true), // 假装启用 → cleanup 会走 disable 路径
             original_dns: Mutex::new(OriginalDns::DhcpEmpty), // DhcpEmpty → 写 Empty
             dns_lock: ApplyLock::new(),
+            ad_block_state: Arc::new(tokio::sync::RwLock::new(mhost_core::AdBlockState::default())),
+            ad_block_refresh_task: Mutex::new(None),
         };
         // cleanup_dns_on_exit → set_dns_mode_disable(interactive=false)
         //   - original 是 DhcpEmpty → 只打印 warning（不返回 Err，bug 1 修复）
@@ -450,6 +589,8 @@ mod tests {
             dns_enabled: AtomicBool::new(true),
             original_dns: Mutex::new(OriginalDns::DhcpEmpty),
             dns_lock: ApplyLock::new(),
+            ad_block_state: Arc::new(tokio::sync::RwLock::new(mhost_core::AdBlockState::default())),
+            ad_block_refresh_task: Mutex::new(None),
         };
 
         // 第一次 cleanup：跑 disable 路径。注意必须用 interactive=false
@@ -481,6 +622,109 @@ mod tests {
         // 第三次（同样）
         let r3 = cleanup_dns_on_exit(&state, false).await;
         assert!(r3.is_ok(), "third cleanup must also be a no-op");
+    }
+
+    // -------------------------------------------------------------------
+    // PR #131 review finding 0.1 + self-review §1 — regression test for
+    // `spawn_ad_block_refresh_task`. The auto-recovery path in
+    // `AppState::new` calls this; a refactor that drops the call would
+    // silently regress back to "DNS auto-recovered but no background refresh".
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_spawn_ad_block_refresh_task_spawns_when_auto_enabled() {
+        // Default AdBlockState has auto_refresh_enabled=true and
+        // refresh_interval_hours=24 — both preconditions for spawning.
+        let temp = TempDir::new().unwrap();
+        let storage = Arc::new(FileStorage::new(temp.path()))
+            as Arc<dyn mhost_storage::storage::Storage + Send + Sync>;
+        let ad_block_state =
+            Arc::new(tokio::sync::RwLock::new(mhost_core::AdBlockState::default()));
+        let dns_server: Arc<std::sync::Mutex<Option<mhost_dns::DnsServer>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let task_slot: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>> =
+            std::sync::Mutex::new(None);
+
+        assert!(
+            lock_or_recover(&task_slot).is_none(),
+            "pre-condition: slot empty"
+        );
+
+        crate::commands::dns::spawn_ad_block_refresh_task(
+            &task_slot,
+            &ad_block_state,
+            &dns_server,
+            &storage,
+        );
+
+        // Slot must be populated.
+        let spawned = lock_or_recover(&task_slot).take();
+        assert!(
+            spawned.is_some(),
+            "task should spawn when auto_refresh_enabled=true and hours>0"
+        );
+        // Clean up the tokio task so it doesn't outlive the test.
+        if let Some(h) = spawned {
+            h.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_spawn_ad_block_refresh_task_skips_when_auto_disabled() {
+        let temp = TempDir::new().unwrap();
+        let storage = Arc::new(FileStorage::new(temp.path()))
+            as Arc<dyn mhost_storage::storage::Storage + Send + Sync>;
+        // user opted out — auto_refresh_enabled=false is the only field that matters
+        let state = mhost_core::AdBlockState {
+            auto_refresh_enabled: false,
+            ..Default::default()
+        };
+        let ad_block_state = Arc::new(tokio::sync::RwLock::new(state));
+        let dns_server: Arc<std::sync::Mutex<Option<mhost_dns::DnsServer>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let task_slot: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>> =
+            std::sync::Mutex::new(None);
+
+        crate::commands::dns::spawn_ad_block_refresh_task(
+            &task_slot,
+            &ad_block_state,
+            &dns_server,
+            &storage,
+        );
+
+        assert!(
+            lock_or_recover(&task_slot).is_none(),
+            "task should NOT spawn when auto_refresh_enabled=false"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_spawn_ad_block_refresh_task_skips_when_interval_zero() {
+        let temp = TempDir::new().unwrap();
+        let storage = Arc::new(FileStorage::new(temp.path()))
+            as Arc<dyn mhost_storage::storage::Storage + Send + Sync>;
+        // "manual only" — interval=0 disables background refresh
+        let state = mhost_core::AdBlockState {
+            refresh_interval_hours: 0,
+            ..Default::default()
+        };
+        let ad_block_state = Arc::new(tokio::sync::RwLock::new(state));
+        let dns_server: Arc<std::sync::Mutex<Option<mhost_dns::DnsServer>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let task_slot: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>> =
+            std::sync::Mutex::new(None);
+
+        crate::commands::dns::spawn_ad_block_refresh_task(
+            &task_slot,
+            &ad_block_state,
+            &dns_server,
+            &storage,
+        );
+
+        assert!(
+            lock_or_recover(&task_slot).is_none(),
+            "task should NOT spawn when refresh_interval_hours=0"
+        );
     }
 }
 

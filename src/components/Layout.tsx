@@ -122,11 +122,11 @@ function DnsIcon() {
 
 const toolNavItems: NavItem[] = [
   {
-    to: "#adblock",
+    // issue #130: ad block is now DNS-mode-only, real route.
+    to: "/ad-block",
     label: "Ad Block",
     icon: <ShieldIcon />,
-    badge: 10,
-    disabled: true,
+    disabled: false,
   },
   {
     to: "#remote",

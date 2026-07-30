@@ -192,6 +192,87 @@ pub enum RuleSource {
 }
 
 // ---------------------------------------------------------------------------
+// AdBlock (issue #130)
+// ---------------------------------------------------------------------------
+//
+// 广告屏蔽状态与配置。**仅在 DNS 模式下生效** —— hosts 模式不再承担
+// 广告屏蔽职责（早期尝试因 `/etc/hosts` 膨胀失败）。
+//
+// 数据布局（mhost-storage）：
+//   {root}/adblock.json         # AdBlockState 整体序列化
+//   {root}/adblock-cache/{id}.txt # 每源原始 hosts 内容
+
+/// Per-source response when a domain hits an ad block rule.
+///
+/// `ZeroAddress` returns a 0.0.0.0 A record (clients typically retry-then-fail
+/// after a timeout). `NxDomain` returns NXDOMAIN immediately (more aggressive
+/// but some clients surface it as an error).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AdBlockResponse {
+    #[default]
+    ZeroAddress,
+    NxDomain,
+}
+
+/// A remote ad block subscription source.
+///
+/// One source = one URL of hosts-format blocklist. Persisted as part of
+/// `AdBlockState`. The cached fetched content lives at
+/// `{root}/adblock-cache/{source_id}.txt` so that DNS mode can keep serving
+/// blocklist hits even when the remote URL is temporarily unreachable.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdBlockSource {
+    pub source_id: SourceId,
+    pub name: String,
+    pub url: String,
+    pub enabled: bool,
+    pub response: AdBlockResponse,
+    /// RFC 3339 timestamp of the last successful fetch. `None` if never fetched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_fetched_at: Option<DateTime<Utc>>,
+    /// Last fetch error message (transport or non-2xx). Cleared on next success.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    /// Number of rules parsed from the last successful fetch.
+    pub rule_count: usize,
+    /// HTTP ETag from the last successful fetch (reserved for future
+    /// conditional GETs — unused in v1 but persisted so we don't need a
+    /// migration when conditional fetch lands).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub etag: Option<String>,
+}
+
+/// Persistent state for the DNS-mode ad block subsystem.
+///
+/// Stored as a single JSON document (`{root}/adblock.json`). All fields are
+/// mutable from the IPC surface; the Rust side owns the on-disk write path
+/// (`mhost-storage/src/adblock.rs`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdBlockState {
+    pub enabled: bool,
+    pub sources: Vec<AdBlockSource>,
+    pub whitelist: Vec<String>,
+    pub auto_refresh_enabled: bool,
+    /// Hours between background refreshes. `0` disables background refresh
+    /// regardless of `auto_refresh_enabled`. Clamped to a sane range at the
+    /// IPC boundary.
+    pub refresh_interval_hours: u32,
+}
+
+impl Default for AdBlockState {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sources: Vec::new(),
+            whitelist: Vec::new(),
+            auto_refresh_enabled: true,
+            refresh_interval_hours: 24,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ExportFormat
 // ---------------------------------------------------------------------------
 
@@ -671,6 +752,110 @@ mod tests {
         assert!(json.contains("\"source_name\":\"AdGuard\""));
         let restored: RuleSource = serde_json::from_str(&json).unwrap();
         assert_eq!(source, restored);
+    }
+
+    // -----------------------------------------------------------------------
+    // AdBlock tests (issue #130)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ad_block_response_default_is_zero_address() {
+        assert_eq!(AdBlockResponse::default(), AdBlockResponse::ZeroAddress);
+    }
+
+    #[test]
+    fn test_ad_block_response_serde_roundtrip() {
+        for variant in [AdBlockResponse::ZeroAddress, AdBlockResponse::NxDomain] {
+            let json = serde_json::to_string(&variant).unwrap();
+            let restored: AdBlockResponse = serde_json::from_str(&json).unwrap();
+            assert_eq!(variant, restored);
+        }
+        // snake_case wire format (serde `rename_all = "snake_case"` treats the
+        // capital N in `NxDomain` as a word boundary → `nx_domain`)
+        assert_eq!(
+            serde_json::to_string(&AdBlockResponse::ZeroAddress).unwrap(),
+            "\"zero_address\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AdBlockResponse::NxDomain).unwrap(),
+            "\"nx_domain\""
+        );
+    }
+
+    #[test]
+    fn test_ad_block_source_serde_skips_none_optionals() {
+        let source = AdBlockSource {
+            source_id: SourceId(Uuid::new_v4()),
+            name: "StevenBlack".to_string(),
+            url: "https://example.com/list.txt".to_string(),
+            enabled: true,
+            response: AdBlockResponse::NxDomain,
+            last_fetched_at: None,
+            last_error: None,
+            rule_count: 0,
+            etag: None,
+        };
+        let json = serde_json::to_string(&source).unwrap();
+        assert!(!json.contains("last_fetched_at"));
+        assert!(!json.contains("last_error"));
+        assert!(!json.contains("etag"));
+        let restored: AdBlockSource = serde_json::from_str(&json).unwrap();
+        assert_eq!(source, restored);
+    }
+
+    #[test]
+    fn test_ad_block_source_serde_includes_some_optionals() {
+        let source = AdBlockSource {
+            source_id: SourceId(Uuid::new_v4()),
+            name: "Test".to_string(),
+            url: "https://example.com/list.txt".to_string(),
+            enabled: false,
+            response: AdBlockResponse::ZeroAddress,
+            last_fetched_at: Some("2026-07-28T00:00:00Z".parse().unwrap()),
+            last_error: Some("timeout".to_string()),
+            rule_count: 42,
+            etag: Some("W/\"abc\"".to_string()),
+        };
+        let json = serde_json::to_string(&source).unwrap();
+        assert!(json.contains("last_fetched_at"));
+        assert!(json.contains("last_error"));
+        assert!(json.contains("etag"));
+        let restored: AdBlockSource = serde_json::from_str(&json).unwrap();
+        assert_eq!(source, restored);
+    }
+
+    #[test]
+    fn test_ad_block_state_default() {
+        let state = AdBlockState::default();
+        assert!(!state.enabled);
+        assert!(state.sources.is_empty());
+        assert!(state.whitelist.is_empty());
+        assert!(state.auto_refresh_enabled);
+        assert_eq!(state.refresh_interval_hours, 24);
+    }
+
+    #[test]
+    fn test_ad_block_state_serde_roundtrip() {
+        let state = AdBlockState {
+            enabled: true,
+            sources: vec![AdBlockSource {
+                source_id: SourceId(Uuid::new_v4()),
+                name: "S1".to_string(),
+                url: "https://example.com/s1".to_string(),
+                enabled: true,
+                response: AdBlockResponse::NxDomain,
+                last_fetched_at: None,
+                last_error: None,
+                rule_count: 100,
+                etag: None,
+            }],
+            whitelist: vec!["trusted.example.com".to_string()],
+            auto_refresh_enabled: true,
+            refresh_interval_hours: 12,
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let restored: AdBlockState = serde_json::from_str(&json).unwrap();
+        assert_eq!(state, restored);
     }
 
     // -----------------------------------------------------------------------

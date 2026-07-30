@@ -1,0 +1,190 @@
+/* ---- AdBlock page layout ---- */
+
+.pageBody {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  max-width: 800px;
+}
+
+.summaryGrid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+  margin-top: 12px;
+}
+
+@media (max-width: 600px) {
+  .summaryGrid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.statCard {
+  padding: 12px 14px;
+  background: var(--color-surface, var(--paper));
+  border: 1px solid var(--rule, #e5e5e5);
+  border-radius: var(--radius-md, 6px);
+}
+
+.statValue {
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--color-text, var(--ink));
+  font-variant-numeric: tabular-nums;
+}
+
+.statLabel {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--color-muted, var(--ink-muted));
+  margin-top: 4px;
+}
+
+/* ---- Source card ---- */
+
+.sourceCard {
+  border: 1px solid var(--rule, #e5e5e5);
+  border-radius: var(--radius-md, 6px);
+  padding: 14px 16px;
+  background: var(--color-surface, var(--paper));
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.sourceCard.dimmed {
+  opacity: 0.55;
+}
+
+.sourceHeader {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.sourceTitle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  color: var(--color-text, var(--ink));
+  font-size: 14px;
+}
+
+.sourceMeta {
+  font-size: 11px;
+  color: var(--color-muted, var(--ink-muted));
+  word-break: break-all;
+}
+
+.sourceActions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.errorBadge {
+  font-size: 11px;
+  color: var(--color-danger, var(--danger));
+  background: var(--color-danger-soft, #fdecec);
+  padding: 2px 8px;
+  border-radius: 10px;
+  display: inline-block;
+  word-break: break-all;
+}
+
+/* ---- Add source form ---- */
+
+.addSourceForm {
+  display: grid;
+  grid-template-columns: 1fr 2fr auto auto;
+  gap: 8px;
+  align-items: end;
+}
+
+@media (max-width: 600px) {
+  .addSourceForm {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ---- Whitelist ---- */
+
+.whitelistList {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.whitelistItem {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--color-surface, var(--paper));
+  border: 1px solid var(--rule, #e5e5e5);
+  border-radius: 12px;
+  padding: 3px 4px 3px 10px;
+  font-size: 12px;
+  font-family: var(--font-mono, monospace);
+}
+
+.removeBtn {
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 0 6px;
+  color: var(--color-muted, var(--ink-muted));
+}
+
+.removeBtn:hover {
+  color: var(--color-danger, var(--danger));
+}
+
+.empty {
+  color: var(--color-muted, var(--ink-muted));
+  font-style: italic;
+  font-size: 13px;
+  padding: 12px 0;
+}
+
+/* ---- Banner ---- */
+
+.banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: var(--color-warning-soft, #fff5e0);
+  border: 1px solid var(--color-warning, var(--warning));
+  color: var(--color-text, var(--ink));
+  padding: 10px 14px;
+  border-radius: var(--radius-md, 6px);
+  font-size: 13px;
+}
+
+.banner button {
+  margin-left: auto;
+}
+
+/* ---- Inline form ---- */
+
+.inlineForm {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.inlineForm input {
+  flex: 1;
+}
+
+.muted {
+  color: var(--color-muted, var(--ink-muted));
+  font-size: 12px;
+}

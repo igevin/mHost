@@ -1,9 +1,10 @@
 use mhost_apply::writer::HostsWriter;
-use mhost_core::{MhostError, OriginalDns, ProfileMode};
+use mhost_core::{AdBlockState, MhostError, OriginalDns, ProfileMode};
 use mhost_storage::migration::migrate_v1_to_v2;
 use mhost_storage::storage::{FileStorage, Storage};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use tokio::task::JoinHandle;
 
 /// Async mutex to serialize apply operations and prevent concurrent writes to /etc/hosts.
 /// Security fix (#16): Prevents race conditions when user rapidly toggles profiles.
@@ -75,6 +76,12 @@ pub struct AppState {
     pub original_dns: Mutex<OriginalDns>,
     /// 串行化 DNS 模式切换操作。
     pub dns_lock: ApplyLock,
+    // 广告屏蔽 (issue #130)
+    /// 当前广告屏蔽状态。`tokio::sync::RwLock` 让热重载可以并发读。
+    /// 写操作集中在 `commands/adblock.rs`（原子写文件 + 内存 + 推引擎）。
+    pub ad_block_state: Arc<tokio::sync::RwLock<AdBlockState>>,
+    /// 后台定时刷新 task 句柄。DNS 模式启用时存在，禁用时被 abort。
+    pub ad_block_refresh_task: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl AppState {
@@ -152,17 +159,63 @@ impl AppState {
             }
         }
 
-        Ok(Self {
+        // 广告屏蔽状态从 adblock.json 读；不存在则默认（issue #130）。
+        // 在 struct 构造前 read_state — 此时 storage 还没被 move 进 AppState。
+        //
+        // **fix (PR #131 review finding 0.2)**: use the back-up variant so
+        // a corrupted `adblock.json` is renamed aside instead of being
+        // silently overwritten with defaults on the next save.
+        let ad_block_state =
+            mhost_storage::adblock::read_state_or_default_with_backup(storage.root());
+
+        let ad_block_state_lock = Arc::new(tokio::sync::RwLock::new(ad_block_state));
+        let dns_server_slot: Arc<Mutex<Option<mhost_dns::DnsServer>>> =
+            Arc::new(Mutex::new(dns_server_opt));
+        let refresh_task_slot: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
+
+        let state = Self {
             storage,
             writer,
             apply_lock: ApplyLock(tokio::sync::Mutex::new(())),
             snapshot_lock: ApplyLock(tokio::sync::Mutex::new(())),
             last_profile_ids: Mutex::new(Vec::new()),
-            dns_server: Arc::new(Mutex::new(dns_server_opt)),
+            dns_server: dns_server_slot,
             dns_enabled: AtomicBool::new(dns_enabled),
             original_dns: Mutex::new(original_dns),
             dns_lock: ApplyLock(tokio::sync::Mutex::new(())),
-        })
+            ad_block_state: ad_block_state_lock,
+            ad_block_refresh_task: refresh_task_slot,
+        };
+
+        // **fix (PR #131 review finding 0.1)**: `try_recover_dns` succeeded
+        // (so `dns_enabled=true` survived the restart), but the periodic
+        // ad-block refresh task is NOT spawned by `set_dns_mode_enable`
+        // (that path is user-driven only). Without this call, an
+        // auto-recovered session would permanently lose background refresh
+        // until the user toggled DNS off and on again.
+        //
+        // **fix (PR #131 re-review P1-1)**: the recovered `DnsServer` was
+        // built with an empty `AdBlockEngine` — `try_recover_dns` loads DNS
+        // profile rules but never ad-block rules, and the refresh task
+        // spawned below sleeps a full interval before its first reload. Load
+        // the cached ad-block rules now so blocking is active from the first
+        // query after auto-recovery.
+        if state.dns_enabled.load(Ordering::Relaxed) {
+            let snap = state.ad_block_state.read().await.clone();
+            let (za, nx, wl) =
+                crate::commands::adblock::classify_rules(&snap, state.storage.root());
+            if let Some(server) = lock_or_recover(&state.dns_server).as_ref() {
+                server.reload_ad_block_rules(za, nx, wl);
+            }
+            crate::commands::dns::spawn_ad_block_refresh_task(
+                &state.ad_block_refresh_task,
+                &state.ad_block_state,
+                &state.dns_server,
+                &state.storage,
+            );
+        }
+
+        Ok(state)
     }
 
     /// 尝试自动恢复 DNS 服务。

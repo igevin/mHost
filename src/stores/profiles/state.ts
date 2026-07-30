@@ -1,5 +1,5 @@
 import { atom } from "jotai";
-import type { ApplyOutcome, Profile, DnsStatus } from "../../types";
+import type { ApplyOutcome, Profile, DnsStatus, AdBlockState } from "../../types";
 import { countRealRules } from "../../lib/rules";
 import { atomWithLocalStorage } from "../../lib/atomWithLocalStorage";
 
@@ -81,3 +81,30 @@ export const quickApplyOutcomeAtom = atom<ApplyOutcome | null>(null);
 /** Visibility gate for QuickApplyToast. Mounted in Layout at all times
  *  but renders `null` when closed. */
 export const isQuickApplyToastOpenAtom = atom(false);
+
+// ---- Ad block atoms (issue #130) ----
+//
+// 全量状态由 `adBlockStateAtom` 持有（master switch + sources + whitelist
+// + 自动刷新配置）。所有 ad-block IPC 调用后都会刷新这个 atom，UI 直接
+// 从这里读，没有 stale cache。
+
+/** 全量广告屏蔽状态。`null` 表示尚未拉取（首屏 loading）。 */
+export const adBlockStateAtom = atom<AdBlockState | null>(null);
+
+export const isAdBlockLoadingAtom = atom(false);
+export const adBlockErrorAtom = atom<string | null>(null);
+
+/** 派生：所有 enabled sources 的规则总数。 */
+export const adBlockRuleCountAtom = atom((get) => {
+  const state = get(adBlockStateAtom);
+  if (!state) return 0;
+  return state.sources
+    .filter((s) => s.enabled)
+    .reduce((sum, s) => sum + s.rule_count, 0);
+});
+
+/** 派生：是否有任意 source 处于 fetch error 状态（用于面板 badge）。 */
+export const adBlockHasErrorsAtom = atom((get) => {
+  const state = get(adBlockStateAtom);
+  return state?.sources.some((s) => s.last_error !== null) ?? false;
+});
