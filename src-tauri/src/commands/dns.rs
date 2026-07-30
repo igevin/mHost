@@ -121,6 +121,18 @@ async fn set_dns_mode_enable(state: &AppState) -> Result<(), MhostError> {
     let enabled_profiles: Vec<_> = profiles.into_iter().filter(|p| p.enabled).collect();
     server.reload_rules(&enabled_profiles);
 
+    // 4.1 广告屏蔽（issue #130）：启用 DNS 前把当前 ad-block 状态注入
+    //     新 server。PR #131 re-review P1-1：之前只 spawn 了周期刷新
+    //     task，而该 task 的首动作是 `sleep(interval)`（最少 1h），导致
+    //     `DnsServer::new` 里空的 AdBlockEngine 在启用后约 1 小时内
+    //     完全不拦截 —— 即使用户磁盘上已有缓存 blocklist。这里复用
+    //     `classify_rules`（与 persist_and_reload 同一份逻辑）做即时加载。
+    {
+        let snap = state.ad_block_state.read().await.clone();
+        let (za, nx, wl) = crate::commands::adblock::classify_rules(&snap, state.storage.root());
+        server.reload_ad_block_rules(za, nx, wl);
+    }
+
     // 5. 启动 server（绑定 1053）。失败时还没有副作用，仅回滚构造。
     if let Err(e) = server.start().await {
         return Err(MhostError::InvalidInput(format!(

@@ -263,8 +263,21 @@ pub(crate) async fn fetch_and_cache_source(
     // 2. Fetch raw bytes via the shared reqwest client (PR #131 review
     // finding 1.9). The static client is built once; size enforcement
     // happens inside `fetch_source` (PR #131 review finding 1.8).
+    //
+    // PR #131 re-review P1-2: record a fetch failure on the source's
+    // `last_error` before propagating — the parse-failure branch below
+    // already did this, but a network/size failure returned via `?` with no
+    // record, so the UI badge and the persisted state both stayed stale.
     let url = source_clone.url.clone();
-    let (body, etag) = fetch_source(&url).await?;
+    let body_and_etag = fetch_source(&url).await;
+    let (body, etag) = match body_and_etag {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = e.to_string();
+            let _ = record_fetch_error(state, source_id, &msg).await;
+            return Err(e);
+        }
+    };
     let content_str = std::str::from_utf8(&body)
         .map_err(|e| MhostError::InvalidInput(format!("response is not valid UTF-8: {}", e)))?;
 
@@ -473,6 +486,17 @@ pub async fn add_ad_block_source(
     response: AdBlockResponse,
     state: State<'_, AppState>,
 ) -> Result<AdBlockSource, MhostError> {
+    add_ad_block_source_impl(&state, name, url, response).await
+}
+
+/// `AppState`-by-ref impl so the persistence-on-fetch-failure contract
+/// (PR #131 re-review P1-2) can be unit-tested without a Tauri `State`.
+pub(crate) async fn add_ad_block_source_impl(
+    state: &AppState,
+    name: String,
+    url: String,
+    response: AdBlockResponse,
+) -> Result<AdBlockSource, MhostError> {
     if name.trim().is_empty() {
         return Err(MhostError::InvalidInput("source name is empty".into()));
     }
@@ -507,12 +531,14 @@ pub async fn add_ad_block_source(
     // UX was confusing). Surface the error to the frontend toast; the
     // source is still in `state.sources` with `last_error` populated so
     // a later "Refresh" works as expected.
-    fetch_and_cache_source(&state, &new_id).await?;
-
-    // Persist AFTER fetch so the disk file captures the fetched record
-    // (rule_count, last_fetched_at, etag, last_error) — not the empty
-    // initial state we just pushed.
-    persist_and_reload(&state).await?;
+    //
+    // PR #131 re-review P1-2: `?` here skipped `persist_and_reload` on
+    // fetch failure, so the source existed only in memory and was lost
+    // on restart. Persist unconditionally first (capturing `last_error`
+    // too), then surface the fetch error to the toast.
+    let fetch_result = fetch_and_cache_source(state, &new_id).await;
+    persist_and_reload(state).await?;
+    fetch_result?;
 
     // Return the freshly-fetched source record to the UI.
     let snap = state.ad_block_state.read().await;
@@ -633,8 +659,13 @@ pub async fn refresh_ad_block_source(
     source_id: SourceId,
     state: State<'_, AppState>,
 ) -> Result<AdBlockSource, MhostError> {
-    fetch_and_cache_source(&state, &source_id).await?;
+    // PR #131 re-review P1-2 (same pattern as add_ad_block_source): persist
+    // unconditionally so `last_error` is captured on disk, then surface the
+    // fetch error. The source already exists on disk here, so this is about
+    // not losing the error state rather than not losing the source.
+    let fetch_result = fetch_and_cache_source(&state, &source_id).await;
     persist_and_reload(&state).await?;
+    fetch_result?;
     let snap = state.ad_block_state.read().await;
     Ok(adblock_store::find_source(&snap, &source_id)
         .cloned()
@@ -794,5 +825,113 @@ mod tests {
         let text = "0.0.0.0 MiXed.ExAmPlE.com\n";
         let domains = parse_blocklist_domains(text);
         assert_eq!(domains, vec!["mixed.example.com".to_string()]);
+    }
+
+    // -----------------------------------------------------------------
+    // PR #131 re-review P1-1: the cold-start fix in `set_dns_mode_enable`
+    // and `AppState::new` relies on `classify_rules` turning a source's
+    // cached blocklist into non-empty rule sets, then `reload_ad_block_rules`
+    // populating the engine. This locks that building block so a refactor
+    // can't silently empty the engine on DNS enable.
+    // -----------------------------------------------------------------
+    #[test]
+    fn classify_rules_populates_from_cached_source() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mk = |name: &str, response: AdBlockResponse| AdBlockSource {
+            source_id: SourceId(Uuid::new_v4()),
+            name: name.into(),
+            url: "https://x".into(),
+            enabled: true,
+            response,
+            last_fetched_at: None,
+            last_error: None,
+            rule_count: 2,
+            etag: None,
+        };
+        let za_source = mk("za", AdBlockResponse::ZeroAddress);
+        let nx_source = mk("nx", AdBlockResponse::NxDomain);
+        // Seed each source's cache file with parsed hosts-format content.
+        mhost_storage::adblock::write_cache(
+            temp.path(),
+            &za_source.source_id,
+            b"0.0.0.0 ads.example.com\n0.0.0.0 tracker.example.com\n",
+        )
+        .unwrap();
+        mhost_storage::adblock::write_cache(
+            temp.path(),
+            &nx_source.source_id,
+            b"0.0.0.0 blocked.example.com\n",
+        )
+        .unwrap();
+        let state = AdBlockState {
+            enabled: true,
+            sources: vec![za_source, nx_source],
+            whitelist: vec!["safe.example.com".to_string()],
+            ..Default::default()
+        };
+        let (z, n, w) = classify_rules(&state, temp.path());
+        assert_eq!(z.len(), 2, "zero_addr set seeded from za source cache");
+        assert!(z.contains_key("ads.example.com"));
+        assert!(z.contains_key("tracker.example.com"));
+        assert_eq!(n.len(), 1, "nxdomain set seeded from nx source cache");
+        assert!(n.contains("blocked.example.com"));
+        assert_eq!(w.len(), 1);
+    }
+
+    // -----------------------------------------------------------------
+    // PR #131 re-review P1-2: a fetch failure must NOT skip persistence —
+    // the source was already pushed into in-memory state, and skipping
+    // `persist_and_reload` lost it on restart. Point the source at a loopback
+    // port that refuses connections so `fetch_source` fails fast (no 30s
+    // timeout). The source should still be on disk after the call errors.
+    // -----------------------------------------------------------------
+    #[tokio::test]
+    async fn add_ad_block_source_persists_on_fetch_failure() {
+        use crate::state::AppState;
+        use mhost_apply::writer::HostsWriter;
+        use mhost_storage::storage::FileStorage;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = Arc::new(FileStorage::new(temp.path()))
+            as Arc<dyn mhost_storage::storage::Storage + Send + Sync>;
+        let state = AppState {
+            storage: storage.clone(),
+            writer: Arc::new(HostsWriter::new()),
+            apply_lock: crate::state::ApplyLock::new(),
+            snapshot_lock: crate::state::ApplyLock::new(),
+            last_profile_ids: std::sync::Mutex::new(Vec::new()),
+            dns_server: Arc::new(std::sync::Mutex::new(None)),
+            dns_enabled: std::sync::atomic::AtomicBool::new(false),
+            original_dns: std::sync::Mutex::new(mhost_core::OriginalDns::DhcpEmpty),
+            dns_lock: crate::state::ApplyLock::new(),
+            ad_block_state: Arc::new(tokio::sync::RwLock::new(AdBlockState::default())),
+            ad_block_refresh_task: std::sync::Mutex::new(None),
+        };
+
+        // Port 1 on loopback refuses connections → fetch_source errors fast.
+        let url = "http://127.0.0.1:1/blocklist".to_string();
+        let err =
+            add_ad_block_source_impl(&state, "failing".into(), url, AdBlockResponse::ZeroAddress)
+                .await
+                .expect_err("fetch should fail (connection refused)");
+        assert!(
+            err.to_string().contains("fetch")
+                || err.to_string().to_lowercase().contains("connect")
+                || err.to_string().to_lowercase().contains("error")
+        );
+
+        // P1-2 invariant: the source is persisted despite the fetch failure.
+        let persisted = mhost_storage::adblock::read_state(storage.root())
+            .expect("adblock.json should exist after persist_and_reload");
+        assert_eq!(
+            persisted.sources.len(),
+            1,
+            "source must be persisted even when initial fetch fails (P1-2)"
+        );
+        assert_eq!(persisted.sources[0].name, "failing");
+        assert!(
+            persisted.sources[0].last_error.is_some(),
+            "last_error must be recorded on the persisted source"
+        );
     }
 }

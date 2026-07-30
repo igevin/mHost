@@ -193,7 +193,20 @@ impl AppState {
         // (that path is user-driven only). Without this call, an
         // auto-recovered session would permanently lose background refresh
         // until the user toggled DNS off and on again.
+        //
+        // **fix (PR #131 re-review P1-1)**: the recovered `DnsServer` was
+        // built with an empty `AdBlockEngine` — `try_recover_dns` loads DNS
+        // profile rules but never ad-block rules, and the refresh task
+        // spawned below sleeps a full interval before its first reload. Load
+        // the cached ad-block rules now so blocking is active from the first
+        // query after auto-recovery.
         if state.dns_enabled.load(Ordering::Relaxed) {
+            let snap = state.ad_block_state.read().await.clone();
+            let (za, nx, wl) =
+                crate::commands::adblock::classify_rules(&snap, state.storage.root());
+            if let Some(server) = lock_or_recover(&state.dns_server).as_ref() {
+                server.reload_ad_block_rules(za, nx, wl);
+            }
             crate::commands::dns::spawn_ad_block_refresh_task(
                 &state.ad_block_refresh_task,
                 &state.ad_block_state,
