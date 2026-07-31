@@ -348,14 +348,66 @@ mod tests {
         assert_eq!(engine.rule_count(), 5);
     }
 
-    /// PR #131 review finding 1.2: `rule_count` reflects zero_addr + nxdomain
-    /// + whitelist (the snapshot total is the sum of all three). Whitelist is
-    /// part of the contract because it short-circuits the hot path.
+    /// PR #131 review finding 1.2: `rule_count` reflects the sum of
+    /// zero_addr, nxdomain and whitelist entries. Whitelist counts toward
+    /// this externally observable stat even though it no longer gates the
+    /// hot-path short-circuit — that's [`RulesSnapshot::has_block_rules`]
+    /// (PR #135 review, Medium #2).
     #[test]
     fn rule_count_includes_whitelist() {
         let engine = AdBlockEngine::new();
         engine.rebuild(za(&["a.com"]), nx(&[]), wl(&["w1", "w2", "w3"]));
         assert_eq!(engine.rule_count(), 4);
+    }
+
+    /// PR #135 review, Medium #2: a whitelist alone must not defeat the fast
+    /// path. `classify_rules` collects the whitelist regardless of the master
+    /// switch, so "ad block off + user has whitelist entries" would otherwise
+    /// make every DNS query walk parents for a result that can only ever be
+    /// `None`.
+    ///
+    /// This asserts on [`RulesSnapshot::has_block_rules`] **directly** on
+    /// purpose. The short-circuit is a pure optimisation — `check` returns
+    /// `None` either way — so a test that only drives the public API passes
+    /// against the un-fixed predicate too and guards nothing.
+    #[test]
+    fn whitelist_only_snapshot_has_no_block_rules() {
+        let whitelist_only = RulesSnapshot {
+            zero_addr: za(&[]),
+            nxdomain: nx(&[]),
+            whitelist: wl(&["trusted.com", "safe.com"]),
+        };
+        assert!(
+            !whitelist_only.has_block_rules(),
+            "whitelist alone must not arm the hot path"
+        );
+        assert_eq!(
+            whitelist_only.total(),
+            2,
+            "...but it still counts toward the externally visible stat"
+        );
+
+        // Either block-rule set alone is enough to arm it.
+        for snap in [
+            RulesSnapshot {
+                zero_addr: za(&["a.com"]),
+                nxdomain: nx(&[]),
+                whitelist: wl(&[]),
+            },
+            RulesSnapshot {
+                zero_addr: za(&[]),
+                nxdomain: nx(&["b.com"]),
+                whitelist: wl(&[]),
+            },
+        ] {
+            assert!(snap.has_block_rules());
+        }
+
+        // End-to-end tie-in: behaviour is unchanged by the optimisation.
+        let engine = AdBlockEngine::new();
+        engine.rebuild(za(&[]), nx(&[]), wl(&["trusted.com"]));
+        assert_eq!(engine.check("trusted.com"), None);
+        assert_eq!(engine.rule_count(), 1);
     }
 
     /// Rebuild publishes a fresh snapshot atomically, so the count reflects
