@@ -378,11 +378,18 @@ pub(crate) fn spawn_ad_block_refresh_task(
             // slot is None the refresh task should be aborted anyway.
             if lock_or_recover(&dns_server).is_some() {
                 let snap = ad_block_state.read().await.clone();
-                let root = storage.root();
-                let (za, nx, wl) = crate::commands::adblock::classify_rules(&snap, root);
-                if let Some(server) = lock_or_recover(&dns_server).as_ref() {
-                    server.reload_ad_block_rules(za, nx, wl);
-                }
+                let root = storage.root().to_path_buf();
+                let dns_server_clone = Arc::clone(&dns_server);
+                // Issue #133: classify_rules reads + parses each source's
+                // cache file synchronously — 100k+ domains can block a
+                // tokio worker for seconds. Move it off the async runtime.
+                let _ = tokio::task::spawn_blocking(move || {
+                    let (za, nx, wl) = crate::commands::adblock::classify_rules(&snap, &root);
+                    if let Some(server) = lock_or_recover(&dns_server_clone).as_ref() {
+                        server.reload_ad_block_rules(za, nx, wl);
+                    }
+                })
+                .await;
             }
         }
     });

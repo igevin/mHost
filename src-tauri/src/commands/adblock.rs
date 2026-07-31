@@ -144,27 +144,26 @@ pub(crate) async fn persist_and_reload(state: &AppState) -> Result<(), MhostErro
         guard.clone()
     };
 
-    // 1. Persist to disk (blocking IO is fine — atomic_write is fast and
-    // we're already in a tokio task that does similar sync IO via
-    // storage layer elsewhere).
+    // Wrap write_state + classify_rules + reload in a single
+    // spawn_blocking so none of the sync file IO or parsing blocks a
+    // tokio worker thread (issue #133 — parsing 100k+ domain blocklists
+    // on the reload path starved concurrent DNS queries).
     let root = state.storage.root().to_path_buf();
-    let snapshot_for_disk = snapshot.clone();
-    tokio::task::spawn_blocking(move || adblock_store::write_state(&root, &snapshot_for_disk))
-        .await
-        .map_err(|e| MhostError::InvalidInput(format!("persist task failed: {}", e)))?
-        .map_err(|e| MhostError::InvalidInput(format!("write_state: {}", e)))?;
-
-    // 2. Hot-reload the DNS server if it's running. No-op when DNS mode off
-    // (rules are stored on disk and will be loaded on next DNS enable).
-    if state.dns_enabled.load(Ordering::Relaxed) {
-        let root = state.storage.root();
-        if let Some(server) = lock_or_recover(&state.dns_server).as_ref() {
-            let (zero_addr, nxdomain, whitelist) = classify_rules(&snapshot, root);
-            server.reload_ad_block_rules(zero_addr, nxdomain, whitelist);
+    let dns_enabled = state.dns_enabled.load(Ordering::Relaxed);
+    let dns_server = Arc::clone(&state.dns_server);
+    tokio::task::spawn_blocking(move || -> Result<(), MhostError> {
+        adblock_store::write_state(&root, &snapshot)
+            .map_err(|e| MhostError::InvalidInput(format!("write_state: {}", e)))?;
+        if dns_enabled {
+            let (zero_addr, nxdomain, whitelist) = classify_rules(&snapshot, &root);
+            if let Some(server) = lock_or_recover(&dns_server).as_ref() {
+                server.reload_ad_block_rules(zero_addr, nxdomain, whitelist);
+            }
         }
-    }
-
-    Ok(())
+        Ok(())
+    })
+    .await
+    .map_err(|e| MhostError::InvalidInput(format!("persist task failed: {}", e)))?
 }
 
 /// Reduce `AdBlockState` into the three rule sets consumed by the engine.
@@ -789,18 +788,70 @@ mod tests {
             rule_count: 0,
             etag: None,
         };
+        let za_source = mk("za", AdBlockResponse::ZeroAddress, true);
+        let nx_source = mk("nx", AdBlockResponse::NxDomain, true);
+        let off_source = mk("off", AdBlockResponse::ZeroAddress, false);
+
+        // Seed cache files so the zero_addr / nxdomain partitions are
+        // non-empty (issue #134 — previously only `w.len()==1` was
+        // asserted, leaving the partition logic untested).
+        mhost_storage::adblock::write_cache(
+            temp.path(),
+            &za_source.source_id,
+            b"0.0.0.0 ads.example.com\n0.0.0.0 tracker.example.com\n",
+        )
+        .unwrap();
+        mhost_storage::adblock::write_cache(
+            temp.path(),
+            &nx_source.source_id,
+            b"0.0.0.0 blocked.example.com\n",
+        )
+        .unwrap();
+        // The disabled source also has a cache file — its domains must
+        // NOT appear in any partition (enabled=false short-circuits it).
+        mhost_storage::adblock::write_cache(
+            temp.path(),
+            &off_source.source_id,
+            b"0.0.0.0 should-not-appear.com\n",
+        )
+        .unwrap();
+
         let state = AdBlockState {
             enabled: true,
-            sources: vec![
-                mk("za", AdBlockResponse::ZeroAddress, true),
-                mk("nx", AdBlockResponse::NxDomain, true),
-                mk("off", AdBlockResponse::ZeroAddress, false),
-            ],
+            sources: vec![za_source, nx_source, off_source],
             whitelist: vec!["trusted.com".to_string()],
             ..Default::default()
         };
-        let (_z, _n, w) = classify_rules(&state, temp.path());
+        let (z, n, w) = classify_rules(&state, temp.path());
+
+        // zero_addr partition: domains from the enabled ZeroAddress source,
+        // mapped to 0.0.0.0.
+        assert_eq!(z.len(), 2, "zero_addr seeded from enabled za source");
+        assert!(z.contains_key("ads.example.com"));
+        assert!(z.contains_key("tracker.example.com"));
+        assert_eq!(
+            z.get("ads.example.com").copied(),
+            Some(IpAddr::from([0u8, 0, 0, 0])),
+            "ZeroAddress domains must map to 0.0.0.0"
+        );
+
+        // nxdomain partition: domains from the enabled NxDomain source.
+        assert_eq!(n.len(), 1, "nxdomain seeded from enabled nx source");
+        assert!(n.contains("blocked.example.com"));
+
+        // whitelist partition.
         assert_eq!(w.len(), 1);
+        assert!(w.contains("trusted.com"));
+
+        // The disabled source's domain must not leak into any partition.
+        assert!(
+            !z.contains_key("should-not-appear.com"),
+            "disabled source must not contribute to zero_addr"
+        );
+        assert!(
+            !n.contains("should-not-appear.com"),
+            "disabled source must not contribute to nxdomain"
+        );
     }
 
     #[test]
