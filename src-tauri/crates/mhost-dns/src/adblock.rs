@@ -51,11 +51,20 @@ struct RulesSnapshot {
 }
 
 impl RulesSnapshot {
+    /// Whether this snapshot has any rules that could produce a block.
+    /// Whitelist is intentionally excluded: the master switch (`state.enabled`)
+    /// only gates zero_addr / nxdomain, while whitelist is always collected
+    /// regardless (review Medium #2). An empty `has_block_rules` means
+    /// `check()` can only return `None`, so callers can short-circuit the
+    /// parent-walk entirely.
     #[inline]
-    fn is_empty(&self) -> bool {
-        self.zero_addr.is_empty() && self.nxdomain.is_empty() && self.whitelist.is_empty()
+    fn has_block_rules(&self) -> bool {
+        !self.zero_addr.is_empty() || !self.nxdomain.is_empty()
     }
 
+    /// Total rule count for stats (`rule_count()`). Includes whitelist
+    /// because it's the externally observable number; short-circuit
+    /// decisions use [`has_block_rules`] instead.
     fn total(&self) -> usize {
         self.zero_addr.len() + self.nxdomain.len() + self.whitelist.len()
     }
@@ -102,7 +111,15 @@ impl AdBlockEngine {
             nxdomain: nxdomain_rules,
             whitelist,
         });
-        *self.current.write() = snapshot;
+        // Swap the Arc under one write lock, then drop the old snapshot
+        // OUTSIDE the lock. The old snapshot can hold 100k+ entries; letting
+        // its refcount hit zero and deallocate under the write lock would
+        // block every concurrent `check()` reader (review Medium #1).
+        let old = {
+            let mut g = self.current.write();
+            std::mem::replace(&mut *g, snapshot)
+        };
+        drop(old);
     }
 
     /// Read the currently published snapshot. Takes the read lock only for
@@ -118,12 +135,14 @@ impl AdBlockEngine {
     /// regular rule engine / upstream) or not blocked at all.
     pub fn check(&self, domain: &str) -> Option<AdBlockAction> {
         let snap = self.snapshot();
-        // Fast-path: no rules loaded → no possible hit. Avoids any domain
-        // walking for the common `state.enabled == false` case. Unlike the
-        // old `AtomicUsize` short-circuit this reads the very snapshot the
-        // walk below uses, so the empty-check can't disagree with the rule
-        // data (issue #132).
-        if snap.is_empty() {
+        // Fast-path: no block rules loaded → no possible hit. Avoids any
+        // domain walking for the common `state.enabled == false` case.
+        // Whitelist is excluded because it's collected regardless of the
+        // master switch (review Medium #2); an empty block-rule set means
+        // `check()` can only return `None`. Unlike the old `AtomicUsize`
+        // short-circuit this reads the very snapshot the walk below uses,
+        // so the empty-check can't disagree with the rule data (issue #132).
+        if !snap.has_block_rules() {
             return None;
         }
 
