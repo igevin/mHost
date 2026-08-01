@@ -543,7 +543,15 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // test_lock() guards a global test mutex; intentional
+    #[allow(clippy::await_holding_lock)] // test_lock() returns a global test mutex that
+                                         // must cover the entire async scenario below:
+                                         // these tests share the runtime directory and
+                                         // signal files on disk, so a concurrent run would
+                                         // race on the proxy PID / shutdown signal. The
+                                         // std::sync::MutexGuard is held across an
+                                         // intentional await for that reason. Do NOT
+                                         // remove the allow without first moving these
+                                         // tests to fully isolated runtimes.
     async fn test_proxy_concurrent_clients() {
         // 关键测试：两个 client 并发，proxy 不能把 response 交叉
         let query_a = b"QUERY_A".to_vec();
@@ -621,7 +629,15 @@ pub(crate) mod tests {
     // 循环不因 poll 阻塞。完整退出流程靠手动 smoke test 在 dev 环境验证。
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // test_lock() guards a global test mutex; intentional
+    #[allow(clippy::await_holding_lock)] // test_lock() returns a global test mutex that
+                                         // must cover the entire async scenario below:
+                                         // these tests share the runtime directory and
+                                         // signal files on disk, so a concurrent run would
+                                         // race on the proxy PID / shutdown signal. The
+                                         // std::sync::MutexGuard is held across an
+                                         // intentional await for that reason. Do NOT
+                                         // remove the allow without first moving these
+                                         // tests to fully isolated runtimes.
     async fn test_proxy_shutdown_signal_during_init() {
         // 简化版集成测试：spawn proxy，**不**写 file signal，proxy
         // 应该持续运行（不主动退出）。验证 poll 不会让 proxy 误退出。
@@ -662,7 +678,15 @@ pub(crate) mod tests {
     ///   2. 剩下的 query 被丢弃（proxy 不 panic）
     ///   3. available_permits() 验证上限确实被强制执行
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // test_lock() guards a global test mutex; intentional
+    #[allow(clippy::await_holding_lock)] // test_lock() returns a global test mutex that
+                                         // must cover the entire async scenario below:
+                                         // these tests share the runtime directory and
+                                         // signal files on disk, so a concurrent run would
+                                         // race on the proxy PID / shutdown signal. The
+                                         // std::sync::MutexGuard is held across an
+                                         // intentional await for that reason. Do NOT
+                                         // remove the allow without first moving these
+                                         // tests to fully isolated runtimes.
     async fn test_proxy_concurrency_capped() {
         // mock upstream 慢响应（5s），确保 task 占住 permit 直到超时
         let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -718,7 +742,15 @@ pub(crate) mod tests {
     /// `available_permits()` 验证首批 N 个 query 正好占满了所有 permit，
     /// 后续 query 被丢弃。
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // test_lock() guards a global test mutex; intentional
+    #[allow(clippy::await_holding_lock)] // test_lock() returns a global test mutex that
+                                         // must cover the entire async scenario below:
+                                         // these tests share the runtime directory and
+                                         // signal files on disk, so a concurrent run would
+                                         // race on the proxy PID / shutdown signal. The
+                                         // std::sync::MutexGuard is held across an
+                                         // intentional await for that reason. Do NOT
+                                         // remove the allow without first moving these
+                                         // tests to fully isolated runtimes.
     async fn test_proxy_semaphore_blocks_excess_spawns() {
         let _lock = test_lock();
         let _tmp = set_test_runtime_dir();
