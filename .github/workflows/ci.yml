@@ -85,7 +85,14 @@ jobs:
         working-directory: src-tauri
 
       - name: Run Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        # `--workspace` is required: `src-tauri/Cargo.toml` is a workspace
+        # with `members = [".", "crates/*"]`. Without it, cargo selects only
+        # the root `mhost` package, so the `mhost-core` / `mhost-hosts` /
+        # `mhost-storage` / `mhost-apply` / `mhost-dns` crates (where the
+        # domain logic lives, per doc/tech/rust-tauri-hosts-tech-route.md)
+        # are compiled as path deps but never linted. The strictest linter
+        # ends up covering the thinnest layer. See issue #136.
+        run: cargo clippy --all-targets --all-features --workspace -- -D warnings
         working-directory: src-tauri
 
       # `--nocapture` removed — it forces per-test stdout even when all
