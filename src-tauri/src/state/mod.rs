@@ -84,14 +84,20 @@ pub struct AppState {
     /// 后台定时刷新 task 句柄。DNS 模式启用时存在，禁用时被 abort。
     pub ad_block_refresh_task: Mutex<Option<JoinHandle<()>>>,
     /// Cooperative cancellation signal for the refresh task + its
-    /// in-flight `spawn_blocking` ticks. The disable path calls
-    /// `cancel()` on this token; the refresh task's `select!` wakes
-    /// up and exits, and any in-flight `spawn_blocking` closure can
-    /// observe `is_cancelled()` to bail before calling
-    /// `reload_ad_block_rules` on a server that's already been stopped.
-    /// Issue #138 — see `abort_ad_block_refresh_task` and the test
+    /// in-flight `spawn_blocking` ticks.
+    ///
+    /// Wrapped in a `Mutex` so `spawn_ad_block_refresh_task` can
+    /// **swap in a fresh, uncancelled token on every spawn** — issue
+    /// #138 follow-up: `CancellationToken::cancel()` is sticky, so if
+    /// the slot held the old (cancelled) token across a
+    /// disable → re-enable cycle, the new task's `select!` would
+    /// match `cancel.cancelled()` immediately and exit on iter 0.
+    /// The swap happens inside the spawn helper; the disable path
+    /// just `.cancel()`s whatever is currently in the slot.
+    ///
+    /// Issue #138 — see `cancel_ad_block_refresh_task` and the test
     /// section in `commands::dns::tests` for the contract.
-    pub ad_block_refresh_cancel: CancellationToken,
+    pub ad_block_refresh_cancel: Mutex<CancellationToken>,
 }
 
 impl AppState {
@@ -195,7 +201,7 @@ impl AppState {
             dns_lock: ApplyLock(tokio::sync::Mutex::new(())),
             ad_block_state: ad_block_state_lock,
             ad_block_refresh_task: refresh_task_slot,
-            ad_block_refresh_cancel: CancellationToken::new(),
+            ad_block_refresh_cancel: Mutex::new(CancellationToken::new()),
         };
 
         // **fix (PR #131 review finding 0.1)**: `try_recover_dns` succeeded

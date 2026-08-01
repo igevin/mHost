@@ -139,14 +139,13 @@ async fn fetch_source(url: &str) -> Result<(Vec<u8>, Option<String>), MhostError
 /// to keep lock-hold time minimal.
 ///
 /// **Issue #138:** the `spawn_blocking` closure below self-checks
-/// `state.ad_block_refresh_cancel.is_cancelled()` immediately before calling
-/// `reload_ad_block_rules`. This protects against the race where the
-/// disable path runs mid-`classify_rules` (which is sync, not
-/// cancellable): the closure finishes classifying, sees the token is
-/// set, and bails before mutating a `DnsServer` that's already been
-/// stopped. `write_state` is intentionally NOT gated on the token —
-/// persisting in-memory state to disk is the safe thing to do regardless
-/// of DNS-mode state.
+/// the cancel token immediately before calling `reload_ad_block_rules`.
+/// This protects against the race where the disable path runs
+/// mid-`classify_rules` (which is sync, not cancellable): the closure
+/// finishes classifying, sees the token is set, and bails before
+/// mutating a `DnsServer` that's already been stopped. `write_state` is
+/// intentionally NOT gated on the token — persisting in-memory state to
+/// disk is the safe thing to do regardless of DNS-mode state.
 pub(crate) async fn persist_and_reload(state: &AppState) -> Result<(), MhostError> {
     // Clone out under the lock, then drop the guard before DNS work.
     let snapshot: AdBlockState = {
@@ -161,11 +160,24 @@ pub(crate) async fn persist_and_reload(state: &AppState) -> Result<(), MhostErro
     let root = state.storage.root().to_path_buf();
     let dns_enabled = state.dns_enabled.load(Ordering::Relaxed);
     let dns_server = Arc::clone(&state.dns_server);
-    let cancel = state.ad_block_refresh_cancel.clone();
+    // Clone the token out from its Mutex slot before crossing the
+    // spawn_blocking boundary. Issue #138 follow-up: the field is a
+    // `Mutex<CancellationToken>` (not a bare token) so the refresh
+    // task can swap in a fresh, uncancelled token on every spawn —
+    // persist_and_reload reads whatever is currently in the slot,
+    // which is the token bound to the latest spawned task.
+    let cancel = lock_or_recover(&state.ad_block_refresh_cancel).clone();
     tokio::task::spawn_blocking(move || -> Result<(), MhostError> {
         adblock_store::write_state(&root, &snapshot)
             .map_err(|e| MhostError::InvalidInput(format!("write_state: {}", e)))?;
         if dns_enabled && !cancel.is_cancelled() {
+            // We deliberately run classify_rules even if the pre-check
+            // just succeeded: it's the long sync step (100k+ domain
+            // parsing) and is exactly where cancel is most likely to
+            // land. The post-classify check below is the only
+            // authoritative one for the reload decision; the pre-check
+            // exists only to skip the work entirely when we know up
+            // front that we'll bail.
             let (zero_addr, nxdomain, whitelist) = classify_rules(&snapshot, &root);
             // Re-check after classify_rules: it's the long sync step and
             // is exactly where cancel is most likely to have landed.
@@ -973,7 +985,9 @@ mod tests {
             dns_lock: crate::state::ApplyLock::new(),
             ad_block_state: Arc::new(tokio::sync::RwLock::new(AdBlockState::default())),
             ad_block_refresh_task: std::sync::Mutex::new(None),
-            ad_block_refresh_cancel: tokio_util::sync::CancellationToken::new(),
+            ad_block_refresh_cancel: std::sync::Mutex::new(
+                tokio_util::sync::CancellationToken::new(),
+            ),
         };
 
         // Port 1 on loopback refuses connections → fetch_source errors fast.
