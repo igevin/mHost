@@ -676,6 +676,30 @@ mod tests {
     // `set_dns_mode_disable` integration is provided by
     // `test_set_dns_mode_disable_succeeds_with_dhcp_empty_snapshot`;
     // this test pins the abort behavior itself.
+    //
+    // === What this test can and cannot verify ===
+    //
+    // We can verify the helper's contract:
+    //   1. Empty slot → no-op, returns false.
+    //   2. Populated slot → takes the handle out, calls `abort()` on it,
+    //      and the slot returns to None.
+    //
+    // We CANNOT directly verify the future was cancelled in this setup.
+    // An earlier attempt used a `Drop` guard (CancellationProbe) on the
+    // spawned future and a bounded wait for the probe to fire. That
+    // experiment (recorded in PR #137 review) showed: when
+    // `JoinHandle::abort()` is called and the handle is then dropped,
+    // the future is *not* dropped within at least 10s — tokio detaches
+    // the task and the abort signal is lost. (The same handle kept
+    // alive after `abort()` does see `is_finished() == true` after
+    // 100ms, confirming abort itself works; the loss is specifically
+    // in the drop path.) This is tokio behavior, not a defect in the
+    // helper, but it does mean the test cannot black-box-verify
+    // "the task is actually dead afterwards". A separate, more
+    // invasive fix (e.g. making the spawned task select on a
+    // `tokio_util::sync::CancellationToken` so it opts into the abort
+    // contract) would be needed to make cancellation reliable — see
+    // the follow-up note in the PR review.
     // -------------------------------------------------------------------
 
     /// Empty slot → no-op, returns false. Covers re-disable and
@@ -690,8 +714,10 @@ mod tests {
         );
     }
 
-    /// Pre-populated slot → task is aborted, slot returns to None,
-    /// and the original `JoinHandle` reports the task as finished.
+    /// Pre-populated slot → the helper takes the handle out, calls
+    /// `abort()` on it, and clears the slot. See the section comment
+    /// above for why we don't additionally assert on the future being
+    /// dropped.
     #[tokio::test]
     async fn test_abort_ad_block_refresh_task_cancels_running_task() {
         use std::time::Duration;
@@ -699,13 +725,15 @@ mod tests {
         let slot: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>> =
             std::sync::Mutex::new(None);
 
-        // Pre-populate with a long-running "mock" task.
+        // Pre-populate with a long-running "mock" task (mimics the
+        // periodic refresh loop in `spawn_ad_block_refresh_task`).
         let handle = tokio::spawn(async {
             tokio::time::sleep(Duration::from_secs(3600)).await;
         });
         *lock_or_recover(&slot) = Some(handle);
 
-        // Sanity: task is still running before abort.
+        // Sanity: the task is still running before abort. We observe
+        // this through the slot's handle before the helper takes it.
         {
             let guard = lock_or_recover(&slot);
             let h = guard.as_ref().expect("pre-condition: handle in slot");
@@ -725,12 +753,7 @@ mod tests {
             "slot must be empty after abort takes the handle"
         );
 
-        // The original JoinHandle (now dropped inside `abort`) carried
-        // the abort signal. We can't await it to observe the cancellation
-        // because the helper consumed the handle via `Option::take`.
-        // Instead: verify that a *fresh* abort on the now-empty slot is
-        // a no-op, which only holds if the previous abort actually
-        // cleared the slot.
+        // Re-abort on the now-empty slot is a no-op (idempotent).
         assert!(
             !abort_ad_block_refresh_task(&slot),
             "second abort on empty slot must be a no-op"
