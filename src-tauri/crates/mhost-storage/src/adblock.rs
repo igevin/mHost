@@ -244,8 +244,10 @@ mod tests {
     #[test]
     fn write_then_read_state_roundtrip() {
         let temp = TempDir::new().unwrap();
-        let mut state = AdBlockState::default();
-        state.enabled = true;
+        let mut state = AdBlockState {
+            enabled: true,
+            ..AdBlockState::default()
+        };
         state.sources.push(sample_source("a"));
         state.whitelist.push("trusted.example.com".to_string());
 
@@ -383,8 +385,10 @@ mod tests {
     #[test]
     fn read_state_or_default_valid_unchanged() {
         let temp = TempDir::new().unwrap();
-        let mut state = AdBlockState::default();
-        state.enabled = true;
+        let mut state = AdBlockState {
+            enabled: true,
+            ..AdBlockState::default()
+        };
         state.whitelist.push("a.com".to_string());
         write_state(temp.path(), &state).unwrap();
 
@@ -443,7 +447,7 @@ mod tests {
             })
             .collect();
         assert!(
-            backups.len() >= 1,
+            !backups.is_empty(),
             "two corruptions must produce at least one backup file (got {})",
             backups.len()
         );

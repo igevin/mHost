@@ -446,7 +446,7 @@ mod tests {
     #[test]
     fn test_extract_managed_block_bytes_crlf() {
         let input = "# hdr\r\n# ---- mHost start ----\r\n127.0.0.1 x.com\r\n# ---- mHost end ----\r\n# tail\r\n";
-        let (start, end) = Parser::extract_managed_block_bytes(input).expect("block exists");
+        let (_start, end) = Parser::extract_managed_block_bytes(input).expect("block exists");
 
         // byte_end must point just past the \r\n after end marker
         assert_eq!(input.as_bytes()[end - 2], b'\r');

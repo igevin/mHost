@@ -85,7 +85,11 @@ jobs:
         working-directory: src-tauri
 
       - name: Run Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        # Lint every package in the Cargo workspace. Without
+        # `--workspace`, cargo selects only the root package and the
+        # `crates/*` workspace members (where the domain logic lives)
+        # are compiled as path deps but never linted. See issue #136.
+        run: cargo clippy --all-targets --all-features --workspace -- -D warnings
         working-directory: src-tauri
 
       # `--nocapture` removed — it forces per-test stdout even when all

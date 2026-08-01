@@ -7,6 +7,8 @@ use tauri::State;
 use crate::state::AppState;
 
 use std::sync::Arc;
+use std::sync::Mutex;
+use tokio::task::JoinHandle;
 
 /// 启动/停止 DNS 模式。
 ///
@@ -282,11 +284,45 @@ async fn set_dns_mode_disable(state: &AppState, interactive: bool) -> Result<(),
     // 6. 终止广告屏蔽后台刷新 task（issue #130）。enable 时 spawn，
     //    disable 必须 abort；不 abort 会让 task 继续跑并尝试 reload
     //    已停的 server。
-    if let Some(handle) = lock_or_recover(&state.ad_block_refresh_task).take() {
-        handle.abort();
-    }
+    abort_ad_block_refresh_task(&state.ad_block_refresh_task);
 
     Ok(())
+}
+
+/// Abort the periodic ad-block refresh task if one is registered.
+///
+/// The disable path (issue #130) is the only legitimate caller:
+/// `spawn_ad_block_refresh_task` registers a `JoinHandle` on enable, and
+/// `set_dns_mode_disable` MUST cancel it — otherwise the task keeps
+/// running and tries to `reload_ad_block_rules` on a server that's
+/// already been stopped, surfacing confusing errors at the next refresh
+/// tick.
+///
+/// Extracted from the inline `if let Some(h) = ...take() { h.abort() }`
+/// in `set_dns_mode_disable` so the abort behavior is unit-testable
+/// without going through the full disable path (issue #134). The full
+/// path calls `mhost_dns::platform::disable_dns_mode` which returns Err
+/// in unit tests (no proxy + non-interactive), short-circuiting before
+/// the abort step — so testing through the public API would not
+/// actually exercise the abort contract.
+///
+/// **This helper only signals cancellation.** It does NOT wait for the
+/// task to actually terminate, and it does NOT abort any `spawn_blocking`
+/// closure the task may have entered (Tokio explicitly does not support
+/// aborting blocking work once started). The full "refresh work is dead
+/// by the time we return" guarantee is a separate concern tracked as a
+/// follow-up issue; see the test module's section comment for context.
+///
+/// Returns `true` if a task was found and `abort()` was called on it,
+/// `false` if the slot was empty (idempotent re-disable, or
+/// disable-before-enable).
+fn abort_ad_block_refresh_task(slot: &Mutex<Option<JoinHandle<()>>>) -> bool {
+    if let Some(handle) = lock_or_recover(slot).take() {
+        handle.abort();
+        true
+    } else {
+        false
+    }
 }
 
 /// Spawn the periodic ad-block refresh task (issue #130).
@@ -629,6 +665,119 @@ mod tests {
         // 第三次（同样）
         let r3 = cleanup_dns_on_exit(&state, false).await;
         assert!(r3.is_ok(), "third cleanup must also be a no-op");
+    }
+
+    // -------------------------------------------------------------------
+    // Issue #134 — disable-path abort-task contract (regression test).
+    //
+    // The disable path MUST cancel the periodic ad-block refresh task
+    // registered on enable. Otherwise the task keeps running and tries
+    // to `reload_ad_block_rules` on a server that's already been stopped
+    // (issue #130's original design point).
+    //
+    // The full `set_dns_mode_disable` early-returns when
+    // `mhost_dns::platform::disable_dns_mode` fails — and that call
+    // always fails in unit tests (no proxy + non-interactive). So we
+    // exercise the abort contract directly via the
+    // `abort_ad_block_refresh_task` helper, using a long-sleeping
+    // `JoinHandle` as the "mock" task. Black-box coverage of the
+    // `set_dns_mode_disable` integration is provided by
+    // `test_set_dns_mode_disable_succeeds_with_dhcp_empty_snapshot`;
+    // this test pins the abort behavior itself.
+    //
+    // === What this test can and cannot verify ===
+    //
+    // We can verify the helper's contract:
+    //   1. Empty slot → no-op, returns false.
+    //   2. Populated slot → takes the handle out, calls `abort()` on it,
+    //      and the slot returns to None.
+    //
+    // We CANNOT directly verify the future was cancelled in this setup.
+    // An earlier attempt used a `Drop` guard (CancellationProbe) on the
+    // spawned future + a bounded wait for the probe to fire. In that
+    // experiment this test did not observe the Drop guard firing within
+    // a 10s wait after `handle.abort()` + `drop(handle)`. The reason
+    // matters for any future fix, so it is worth recording precisely:
+    //
+    //   * `JoinHandle::abort()` itself works (the same handle kept alive
+    //     after `abort()` reports `is_finished() == true` after ~100ms).
+    //   * The bounded-wait experiment alone is not enough evidence to
+    //     generalize to "tokio drops the abort signal on JoinHandle
+    //     drop" — Tokio's documented `abort()` semantics are async and
+    //     scheduler-dependent, and the test's single-threaded runtime
+    //     may not have polled the detached task within the wait window.
+    //   * The DEFINITE, documented limitation that this test does
+    //     demonstrate is the test's structural blind spot: the helper
+    //     drops the `JoinHandle` after `abort()`, so the test cannot
+    //     observe `is_finished()` on it. To assert cancellation, a
+    //     future PR must change the spawned task to opt into abort
+    //     (e.g. `select!` on a `tokio_util::sync::CancellationToken`).
+    //
+    // For a separate, deeper issue: even with reliable outer-task
+    // abort, the refresh task's `spawn_blocking(classify_rules + reload)`
+    // is NOT cancellable once the blocking closure has started (tokio
+    // explicitly documents this). That race is a separate bug tracked
+    // as the follow-up issue filed alongside PR #137.
+    // -------------------------------------------------------------------
+
+    /// Empty slot → no-op, returns false. Covers re-disable and
+    /// disable-before-enable.
+    #[tokio::test]
+    async fn test_abort_ad_block_refresh_task_empty_slot_is_noop() {
+        let slot: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>> =
+            std::sync::Mutex::new(None);
+        assert!(
+            !abort_ad_block_refresh_task(&slot),
+            "empty slot must report no task aborted"
+        );
+    }
+
+    /// Pre-populated slot → the helper takes the handle out, calls
+    /// `abort()` on it, and clears the slot. The test name reflects
+    /// this exact contract: it asserts slot ownership and abort()
+    /// invocation, not that the future has been observed to terminate
+    /// (see the section comment above for why that is not black-box
+    /// verifiable with the current helper shape).
+    #[tokio::test]
+    async fn test_abort_ad_block_refresh_task_takes_and_aborts_handle() {
+        use std::time::Duration;
+
+        let slot: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>> =
+            std::sync::Mutex::new(None);
+
+        // Pre-populate with a long-running "mock" task (mimics the
+        // periodic refresh loop in `spawn_ad_block_refresh_task`).
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        });
+        *lock_or_recover(&slot) = Some(handle);
+
+        // Sanity: the task is still running before abort. We observe
+        // this through the slot's handle before the helper takes it.
+        {
+            let guard = lock_or_recover(&slot);
+            let h = guard.as_ref().expect("pre-condition: handle in slot");
+            assert!(
+                !h.is_finished(),
+                "task should still be running before abort"
+            );
+        }
+
+        // Run the abort helper.
+        let aborted = abort_ad_block_refresh_task(&slot);
+        assert!(aborted, "abort helper must report task was aborted");
+
+        // Slot is now empty (handle was taken out, not just left behind).
+        assert!(
+            lock_or_recover(&slot).is_none(),
+            "slot must be empty after abort takes the handle"
+        );
+
+        // Re-abort on the now-empty slot is a no-op (idempotent).
+        assert!(
+            !abort_ad_block_refresh_task(&slot),
+            "second abort on empty slot must be a no-op"
+        );
     }
 
     // -------------------------------------------------------------------
