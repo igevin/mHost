@@ -137,6 +137,16 @@ async fn fetch_source(url: &str) -> Result<(Vec<u8>, Option<String>), MhostError
 /// Must be called from a tokio context (uses `.await`). Acquires the state
 /// write lock briefly to clone out, then releases before touching DNS server
 /// to keep lock-hold time minimal.
+///
+/// **Issue #138:** the `spawn_blocking` closure below self-checks
+/// `state.ad_block_refresh_cancel.is_cancelled()` immediately before calling
+/// `reload_ad_block_rules`. This protects against the race where the
+/// disable path runs mid-`classify_rules` (which is sync, not
+/// cancellable): the closure finishes classifying, sees the token is
+/// set, and bails before mutating a `DnsServer` that's already been
+/// stopped. `write_state` is intentionally NOT gated on the token —
+/// persisting in-memory state to disk is the safe thing to do regardless
+/// of DNS-mode state.
 pub(crate) async fn persist_and_reload(state: &AppState) -> Result<(), MhostError> {
     // Clone out under the lock, then drop the guard before DNS work.
     let snapshot: AdBlockState = {
@@ -151,13 +161,19 @@ pub(crate) async fn persist_and_reload(state: &AppState) -> Result<(), MhostErro
     let root = state.storage.root().to_path_buf();
     let dns_enabled = state.dns_enabled.load(Ordering::Relaxed);
     let dns_server = Arc::clone(&state.dns_server);
+    let cancel = state.ad_block_refresh_cancel.clone();
     tokio::task::spawn_blocking(move || -> Result<(), MhostError> {
         adblock_store::write_state(&root, &snapshot)
             .map_err(|e| MhostError::InvalidInput(format!("write_state: {}", e)))?;
-        if dns_enabled {
+        if dns_enabled && !cancel.is_cancelled() {
             let (zero_addr, nxdomain, whitelist) = classify_rules(&snapshot, &root);
-            if let Some(server) = lock_or_recover(&dns_server).as_ref() {
-                server.reload_ad_block_rules(zero_addr, nxdomain, whitelist);
+            // Re-check after classify_rules: it's the long sync step and
+            // is exactly where cancel is most likely to have landed.
+            // (See issue #138: spawn_blocking cannot be aborted.)
+            if !cancel.is_cancelled() {
+                if let Some(server) = lock_or_recover(&dns_server).as_ref() {
+                    server.reload_ad_block_rules(zero_addr, nxdomain, whitelist);
+                }
             }
         }
         Ok(())
@@ -957,6 +973,7 @@ mod tests {
             dns_lock: crate::state::ApplyLock::new(),
             ad_block_state: Arc::new(tokio::sync::RwLock::new(AdBlockState::default())),
             ad_block_refresh_task: std::sync::Mutex::new(None),
+            ad_block_refresh_cancel: tokio_util::sync::CancellationToken::new(),
         };
 
         // Port 1 on loopback refuses connections → fetch_source errors fast.
