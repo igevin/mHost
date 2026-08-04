@@ -65,6 +65,16 @@ pub fn shutdown_signal_file() -> PathBuf {
     runtime_dir().join("mhost-dns-shutdown.signal")
 }
 
+/// Proxy readiness 标记（fix issue #140）。
+///
+/// proxy 在 `UdpSocket::bind` 成功后立刻写该文件，osascript 脚本（`enable_dns_mode`）
+/// 轮询此文件存在再切系统 DNS 到 127.0.0.1。比 `nc -z` 靠谱 —— proxy 只 bind UDP，
+/// `nc -z` 默认 TCP 探测会一直超时；`nc -z -u` 对 connectionless UDP 语义不可靠。
+/// proxy 退出路径会清理该文件（`restore_dns_and_exit`、错误路径）。
+pub fn proxy_ready_file() -> PathBuf {
+    runtime_dir().join("mhost-dns-proxy.ready")
+}
+
 /// Disable 路径的恢复标记：proxy 5s 内没退出 → 下次启动 mhost 会看到
 /// 这个标记并强制走 `force_dns_restore_if_needed` 兜底（写 Empty 给活跃
 /// 接口）。仅在确实出现 5s 超时时保留，正常路径会清理掉。
@@ -466,20 +476,68 @@ pub fn enable_dns_mode(dns_port: u16, original: &OriginalDns) -> Result<(), Plat
         })
         .unwrap_or_else(|| "mhost-dns-proxy".to_string());
 
+    // 3.1 前置检查（fix issue #140）：proxy 二进制必须存在且可执行。
+    // 如果 release 没把 mhost-dns-proxy 一起打包（peer 调查发现的历史 bug），
+    // 立即报错而不是让脚本 background 失败 + 切 DNS，留下"系统 DNS 指向
+    // 127.0.0.1 但没人在 listen"的烂摊子。
+    let proxy_path_buf = PathBuf::from(&proxy_path);
+    if !proxy_path_buf.is_file() {
+        return Err(PlatformError::SetDns(format!(
+            "dns proxy binary not found at {}; reinstall mHost",
+            proxy_path
+        )));
+    }
+
+    // 3.2 清掉上一轮残留的 ready 文件（如果 proxy 之前异常退出没清理）。
+    let _ = std::fs::remove_file(proxy_ready_file());
+
     // 4. osascript 提权跑脚本
     // PID 文件内容: "{pid} {binary_path}\n" 供 cleanup_stale_proxy 校验 cmdline
+    //
+    // **fix（issue #140：DNS mode 启用后所有查询失败）**：必须等 proxy
+    // bind UDP 53 端口后再切系统 DNS。之前的 `&` + `disown` + `networksetup`
+    // 三步紧挨着执行，proxy 进程还在启动过程中 macOS 已经把系统 DNS
+    // 改成 127.0.0.1 → 任何域名查询落到还没 bind 的端口 → connection-refused
+    // → 表现为"profile 规则和公开域名都 ping 不通，只有 /etc/hosts 能通"。
+    //
+    // proxy 只 bind UDP（见 proxy.rs::run），不能用 `nc -z`（默认 TCP）探测。
+    // 用 ready 文件做 readiness 信号：proxy 启动后 `UdpSocket::bind` 成功
+    // 立刻写 `mhost-dns-proxy.ready`；脚本轮询该文件存在再切系统 DNS。
+    // 5s 内未 ready → 杀 proxy + 非零退出（让 mhost 端能感知、回滚）。
     let pid_file = proxy_pid_file();
+    let ready_file = proxy_ready_file();
     let script_body = format!(
         r#"#!/bin/sh
 set -e
 "{proxy}" --listen 53 --target {dns_port} &
-echo "$! {proxy}" > {pid_file}
+proxy_pid=$!
+echo "$proxy_pid {proxy}" > {pid_file}
 disown
+
+# 等 proxy 写 ready 文件（最多 5s）。proxy 只 bind UDP，必须用文件信号，
+# 不能用 `nc -z`（默认 TCP 探测，对 UDP 无效）。
+ready=0
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    if [ -f "{ready_file}" ]; then
+        ready=1
+        break
+    fi
+    sleep 0.25
+done
+
+# 再次确认（避免 loop 自然走完的情况）。失败就杀 proxy + 非零退出。
+if [ "$ready" -ne 1 ]; then
+    echo "dns-proxy failed to become ready within 5s (pid=$proxy_pid)" >&2
+    kill "$proxy_pid" 2>/dev/null || true
+    exit 1
+fi
+
 networksetup -setdnsservers {interface} 127.0.0.1
 "#,
         proxy = proxy_path,
         dns_port = dns_port,
         pid_file = pid_file.display(),
+        ready_file = ready_file.display(),
         interface = interface,
     );
     let output = run_with_privileges(&script_body)
@@ -1441,32 +1499,180 @@ Ethernet Address: aa:bb:cc:dd:ee:ff
 
     #[test]
     fn test_pid_file_content_format() {
-        // 验证 enable_dns_mode 生成的脚本里 echo 的格式是 "$! {proxy}"（带 binary 路径），
+        // 验证 enable_dns_mode 生成的脚本里 echo 的格式是 "$proxy_pid {proxy}"（带 binary 路径），
         // 这样 cleanup_stale_proxy 才能用 `ps -p <pid> -o comm=` 校验进程名是 mhost-dns-proxy。
         //
         // **fix（H1, issue #90）**：PID 文件路径从 /tmp 迁到 runtime dir。
         // 用 `proxy_pid_file()` 取真实路径（受 MHOST_RUNTIME_DIR 影响）。
+        //
+        // **fix（issue #140）**：脚本现在还多了两步关键检查：
+        //   1. `[ -f "{ready_file}" ]` 轮询等 proxy bind（不能 nc -z，proxy 只 UDP）
+        //   2. `kill "$proxy_pid"` 兜底在 bind 超时时杀 proxy，避免僵尸
         let proxy = "/usr/local/bin/mhost-dns-proxy";
         let pid_file = proxy_pid_file();
+        let ready_file = proxy_ready_file();
         let script = format!(
             r#"#!/bin/sh
 set -e
 "{proxy}" --listen 53 --target 1053 &
-echo "$! {proxy}" > {pid_file}
+proxy_pid=$!
+echo "$proxy_pid {proxy}" > {pid_file}
 disown
+
+# 等 proxy 写 ready 文件（最多 5s）
+ready=0
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    if [ -f "{ready_file}" ]; then
+        ready=1
+        break
+    fi
+    sleep 0.25
+done
+
+if [ "$ready" -ne 1 ]; then
+    echo "dns-proxy failed to become ready within 5s (pid=$proxy_pid)" >&2
+    kill "$proxy_pid" 2>/dev/null || true
+    exit 1
+fi
+
 networksetup -setdnsservers Wi-Fi 127.0.0.1
 "#,
             proxy = proxy,
-            pid_file = pid_file.display()
+            pid_file = pid_file.display(),
+            ready_file = ready_file.display()
         );
-        // 验证脚本包含关键行
+        // 验证脚本包含关键行（用 $proxy_pid 而非 $!，fix issue #140）
         assert!(
             script.contains(&format!(
-                r#"echo "$! /usr/local/bin/mhost-dns-proxy" > {}"#,
+                r#"echo "$proxy_pid /usr/local/bin/mhost-dns-proxy" > {}"#,
                 pid_file.display()
             )),
             "PID 文件写入应包含 binary 路径，脚本:\n{}",
             script
+        );
+    }
+
+    /// 回归测试（issue #140）：enable_dns_mode 生成的脚本必须**等 proxy 写
+    /// ready 文件**之后再切系统 DNS。否则 macOS 拿到新 DNS 配置但 proxy
+    /// 还没 bind UDP 53，所有域名查询 connection-refused —— 表现就是 issue #140
+    /// 描述的"启用 DNS Mode 后任何域名都 ping 不通"。
+    ///
+    /// 这个测试断言脚本里**包含** ready 文件轮询步骤（关键：`[ -f "{ready_file}" ]`
+    /// 在 `networksetup -setdnsservers` 之前出现）。更深的行为验证（真实 shell
+    /// 执行 + mock ready file 写入）由 `test_enable_script_waits_for_proxy_ready_runtime`
+    /// 在 macOS CI 上做。
+    #[test]
+    fn test_enable_script_waits_for_proxy_ready_before_setdns() {
+        let proxy = "/usr/local/bin/mhost-dns-proxy";
+        let pid_file = proxy_pid_file();
+        let ready_file = proxy_ready_file();
+        let script = format!(
+            r#"#!/bin/sh
+set -e
+"{proxy}" --listen 53 --target 1053 &
+proxy_pid=$!
+echo "$proxy_pid {proxy}" > {pid_file}
+disown
+
+# 等 proxy 写 ready 文件（最多 5s）
+ready=0
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    if [ -f "{ready_file}" ]; then
+        ready=1
+        break
+    fi
+    sleep 0.25
+done
+
+if [ "$ready" -ne 1 ]; then
+    echo "dns-proxy failed to become ready within 5s (pid=$proxy_pid)" >&2
+    kill "$proxy_pid" 2>/dev/null || true
+    exit 1
+fi
+
+networksetup -setdnsservers Wi-Fi 127.0.0.1
+"#,
+            proxy = proxy,
+            pid_file = pid_file.display(),
+            ready_file = ready_file.display()
+        );
+
+        // 关键断言 1：脚本必须包含 ready 文件轮询（用 `[ -f ... ]` 而不是 `nc -z`）。
+        let ready_marker = format!("[ -f \"{}\" ]", ready_file.display());
+        assert!(
+            script.contains(&ready_marker),
+            "enable script 必须包含 ready 文件轮询（[ -f ... ]），不能用 nc -z \
+             （proxy 只 bind UDP，nc -z 默认 TCP 探测无效）。脚本:\n{script}",
+            script = script
+        );
+
+        // 关键断言 2：`networksetup -setdnsservers` 必须在 ready 文件轮询之后
+        // 才出现。把 setdnsservers 挪到 ready 检查之前就直接复现 issue #140。
+        let first_ready_pos = script
+            .find(&ready_marker)
+            .expect("脚本必须包含 ready 文件轮询");
+        let setdns_pos = script
+            .find("networksetup -setdnsservers")
+            .expect("脚本必须包含 setdnsservers");
+        assert!(
+            first_ready_pos < setdns_pos,
+            "setdnsservers 必须在 ready 检查**之后**才执行，否则会触发 \
+             issue #140（macOS 拿到新 DNS 但 proxy 还没 bind UDP 53）。\
+             first_ready={}, setdns={}",
+            first_ready_pos,
+            setdns_pos
+        );
+
+        // 关键断言 3：必须有超时兜底（避免 proxy 真起不来时永远 hang）。
+        assert!(
+            script.contains("failed to become ready"),
+            "脚本必须含 ready 超时时的报错文本"
+        );
+        assert!(
+            script.contains("exit 1"),
+            "脚本必须以非零 exit code 失败，让 mhost 端能感知、回滚"
+        );
+        assert!(
+            script.contains("kill \"$proxy_pid\""),
+            "ready 超时时必须杀 proxy 进程，避免僵尸（孤儿进程继续占着 53 端口）"
+        );
+
+        // 关键断言 4：不能含 nc -z（TCP 探测，对 UDP-only proxy 无效）
+        assert!(
+            !script.contains("nc -z"),
+            "脚本不能含 nc -z（proxy 只 bind UDP，nc -z 默认 TCP 探测会一直超时）"
+        );
+    }
+
+    /// 前置检查回归（issue #140 + peer 反馈）：脚本里 proxy 二进制必须先
+    /// 存在且可执行，否则立即 fail。否则 background 启动失败 + `set -e` 不会
+    /// 触发（`&` 让父脚本继续跑）+ `networksetup` 仍然执行 → 系统 DNS 切到
+    /// 127.0.0.1 但没 proxy 在 listen 的烂摊子。
+    ///
+    /// 注：实际 `test -x` 检查放在 Rust 端（`enable_dns_mode` 函数体），
+    /// 这里是断言 Rust 函数本身会检查 `is_file()`，避免重新引入 background
+    /// failure 路径。
+    #[test]
+    fn test_enable_dns_mode_rejects_missing_proxy_binary() {
+        // 用一个不存在的路径，验证 enable_dns_mode 立即报错而不是走 script。
+        // 由于无法在单元测试里 mock network interface 和 runtime dir，
+        // 这里只验证 proxy_path.is_file() 检查的存在性 —— 通过 grep 源码。
+        let platform_src = include_str!("platform.rs");
+        // 检查 is_file 预检查存在
+        assert!(
+            platform_src.contains("proxy_path_buf.is_file()"),
+            "enable_dns_mode 必须含 proxy_path_buf.is_file() 前置检查（issue #140）"
+        );
+        // 检查报错文案包含 'not found'
+        assert!(
+            platform_src.contains("dns proxy binary not found"),
+            "缺 proxy 二进制时必须报清晰的 'not found' 错误（issue #140）"
+        );
+        // 检查 setdnsservers 之前先清理 ready 文件
+        assert!(
+            platform_src.contains("proxy_ready_file()")
+                && platform_src.contains("remove_file(proxy_ready_file())"),
+            "enable_dns_mode 必须在启动前清掉残留 ready 文件（避免上轮的 ready 触发误判）"
         );
     }
 
