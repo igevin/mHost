@@ -2,6 +2,12 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## 项目约定
+
+- **保护分支**：除非用户明确指示，否则**不得**在 `main`、`master`、`dev` 分支做任何变更（包括直接编辑、提交、merge）。所有改动一律新建分支后再操作。
+
+- **代码托管**：本项目默认仓库是GitHub，远端操作（MR、issue、CI 等）一律用 `gh` 命令。
+
 ## What this project is
 
 mHost — a lightweight cross-platform Hosts manager desktop app (Tauri 2). Two modes that can coexist:

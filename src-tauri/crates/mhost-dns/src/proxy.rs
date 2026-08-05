@@ -264,10 +264,15 @@ impl DnsProxy {
         self.cleanup_signal_files();
     }
 
-    /// 清理 signal 文件 + original DNS 文件。
+    /// 清理 signal 文件 + original DNS 文件 + ready 文件。
+    ///
+    /// **fix（issue #140）**：ready 文件必须在退出时清掉，否则下次 enable
+    /// 轮询会立刻看到残留 ready 文件 → 在 proxy 真正 bind 前就切系统 DNS，
+    // 重新触发 issue #140 的 race。
     fn cleanup_signal_files(&self) {
         let _ = std::fs::remove_file(crate::platform::shutdown_signal_file());
         let _ = std::fs::remove_file(crate::platform::original_dns_file());
+        let _ = std::fs::remove_file(crate::platform::proxy_ready_file());
     }
 
     /// 运行代理（阻塞），直到收到 shutdown 信号或主 socket 不可恢复错误。
@@ -282,6 +287,20 @@ impl DnsProxy {
                 })?;
         // UdpSocket 内部是 Arc，clone 便宜，spawn 时把 Arc 形式的引用传给 task
         let listen_socket = Arc::new(listen_socket);
+
+        // **fix（issue #140）**：bind 成功立刻写 ready 文件，让 osascript
+        // 脚本（`enable_dns_mode`）知道可以切系统 DNS 到 127.0.0.1 了。
+        // 不能用 `nc -z` 探测 —— proxy 只 bind UDP，`nc -z` 默认 TCP。
+        // 不能用 `nc -z -u` —— 对 connectionless UDP 语义不可靠（无 listener
+        // 也能报成功）。ready 文件是最直接、最可靠的 readiness 信号。
+        let ready_path = crate::platform::proxy_ready_file();
+        if let Err(e) = std::fs::write(&ready_path, b"ready") {
+            eprintln!(
+                "[mhost-dns-proxy] failed to write ready file at {}: {}",
+                ready_path.display(),
+                e
+            );
+        }
 
         eprintln!(
             "[mhost-dns-proxy] listening on {} -> {}",
