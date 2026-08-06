@@ -80,6 +80,27 @@ jobs:
           workspaces: src-tauri -> target
           shared-key: ${{ runner.os }}-rust
 
+      # Tauri's build.rs validates `bundle.externalBin` paths at compile
+      # time (refuses to compile if `bin/mhost-dns-proxy-<triple>` is
+      # missing), so any `cargo clippy` / `cargo test` invocation on the
+      # root `mhost` crate needs the sidecar present. We don't need the
+      # full release + both-arch build from `scripts/build-proxy-sidecar.sh`
+      # here — just a debug-mode build of the native triple so Tauri's
+      # externalBin check passes. Swatinem/rust-cache re-uses the
+      # incremental target/ artifacts, so this is fast on warm cache.
+      - name: Build mhost-dns-proxy sidecar (debug, native)
+        run: |
+          set -euo pipefail
+          cargo build \
+              --manifest-path src-tauri/Cargo.toml \
+              --package mhost-dns \
+              --bin mhost-dns-proxy
+          TRIPLE="$(rustc -vV | sed -n 's|host: ||p')"
+          mkdir -p src-tauri/bin
+          cp src-tauri/target/debug/mhost-dns-proxy \
+             "src-tauri/bin/mhost-dns-proxy-${TRIPLE}"
+          echo "OK: sidecar staged at src-tauri/bin/mhost-dns-proxy-${TRIPLE}"
+
       - name: Check formatting
         run: cargo fmt --all -- --check
         working-directory: src-tauri
