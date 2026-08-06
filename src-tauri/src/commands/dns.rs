@@ -148,7 +148,43 @@ async fn set_dns_mode_enable(state: &AppState) -> Result<(), MhostError> {
     //    这是不可逆的副作用；失败必须 stop server 并返回 Err。
     //    fix（proxy self-cleanup）：把 &OriginalDns 传给 proxy，让它在
     //    退出时能自己恢复系统 DNS（DhcpEmpty → 写 Empty；Manual → 写回 list）。
-    if let Err(e) = mhost_dns::platform::enable_dns_mode(dns_port, &original) {
+    //
+    // **fix（issue #142）**：wrap sync `enable_dns_mode`（其内部 `Command::output()`
+    // 调 osascript 无超时）在 tokio::spawn_blocking 里跑，并加 60 s 上限。
+    // osascript TCC 弹窗在 macOS 极少数情况下会假死（已修复的 race-condition bug），
+    // 之前会让 `set_dns_mode` IPC 永久挂起，UI spinner 卡死在 "Enabling..." 状态。
+    // 60 s 是 generous 的上限，正常弹窗 + 输密码远低于此；超时立即 rollback +
+    // 返回明确错误给前端。
+    const ENABLE_TIMEOUT_SECS: u64 = 60;
+    let original_for_enable = original.clone();
+    let enable_result = tokio::time::timeout(
+        std::time::Duration::from_secs(ENABLE_TIMEOUT_SECS),
+        tokio::task::spawn_blocking(move || {
+            mhost_dns::platform::enable_dns_mode(dns_port, &original_for_enable)
+        }),
+    )
+    .await;
+    let enable_outcome = match enable_result {
+        Ok(Ok(r)) => r,
+        Ok(Err(join_err)) => {
+            let _ = server.stop().await;
+            return Err(MhostError::InvalidInput(format!(
+                "enable_dns_mode task panicked: {}",
+                join_err
+            )));
+        }
+        Err(_) => {
+            // 超时：spawn_blocking 里的 osascript 可能仍在跑（即使我们
+            // 已经不管了），随它去。下次 disable / mhost 退出 cleanup 会兜底。
+            let _ = server.stop().await;
+            return Err(MhostError::InvalidInput(format!(
+                "enable_dns_mode timed out after {}s (osascript dialog never resolved); \
+                 retry from UI or kill any lingering mhost-dns-proxy processes",
+                ENABLE_TIMEOUT_SECS
+            )));
+        }
+    };
+    if let Err(e) = enable_outcome {
         let _ = server.stop().await;
         return Err(MhostError::InvalidInput(format!(
             "Failed to enable DNS mode: {}",

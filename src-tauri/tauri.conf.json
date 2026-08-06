@@ -4,9 +4,9 @@
   "version": "0.3.3",
   "identifier": "com.gevin.mhost",
   "build": {
-    "beforeDevCommand": "pnpm dev",
+    "beforeDevCommand": "cargo build --bin mhost-dns-proxy && cd .. && pnpm dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "pnpm build",
+    "beforeBuildCommand": "pnpm build && cargo build --release --bin mhost-dns-proxy",
     "frontendDist": "../dist"
   },
   "app": {
