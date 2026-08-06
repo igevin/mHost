@@ -201,10 +201,22 @@ pub fn run() {
             // 下经常不触发）。在 Tauri 自己的 tokio runtime 里 spawn，
             // 与 RunEvent 钩子互不干扰，cleanup_dns_on_exit 内部幂等。
             //
-            // fix (bug 3, Ctrl+C 不退出):
-            //   在某些 tao / Tauri 2 版本下，`handle.exit(0)` 不会真正
-            //   终止进程 —— 表现为「Ctrl+C 之后 app 还在」。
-            //   兜底：先尝试优雅退出，400ms 后若进程还活着，强退。
+            // **fix (bug 3, Ctrl+C / pnpm tauri dev 不退出)**：
+            //
+            // 旧实现用 `handle.exit(0)` 在 `pnpm tauri dev` 下经常不真正终止
+            // 进程(tao / Tauri 2 的已知问题),依赖一个 400 ms 后台 `std::process::exit`
+            // 兜底线程。结果是用户按 Ctrl+C 后 mhost GUI 还活着,要再点一次
+            // 关闭按钮才行。
+            //
+            // 新实现:
+            //   1. cleanup 用 `interactive=false`(不弹 sudo 弹窗)。pnpm tauri dev
+            //      场景用户是「按 Ctrl+C 想立即走」,sudo prompt 反而碍事;system
+            //      DNS 还原靠 disable_recovery_marker + 下次启动 try_recover_dns。
+            //   2. cleanup 用 `tokio::time::timeout(700ms)` 包住,极端情况
+            //      (proxy 还活着、网络挂了、networksetup 卡)不阻塞退出。
+            //   3. cleanup 结束(或超时) → 直接 `std::process::exit(0)`,
+            //      绕开 tao / Tauri 那些 async exit 偶尔 hang 的路径。
+            //   4. 仍然是 1.5 s 后台 hard-kill 线程作最后兜底,但实际大概率不会触发。
             let sig_app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 eprintln!(
@@ -236,27 +248,44 @@ pub fn run() {
                             eprintln!("[mHost] exit: SIGINT received, cleaning up DNS");
                         }
                     }
-                    if let Some(state) = sig_app_handle.try_state::<AppState>() {
-                        // **fix (Ctrl+C / pnpm tauri dev 也要 sudo fallback)**：
-                        // SIGINT/SIGTERM 通常来自用户的 Ctrl+C 或 kill（用户在场），
-                        // → `interactive=true` 让 proxy 没自恢复时走 osascript 兜底。
-                        // OS 关机场景下 sudo 弹窗会短暂无人响应，但 recovery marker
-                        // 留给下次启动 `try_recover_dns` 兜底。
-                        if let Err(e) =
-                            commands::dns::cleanup_dns_on_exit(state.inner(), true).await
-                        {
-                            eprintln!("[mHost] DNS cleanup on signal failed: {}", e);
-                        }
-                    }
-                    // 兜底 force-exit：handle.exit(0) 在某些 tao 版本下
-                    // 不真正终止进程。优雅退出 + 400ms 后强退。
-                    let graceful = sig_app_handle.clone();
-                    std::thread::spawn(move || {
-                        std::thread::sleep(std::time::Duration::from_millis(400));
-                        eprintln!("[mHost] graceful exit timed out, force-exiting process");
+
+                    // 兜底 hard-kill 线程 (cleanup exit 真挂了的最后一道保险)
+                    // —— 必须在 cleanup 之前 spawn,这样即使 cleanup 永远
+                    // 阻塞,sleep 也照常走,exit 照常调。
+                    std::thread::spawn(|| {
+                        std::thread::sleep(std::time::Duration::from_millis(1500));
+                        eprintln!("[mHost] exit: hard-kill fallback after 1500ms");
                         std::process::exit(0);
                     });
-                    graceful.exit(0);
+
+                    // Cleanup bound by 700ms; missing proxy cleanup at exit
+                    // is covered by recovery marker on next start.
+                    if let Some(state) = sig_app_handle.try_state::<AppState>() {
+                        let cleanup = commands::dns::cleanup_dns_on_exit(state.inner(), false);
+                        match tokio::time::timeout(std::time::Duration::from_millis(700), cleanup)
+                            .await
+                        {
+                            Ok(Ok(())) => {
+                                eprintln!("[mHost] exit: DNS cleanup ok");
+                            }
+                            Ok(Err(e)) => {
+                                eprintln!("[mHost] exit: DNS cleanup error: {}", e);
+                            }
+                            Err(_) => {
+                                eprintln!(
+                                    "[mHost] exit: DNS cleanup timed out after 700ms; \
+                                     recovery marker on disk covers next-launch recovery"
+                                );
+                            }
+                        }
+                    } else {
+                        eprintln!("[mHost] exit: no AppState, skipping cleanup");
+                    }
+
+                    // 直接 std::process::exit 绕过 Tauri 的 async exit 路径,
+                    // 那些路径在某些 tao 版本下会 hang 不退。
+                    eprintln!("[mHost] exit: calling std::process::exit(0)");
+                    std::process::exit(0);
                 }
                 #[cfg(not(unix))]
                 {
