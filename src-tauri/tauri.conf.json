@@ -4,9 +4,9 @@
   "version": "0.3.3",
   "identifier": "com.gevin.mhost",
   "build": {
-    "beforeDevCommand": "cargo build --bin mhost-dns-proxy && cd .. && pnpm dev",
+    "beforeDevCommand": "cargo build --manifest-path src-tauri/Cargo.toml --package mhost-dns --bin mhost-dns-proxy && pnpm dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "pnpm build && cargo build --release --bin mhost-dns-proxy",
+    "beforeBuildCommand": "pnpm build && bash scripts/build-proxy-sidecar.sh",
     "frontendDist": "../dist"
   },
   "app": {
@@ -25,6 +25,9 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "externalBin": [
+      "bin/mhost-dns-proxy"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

@@ -376,6 +376,27 @@ export const toggleDnsModeAtom = atom(null, async (_get, set, enabled: boolean) 
   } catch (err) {
     set(dnsErrorAtom, extractErrorMessage(err));
     set(dnsStatusAtom, null);
+    // **fix (DNS enable state desync, follow-up to #146 review)**:
+    // 后端 IPC 返回 Err 不一定意味着 enable 真失败 —— 可能是 transient
+    // 网络问题、proxy 启动慢、osascript 卡住之类的边缘情况让 IPC 出错,
+    // 但后端状态实际上已经是 enabled(例如 osascript 跑了 >N 秒,我们
+    // 旧版本曾用 60s timeout 让 IPC 提前返回 Err 但 osascript 继续跑
+    // 并最终成功 —— 留下了 "Stopped" UI + 真实 running proxy 的 desync)。
+    // 这里兜底:catch 里跑一次 backend truth 同步,如果后端其实 enabled,
+    // 把 UI 拨正 + 清掉误导性的错误。
+    try {
+      const truth = await getDnsMode();
+      set(dnsEnabledAtom, truth);
+      const status = await getDnsStatus();
+      set(dnsStatusAtom, status);
+      if (truth === enabled) {
+        // 后端状态与用户意图一致,Err 应该是 transient IPC 问题。
+        // 清掉错误,避免用户看到 "Failed to enable" 但实际已 enabled。
+        set(dnsErrorAtom, null);
+      }
+    } catch {
+      // backend truth fetch 也挂了 —— 保留原错误,让用户重试。
+    }
     throw err;
   } finally {
     set(isDnsLoadingAtom, false);

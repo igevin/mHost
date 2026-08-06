@@ -80,6 +80,27 @@ jobs:
           workspaces: src-tauri -> target
           shared-key: ${{ runner.os }}-rust
 
+      # Tauri's build.rs validates `bundle.externalBin` paths at compile
+      # time (refuses to compile if `bin/mhost-dns-proxy-<triple>` is
+      # missing), so any `cargo clippy` / `cargo test` invocation on the
+      # root `mhost` crate needs the sidecar present. We don't need the
+      # full release + both-arch build from `scripts/build-proxy-sidecar.sh`
+      # here — just a debug-mode build of the native triple so Tauri's
+      # externalBin check passes. Swatinem/rust-cache re-uses the
+      # incremental target/ artifacts, so this is fast on warm cache.
+      - name: Build mhost-dns-proxy sidecar (debug, native)
+        run: |
+          set -euo pipefail
+          cargo build \
+              --manifest-path src-tauri/Cargo.toml \
+              --package mhost-dns \
+              --bin mhost-dns-proxy
+          TRIPLE="$(rustc -vV | sed -n 's|host: ||p')"
+          mkdir -p src-tauri/bin
+          cp src-tauri/target/debug/mhost-dns-proxy \
+             "src-tauri/bin/mhost-dns-proxy-${TRIPLE}"
+          echo "OK: sidecar staged at src-tauri/bin/mhost-dns-proxy-${TRIPLE}"
+
       - name: Check formatting
         run: cargo fmt --all -- --check
         working-directory: src-tauri
@@ -166,8 +187,14 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # Both Apple Silicon targets are required so that
+      # `scripts/build-proxy-sidecar.sh` can cross-build x86_64 from the
+      # arm64 macos-latest runner. release.yml already does this for
+      # the actual release matrix; the smoke test needs the same.
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
 
       - name: Install Node.js
         uses: actions/setup-node@v5
@@ -194,5 +221,37 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # Build the mhost-dns-proxy sidecars up front so the smoke
+      # verification below can assert both arches are present in
+      # `src-tauri/bin/`. `pnpm tauri build` also runs this via
+      # beforeBuildCommand, so running it explicitly here is just for
+      # clarity in the test assertion.
+      - name: Build proxy sidecars (smoke)
+        run: bash scripts/build-proxy-sidecar.sh
+
+      # Regression guard (fix: release pipeline): if either sidecar is
+      # missing after build-proxy-sidecar.sh, the eventual
+      # `bundle.externalBin` lookup in `pnpm tauri build` produces an
+      # .app without `mhost-dns-proxy`, and a user install will fail
+      # at "dns proxy binary not found" the moment they click Enable.
+      - name: Assert both sidecar triples exist
+        run: |
+          set -euo pipefail
+          test -f src-tauri/bin/mhost-dns-proxy-aarch64-apple-darwin
+          test -f src-tauri/bin/mhost-dns-proxy-x86_64-apple-darwin
+          echo "OK: both Apple Silicon sidecars present"
+
       - name: Build Tauri app
         run: pnpm tauri build
+
+      # Strongest assertion: after `pnpm tauri build` the .app bundle
+      # actually contains `mhost-dns-proxy` next to `mhost`. This is
+      # what makes Enable DNS mode work on a real install.
+      - name: Assert mhost-dns-proxy landed in the .app
+        run: |
+          set -euo pipefail
+          APP=src-tauri/target/release/bundle/macos/mhost.app
+          test -d "$APP"
+          test -x "$APP/Contents/MacOS/mhost"
+          test -x "$APP/Contents/MacOS/mhost-dns-proxy"
+          echo "OK: mhost and mhost-dns-proxy both shipped inside .app"
