@@ -134,24 +134,42 @@ async fn set_dns_mode_enable(state: &AppState) -> Result<(), MhostError> {
     //    fix（proxy self-cleanup）：把 &OriginalDns 传给 proxy，让它在
     //    退出时能自己恢复系统 DNS（DhcpEmpty → 写 Empty；Manual → 写回 list）。
     //
-    //    fix（regression from #155）：enable_dns_mode 内部走
-    //    osascript 弹 sudo 密码框，`Command::output()` 同步阻塞。直接裸调
-    //    会卡死当前 tokio worker，进而让 IPC handler 永远不 resolve、
-    //    前端 `isDnsLoadingAtom` 永远 true。挪到 spawn_blocking，让阻塞
-    //    syscall 跑在 blocking thread pool 上，tokio worker 保持响应。
-    //    前端 invoke 仍带 30s timeout 兜底（见 src/lib/tauri.ts）。
-    let enable_result = tokio::task::spawn_blocking({
-        let original = original.clone();
-        move || mhost_dns::platform::enable_dns_mode(dns_port, &original)
-    })
+    //    fix（regression from #155）+ **fix（issue #142）**：enable_dns_mode 内部走
+    //    osascript 弹 sudo 密码框，`Command::output()` 同步阻塞。
+    //
+    //    1. spawn_blocking 让阻塞 syscall 跑在 blocking thread pool 上，
+    //       tokio worker 保持响应（fix #162 / PR #155 regression）。
+    //    2. 外层 tokio::time::timeout(60s) 防止 osascript TCC 弹窗假死
+    //       让 IPC 永久挂起（fix #142）。60s 是 generous 上限，正常
+    //       弹窗 + 输密码远低于此；超时立即 rollback + 返回明确错误。
+    //    3. 前端 invoke 仍带 30s timeout 兜底（见 src/lib/tauri.ts），
+    //       这层 60s 是 Rust 端的后盾。
+    const ENABLE_TIMEOUT_SECS: u64 = 60;
+    let enable_result = tokio::time::timeout(
+        std::time::Duration::from_secs(ENABLE_TIMEOUT_SECS),
+        tokio::task::spawn_blocking({
+            let original = original.clone();
+            move || mhost_dns::platform::enable_dns_mode(dns_port, &original)
+        }),
+    )
     .await;
     let enable_outcome = match enable_result {
-        Ok(inner) => inner,
-        Err(join_err) => {
+        Ok(Ok(inner)) => inner,
+        Ok(Err(join_err)) => {
             let _ = server.stop().await;
             return Err(MhostError::InvalidInput(format!(
                 "Failed to enable DNS mode (blocking task join failed): {}",
                 join_err
+            )));
+        }
+        Err(_elapsed) => {
+            // 超时：spawn_blocking 里的 osascript 可能仍在跑（即使我们
+            // 已经不管了），随它去。下次 disable / mhost 退出 cleanup 会兜底。
+            let _ = server.stop().await;
+            return Err(MhostError::InvalidInput(format!(
+                "enable_dns_mode timed out after {}s (osascript dialog never resolved); \
+                 retry from UI or kill any lingering mhost-dns-proxy processes",
+                ENABLE_TIMEOUT_SECS
             )));
         }
     };
