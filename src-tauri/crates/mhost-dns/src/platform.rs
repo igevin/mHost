@@ -491,6 +491,20 @@ pub fn enable_dns_mode(dns_port: u16, original: &OriginalDns) -> Result<(), Plat
     // 3.2 清掉上一轮残留的 ready 文件（如果 proxy 之前异常退出没清理）。
     let _ = std::fs::remove_file(proxy_ready_file());
 
+    // 3.3 **fix（stale proxy 占 53 端口）**：cleanup_stale_proxy 跑在 AppState::new()
+    // 只覆盖启动场景且仅依赖 pid 文件。如果上一轮 mhost 在 enable 之后被 SIGKILL /
+    // 强杀 / 系统重启的过程中 proxy 进程被遗漏、或 pid 文件压根没写（proxy 异常
+    // 退出），就会留下一个孤儿 mhost-dns-proxy 还占着 53 端口，让新 enable 撞
+    //   bind: Address already in use (os error 48)
+    // 然后 5s 后 ready 超时 → exit 1 → 用户看到
+    //   "dns-proxy failed to become ready within 5s" / enable Failed
+    // 这条防御就算 cleanup_stale_proxy 漏过(dead pid file / wrong cmdline)也能
+    // 兜底:扫描**任意** mhost-dns-proxy 进程,SIGTERM + 等 1s 让它释放 53。
+    kill_orphan_dns_proxies();
+    // 防御性短暂停顿,让被 kill 的进程释放 UDP 53 port。Linux/macOS 大多数
+    // 情况下释放是即时的,但保险起见给 200 ms。
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
     // 4. osascript 提权跑脚本
     // PID 文件内容: "{pid} {binary_path}\n" 供 cleanup_stale_proxy 校验 cmdline
     //
@@ -868,6 +882,64 @@ pub fn cleanup_stale_proxy() {
         }
     }
     let _ = std::fs::remove_file(pid_path);
+}
+
+/// **fix（stale proxy 占 53 端口导致 enable 失败）**：
+///
+/// `cleanup_stale_proxy` 只跑在 AppState::new()（启动时），且只读 pid 文件。
+/// 如果 mhost 在上一次 enable 后被 SIGKILL / 强杀 / 系统重启过程中没机会
+/// 触发 cleanup_dns_on_exit，或者 proxy 异常退出没写 pid 文件，就会留下
+/// 一个孤儿 mhost-dns-proxy 进程依然占着 UDP 53。新的 enable 撞到：
+///
+///   bind: Address already in use (os error 48)
+///
+/// 5s 后 ready 超时 → exit 1 → 用户看到 "dns-proxy failed to become ready
+/// within 5s" / "Failed to enable DNS mode"。
+///
+/// 这个函数按进程名扫描（`pgrep -x mhost-dns-proxy` exact match）兜底，
+/// 把所有还活着的 mhost-dns-proxy 都 SIGTERM，让 port 53 释放出来。
+///
+/// 不是 cleanup_stale_proxy 的替代品 —— 那个有 pid 文件校验防止 PID 重用
+/// 误杀；这个是 last-resort 清理。两路并用。
+fn kill_orphan_dns_proxies() {
+    // `pgrep -x NAME` 只匹配进程名 basename 精确等于 NAME 的进程。
+    // 不会误匹配 `not-mhost-dns-proxy` 之类的，也不会匹配 grep 自己的命令行。
+    let output = std::process::Command::new("pgrep")
+        .args(["-x", "mhost-dns-proxy"])
+        .output();
+    let pids: Vec<u32> = match output {
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            stdout
+                .lines()
+                .filter_map(|line| line.trim().parse::<u32>().ok())
+                .collect()
+        }
+        // pgrep 退出码 1 = 没匹配（success=false 但也无错误）；其他 =
+        // 工具不可用。我们都当成 "无孤儿" 处理（best-effort）。
+        _ => Vec::new(),
+    };
+    if pids.is_empty() {
+        return;
+    }
+    eprintln!(
+        "[mHost] kill_orphan_dns_proxies: found {} stale mhost-dns-proxy process(es); sending SIGTERM",
+        pids.len()
+    );
+    for pid in pids {
+        // SAFETY: libc::kill with valid pid and SIGTERM is safe; failed kill
+        // (ESRCH = process already gone) is benign here.
+        let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            // ESRCH = process already gone between pgrep and our kill; benign.
+            if err.raw_os_error() != Some(libc::ESRCH) {
+                eprintln!("[mHost] failed to SIGTERM orphan pid {}: {}", pid, err);
+            }
+        } else {
+            eprintln!("[mHost] SIGTERM -> orphan mhost-dns-proxy pid {}", pid);
+        }
+    }
 }
 
 /// 获取当前活跃的网络接口名（Hardware Port）。
@@ -1823,5 +1895,26 @@ rm -f /tmp/mhost-dns-nonexistent.pid
                 recorded, ps_line, expected_comm, comm_basename
             );
         }
+    }
+
+    /// 回归测试（fix: stale proxy 占 53 端口导致 enable 失败）：
+    /// 调用 `kill_orphan_dns_proxies()` 不能 panic，也不能 SIGTERM 当前测试进程。
+    ///
+    /// 怎么测:CI 里不太可能正好有 mhost-dns-proxy 进程;所以这个测试主要是
+    /// 「不 panic、不误杀 self」的 sanity check。如果 pgrep 不可用(罕见),跳过。
+    #[test]
+    fn test_kill_orphan_dns_proxies_idempotent_safe() {
+        let my_pid = std::process::id();
+        let before_alive = unsafe { libc::kill(my_pid as libc::pid_t, 0) };
+        assert_eq!(before_alive, 0, "test process should be alive");
+
+        // 跑清理 — 不应该 panic,也不应该 kill 当前测试进程
+        super::kill_orphan_dns_proxies();
+
+        let after_alive = unsafe { libc::kill(my_pid as libc::pid_t, 0) };
+        assert_eq!(
+            after_alive, 0,
+            "test process must remain alive after orphan-cleanup"
+        );
     }
 }
