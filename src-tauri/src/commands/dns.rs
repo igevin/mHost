@@ -149,47 +149,53 @@ async fn set_dns_mode_enable(state: &AppState) -> Result<(), MhostError> {
     //    fix（proxy self-cleanup）：把 &OriginalDns 传给 proxy，让它在
     //    退出时能自己恢复系统 DNS（DhcpEmpty → 写 Empty；Manual → 写回 list）。
     //
-    // **fix（issue #142）**：wrap sync `enable_dns_mode`（其内部 `Command::output()`
-    // 调 osascript 无超时）在 tokio::spawn_blocking 里跑，并加 60 s 上限。
-    // osascript TCC 弹窗在 macOS 极少数情况下会假死（已修复的 race-condition bug），
-    // 之前会让 `set_dns_mode` IPC 永久挂起，UI spinner 卡死在 "Enabling..." 状态。
-    // 60 s 是 generous 的上限，正常弹窗 + 输密码远低于此；超时立即 rollback +
-    // 返回明确错误给前端。
-    const ENABLE_TIMEOUT_SECS: u64 = 60;
+    // **fix (DNS enable state desync, follow-up to #146 review)**:
+    //   这里**不**用 `tokio::time::timeout` 包 spawn_blocking。`timeout` 不
+    //   取消内部的 spawn_blocking —— timeout fire 时内部 future 被 drop、
+    //   JoinHandle 也被 drop,但 **blocking 线程继续跑**。
+    //
+    //   之前 PR #143 加过 60s 超时,本意是防御 #142 的"授权对话框卡死"
+    //   场景。但在慢机器 / 慢网络 / 用户输密码慢的场景下:
+    //     1. 60s 到,IPC 返回 Err,前端 loading 复位显示 "Stopped"。
+    //     2. osascript 仍在后台线程跑,几秒后完成:
+    //        spawn proxy + networksetup 改系统 DNS。
+    //     3. Backend state: dns_enabled=false (in-memory + manifest);
+    //        proxy 在跑 + 系统 DNS 指向 127.0.0.1 → 完全 desync。
+    //     4. 用户再点 Enable,kill_orphan_dns_proxies 试图 SIGTERM proxy,
+    //        但 proxy 已经在自管 shutdown,有时序竞争;SIGTERM 偶发不到
+    //        → 用户只能 kill -9。
+    //
+    //   改为直接 `await spawn_blocking`:osascript 弹授权框时自带 Cancel 按钮,
+    //   用户可主动取消。真卡死(#142 原始场景:TCC 死锁)的兜底行为和旧 60s
+    //   timeout 在该场景下一样(用户都要 force-quit),**且不再 leak**。
     let original_for_enable = original.clone();
-    let enable_result = tokio::time::timeout(
-        std::time::Duration::from_secs(ENABLE_TIMEOUT_SECS),
-        tokio::task::spawn_blocking(move || {
-            mhost_dns::platform::enable_dns_mode(dns_port, &original_for_enable)
-        }),
-    )
-    .await;
-    let enable_outcome = match enable_result {
-        Ok(Ok(r)) => r,
-        Ok(Err(join_err)) => {
+    match tokio::task::spawn_blocking(move || {
+        mhost_dns::platform::enable_dns_mode(dns_port, &original_for_enable)
+    })
+    .await
+    {
+        Ok(Ok(())) => {
+            // osascript 跑完了,proxy 在跑 + 系统 DNS 已切。
+            // 直接往下走 manifest 持久化 + in-memory state 更新。
+        }
+        Ok(Err(e)) => {
+            // osascript 跑完了但返回 Err(proxy binary missing / 脚本 non-zero /
+            // networksetup 失败等)。这种情况没有 leak —— enable_dns_mode 内部
+            // 已经 rollback(proxy 被脚本自己 kill + 系统 DNS 未改)。
+            let _ = server.stop().await;
+            return Err(MhostError::InvalidInput(format!(
+                "Failed to enable DNS mode: {}",
+                e
+            )));
+        }
+        Err(join_err) => {
+            // spawn_blocking task panic(异常;enable_dns_mode 不应 panic)。
             let _ = server.stop().await;
             return Err(MhostError::InvalidInput(format!(
                 "enable_dns_mode task panicked: {}",
                 join_err
             )));
         }
-        Err(_) => {
-            // 超时：spawn_blocking 里的 osascript 可能仍在跑（即使我们
-            // 已经不管了），随它去。下次 disable / mhost 退出 cleanup 会兜底。
-            let _ = server.stop().await;
-            return Err(MhostError::InvalidInput(format!(
-                "enable_dns_mode timed out after {}s (osascript dialog never resolved); \
-                 retry from UI or kill any lingering mhost-dns-proxy processes",
-                ENABLE_TIMEOUT_SECS
-            )));
-        }
-    };
-    if let Err(e) = enable_outcome {
-        let _ = server.stop().await;
-        return Err(MhostError::InvalidInput(format!(
-            "Failed to enable DNS mode: {}",
-            e
-        )));
     }
 
     // 7. **PERSIST MANIFEST FIRST** —— 持久层是 commit point。
