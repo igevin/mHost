@@ -626,6 +626,20 @@ pub async fn cleanup_dns_on_exit(state: &AppState, interactive: bool) -> Result<
     // （SIGINT + Tauri ExitRequested + tray Quit 三条路径竞态时）走 no-op。
     state.dns_enabled.store(false, Ordering::Relaxed);
 
+    // **fix (issue #148 review Blocker 1)**：sudo_kill_orphan_dns_proxies
+    // 用 `pgrep -x mhost-dns-proxy` 枚举,会把**还在跑**的 expected proxy
+    // 也当作孤儿杀掉 —— 这会:
+    //   - 多弹一次 sudo 框(tray Quit / Cmd-Q 路径)
+    //   - 让 disable 走「proxy 不在」分支 + osascript 兜底,不再走
+    //     signal-file 协议的 graceful 恢复
+    //
+    // 正确做法:先探测 PID 文件 + kill(pid, 0) 判断 expected proxy 还活不活。
+    // - 还活着 → signal-file 协议自管,不要碰。
+    // - 死了 / pid_file 缺失 → 真正的孤儿场景,才调 sudo-kill 兜底。
+    if !mhost_dns::platform::is_expected_proxy_alive() {
+        mhost_dns::platform::sudo_kill_orphan_dns_proxies(interactive);
+    }
+
     match set_dns_mode_disable(state, interactive).await {
         Ok(()) => Ok(()),
         Err(e) => {
@@ -677,6 +691,70 @@ mod tests {
         // dns_enabled = false → cleanup 应直接返回 Ok
         let result = cleanup_dns_on_exit(&state, false).await;
         assert!(result.is_ok(), "DNS disabled → cleanup should be a no-op");
+    }
+
+    /// **fix (issue #148 review Blocker 1)**:cleanup_dns_on_exit 入口应该用
+    /// `is_expected_proxy_alive()` 判断是否真的有孤儿:
+    /// - pid_file 缺失 / PID 不存在 → true 孤儿,调 sudo_kill_orphan_dns_proxies
+    /// - pid_file 存在 + kill(pid, 0) 成功 → proxy 还活着,**不要**杀它
+    ///
+    /// 这条 test 直接验证 helper 在没有 pid_file / pid_file 内容损坏 /
+    /// pid_file 指向一个已死 PID 这三种场景下都返回 false —— 这些是
+    /// cleanup_dns_on_exit 走 sudo-kill 分支的入口条件。
+    ///
+    /// **fix (CI regression)**：必须通过 `MHOST_RUNTIME_DIR` 把 runtime
+    /// 路径重定向到 tempdir —— 在 CI runner 上 `dirs::data_dir()` 解析不到
+    /// 真实用户目录,`runtime_dir()` 退到 `/tmp`,而 pid_file 的父目录
+    /// 还没创建,直接 `std::fs::write` 会 NotFound panic。
+    /// 用本地 `static LOCK` 串行化(避免与并行 test 共享 env var race),
+    /// 不复用 mhost-dns crate 的 `serial_runtime_dir_test()`(跨 crate 锁
+    /// 不可达)。
+    #[test]
+    fn test_is_expected_proxy_alive_handles_missing_or_stale_pid_file() {
+        use mhost_dns::platform::{is_expected_proxy_alive, proxy_pid_file};
+
+        // **fix (issue #148 review 🟡 #2)**：跟 mhost-dns 平台测试共用
+        // mhost_dns::RUNTIME_DIR_TEST_LOCK,避免跨 crate binary 的 env var
+        // race(proxy pid_file 在一边被写,另一边同时改 runtime_dir)。
+        let _guard = mhost_dns::RUNTIME_DIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let dir = tempfile::TempDir::new().unwrap();
+        std::env::set_var("MHOST_RUNTIME_DIR", dir.path());
+
+        let pid_path = proxy_pid_file();
+        assert_eq!(
+            pid_path.parent().unwrap(),
+            dir.path(),
+            "MHOST_RUNTIME_DIR must redirect runtime_dir()"
+        );
+
+        // 1. 没有 pid_file → false
+        let _ = std::fs::remove_file(&pid_path);
+        assert!(
+            !is_expected_proxy_alive(),
+            "missing pid_file must report proxy as not alive"
+        );
+
+        // 2. pid_file 指向一个肯定不存在的 PID
+        std::fs::write(&pid_path, "999999999 /usr/local/bin/mhost-dns-proxy\n").unwrap();
+        assert!(
+            !is_expected_proxy_alive(),
+            "pid_file pointing to dead pid must report proxy as not alive"
+        );
+
+        // 3. pid_file 内容损坏(非数字)
+        std::fs::write(&pid_path, "garbage not a pid\n").unwrap();
+        assert!(
+            !is_expected_proxy_alive(),
+            "pid_file with non-numeric content must report proxy as not alive"
+        );
+
+        let _ = std::fs::remove_file(&pid_path);
+
+        // 清理 env var,避免污染后续 test。
+        std::env::remove_var("MHOST_RUNTIME_DIR");
     }
 
     /// 回归测试（bug 1 + bug 4 + disabling-after-network-switch fix）：

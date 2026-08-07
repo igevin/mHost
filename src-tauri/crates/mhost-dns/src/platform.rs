@@ -491,24 +491,20 @@ pub fn enable_dns_mode(dns_port: u16, original: &OriginalDns) -> Result<(), Plat
     // 3.2 清掉上一轮残留的 ready 文件（如果 proxy 之前异常退出没清理）。
     let _ = std::fs::remove_file(proxy_ready_file());
 
-    // 3.3 **fix（stale proxy 占 53 端口）**：cleanup_stale_proxy 跑在 AppState::new()
-    // 只覆盖启动场景且仅依赖 pid 文件。如果上一轮 mhost 在 enable 之后被 SIGKILL /
-    // 强杀 / 系统重启的过程中 proxy 进程被遗漏、或 pid 文件压根没写（proxy 异常
-    // 退出），就会留下一个孤儿 mhost-dns-proxy 还占着 53 端口，让新 enable 撞
-    //   bind: Address already in use (os error 48)
-    // 然后 5s 后 ready 超时 → exit 1 → 用户看到
-    //   "dns-proxy failed to become ready within 5s" / enable Failed
-    // 这条防御就算 cleanup_stale_proxy 漏过(dead pid file / wrong cmdline)也能
-    // 兜底:扫描**任意** mhost-dns-proxy 进程,SIGTERM + 等 1s 让它释放 53。
-    kill_orphan_dns_proxies();
-    // 防御性短暂停顿,让被 kill 的进程释放 UDP 53 port。Linux/macOS 大多数
-    // 情况下释放是即时的,但保险起见给 200 ms。
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    // 3.3 **fix (issue #148)**：orphan-cleanup 由 `build_enable_script_body`
+    // 顶部的 inline pgrep 循环负责(脚本本身 root,TERM/KILL 一定能送达)。
+    //
+    // 旧实现 `kill_orphan_dns_proxies()` + `sleep(200ms)` 是 user-mode
+    // `libc::kill(SIGTERM)`,对 root-owned proxy 会被 macOS EACCES 静默丢弃
+    // —— pgrep 找得到但 kill 杀不掉,等于 silent no-op 还给读者制造「双重
+    // 保护」的错觉。**已删除**(fix issue #148 review):enable 路径唯一真
+    // 兜底是 inline 脚本里的 pgrep 循环,disable 路径在 `cleanup_dns_on_exit`
+    // 入口用 `is_expected_proxy_alive()` 区分后调 `sudo_kill_orphan_dns_proxies`。
 
     // 4. osascript 提权跑脚本
     // PID 文件内容: "{pid} {binary_path}\n" 供 cleanup_stale_proxy 校验 cmdline
     //
-    // **fix（issue #140：DNS mode 启用后所有查询失败）**：必须等 proxy
+    // **fix (issue #140：DNS mode 启用后所有查询失败)**：必须等 proxy
     // bind UDP 53 端口后再切系统 DNS。之前的 `&` + `disown` + `networksetup`
     // 三步紧挨着执行，proxy 进程还在启动过程中 macOS 已经把系统 DNS
     // 改成 127.0.0.1 → 任何域名查询落到还没 bind 的端口 → connection-refused
@@ -518,42 +514,15 @@ pub fn enable_dns_mode(dns_port: u16, original: &OriginalDns) -> Result<(), Plat
     // 用 ready 文件做 readiness 信号：proxy 启动后 `UdpSocket::bind` 成功
     // 立刻写 `mhost-dns-proxy.ready`；脚本轮询该文件存在再切系统 DNS。
     // 5s 内未 ready → 杀 proxy + 非零退出（让 mhost 端能感知、回滚）。
+    //
+    // **fix (issue #148：orphan proxy)**：trap + cleanup() 在脚本任何退出路径
+    // (exit 1 / Cancel / networksetup reject / ready 失败)kill proxy。
+    // `proxy_should_keep_running=1` 标志在 networksetup 成功之后才置位,
+    // 此后 trap 触发不再 kill —— 这是正常成功路径下让 proxy 留活的关键。
     let pid_file = proxy_pid_file();
     let ready_file = proxy_ready_file();
-    let script_body = format!(
-        r#"#!/bin/sh
-set -e
-"{proxy}" --listen 53 --target {dns_port} &
-proxy_pid=$!
-echo "$proxy_pid {proxy}" > {pid_file}
-disown
-
-# 等 proxy 写 ready 文件（最多 5s）。proxy 只 bind UDP，必须用文件信号，
-# 不能用 `nc -z`（默认 TCP 探测，对 UDP 无效）。
-ready=0
-for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-    if [ -f "{ready_file}" ]; then
-        ready=1
-        break
-    fi
-    sleep 0.25
-done
-
-# 再次确认（避免 loop 自然走完的情况）。失败就杀 proxy + 非零退出。
-if [ "$ready" -ne 1 ]; then
-    echo "dns-proxy failed to become ready within 5s (pid=$proxy_pid)" >&2
-    kill "$proxy_pid" 2>/dev/null || true
-    exit 1
-fi
-
-networksetup -setdnsservers {interface} 127.0.0.1
-"#,
-        proxy = proxy_path,
-        dns_port = dns_port,
-        pid_file = pid_file.display(),
-        ready_file = ready_file.display(),
-        interface = interface,
-    );
+    let script_body =
+        build_enable_script_body(&proxy_path, dns_port, &pid_file, &ready_file, &interface);
     let output = run_with_privileges(&script_body)
         .map_err(|e| PlatformError::SetDns(format!("enable dns mode failed: {}", e)))?;
     if !output.status.success() {
@@ -564,6 +533,122 @@ networksetup -setdnsservers {interface} 127.0.0.1
         return Err(PlatformError::SetDns(format!("command failed: {}", stderr)));
     }
     Ok(())
+}
+
+/// **fix (issue #148)**：构造 enable DNS mode 的 elevated sh 脚本。
+///
+/// 单独提出来是为了让 `platform.rs::tests` 能在不需要 sudo 的前提下断言
+/// 脚本结构(trap / cleanup / handoff flag / inline orphan-kill)。
+///
+/// 返回的脚本里：
+/// 1. inline sudo-level orphan-kill（脚本本身 root，TERM/KILL 都能送达）
+/// 2. `trap cleanup EXIT INT TERM` + `cleanup()` 函数：脚本任何失败路径
+///    (ready 超时、networksetup 拒绝、用户 osascript Cancel)kill proxy
+/// 3. ready-file polling → networksetup 切系统 DNS
+/// 4. `proxy_should_keep_running=1` handoff flag:成功路径下 trap 不 kill proxy
+///
+/// 注：`{proxy}` `{pid_file}` `{ready_file}` `{interface}` 都来自调用方已校验
+/// 的输入；`proxy_path` 已经在 caller 端 `is_file()` 校验过；
+/// `validate_interface_name` 在 `enable_dns_mode` 入口处跑过；`pid_file` /
+/// `ready_file` 是固定 runtime_dir 下的派生路径，不是用户输入。
+#[cfg(target_os = "macos")]
+pub(crate) fn build_enable_script_body(
+    proxy: &str,
+    dns_port: u16,
+    pid_file: &std::path::Path,
+    ready_file: &std::path::Path,
+    interface: &str,
+) -> String {
+    format!(
+        r#"#!/bin/sh
+set -e
+
+# ---- issue #148: trap-based lifecycle for the elevated proxy ----
+# proxy 是这个 osascript-elevated sh 的 root 后台子进程。任何失败路径
+# (bind fail / networksetup reject / osascript Cancel)都必须 kill proxy,
+# 否则它就以 root 身份孤儿着占着 UDP 53,下一次 enable 撞
+# `Address already in use`。
+#
+# 成功路径:networksetup 切完 DNS 后,设 `proxy_should_keep_running=1` 然后
+# exit 0 → trap 触发但不 kill(proxy 还在跑)。
+proxy_pid=""
+proxy_should_keep_running=0
+
+cleanup() {{
+    if [ "$proxy_should_keep_running" != "1" ]; then
+        if [ -n "$proxy_pid" ]; then
+            kill -TERM "$proxy_pid" 2>/dev/null || true
+            sleep 1
+            kill -KILL "$proxy_pid" 2>/dev/null || true
+        fi
+        # 兜底:扫一遍同名孤儿(root signal 一定能送达)
+        for pid in $(pgrep -x mhost-dns-proxy); do
+            kill -TERM "$pid" 2>/dev/null || true
+        done
+        sleep 1
+        for pid in $(pgrep -x mhost-dns-proxy); do
+            kill -KILL "$pid" 2>/dev/null || true
+        done
+        # 失败路径:pid_file 也清掉,disable 协议里 read_proxy_pid() 会读到 None
+        # → 走「proxy 不在」分支 + osascript sudo 兜底,符合预期。
+        rm -f "{pid_file}" "{ready_file}"
+    else
+        # 成功路径:proxy 还在跑,pid_file 必须保留给 disable 协议用
+        # (read_proxy_pid() → signal-file 协议 → 自我恢复 DNS)。
+        # 只清 ready_file(proxy 退出时本来也会清)。
+        rm -f "{ready_file}"
+    fi
+}}
+trap cleanup EXIT INT TERM
+
+# ---- fix A: inline sudo-level orphan cleanup (already-elevated shell) ----
+# 在起新 proxy 之前先把上一轮残留的同名孤儿杀掉 —— 既然脚本已经 root,
+# TERM/KILL 一定能送达,不需要再来一次 sudo 弹窗。
+for pid in $(pgrep -x mhost-dns-proxy); do
+    kill -TERM "$pid" 2>/dev/null || true
+done
+sleep 1
+for pid in $(pgrep -x mhost-dns-proxy); do
+    kill -KILL "$pid" 2>/dev/null || true
+done
+
+# ---- enable: launch proxy, wait for ready, hand off to system ----
+"{proxy}" --listen 53 --target {dns_port} &
+proxy_pid=$!
+echo "$proxy_pid {proxy}" > {pid_file}
+disown
+
+# 等 proxy 写 ready 文件（最多 5s）。proxy 只 bind UDP,必须用文件信号,
+# 不能用 TCP port-probe 工具(默认 TCP 探测,对 UDP 无效)。
+ready=0
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    if [ -f "{ready_file}" ]; then
+        ready=1
+        break
+    fi
+    sleep 0.25
+done
+
+# ready 超时:inline 立即 kill(快速失败响应),trap 也会跑兜底 + 清理文件
+if [ "$ready" -ne 1 ]; then
+    echo "dns-proxy failed to become ready within 5s (pid=$proxy_pid)" >&2
+    kill "$proxy_pid" 2>/dev/null || true
+    exit 1
+fi
+
+networksetup -setdnsservers {interface} 127.0.0.1
+
+# Success handoff:告诉 trap 留下 proxy。
+proxy_should_keep_running=1
+rm -f "{ready_file}"
+exit 0
+"#,
+        proxy = proxy,
+        dns_port = dns_port,
+        pid_file = pid_file.display(),
+        ready_file = ready_file.display(),
+        interface = interface,
+    )
 }
 
 /// 原子写入文件，mode 0o600（owner only）。
@@ -804,9 +889,28 @@ pub fn force_dns_restore_if_needed() -> Result<(), PlatformError> {
 }
 
 /// 从 PID 文件读出 proxy 的 PID（如果可读 + 可解析）。
-fn read_proxy_pid() -> Option<u32> {
+///
+/// **fix (issue #148)**：改 pub 让 `commands::dns::cleanup_dns_on_exit`
+/// 在调 `sudo_kill_orphan_dns_proxies` 前能区分「被记录在册的 expected
+/// proxy」和「真正无人管的孤儿」。
+pub fn read_proxy_pid() -> Option<u32> {
     let content = std::fs::read_to_string(proxy_pid_file()).ok()?;
     content.split_whitespace().next()?.parse().ok()
+}
+
+/// **fix (issue #148)**：检测 PID 文件里记录的 proxy 是否还活着。
+///
+/// `read_proxy_pid()` + `kill(pid, 0)` 探测 —— 不发信号,只问「这 pid
+/// 还有效吗」。用来在 `cleanup_dns_on_exit` 入口区分两种场景:
+///
+/// - alive → expected proxy 在跑,disable 走 signal-file 协议自管恢复,**不要**
+///   sudo-kill(expected proxy 进程名就叫 `mhost-dns-proxy`,会被 pgrep 误杀)
+/// - dead / pid_file 缺失 → 真正的孤儿场景,才调 `sudo_kill_orphan_dns_proxies`
+pub fn is_expected_proxy_alive() -> bool {
+    match read_proxy_pid() {
+        Some(pid) => unsafe { libc::kill(pid as libc::pid_t, 0) == 0 },
+        None => false,
+    }
 }
 
 /// 清理残留的 dns-proxy 进程（应用启动时调用）。
@@ -899,15 +1003,24 @@ pub fn cleanup_stale_proxy() {
 /// 这个函数按进程名扫描（`pgrep -x mhost-dns-proxy` exact match）兜底，
 /// 把所有还活着的 mhost-dns-proxy 都 SIGTERM，让 port 53 释放出来。
 ///
-/// 不是 cleanup_stale_proxy 的替代品 —— 那个有 pid 文件校验防止 PID 重用
-/// 误杀；这个是 last-resort 清理。两路并用。
-fn kill_orphan_dns_proxies() {
-    // `pgrep -x NAME` 只匹配进程名 basename 精确等于 NAME 的进程。
-    // 不会误匹配 `not-mhost-dns-proxy` 之类的，也不会匹配 grep 自己的命令行。
+/// **fix (issue #148)**：用 pgrep -x 找出当前所有 mhost-dns-proxy 进程。
+///
+/// `pgrep -x NAME` 只匹配进程名 basename 精确等于 NAME 的进程 —— 不会误匹配
+/// `not-mhost-dns-proxy` 之类的，也不会匹配 grep 自己的命令行。
+///
+/// - pgrep 退出码 1 = 没匹配（success=false 但也无错误）
+/// - 其他 = 工具不可用（罕见）
+///
+/// 两种情况都返回空 Vec（best-effort）。
+///
+/// 提取出来作为单独函数是因为 `sudo_kill_orphan_dns_proxies` 也要枚举同一组
+/// pid，但要走 sudo 提权路径。函数本身纯本地 pgrep，不涉及 sudo / osascript，
+/// 可以在非 macOS 平台编译 + 测试。
+pub(crate) fn find_orphan_proxy_pids() -> Vec<u32> {
     let output = std::process::Command::new("pgrep")
         .args(["-x", "mhost-dns-proxy"])
         .output();
-    let pids: Vec<u32> = match output {
+    match output {
         Ok(out) if out.status.success() => {
             let stdout = String::from_utf8_lossy(&out.stdout);
             stdout
@@ -915,30 +1028,62 @@ fn kill_orphan_dns_proxies() {
                 .filter_map(|line| line.trim().parse::<u32>().ok())
                 .collect()
         }
-        // pgrep 退出码 1 = 没匹配（success=false 但也无错误）；其他 =
-        // 工具不可用。我们都当成 "无孤儿" 处理（best-effort）。
         _ => Vec::new(),
-    };
+    }
+}
+
+/// **fix (issue #148)**：sudo 提权 SIGTERM 所有 mhost-dns-proxy 孤儿。
+///
+/// `kill_orphan_dns_proxies` 是 user-mode `libc::kill(SIGTERM)`，在 macOS
+/// 上对 root 进程会被 EACCES 静默丢弃（user 态信号无法送达到 root 进程）。
+/// 上一轮 enable 的 proxy 是 osascript 提权起 root 进程，本函数的 SIGTERM
+/// 才能真正杀掉它，释放 UDP 53 让下一次 enable 不撞 `Address already in use`。
+///
+/// # `interactive` 语义
+/// - `true`：弹 sudo 框真去 kill。Tray Quit / Cmd-Q 路径用 —— 用户在场，
+///   可重新输入密码。
+/// - `false`：no-op。Enable 路径用 —— 那个路径里 sudo-kill 已经 inline 进
+///   同一个 elevated script（见 `enable_dns_mode` 里的 `script_body`），
+///   不需要再弹第二次 sudo。
+///
+/// 找不到孤儿时（pgrep 无输出）提前 return，不会调用 osascript / 不会弹框。
+///
+/// best-effort：osascript 失败 / 用户在弹窗里 Cancel 只 log，不返回 Err。
+#[cfg(target_os = "macos")]
+pub fn sudo_kill_orphan_dns_proxies(interactive: bool) {
+    let pids = find_orphan_proxy_pids();
     if pids.is_empty() {
         return;
     }
+    if !interactive {
+        eprintln!(
+            "[mHost] sudo_kill_orphan_dns_proxies: {} orphan pid(s) found but skipping \
+             non-interactive kill (enable path inlines the kill into the elevated script)",
+            pids.len()
+        );
+        return;
+    }
     eprintln!(
-        "[mHost] kill_orphan_dns_proxies: found {} stale mhost-dns-proxy process(es); sending SIGTERM",
+        "[mHost] sudo_kill_orphan_dns_proxies: {} orphan pid(s) found, prompting sudo",
         pids.len()
     );
-    for pid in pids {
-        // SAFETY: libc::kill with valid pid and SIGTERM is safe; failed kill
-        // (ESRCH = process already gone) is benign here.
-        let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-        if rc != 0 {
-            let err = std::io::Error::last_os_error();
-            // ESRCH = process already gone between pgrep and our kill; benign.
-            if err.raw_os_error() != Some(libc::ESRCH) {
-                eprintln!("[mHost] failed to SIGTERM orphan pid {}: {}", pid, err);
-            }
-        } else {
-            eprintln!("[mHost] SIGTERM -> orphan mhost-dns-proxy pid {}", pid);
-        }
+    // TERM → 等 1s → KILL。同 run_with_privileges() 的 elevated 路径
+    // 一样用 `do shell script` + quoted path，避开手工 shell escape。
+    let script = r#"#!/bin/sh
+for pid in $(pgrep -x mhost-dns-proxy); do
+    kill -TERM "$pid" 2>/dev/null || true
+done
+sleep 1
+for pid in $(pgrep -x mhost-dns-proxy); do
+    kill -KILL "$pid" 2>/dev/null || true
+done
+exit 0
+"#;
+    if let Err(e) = run_with_privileges(script) {
+        eprintln!(
+            "[mHost] sudo_kill_orphan_dns_proxies: osascript failed ({}); orphans may persist",
+            e
+        );
     }
 }
 
@@ -1196,12 +1341,16 @@ mod tests {
         // 主要断言：调用不 panic 且返回 Ok
     }
 
-    /// 串行化 runtime dir 相关测试的 helper。**fix H1**：之前用本地
-    /// `serial_runtime_dir_test` mutex，与 proxy.rs 测试的 `TEST_LOCK`
-    /// 不同 —— 两边同时改 `MHOST_RUNTIME_DIR` 会 race，导致测试
-    /// 读写错的路径。统一用 `proxy::tests::TEST_LOCK` 保证串行化。
+    /// 串行化 runtime dir 相关测试的 helper。
+    ///
+    /// **fix (issue #148 review 🟡 #2)**：改用 crate 顶层 pub 的
+    /// `RUNTIME_DIR_TEST_LOCK`,让 mhost crate 里的 `cleanup_dns_on_exit` 测试
+    /// 也能引用同一把锁 —— `proxy::tests::TEST_LOCK` 是 pub(crate),跨 crate
+    /// binary 不可见。
     fn serial_runtime_dir_test() -> std::sync::MutexGuard<'static, ()> {
-        crate::proxy::tests::test_lock()
+        crate::RUNTIME_DIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     // -----------------------------------------------------------------------
@@ -1583,36 +1732,10 @@ Ethernet Address: aa:bb:cc:dd:ee:ff
         let proxy = "/usr/local/bin/mhost-dns-proxy";
         let pid_file = proxy_pid_file();
         let ready_file = proxy_ready_file();
-        let script = format!(
-            r#"#!/bin/sh
-set -e
-"{proxy}" --listen 53 --target 1053 &
-proxy_pid=$!
-echo "$proxy_pid {proxy}" > {pid_file}
-disown
-
-# 等 proxy 写 ready 文件（最多 5s）
-ready=0
-for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-    if [ -f "{ready_file}" ]; then
-        ready=1
-        break
-    fi
-    sleep 0.25
-done
-
-if [ "$ready" -ne 1 ]; then
-    echo "dns-proxy failed to become ready within 5s (pid=$proxy_pid)" >&2
-    kill "$proxy_pid" 2>/dev/null || true
-    exit 1
-fi
-
-networksetup -setdnsservers Wi-Fi 127.0.0.1
-"#,
-            proxy = proxy,
-            pid_file = pid_file.display(),
-            ready_file = ready_file.display()
-        );
+        // **fix (issue #148)**：直接调 build_enable_script_body() 而不是
+        // 在测试里 inline 整个脚本 —— 单一来源。如果 inline,改 helper 时
+        // 容易漏改测试副本导致 false-pass。
+        let script = build_enable_script_body(proxy, 1053, &pid_file, &ready_file, "Wi-Fi");
         // 验证脚本包含关键行（用 $proxy_pid 而非 $!，fix issue #140）
         assert!(
             script.contains(&format!(
@@ -1633,41 +1756,15 @@ networksetup -setdnsservers Wi-Fi 127.0.0.1
     /// 在 `networksetup -setdnsservers` 之前出现）。更深的行为验证（真实 shell
     /// 执行 + mock ready file 写入）由 `test_enable_script_waits_for_proxy_ready_runtime`
     /// 在 macOS CI 上做。
+    #[cfg(target_os = "macos")] // build_enable_script_body is macOS-gated
     #[test]
     fn test_enable_script_waits_for_proxy_ready_before_setdns() {
         let proxy = "/usr/local/bin/mhost-dns-proxy";
         let pid_file = proxy_pid_file();
         let ready_file = proxy_ready_file();
-        let script = format!(
-            r#"#!/bin/sh
-set -e
-"{proxy}" --listen 53 --target 1053 &
-proxy_pid=$!
-echo "$proxy_pid {proxy}" > {pid_file}
-disown
-
-# 等 proxy 写 ready 文件（最多 5s）
-ready=0
-for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-    if [ -f "{ready_file}" ]; then
-        ready=1
-        break
-    fi
-    sleep 0.25
-done
-
-if [ "$ready" -ne 1 ]; then
-    echo "dns-proxy failed to become ready within 5s (pid=$proxy_pid)" >&2
-    kill "$proxy_pid" 2>/dev/null || true
-    exit 1
-fi
-
-networksetup -setdnsservers Wi-Fi 127.0.0.1
-"#,
-            proxy = proxy,
-            pid_file = pid_file.display(),
-            ready_file = ready_file.display()
-        );
+        // **fix (issue #148)**：直接调 build_enable_script_body()。这是
+        // 单一来源；测试不再维护一份副本。
+        let script = build_enable_script_body(proxy, 1053, &pid_file, &ready_file, "Wi-Fi");
 
         // 关键断言 1：脚本必须包含 ready 文件轮询（用 `[ -f ... ]` 而不是 `nc -z`）。
         let ready_marker = format!("[ -f \"{}\" ]", ready_file.display());
@@ -1712,7 +1809,8 @@ networksetup -setdnsservers Wi-Fi 127.0.0.1
         // 关键断言 4：不能含 nc -z（TCP 探测，对 UDP-only proxy 无效）
         assert!(
             !script.contains("nc -z"),
-            "脚本不能含 nc -z（proxy 只 bind UDP，nc -z 默认 TCP 探测会一直超时）"
+            "脚本不能含 nc -z（proxy 只 bind UDP，nc -z 默认 TCP 探测会一直超时）。脚本:\n{}",
+            script
         );
     }
 
@@ -1898,23 +1996,357 @@ rm -f /tmp/mhost-dns-nonexistent.pid
     }
 
     /// 回归测试（fix: stale proxy 占 53 端口导致 enable 失败）：
-    /// 调用 `kill_orphan_dns_proxies()` 不能 panic，也不能 SIGTERM 当前测试进程。
+    /// 调用 `sudo_kill_orphan_dns_proxies()` 不能 panic，也不能 SIGTERM
+    /// 当前测试进程。
     ///
     /// 怎么测:CI 里不太可能正好有 mhost-dns-proxy 进程;所以这个测试主要是
     /// 「不 panic、不误杀 self」的 sanity check。如果 pgrep 不可用(罕见),跳过。
+    ///
+    /// **fix (issue #148 review)**：原 `kill_orphan_dns_proxies`（user-mode
+    /// libc::kill，对 root-owned proxy 是 EACCES silent no-op）已删除,改
+    /// 测 `sudo_kill_orphan_dns_proxies` 的两条 early-return 路径。
     #[test]
-    fn test_kill_orphan_dns_proxies_idempotent_safe() {
+    fn test_sudo_kill_orphan_dns_proxies_idempotent_safe() {
         let my_pid = std::process::id();
         let before_alive = unsafe { libc::kill(my_pid as libc::pid_t, 0) };
         assert_eq!(before_alive, 0, "test process should be alive");
 
-        // 跑清理 — 不应该 panic,也不应该 kill 当前测试进程
-        super::kill_orphan_dns_proxies();
+        // 跑清理 — 不应该 panic,也不应该 kill 当前测试进程。
+        // interactive=false 跳过 osascript;true 会 pop sudo 框 —— 我们
+        // 提前 return(无孤儿时 pgrep 无输出),所以两条路径都安全。
+        super::sudo_kill_orphan_dns_proxies(false);
+        super::sudo_kill_orphan_dns_proxies(true);
 
         let after_alive = unsafe { libc::kill(my_pid as libc::pid_t, 0) };
         assert_eq!(
             after_alive, 0,
             "test process must remain alive after orphan-cleanup"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // issue #148 regression tests: orphan-proxy cleanup + trap lifecycle
+    // -----------------------------------------------------------------------
+
+    /// **fix (issue #148)**：`find_orphan_proxy_pids` 必须能在没有 proxy 进程时
+    /// 返回空 Vec,不 panic。这是 `kill_orphan_dns_proxies` 和
+    /// `sudo_kill_orphan_dns_proxies` 都依赖的纯函数;early-return 正确性
+    /// 关系到"无孤儿时不弹 sudo 框"的核心 UX 保证。
+    #[test]
+    fn test_find_orphan_proxy_pids_idempotent() {
+        // 在 CI 环境基本不可能正好有 mhost-dns-proxy 进程在跑,这里只断言
+        // 调用不 panic + 返回 Vec< u32> 类型 + 不误报 test 自己 PID。
+        let my_pid = std::process::id();
+        let pids = super::find_orphan_proxy_pids();
+        for pid in &pids {
+            assert_ne!(*pid, my_pid, "find_orphan_proxy_pids 不应匹配测试进程自身");
+        }
+    }
+
+    /// **fix (issue #148)**:build_enable_script_body 必须包含 trap +
+    /// cleanup() + handoff flag + inline orphan-kill。这些是 orphan proxy
+    /// 不会泄露到下次 enable 的全部契约。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_enable_script_contains_trap_cleanup() {
+        let script = super::build_enable_script_body(
+            "/usr/local/bin/mhost-dns-proxy",
+            1053,
+            std::path::Path::new("/tmp/test.pid"),
+            std::path::Path::new("/tmp/test.ready"),
+            "Wi-Fi",
+        );
+
+        // trap 必须存在,覆盖 EXIT/INT/TERM 三种退出路径
+        assert!(
+            script.contains("trap cleanup EXIT INT TERM"),
+            "script must register trap for EXIT/INT/TERM (issue #148)\n{}",
+            script
+        );
+
+        // cleanup() 必须 kill TERM + KILL 兜底
+        assert!(
+            script.contains(r#"kill -TERM "$proxy_pid""#),
+            "cleanup must TERM the proxy before KILL\n{}",
+            script
+        );
+        assert!(
+            script.contains(r#"kill -KILL "$proxy_pid""#),
+            "cleanup must KILL after TERM grace period\n{}",
+            script
+        );
+
+        // inline sudo-level orphan-kill 必须存在(脚本顶部 pgrep 循环)
+        assert!(
+            script.contains("pgrep -x mhost-dns-proxy"),
+            "script must inline pgrep-based orphan kill (already elevated)\n{}",
+            script
+        );
+
+        // handoff flag 必须存在
+        assert!(
+            script.contains("proxy_should_keep_running=1"),
+            "script must set handoff flag on success path\n{}",
+            script
+        );
+    }
+
+    /// **fix (issue #148)**:成功路径下 proxy_should_keep_running=1 必须
+    /// 在 exit 0 之前被设上,这样 trap 触发时不 kill 正常运行的 proxy。
+    /// 如果顺序反了,每次 enable 成功反而会自杀 proxy。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_enable_script_trap_does_not_kill_on_success() {
+        let script = super::build_enable_script_body(
+            "/usr/local/bin/mhost-dns-proxy",
+            1053,
+            std::path::Path::new("/tmp/test.pid"),
+            std::path::Path::new("/tmp/test.ready"),
+            "Wi-Fi",
+        );
+
+        let handoff_pos = script
+            .rfind("proxy_should_keep_running=1")
+            .expect("script must set handoff flag on success path");
+        let exit_pos = script
+            .rfind("exit 0")
+            .expect("script must end with exit 0 on success path");
+
+        assert!(
+            handoff_pos < exit_pos,
+            "proxy_should_keep_running=1 (offset {}) 必须早于最后 exit 0 (offset {}), \
+             否则 trap 触发时会 kill 正常运行的 proxy",
+            handoff_pos,
+            exit_pos
+        );
+    }
+
+    /// **fix (issue #148)**:ready 超时分支必须**在** handoff flag 被置位
+    /// 之前就 exit 1,这样 trap 在 flag=0 时触发,kill proxy。
+    /// 如果 ready-timeout 分支错被放在 `proxy_should_keep_running=1` 之后,
+    /// trap 就会跳过 kill,proxy 留下来成孤儿。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_enable_script_trap_kills_on_failure_path() {
+        let script = super::build_enable_script_body(
+            "/usr/local/bin/mhost-dns-proxy",
+            1053,
+            std::path::Path::new("/tmp/test.pid"),
+            std::path::Path::new("/tmp/test.ready"),
+            "Wi-Fi",
+        );
+
+        // timeout 分支的特征串:在脚本里的位置
+        let timeout_marker_pos = script
+            .find("dns-proxy failed to become ready")
+            .expect("script must contain ready-timeout branch");
+        let exit_after_timeout_marker = script[timeout_marker_pos..]
+            .find("exit 1")
+            .map(|p| timeout_marker_pos + p)
+            .expect("script must contain exit 1 right after ready-timeout branch");
+
+        // handoff 用 `=1`(赋值),不是 `!= "1"`(cleanup 函数里的比较)
+        // 用 rfind 拿最后一个 =1 的位置(成功路径最后的赋值)。
+        let handoff_pos = script
+            .rfind("proxy_should_keep_running=1")
+            .expect("script must set handoff flag on success path");
+
+        assert!(
+            exit_after_timeout_marker < handoff_pos,
+            "ready-timeout exit 1 (offset {}) 必须早于 proxy_should_keep_running=1 (offset {}), \
+             否则 timeout 分支不会 kill proxy (issue #148 bug #1 regression). Script:\n{}",
+            exit_after_timeout_marker,
+            handoff_pos,
+            script
+        );
+    }
+
+    /// **fix (issue #148)**：`sudo_kill_orphan_dns_proxies` 在没有孤儿时
+    /// 必须 no-op,不调 osascript,不弹 sudo。这条 invariant 已合并到
+    /// `test_sudo_kill_orphan_dns_proxies_idempotent_safe`(上面)。
+    ///
+    /// `is_expected_proxy_alive()` 必须不 panic,返回 bool。读到损坏的
+    /// pid_file 内容(非数字、空)返回 false —— disable 路径会走 sudo-kill
+    /// 兜底,而不是把 broken pid 当活 proxy 用 signal-file 协议。
+    #[test]
+    fn test_is_expected_proxy_alive_returns_bool() {
+        // CI 里没有 proxy,应该返回 false
+        let _ = super::is_expected_proxy_alive();
+    }
+
+    /// **fix (issue #148 review)**:trap 必须在脚本 EXIT 时真的 kill 子进程。
+    /// 这是 issue #148 描述的 root cause 的端到端验证 —— 用户 Cancel
+    /// osascript,shell 退出非零,trap 杀掉 proxy。
+    ///
+    /// 不直接测 build_enable_script_body(里面包了 pgrep + networksetup,
+    /// CI 环境跑不动);改测最小化的 trap 模式:`sleep 30 &` + `exit 1` →
+    /// 验证 trap 把 sleep 杀掉。
+    ///
+    /// 强验证(替代旧的 3s hang-only assertion):trap 跑完后通过 `pgrep`
+    /// 找以自己 PPID 为父的 sleep 子进程,应该找不到。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_enable_script_trap_kills_long_sleeping_child() {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        // 最小 trap 脚本:启动 sleep 子进程 + exit 1 → trap kill 子进程
+        let script_body = r#"#!/bin/sh
+set -e
+child_pid=""
+cleanup() {
+    if [ -n "$child_pid" ]; then
+        kill -TERM "$child_pid" 2>/dev/null || true
+        sleep 1
+        kill -KILL "$child_pid" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT INT TERM
+
+sleep 30 &
+child_pid=$!
+disown
+
+# 立刻失败,触发 trap
+exit 1
+"#;
+        let path = std::env::temp_dir().join(format!(
+            "mhost-dns-trap-test-{}-{}.sh",
+            std::process::id(),
+            1
+        ));
+        let _ = std::fs::remove_file(&path);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o700)
+            .open(&path)
+            .unwrap();
+        std::fs::write(&path, script_body).unwrap();
+
+        let output = Command::new(&path).output().expect("run trap test script");
+
+        assert!(
+            !output.status.success(),
+            "trap test 脚本应该 exit 1 (失败路径),让 trap 触发"
+        );
+
+        // 等最多 2s 让 trap 的 TERM→KILL 序列(1s sleep + 一点缓冲)跑完。
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut sleep_pids_after: Vec<u32> = Vec::new();
+        while Instant::now() < deadline {
+            // 找以这个测试进程为父的 sleep 30 子进程(trap 脚本 disown 了,
+            // 所以 PPID 是 trap test script 而不是测试进程。但 trap 跑完
+            // sleep 应该已经被 KILL 掉,任何 ppid 下都不应存在)。
+            let pgrep_out = Command::new("pgrep").args(["-f", "sleep 30"]).output();
+            if let Ok(out) = pgrep_out {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                sleep_pids_after = stdout
+                    .lines()
+                    .filter_map(|l| l.trim().parse::<u32>().ok())
+                    .collect();
+                if sleep_pids_after.is_empty() {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            sleep_pids_after.is_empty(),
+            "trap must kill sleep 30 child; found pids still alive: {:?}",
+            sleep_pids_after
+        );
+    }
+
+    /// **fix (issue #148 review)**:`set -e` + `for pid in $(pgrep -x nothing-running)`
+    /// 的组合必须不因 pgrep 退出 1 而让整个脚本提前退出 —— 这是 inline
+    /// orphan-cleanup 在脚本顶部能用 `set -e` 的关键不变量。Linux dash /
+    /// bash 5 的 `set -e` 行为在 command substitution 失败时与 macOS bash 3.2
+    /// 不同,值得显式测试。
+    ///
+    /// 直接用 `sh -c "..."` 跑一段最小 inline-kill 模式,断言:
+    /// - pgrep 退出 1 不导致外层脚本退出
+    /// - `after-loop` echo 仍然执行
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_enable_script_no_orphan_does_not_exit_early() {
+        use std::process::Command;
+
+        // 1. 用 sh 跑的最小版本(macOS /bin/sh 实际是 bash 3.2)。
+        let sh_script = r#"#!/bin/sh
+set -e
+for pid in $(pgrep -x definitely-not-running-mhost-dns-proxy-xyz); do
+    kill -TERM "$pid" 2>/dev/null || true
+done
+echo "after-loop-marker"
+exit 0
+"#;
+        let sh_path = std::env::temp_dir().join(format!(
+            "mhost-dns-no-orphan-sh-{}-{}.sh",
+            std::process::id(),
+            1
+        ));
+        let _ = std::fs::remove_file(&sh_path);
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o700)
+                .open(&sh_path)
+                .unwrap();
+        }
+        std::fs::write(&sh_path, sh_script).unwrap();
+        let sh_out = Command::new(&sh_path).output().expect("run sh test");
+        let sh_stdout = String::from_utf8_lossy(&sh_out.stdout).into_owned();
+        let _ = std::fs::remove_file(&sh_path);
+        assert!(
+            sh_out.status.success(),
+            "sh script with empty pgrep must succeed; stderr: {}",
+            String::from_utf8_lossy(&sh_out.stderr)
+        );
+        assert!(
+            sh_stdout.contains("after-loop-marker"),
+            "sh: script must reach echo after empty pgrep loop; stdout: {:?}",
+            sh_stdout
+        );
+
+        // 2. bash (Linux CI 主流 shell) 也跑一遍同样的脚本。
+        if let Ok(bash_path) = std::process::Command::new("which")
+            .arg("bash")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        {
+            if !bash_path.is_empty() && std::path::Path::new(&bash_path).exists() {
+                let bash_script = sh_script.replace("#!/bin/sh", "#!/usr/bin/env bash");
+                let bash_path_file = std::env::temp_dir().join(format!(
+                    "mhost-dns-no-orphan-bash-{}-{}.sh",
+                    std::process::id(),
+                    1
+                ));
+                let _ = std::fs::remove_file(&bash_path_file);
+                std::fs::write(&bash_path_file, &bash_script).unwrap();
+                let bash_out = Command::new(&bash_path)
+                    .arg(&bash_path_file)
+                    .output()
+                    .expect("run bash test");
+                let bash_stdout = String::from_utf8_lossy(&bash_out.stdout).into_owned();
+                let _ = std::fs::remove_file(&bash_path_file);
+                assert!(
+                    bash_out.status.success(),
+                    "bash script with empty pgrep must succeed; stderr: {}",
+                    String::from_utf8_lossy(&bash_out.stderr)
+                );
+                assert!(
+                    bash_stdout.contains("after-loop-marker"),
+                    "bash: script must reach echo after empty pgrep loop; stdout: {:?}",
+                    bash_stdout
+                );
+            }
+        }
     }
 }
