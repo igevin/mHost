@@ -626,14 +626,19 @@ pub async fn cleanup_dns_on_exit(state: &AppState, interactive: bool) -> Result<
     // （SIGINT + Tauri ExitRequested + tray Quit 三条路径竞态时）走 no-op。
     state.dns_enabled.store(false, Ordering::Relaxed);
 
-    // **fix (issue #148)**：set_dns_mode_disable 的 signal-file protocol
-    // 假设 proxy 还在跑（写 "shutdown" → proxy 轮询 → 自我恢复 DNS）。
-    // 但 proxy 可能因为上一轮 enable 被 osascript Cancel 留下来成孤儿
-    // —— 早就 disown + trap-没装 → 现在还在占 UDP 53 + 系统 DNS 指向
-    // 127.0.0.1。先 sudo-kill 孤儿,让 signal-file protocol 有干净起点;
-    // interactive=true 时 pop sudo,false 时 no-op(proxy 还活着就让
-    // signal-file protocol 走自我恢复路径)。
-    mhost_dns::platform::sudo_kill_orphan_dns_proxies(interactive);
+    // **fix (issue #148 review Blocker 1)**：sudo_kill_orphan_dns_proxies
+    // 用 `pgrep -x mhost-dns-proxy` 枚举,会把**还在跑**的 expected proxy
+    // 也当作孤儿杀掉 —— 这会:
+    //   - 多弹一次 sudo 框(tray Quit / Cmd-Q 路径)
+    //   - 让 disable 走「proxy 不在」分支 + osascript 兜底,不再走
+    //     signal-file 协议的 graceful 恢复
+    //
+    // 正确做法:先探测 PID 文件 + kill(pid, 0) 判断 expected proxy 还活不活。
+    // - 还活着 → signal-file 协议自管,不要碰。
+    // - 死了 / pid_file 缺失 → 真正的孤儿场景,才调 sudo-kill 兜底。
+    if !mhost_dns::platform::is_expected_proxy_alive() {
+        mhost_dns::platform::sudo_kill_orphan_dns_proxies(interactive);
+    }
 
     match set_dns_mode_disable(state, interactive).await {
         Ok(()) => Ok(()),
@@ -686,6 +691,45 @@ mod tests {
         // dns_enabled = false → cleanup 应直接返回 Ok
         let result = cleanup_dns_on_exit(&state, false).await;
         assert!(result.is_ok(), "DNS disabled → cleanup should be a no-op");
+    }
+
+    /// **fix (issue #148 review Blocker 1)**:cleanup_dns_on_exit 入口应该用
+    /// `is_expected_proxy_alive()` 判断是否真的有孤儿:
+    /// - pid_file 缺失 / PID 不存在 → true 孤儿,调 sudo_kill_orphan_dns_proxies
+    /// - pid_file 存在 + kill(pid, 0) 成功 → proxy 还活着,**不要**杀它
+    ///
+    /// 这条 test 直接验证 helper 在没有 pid_file / pid_file 内容损坏 /
+    /// pid_file 指向一个已死 PID 这三种场景下都返回 false —— 这些是
+    /// cleanup_dns_on_exit 走 sudo-kill 分支的入口条件。
+    #[test]
+    fn test_is_expected_proxy_alive_handles_missing_or_stale_pid_file() {
+        use mhost_dns::platform::{is_expected_proxy_alive, proxy_pid_file};
+
+        // 1. 没有 pid_file → false
+        let pid_path = proxy_pid_file();
+        let _ = std::fs::remove_file(&pid_path);
+        assert!(
+            !is_expected_proxy_alive(),
+            "missing pid_file must report proxy as not alive"
+        );
+
+        // 2. pid_file 指向自己(测试进程),kill(pid, 0) 当然成功 →
+        //    true。但我们不用这个测试这个分支,因为它依赖当前进程 PID。
+        //    改成测试「指向一个肯定不存在的 PID」(fake pid 999999999)。
+        std::fs::write(&pid_path, "999999999 /usr/local/bin/mhost-dns-proxy\n").unwrap();
+        assert!(
+            !is_expected_proxy_alive(),
+            "pid_file pointing to dead pid must report proxy as not alive"
+        );
+
+        // 3. pid_file 内容损坏(非数字)
+        std::fs::write(&pid_path, "garbage not a pid\n").unwrap();
+        assert!(
+            !is_expected_proxy_alive(),
+            "pid_file with non-numeric content must report proxy as not alive"
+        );
+
+        let _ = std::fs::remove_file(&pid_path);
     }
 
     /// 回归测试（bug 1 + bug 4 + disabling-after-network-switch fix）：
