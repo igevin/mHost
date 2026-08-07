@@ -205,6 +205,104 @@ fn invoke_osascript(path: &std::path::Path) -> Result<std::process::Output, Stri
         .map_err(|e| format!("osascript failed: {}", e))
 }
 
+/// **fix (issue #142 follow-up)**：Result of an osascript invocation that
+/// exposes the child PID so the caller can kill it on timeout — the
+/// previous `Command::output()` wrapper hid the PID. macOS-only because
+/// the osascript call site itself is macOS-only.
+#[cfg(target_os = "macos")]
+pub(crate) struct OsascriptRun {
+    pub child: std::process::Child,
+    pub pid: i32,
+}
+
+/// Spawn osascript and return the running `Child` so the caller can kill
+/// it on timeout. Replaces the previous fire-and-forget `.output()` call.
+///
+/// Stdio pipes are set explicitly (`Stdio::piped()`) so the Rust side
+/// owns valid pipes; without them `wait_with_output` would fail.
+#[cfg(target_os = "macos")]
+pub(crate) fn spawn_osascript(path: &std::path::Path) -> Result<OsascriptRun, String> {
+    let path_str = path.to_string_lossy();
+    let apple_script = format!(
+        "do shell script \"sh \" & quoted form of POSIX path of \"{}\" with administrator privileges",
+        path_str.replace('\\', "\\\\").replace('"', "\\\""),
+    );
+    let child = Command::new("osascript")
+        .args(["-e", &apple_script])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("osascript spawn failed: {}", e))?;
+    let pid = child.id() as i32;
+    Ok(OsascriptRun { child, pid })
+}
+
+/// Best-effort SIGKILL the osascript child. The goal is to unblock the
+/// Rust-side wait so the UI can recover; the kill itself is fire-and-forget.
+#[cfg(target_os = "macos")]
+pub(crate) fn kill_osascript(pid: i32) {
+    // SAFETY: `kill(2)` with a valid PID is safe; the PID comes from the
+    // Child we just spawned and we hold the Child handle.
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+    }
+}
+
+/// Run osascript with a hard wall-clock timeout. On timeout, SIGKILL the
+/// child and return `Err` so the caller surfaces a clear error to the UI.
+///
+/// Synchronous (not `tokio::time::timeout` + `spawn_blocking`) on purpose:
+/// the v0.3.3 attempt used that pattern and was removed because dropping
+/// the `JoinHandle` after timeout doesn't interrupt the blocking thread,
+/// which leaks osascript and leaves `dns_enabled=false` in-memory while
+/// the proxy is already running + system DNS is already flipped
+/// (state desync). Here we hold the `Child` directly and SIGKILL on
+/// expiry, so the child is reaped on every exit path.
+#[cfg(target_os = "macos")]
+pub(crate) fn run_with_privileges_timeout(
+    script_body: &str,
+    timeout: std::time::Duration,
+) -> Result<std::process::Output, String> {
+    let path = write_temp_script(script_body).map_err(|e| format!("temp script failed: {}", e))?;
+    let mut run = match spawn_osascript(&path) {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = std::fs::remove_file(&path);
+            return Err(e);
+        }
+    };
+    // Script file is already exec'd by osascript; safe to remove.
+    let _ = std::fs::remove_file(&path);
+
+    let start = std::time::Instant::now();
+    loop {
+        match run.child.try_wait() {
+            Ok(Some(_status)) => {
+                return run
+                    .child
+                    .wait_with_output()
+                    .map_err(|e| format!("osascript wait_with_output failed: {}", e));
+            }
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    kill_osascript(run.pid);
+                    // Reap the zombie but don't block forever — the SIGKILL
+                    // is best-effort, wait() may not return cleanly.
+                    let _ = run.child.wait();
+                    return Err(format!(
+                        "osascript timed out after {:?} (killed pid={}); \
+                         the TCC prompt may be stuck — try again or \
+                         force-quit System Events",
+                        timeout, run.pid
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => return Err(format!("osascript try_wait failed: {}", e)),
+        }
+    }
+}
+
 /// **fix（disabling-after-network-switch）**：capture the user's original DNS
 /// configuration **type**, separating "user managed" from "DHCP/empty".
 ///
@@ -523,8 +621,19 @@ pub fn enable_dns_mode(dns_port: u16, original: &OriginalDns) -> Result<(), Plat
     let ready_file = proxy_ready_file();
     let script_body =
         build_enable_script_body(&proxy_path, dns_port, &pid_file, &ready_file, &interface);
-    let output = run_with_privileges(&script_body)
+    tracing::info!(
+        "enable_dns_mode: invoking osascript (timeout=60s) for interface={}, dns_port={}",
+        interface,
+        dns_port
+    );
+    let output = run_with_privileges_timeout(&script_body, std::time::Duration::from_secs(60))
         .map_err(|e| PlatformError::SetDns(format!("enable dns mode failed: {}", e)))?;
+    tracing::info!(
+        "enable_dns_mode: osascript returned: status={:?}, stdout_len={}, stderr_len={}",
+        output.status,
+        output.stdout.len(),
+        output.stderr.len()
+    );
     if !output.status.success() {
         // 回滚：清理刚才写的文件
         let _ = std::fs::remove_file(&original_path);
@@ -613,7 +722,14 @@ for pid in $(pgrep -x mhost-dns-proxy); do
 done
 
 # ---- enable: launch proxy, wait for ready, hand off to system ----
-"{proxy}" --listen 53 --target {dns_port} &
+# Critical: redirect all three FDs to /dev/null BEFORE backgrounding.
+# `disown` removes the job from the shell's job table but does NOT close
+# inherited FDs. Without this redirect, mhost-dns-proxy inherits
+# osascript's captured stdout/stderr pipes (invoke_osascript uses
+# Command::output()). The proxy stays alive and keeps those pipes open,
+# so Command::output() never observes EOF and the enable-dns IPC hangs
+# forever with no error. Order matters: `&` MUST come last.
+"{proxy}" --listen 53 --target {dns_port} </dev/null >/dev/null 2>&1 &
 proxy_pid=$!
 echo "$proxy_pid {proxy}" > {pid_file}
 disown
@@ -2113,6 +2229,78 @@ rm -f /tmp/mhost-dns-nonexistent.pid
             script.contains("proxy_should_keep_running=1"),
             "script must set handoff flag on success path\n{}",
             script
+        );
+    }
+
+    /// **fix (DNS enable hang root cause)**: the backgrounded privileged
+    /// proxy (`... &` + `disown`) must NOT inherit osascript's captured
+    /// stdout/stderr pipes — otherwise osascript's `Command::output()` on
+    /// the Rust side never observes EOF and the enable-dns IPC hangs
+    /// forever with no error (no TCC prompt appears, UI stuck on "Loading").
+    ///
+    /// The script must redirect all three FDs to /dev/null BEFORE the `&`
+    /// that backgrounds the proxy. Order matters: `&` after the redirects
+    /// is the safe form — putting `&` first detaches the process before
+    /// its FDs are reassigned, defeating the redirect.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_enable_script_redirects_backgrounded_proxy_fds() {
+        let script = super::build_enable_script_body(
+            "/usr/local/bin/mhost-dns-proxy",
+            1053,
+            std::path::Path::new("/tmp/test.pid"),
+            std::path::Path::new("/tmp/test.ready"),
+            "Wi-Fi",
+        );
+
+        // Locate the proxy-launch line.
+        let launch_pos = script
+            .find(r#""/usr/local/bin/mhost-dns-proxy" --listen 53 --target 1053"#)
+            .expect("script must launch proxy with the expected flags");
+        let next_line_pos = script[launch_pos..]
+            .find('\n')
+            .map(|p| launch_pos + p)
+            .expect("proxy launch line must be newline-terminated");
+        let launch_line = &script[launch_pos..next_line_pos];
+
+        assert!(
+            launch_line.contains("</dev/null"),
+            "backgrounded proxy must redirect stdin </dev/null — \
+             otherwise it inherits osascript's pipe and Command::output() \
+             never observes EOF. Line:\n{launch_line}"
+        );
+        assert!(
+            launch_line.contains(">/dev/null"),
+            "backgrounded proxy must redirect stdout >/dev/null. Line:\n{launch_line}"
+        );
+        assert!(
+            launch_line.contains("2>&1"),
+            "backgrounded proxy must merge stderr (2>&1). Line:\n{launch_line}"
+        );
+
+        // Order check: `&` must come AFTER all three redirects.
+        let amp_pos = launch_line
+            .rfind('&')
+            .expect("backgrounded proxy must use &");
+        let stdin_pos = launch_line
+            .find("</dev/null")
+            .expect("stdin redirect must be present");
+        let stdout_pos = launch_line
+            .find(">/dev/null")
+            .expect("stdout redirect must be present");
+        let stderr_pos = launch_line
+            .find("2>&1")
+            .expect("stderr merge must be present");
+        assert!(
+            stdin_pos < amp_pos && stdout_pos < amp_pos && stderr_pos < amp_pos,
+            "FD redirects must precede `&` — putting `&` first detaches the \
+             process before stdout/stderr are reassigned. Line:\n{launch_line}"
+        );
+
+        // PID file write must still occur (regression: prior tests pin this).
+        assert!(
+            script.contains(r#"echo "$proxy_pid /usr/local/bin/mhost-dns-proxy" > "#),
+            "PID file write must still occur"
         );
     }
 
