@@ -39,13 +39,56 @@ use crate::state::{lock_or_recover, AppState};
 pub async fn set_dns_mode(enabled: bool, state: State<'_, AppState>) -> Result<(), MhostError> {
     let _guard = state.dns_lock.lock().await;
 
-    if enabled {
-        set_dns_mode_enable(&state).await
-    } else {
-        // 用户点 Disable → 在场，可以弹 sudo。`interactive=true` 让
-        // proxy 死了 / 5s 超时分支用 osascript 兜底恢复。
-        set_dns_mode_disable(&state, true).await
+    // 分配新的 cancellation token，并 swap 进 slot（issue #138 follow-up
+    // 复用同一模式：不要 clone 现有 token，避免上一次操作的 cancel 漏到
+    // 本次）。`cancel_dns_mode` IPC 会通过这个 token 通知 enable/disable
+    // 路径走 rollback。
+    let cancel = CancellationToken::new();
+    *lock_or_recover(&state.dns_cancel) = Some(cancel.clone());
+
+    let work = async {
+        if enabled {
+            set_dns_mode_enable(&state, &cancel).await
+        } else {
+            // 用户点 Disable → 在场，可以弹 sudo。`interactive=true` 让
+            // proxy 死了 / 5s 超时分支用 osascript 兜底恢复。
+            set_dns_mode_disable(&state, true, Some(&cancel)).await
+        }
+    };
+
+    // select! 让 cancel 立即返回（前端 UI 可以立刻响应）；同时 enable
+    // 内部也在 phase 边界检查 cancel 并跑 rollback，select! 是兜底。
+    // **tokio::select! 不能取消 spawn_blocking**：enable 里的 osascript
+    // 调用是 sync 阻塞在另一个线程，select! 不会中断它。enable 在
+    // spawn_blocking 返回后会再次检查 cancel 走 disable rollback —— 这
+    // 覆盖了 cancel 落在 spawn_blocking 期间的场景。
+    let result = tokio::select! {
+        biased;
+        res = work => res,
+        _ = cancel.cancelled() => Err(MhostError::Cancelled),
+    };
+
+    // 清空 slot。失败也清，保证下次操作拿到 fresh token。
+    *lock_or_recover(&state.dns_cancel) = None;
+    result
+}
+
+/// 取消正在进行的 DNS 启用/停用操作（issue #149）。
+///
+/// 通过 `AppState::dns_cancel` 里的 `CancellationToken` 通知
+/// `set_dns_mode` 走 rollback 路径。没有正在进行的操作时是 no-op。
+///
+/// 前端 Cancel 按钮触发。AbortSignal 和本 IPC 是两件事：
+/// - AbortSignal 让 `invoke()` 的 JS promise 立刻 reject 为
+///   `DOMException(AbortError)`，前端据此识别「用户主动 cancel」；
+/// - 本 IPC 让 Rust 端真正滚回去——否则 enable 路径上的 osascript
+///   还在跑，proxy 已经被 trap 杀掉（issue #148）但系统 DNS 还没恢复。
+#[tauri::command]
+pub async fn cancel_dns_mode(state: State<'_, AppState>) -> Result<(), MhostError> {
+    if let Some(token) = lock_or_recover(&state.dns_cancel).as_ref() {
+        token.cancel();
     }
+    Ok(())
 }
 
 /// 启用 DNS 模式。
@@ -53,7 +96,23 @@ pub async fn set_dns_mode(enabled: bool, state: State<'_, AppState>) -> Result<(
 /// 失败时的回滚是**尽力而为**：每个外部副作用（bind 端口、调用 osascript、
 /// 写 manifest）失败时，我们尝试撤销之前已完成的副作用。但只要成功撤销
 /// 关键的「系统 DNS 改写」就算用户可恢复；端口绑定的 server 会立即 stop。
-async fn set_dns_mode_enable(state: &AppState) -> Result<(), MhostError> {
+///
+/// **`cancel` 协作语义（issue #149）**：在 phase 边界检查 cancel：
+/// 1. `server.start()` OK 后、osascript 前 → 取消 → stop server 即可
+///    （无系统副作用）；返回 `Err(Cancelled)`。
+/// 2. osascript OK 后 → 取消 → 系统 DNS 已切到 127.0.0.1 + proxy 已起。
+///    必须调 `disable_dns_mode(..., None)` 走 self-cleanup + osascript
+///    兜底把系统 DNS 恢复成 original。
+/// 3. manifest 持久化后 → 取消 → 同上，调用 `set_dns_mode_disable`
+///    走完整 rollback（清 in-memory 状态）。
+///
+/// **tokio::select! 不能取消 spawn_blocking**：osascript 那段不能被
+/// 中断。enable 在 spawn_blocking 返回后会再次 check cancel 走 rollback，
+/// 覆盖 cancel 落在 spawn_blocking 期间的场景。outer select! 是兜底。
+async fn set_dns_mode_enable(
+    state: &AppState,
+    cancel: &CancellationToken,
+) -> Result<(), MhostError> {
     // 1. 单一来源读取（fix：disabling-after-network-switch）。
     //    capture_dns_state() 返回语义版本 `OriginalDns`：
     //      - Tier 1 (`networksetup -getdnsservers`) 非空 → Manual(list)
@@ -129,6 +188,16 @@ async fn set_dns_mode_enable(state: &AppState) -> Result<(), MhostError> {
         )));
     }
 
+    // 5.1 (issue #149) cancel check before spawn_blocking。
+    //   server 已 bind 端口,但还没有系统副作用(proxy 没起、networksetup
+    //   没跑、manifest 没写)。如果 cancel 已触发,只需 stop server 释放
+    //   端口 + 返回 Err(Cancelled),无需 disable rollback。
+    if cancel.is_cancelled() {
+        let _ = server.stop().await;
+        eprintln!("[mHost] set_dns_mode_enable: cancelled before spawn_blocking");
+        return Err(MhostError::Cancelled);
+    }
+
     // 6. 启动 privileged proxy + 把系统 DNS 切到 127.0.0.1。
     //    这是不可逆的副作用；失败必须 stop server 并返回 Err。
     //    fix（proxy self-cleanup）：把 &OriginalDns 传给 proxy，让它在
@@ -137,49 +206,66 @@ async fn set_dns_mode_enable(state: &AppState) -> Result<(), MhostError> {
     //    fix（regression from #155）+ **fix（issue #142）**：enable_dns_mode 内部走
     //    osascript 弹 sudo 密码框，`Command::output()` 同步阻塞。
     //
-    //    1. spawn_blocking 让阻塞 syscall 跑在 blocking thread pool 上，
-    //       tokio worker 保持响应（fix #162 / PR #155 regression）。
-    //    2. 外层 tokio::time::timeout(60s) 防止 osascript TCC 弹窗假死
-    //       让 IPC 永久挂起（fix #142）。60s 是 generous 上限，正常
-    //       弹窗 + 输密码远低于此；超时立即 rollback + 返回明确错误。
-    //    3. 前端 invoke 仍带 30s timeout 兜底（见 src/lib/tauri.ts），
-    //       这层 60s 是 Rust 端的后盾。
-    const ENABLE_TIMEOUT_SECS: u64 = 60;
-    let enable_result = tokio::time::timeout(
-        std::time::Duration::from_secs(ENABLE_TIMEOUT_SECS),
-        tokio::task::spawn_blocking({
-            let original = original.clone();
-            move || mhost_dns::platform::enable_dns_mode(dns_port, &original)
-        }),
-    )
-    .await;
-    let enable_outcome = match enable_result {
-        Ok(Ok(inner)) => inner,
-        Ok(Err(join_err)) => {
+    //   **Group 4 (#149) 改动**:放弃 Group 3 加的 `tokio::time::timeout(60s, ...)`
+    //   包装。理由:
+    //     1. timeout 不取消 spawn_blocking 闭包 —— 60s 到时 IPC 返回 Err、前端
+    //        loading 复位,但 osascript 在 blocking 线程继续跑,几秒后完成
+    //        切系统 DNS + 起 proxy,in-memory 状态停留在 dns_enabled=false →
+    //        完全 desync (issue #149 + PR #167 review feedback)。
+    //     2. 改为直接 `await spawn_blocking`:osascript 弹授权框自带 Cancel
+    //        按钮,用户可主动取消;前端 `withTimeout(30s)` (src/lib/tauri.ts)
+    //        兜底;取消意图通过 `cancel_dns_mode` IPC 通知 Rust 端走
+    //        rollback (见 issue #149)。
+    //     3. 真正卡死场景 (#142 原始 TCC 死锁) 的兜底行为和旧 60s timeout
+    //        一样 (用户都得 force-quit),但**不再 leak**。
+    //
+    //   cancel 检查放在 spawn_blocking 返回后:select! 不能取消已经在跑的
+    //   spawn_blocking 闭包,但我们一定是在 osascript 自然返回后才到这里,
+    //   此时 cancel token 已 fire → 必须 rollback (stop server + 调
+    //   disable_dns_mode 把系统 DNS 恢复)。这里 `cancel=None` 因为 rollback
+    //   是「已经决定要清理」,不应该被 cancel 再次打断。
+    let original_for_enable = original.clone();
+    match tokio::task::spawn_blocking(move || {
+        mhost_dns::platform::enable_dns_mode(dns_port, &original_for_enable)
+    })
+    .await
+    {
+        Ok(Ok(())) => {
+            // osascript 跑完了,proxy 在跑 + 系统 DNS 已切。
+            if cancel.is_cancelled() {
+                eprintln!(
+                    "[mHost] set_dns_mode_enable: cancelled after spawn_blocking — rolling back"
+                );
+                let _ = server.stop().await;
+                let _ = mhost_dns::platform::disable_dns_mode(&original, true, None);
+                return Err(MhostError::Cancelled);
+            }
+        }
+        Ok(Err(e)) => {
+            // osascript 跑完了但返回 Err (proxy binary missing / 脚本 non-zero /
+            // networksetup 失败等)。这种情况没有 leak —— enable_dns_mode 内部
+            // 已经 rollback (proxy 被脚本自己 kill + 系统 DNS 未改)。
+            let _ = server.stop().await;
+            return Err(MhostError::InvalidInput(format!(
+                "Failed to enable DNS mode: {}",
+                e
+            )));
+        }
+        Err(join_err) => {
+            // spawn_blocking task panic。enable_dns_mode 不应 panic。
             let _ = server.stop().await;
             return Err(MhostError::InvalidInput(format!(
                 "Failed to enable DNS mode (blocking task join failed): {}",
                 join_err
             )));
         }
-        Err(_elapsed) => {
-            // 超时：spawn_blocking 里的 osascript 可能仍在跑（即使我们
-            // 已经不管了），随它去。下次 disable / mhost 退出 cleanup 会兜底。
+    }
             let _ = server.stop().await;
             return Err(MhostError::InvalidInput(format!(
-                "enable_dns_mode timed out after {}s (osascript dialog never resolved); \
-                 retry from UI or kill any lingering mhost-dns-proxy processes",
-                ENABLE_TIMEOUT_SECS
+                "Failed to enable DNS mode (blocking task join failed): {}",
+                join_err
             )));
         }
-    };
-    if let Err(e) = enable_outcome {
-        let _ = server.stop().await;
-        return Err(MhostError::InvalidInput(format!(
-            "Failed to enable DNS mode: {}",
-            e
-        )));
-    }
 
     // 7. **PERSIST MANIFEST FIRST** —— 持久层是 commit point。
     //    只有 manifest 写入成功后才允许修改 in-memory state。
@@ -200,21 +286,11 @@ async fn set_dns_mode_enable(state: &AppState) -> Result<(), MhostError> {
         // 尽力回滚：恢复系统 DNS + 停 server。
         // 用户刚接受了 enable 的 sudo 弹窗，回滚也用 interactive=true
         // 让 proxy 死了时也能走 osascript 兜底（同样弹 sudo 框）。
-        //
         // 同样包 spawn_blocking —— 见 set_dns_mode_enable 第 6 步注释，
         // disable_dns_mode 内部走 osascript 也会阻塞 tokio worker。
-        let restore_result = tokio::task::spawn_blocking({
-            let original = original.clone();
-            move || mhost_dns::platform::disable_dns_mode(&original, true)
-        })
-        .await;
-        let restore_err = match restore_result {
-            Ok(inner) => inner,
-            Err(join_err) => Err(mhost_dns::platform::PlatformError::SetDns(format!(
-                "rollback disable task join failed: {}",
-                join_err
-            ))),
-        };
+        // **Group 4 (#149) 改动**：rollback 路径改成同步调用（cleanup 路径
+        // 持 dns_lock，无并发 DNS 操作；阻塞 tokio worker 在此可接受）。
+        let restore_err = mhost_dns::platform::disable_dns_mode(&original, true, None);
         let _ = server.stop().await;
         return Err(match restore_err {
             Ok(_) => e,
@@ -222,6 +298,16 @@ async fn set_dns_mode_enable(state: &AppState) -> Result<(), MhostError> {
                 MhostError::InvalidInput(format!("{} (rollback also failed: {})", e, restore))
             }
         });
+    }
+
+    // 7.1 (issue #149) cancel check after manifest save。
+    //   manifest 已落盘 + 系统 DNS = 127.0.0.1。如果 cancel 已触发,
+    //   必须清 in-memory 状态 + 恢复系统 DNS = original。这里直接
+    //   调 set_dns_mode_disable 走完整 rollback。注意 cancel=None:
+    //   rollback 是已经决定要清理,不应该再被 cancel 打断。
+    if cancel.is_cancelled() {
+        eprintln!("[mHost] set_dns_mode_enable: cancelled after manifest save — rolling back");
+        return set_dns_mode_disable(state, true, None).await;
     }
 
     // 8. manifest 已成功落盘，现在才允许修改 in-memory state。
@@ -274,7 +360,17 @@ async fn set_dns_mode_enable(state: &AppState) -> Result<(), MhostError> {
 /// 走 osascript 弹 sudo 兜底。
 /// `interactive=false`：app 退出清理（用户可能不在场），不弹 sudo，
 /// marker 保留给下次启动 `try_recover_dns` 走 `force_dns_restore_if_needed`。
-async fn set_dns_mode_disable(state: &AppState, interactive: bool) -> Result<(), MhostError> {
+///
+/// **`cancel`（issue #149）**：`Some(cancel)` 让用户在 disable 中途点
+/// Cancel 时立刻跳出 `disable_dns_mode` 的 5s 等 proxy exit 等待循环，
+/// proxy 自管清理继续在后台跑（recovery marker 兜底）。`None` 用于
+/// rollback 调用（enable 路径里的 cancel 后清理）和 cleanup 路径，
+/// 此时不能被打断。
+async fn set_dns_mode_disable(
+    state: &AppState,
+    interactive: bool,
+    cancel: Option<&CancellationToken>,
+) -> Result<(), MhostError> {
     // 1. 读取 in-memory original_dns（由 enable 路径写入）
     let original = match state.original_dns.lock() {
         Ok(guard) => guard.clone(),
@@ -317,21 +413,14 @@ async fn set_dns_mode_disable(state: &AppState, interactive: bool) -> Result<(),
     //    但 in-memory 状态已经标 false，下次启动会按 dns_enabled=false
     //    处理；这是可恢复的。
     //
-    //    包 spawn_blocking —— 见 set_dns_mode_enable 第 6 步注释，
-    //    disable_dns_mode 内部走 osascript 也会阻塞 tokio worker。
-    let disable_result = tokio::task::spawn_blocking({
-        let original = original.clone();
-        move || mhost_dns::platform::disable_dns_mode(&original, interactive)
-    })
-    .await;
-    let disable_outcome = match disable_result {
-        Ok(inner) => inner,
-        Err(join_err) => Err(mhost_dns::platform::PlatformError::SetDns(format!(
-            "blocking task join failed: {}",
-            join_err
-        ))),
-    };
-    if let Err(e) = disable_outcome {
+    //    cancel=None (rollback/cleanup 路径) :必须等 5s 完成 self-cleanup。
+    //    cancel=Some (用户 disable 路径) :5s 等待里每 100ms 检查 cancel,
+    //    一旦触发就立刻 return Ok;proxy 后续退出靠 recovery marker 兜底。
+    //
+    //    **Group 4 (#149) 改动**:与 enable 路径对称 —— disable 路径也直接
+    //    调 disable_dns_mode (不再包 spawn_blocking)。cleanup 路径持 dns_lock,
+    //    阻塞 tokio worker 在此可接受。
+    if let Err(e) = mhost_dns::platform::disable_dns_mode(&original, interactive, cancel) {
         // 已经成功写了 manifest 标 false，所以这里只用 InvalidInput
         // 提示用户「系统 DNS 没恢复成功，需要手动检查」。
         return Err(MhostError::InvalidInput(format!(
@@ -446,7 +535,7 @@ pub async fn cleanup_dns_on_exit(state: &AppState, interactive: bool) -> Result<
     // （SIGINT + Tauri ExitRequested + tray Quit 三条路径竞态时）走 no-op。
     state.dns_enabled.store(false, Ordering::Relaxed);
 
-    match set_dns_mode_disable(state, interactive).await {
+    match set_dns_mode_disable(state, interactive, None).await {
         Ok(()) => Ok(()),
         Err(e) => {
             // 清理失败一般是 proxy 早死或 osascript 失败 —— 留给下次启动

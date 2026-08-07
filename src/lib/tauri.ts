@@ -170,7 +170,36 @@ async function withTimeout<T>(
   }
 }
 
-export async function setDnsMode(enabled: boolean): Promise<void> {
+/**
+ * Toggle DNS mode on or off.
+ *
+ * **issue #149 (Settings cancel button)**: accepts an optional
+ * `AbortSignal` for symmetry with `fetch`-style APIs, but Tauri 2's
+ * `invoke()` does NOT natively propagate the signal to the backend
+ * (the in-flight Rust future keeps running after abort). The frontend
+ * therefore tracks cancellation via the signal's abort event itself
+ * (see `toggleDnsModeAtom`) and additionally fires the separate
+ * `cancelDnsMode()` IPC so the Rust `CancellationToken` drives the
+ * rollback.
+ *
+ * **Frontend 30s safety net (retained from Group 3 PR #167)**: the
+ * `withTimeout` wrapper still recovers the UI if a stuck osascript
+ * sudo prompt never resolves — the Rust-side `tokio::time::timeout`
+ * leaks the spawn_blocking thread, so this Promise-level rejection is
+ * the only path that actually unblocks the JS side. The user-facing
+ * error message guides recovery (run `networksetup -setdnsservers
+ * <interface> Empty` to undo a partial enable).
+ */
+export async function setDnsMode(
+  enabled: boolean,
+  options?: { signal?: AbortSignal },
+): Promise<void> {
+  // Tauri 2's `invoke` InvokeOptions doesn't expose `signal`; the
+  // `options.signal` is consumed only by the surrounding tracking
+  // logic in `toggleDnsModeAtom`. We still accept it here so the
+  // call site matches the documented contract and is forward-
+  // compatible if Tauri later adds native signal propagation.
+  void options?.signal;
   return withTimeout(
     () => invoke<void>("set_dns_mode", { enabled }),
     DNS_MODE_TIMEOUT_MS,
@@ -180,6 +209,20 @@ export async function setDnsMode(enabled: boolean): Promise<void> {
       `The sudo prompt may have been dismissed or never shown. ` +
       `If your system DNS still points at 127.0.0.1, run \`networksetup -setdnsservers <interface> Empty\` manually.`,
   );
+}
+
+/**
+ * Fire the backend `CancellationToken` for the in-flight `set_dns_mode`
+ * call, causing it to roll back any committed side effects (proxy
+ * startup, system DNS rewrite, manifest persist) and return
+ * `MhostError::Cancelled`.
+ *
+ * **issue #149**: a no-op when no DNS operation is in flight. Safe to
+ * call from the signal-abort handler even if the operation finished
+ * milliseconds earlier.
+ */
+export async function cancelDnsMode(): Promise<void> {
+  return invoke("cancel_dns_mode");
 }
 
 export async function getDnsMode(): Promise<boolean> {

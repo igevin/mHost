@@ -46,6 +46,7 @@ export {
   deleteSnapshotAtom,
   fetchDnsModeAtom,
   toggleDnsModeAtom,
+  cancelActiveDnsToggle,
   fetchDnsProfilesAtom,
   createDnsProfileAtom,
   reloadDnsRulesAtom,

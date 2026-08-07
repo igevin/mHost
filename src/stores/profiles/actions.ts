@@ -17,6 +17,7 @@ import {
   getDnsMode,
   getDnsStatus,
   setDnsMode,
+  cancelDnsMode,
   reloadDnsRules,
   listDnsProfiles,
   getAdBlockState,
@@ -282,19 +283,102 @@ export const fetchDnsModeAtom = atom(null, async (_get, set) => {
   }
 });
 
+/**
+ * Module-level holder for the in-flight DNS toggle's AbortController
+ * (issue #149). The Settings page Cancel button calls
+ * {@link cancelActiveDnsToggle} which aborts it and fires the backend
+ * `cancel_dns_mode` IPC to drive the Rust-side rollback.
+ *
+ * Only one DNS toggle can be in flight at a time (the backend serializes
+ * via `dns_lock`), so a single slot suffices. Stored outside of Jotai
+ * intentionally — the AbortController is mutable imperative state, not
+ * something we want to track through atom subscribers (would cause every
+ * component reading `isDnsLoadingAtom` to re-render on each `.abort()`
+ * call).
+ */
+let activeDnsToggleController: AbortController | null = null;
+
+/**
+ * Abort the in-flight DNS toggle (issue #149 Settings cancel button).
+ *
+ * Fires both:
+ *   1. `controller.abort()` — flips the local `cancelled` flag so the
+ *      `toggleDnsModeAtom` catch path treats the eventual IPC return
+ *      as a user cancel (no error toast, UI reverts).
+ *   2. `cancelDnsMode()` IPC — fires the backend `CancellationToken`
+ *      so the Rust side actually rolls back the in-flight enable/disable.
+ *
+ * Tauri 2's `invoke()` does NOT natively propagate AbortSignal to the
+ * backend — the Rust future keeps running after abort. Both signals
+ * are therefore required: the abort event handler on the controller
+ * fires `cancelDnsMode()` (step 2), and the local flag (step 1) tells
+ * the JS code path to treat the late IPC return as a cancellation.
+ *
+ * Safe to call when no toggle is in flight (no-op).
+ */
+export function cancelActiveDnsToggle(): void {
+  const ctrl = activeDnsToggleController;
+  if (!ctrl) return;
+  ctrl.abort();
+  activeDnsToggleController = null;
+}
+
 export const toggleDnsModeAtom = atom(null, async (_get, set, enabled: boolean) => {
   set(isDnsLoadingAtom, true);
   set(dnsErrorAtom, null);
+
+  const ctrl = new AbortController();
+  activeDnsToggleController = ctrl;
+
+  // 跟踪是否被用户主动 cancel（issue #149）：abort 信号触发时记下
+  // 这个 flag,在 catch 块里用它区分「用户 cancel」和「真错误」。
+  // Tauri 2 invoke 不原生支持 signal,所以我们用本地 flag 而非依赖
+  // DOMException(AbortError) 的 reject 类型。
+  let cancelled = false;
+  ctrl.signal.addEventListener("abort", () => {
+    cancelled = true;
+    // 同步触发后端 cancel_dns_mode IPC,Rust 端的 CancellationToken
+    // 点亮后会走 rollback。后端最终返回 Err(Cancelled),但 JS 端
+    // 不靠这个 reject 来识别 cancel —— 我们已经在 cancelled 标志里
+    // 知道了,这里单独处理就行。
+    cancelDnsMode().catch((e) => {
+      // 后端拿不到 cancel 信号时 recovery marker 兜底,这里仅打日志
+      console.error("[mHost] cancelDnsMode IPC failed:", e);
+    });
+  });
+
   try {
-    await setDnsMode(enabled);
+    await setDnsMode(enabled, { signal: ctrl.signal });
     set(dnsEnabledAtom, enabled);
     const status = await getDnsStatus();
     set(dnsStatusAtom, status);
   } catch (err) {
+    if (cancelled) {
+      // 用户主动 cancel —— issue #149：
+      //   1) 不弹错误 toast（cancel 是用户的意图,不是失败）
+      //   2) 不 throw —— 调用方(Settings)不需要走错误分支
+      //   3) 后端可能还在跑 rollback（proxy self-cleanup），所以**不**
+      //      主动写 dnsEnabledAtom —— 等下一次 fetchDnsModeAtom 从
+      //      后端拉真值。这里兜底再 fetch 一次,如果 cancel 已经把
+      //      后端清成之前的状态,UI 立刻拨正。
+      set(dnsErrorAtom, null);
+      try {
+        const truth = await getDnsMode();
+        set(dnsEnabledAtom, truth);
+        const status = await getDnsStatus();
+        set(dnsStatusAtom, status);
+      } catch {
+        // 后端 truth fetch 失败,保留旧 UI 状态,等下次 fetch。
+      }
+      return;
+    }
     set(dnsErrorAtom, extractErrorMessage(err));
     set(dnsStatusAtom, null);
     throw err;
   } finally {
+    if (activeDnsToggleController === ctrl) {
+      activeDnsToggleController = null;
+    }
     set(isDnsLoadingAtom, false);
   }
 });

@@ -5,6 +5,7 @@ import {
   dnsStatusAtom,
   isDnsLoadingAtom,
   toggleDnsModeAtom,
+  cancelActiveDnsToggle,
   dnsErrorAtom,
 } from "../stores/profiles";
 import { useWebKitPointerDown } from "../hooks/useWebKitPointerDown";
@@ -54,6 +55,14 @@ function Settings() {
     },
     [toggleDnsMode],
   );
+
+  // issue #149: Settings cancel button. Aborts the in-flight `set_dns_mode`
+  // IPC, fires `cancel_dns_mode` to drive the backend rollback, and lets
+  // `toggleDnsModeAtom`'s catch path revert the UI without surfacing an
+  // error. No-op when no toggle is in flight.
+  const handleCancelDns = useCallback(() => {
+    cancelActiveDnsToggle();
+  }, []);
 
   return (
     <div className="mhost-page">
@@ -148,23 +157,34 @@ function Settings() {
             )}
           </div>
           <div className={styles.dnsActions}>
-            {dnsEnabled ? (
+            {/* issue #149: while toggling, the primary action button is
+                replaced with a Cancel button. Clicking it aborts the
+                in-flight `set_dns_mode` IPC and fires the backend
+                rollback — the user sees the UI revert without an
+                error toast. */}
+            {isDnsLoading ? (
+              <button
+                className="btn btn-danger"
+                onClick={handleCancelDns}
+                data-testid="dns-cancel-button"
+              >
+                Cancel
+              </button>
+            ) : dnsEnabled ? (
               <button
                 className="btn btn-danger"
                 onClick={() => handleToggleDns(false)}
                 onPointerDown={onPointerDown(() => handleToggleDns(false))}
-                disabled={isDnsLoading}
               >
-                {isDnsLoading ? "Disabling..." : "Disable DNS Mode"}
+                Disable DNS Mode
               </button>
             ) : (
               <button
                 className="btn btn-primary"
                 onClick={() => handleToggleDns(true)}
                 onPointerDown={onPointerDown(() => handleToggleDns(true))}
-                disabled={isDnsLoading}
               >
-                {isDnsLoading ? "Enabling..." : "Enable DNS Mode"}
+                Enable DNS Mode
               </button>
             )}
           </div>

@@ -5,6 +5,7 @@ use mhost_storage::storage::{FileStorage, Storage};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 /// Poison-recovery helper for `std::sync::Mutex` (issue #130, PR #131
 /// re-review). Returns the inner guard even if a previous holder panicked.
@@ -69,6 +70,23 @@ pub struct AppState {
     pub original_dns: Mutex<OriginalDns>,
     /// 串行化 DNS 模式切换操作。
     pub dns_lock: ApplyLock,
+
+    /// Cooperative cancellation signal for the in-flight DNS enable/disable
+    /// operation (issue #149).
+    ///
+    /// `set_dns_mode` allocates a fresh `CancellationToken` on entry and
+    /// swaps it into this slot; `cancel_dns_mode` fires the token so the
+    /// long-running enable path can observe cancellation at its phase
+    /// boundaries and roll back. The token is cleared on `set_dns_mode`
+    /// completion.
+    ///
+    /// Like `ad_block_refresh_cancel` (issue #138), this is wrapped in a
+    /// `Mutex` so callers can replace the slot (rather than mutate a
+    /// shared token) — `CancellationToken::cancel()` is sticky, so a
+    /// disable → re-enable cycle must not hand the new operation the
+    /// previously-cancelled token. See `dns::set_dns_mode` for the swap
+    /// contract and tests for the rollback behavior.
+    pub dns_cancel: Mutex<Option<CancellationToken>>,
 
     // -------------------------------------------------------------------
     // 广告屏蔽（issue #130）
@@ -176,6 +194,7 @@ impl AppState {
             dns_enabled: AtomicBool::new(dns_enabled),
             original_dns: Mutex::new(original_dns),
             dns_lock: ApplyLock(tokio::sync::Mutex::new(())),
+            dns_cancel: Mutex::new(None),
             // Ad block（issue #130）：从 adblock.json 恢复，损坏时自动备份。
             ad_block_state: Arc::new(tokio::sync::RwLock::new(
                 mhost_storage::adblock::read_state_or_default_with_backup(&storage_root),
