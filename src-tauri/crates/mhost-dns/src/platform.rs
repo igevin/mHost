@@ -726,7 +726,16 @@ pub(crate) fn write_signal_file(path: &Path, content: &str) -> std::io::Result<(
 /// 注：参数 `servers` 保留 API 兼容：proxy 用自己的 original.txt 恢复，
 /// 但 interactive 分支用 `servers` 决定要恢复成什么 IP（proxy 不在的
 /// 兜底场景）。
-pub fn disable_dns_mode(original: &OriginalDns, interactive: bool) -> Result<(), PlatformError> {
+///
+/// **`cancel`（issue #149）**：`Some(cancel)` 让用户在 disable 中途点
+/// Cancel 时立刻跳出 5s 等 proxy exit 的等待循环 → `Ok(())`，proxy
+/// self-cleanup 继续在后台跑（recovery marker 兜底最坏情况）。
+/// `None` 用于 rollback 和 cleanup 路径，必须等 5s 完成自管清理。
+pub fn disable_dns_mode(
+    original: &OriginalDns,
+    interactive: bool,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<(), PlatformError> {
     // 0. 写恢复标记（用户态、不需 root）。如果本次 disable 任何分支没
     //    成功恢复 DNS，marker 会保留 → 下次启动 try_recover_dns 看到标记
     //    会调 force_dns_restore_if_needed 强退。
@@ -782,6 +791,22 @@ pub fn disable_dns_mode(original: &OriginalDns, interactive: bool) -> Result<(),
                 + std::time::Duration::from_secs(PROXY_SHUTDOWN_TIMEOUT_SECS);
             while std::time::Instant::now() < deadline {
                 std::thread::sleep(std::time::Duration::from_millis(100));
+
+                // (issue #149) cancel check：用户在 disable 中途点了
+                // Cancel → 跳出等待循环,proxy 自管清理继续在后台跑,
+                // 下次启动 try_recover_dns 看到 recovery marker 会兜底。
+                // PID 文件 / original.txt / signal 文件保留让 proxy
+                // 还能正常 self-cleanup(它会读 original.txt 恢复 DNS)。
+                if let Some(c) = cancel {
+                    if c.is_cancelled() {
+                        eprintln!(
+                            "[mHost] dns mode disable: cancelled during proxy wait; \
+                             leaving recovery marker for next-launch force restore"
+                        );
+                        return Ok(());
+                    }
+                }
+
                 if unsafe { libc::kill(proxy_pid as libc::pid_t, 0) != 0 } {
                     // proxy 已退出 → restore_dns_and_exit 已恢复系统 DNS。
                     // 全部临时文件 + marker 都可以清掉。
@@ -2348,5 +2373,121 @@ exit 0
                 );
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #149 — disable_dns_mode cancel-token contract
+    //
+    // When `Some(cancel)` is passed, the 5s proxy-exit wait loop must bail
+    // promptly on cancellation and return Ok(()). Recovery marker stays on
+    // disk so next-launch `try_recover_dns` can force-restore.
+    //
+    // The cancel check only fires inside the `kill(proxy_pid, 0)` alive
+    // branch; if no PID file is present, the function short-circuits and
+    // returns without consulting the cancel token. That branch is already
+    // exercised by the disable-time sudo fallback tests; here we focus on
+    // the wait-loop bailing path.
+    // -----------------------------------------------------------------------
+
+    /// Pre-cancelled token → `disable_dns_mode` returns `Ok(())` within
+    /// the 5s window instead of waiting for the fake proxy to exit.
+    ///
+    /// Sets up a fake "alive" proxy PID (the test process itself) so the
+    /// function enters the wait loop, then pre-cancels and verifies the
+    /// loop bails on the first cancel-check tick (~100ms).
+    #[test]
+    fn test_disable_dns_mode_cancellable_bails_on_pre_cancelled_token() {
+        let _guard = serial_runtime_dir_test();
+        let _tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("MHOST_RUNTIME_DIR", _tmp.path());
+
+        // Write a PID file pointing at the test process itself. `kill(pid, 0)`
+        // returns 0 because we can signal ourselves — so disable_dns_mode
+        // enters the alive-proxy branch and would normally wait the full 5s.
+        std::fs::create_dir_all(runtime_dir()).unwrap();
+        std::fs::write(
+            proxy_pid_file(),
+            format!("{} /test/mhost-dns-proxy\n", std::process::id()),
+        )
+        .unwrap();
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+
+        let start = std::time::Instant::now();
+        let result = disable_dns_mode(&mhost_core::OriginalDns::DhcpEmpty, true, Some(&cancel));
+        let elapsed = start.elapsed();
+
+        assert!(
+            result.is_ok(),
+            "cancelled disable must return Ok: {:?}",
+            result
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "cancel must bail the 5s wait loop within 2s; took {:?}",
+            elapsed
+        );
+
+        // Recovery marker must stay on disk so next launch can force-restore
+        // (cancel path doesn't get to call osascript sudo because the
+        // function bailed before the interactive branch).
+        assert!(
+            disable_recovery_marker_file().exists(),
+            "cancel path must leave recovery marker for next-launch force restore"
+        );
+
+        // Cleanup
+        let _ = std::fs::remove_file(proxy_pid_file());
+        let _ = std::fs::remove_file(disable_recovery_marker_file());
+        std::env::remove_var("MHOST_RUNTIME_DIR");
+    }
+
+    /// `cancel=None` (rollback / cleanup path) must NOT bail — it must wait
+    /// the full 5s for proxy to exit. With a fake alive PID, the loop will
+    /// time out, hit the interactive osascript fallback, and return either
+    /// Ok (if osascript + networksetup succeed in this runner) or Err
+    /// (if sudo isn't available). The point is: cancel=None behaves
+    /// exactly as before this PR — the cancel token must be ignored.
+    #[test]
+    fn test_disable_dns_mode_cancellable_none_does_not_bail() {
+        let _guard = serial_runtime_dir_test();
+        let _tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("MHOST_RUNTIME_DIR", _tmp.path());
+
+        std::fs::create_dir_all(runtime_dir()).unwrap();
+        std::fs::write(
+            proxy_pid_file(),
+            format!("{} /test/mhost-dns-proxy\n", std::process::id()),
+        )
+        .unwrap();
+
+        // Pre-cancel a token but DON'T pass it to disable_dns_mode.
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+
+        let start = std::time::Instant::now();
+        let _ = disable_dns_mode(
+            &mhost_core::OriginalDns::DhcpEmpty,
+            true, // interactive=true triggers osascript fallback after timeout
+            None, // <-- the contract: no cancel checking
+        );
+        let elapsed = start.elapsed();
+
+        // The defining assertion: cancel=None must wait the full 5s timeout,
+        // proving the cancel token was NOT consulted. The result type
+        // depends on whether osascript + networksetup succeed in this
+        // runner (Ok on dev machines with sudo, Err in CI without), so we
+        // don't assert on it.
+        assert!(
+            elapsed >= std::time::Duration::from_secs(4),
+            "cancel=None must wait full timeout; took {:?}",
+            elapsed
+        );
+
+        // Cleanup
+        let _ = std::fs::remove_file(proxy_pid_file());
+        let _ = std::fs::remove_file(disable_recovery_marker_file());
+        std::env::remove_var("MHOST_RUNTIME_DIR");
     }
 }

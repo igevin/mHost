@@ -43,6 +43,28 @@ pub enum MhostError {
     /// dialog rather than trusting a payload-carried plan.
     #[error("preview required: {0}")]
     PreviewRequired(String),
+
+    /// The user actively cancelled an in-flight DNS mode operation. The
+    /// IPC layer maps this to `DOMException(AbortError)` on the frontend
+    /// (see `toggleDnsModeAtom`); it is **not** surfaced as a user-facing
+    /// error.
+    ///
+    /// Refs #149: Settings page exposes a Cancel button while
+    /// `set_dns_mode` is awaiting an osascript sudo prompt. The frontend
+    /// fires a `cancel_dns_mode` IPC that flips the backend's
+    /// `CancellationToken`; the enable path observes it at each phase
+    /// boundary (before `spawn_blocking`, after server start, after
+    /// osascript) and rolls back any committed side effects (system DNS
+    /// rewrite, manifest persist) before returning this error.
+    ///
+    /// Because `tokio::select!` cannot interrupt a `spawn_blocking`
+    /// closure once it has started running, cancel during the osascript
+    /// phase waits for the closure to return naturally and then runs
+    /// `disable_dns_mode` (with `interactive=true`) to put the system
+    /// back into the user's pre-enable state. See `set_dns_mode_enable`
+    /// and `set_dns_mode_disable` in `commands::dns`.
+    #[error("cancelled")]
+    Cancelled,
 }
 
 impl From<std::io::Error> for MhostError {
@@ -227,6 +249,7 @@ mod tests {
                 MhostError::PreviewRequired("conflicts detected".to_string()),
                 "preview required",
             ),
+            ("cancelled", MhostError::Cancelled, "cancelled"),
         ];
 
         for (name, err, expected_substring) in cases {
@@ -313,6 +336,7 @@ mod tests {
                 "preview_required",
                 MhostError::PreviewRequired("would disable another profile".to_string()),
             ),
+            ("cancelled", MhostError::Cancelled),
         ];
 
         for (name, err) in cases {
