@@ -267,18 +267,23 @@ pub(crate) fn run_with_privileges_timeout(
     let mut run = match spawn_osascript(&path) {
         Ok(r) => r,
         Err(e) => {
+            // spawn failed; safe to remove (osascript never started).
             let _ = std::fs::remove_file(&path);
             return Err(e);
         }
     };
-    // Script file is already exec'd by osascript; safe to remove.
-    let _ = std::fs::remove_file(&path);
 
     let start = std::time::Instant::now();
-    loop {
+    // **Critical (issue found 2026-08-07)**: do NOT remove the temp script
+    // file until AFTER osascript has exited. osascript spawns `sh <path>`
+    // lazily from the AppleScript engine — if we delete the file before
+    // that exec, sh gets ENOENT (exit 127) and osascript returns exit 256
+    // with no error dialog visible to the user. This was the cause of
+    // the "no prompt, no error, UI stuck" hang.
+    let outcome: Result<std::process::Output, String> = loop {
         match run.child.try_wait() {
             Ok(Some(_status)) => {
-                return run
+                break run
                     .child
                     .wait_with_output()
                     .map_err(|e| format!("osascript wait_with_output failed: {}", e));
@@ -286,10 +291,9 @@ pub(crate) fn run_with_privileges_timeout(
             Ok(None) => {
                 if start.elapsed() >= timeout {
                     kill_osascript(run.pid);
-                    // Reap the zombie but don't block forever — the SIGKILL
-                    // is best-effort, wait() may not return cleanly.
+                    // Reap the zombie, don't block forever.
                     let _ = run.child.wait();
-                    return Err(format!(
+                    break Err(format!(
                         "osascript timed out after {:?} (killed pid={}); \
                          the TCC prompt may be stuck — try again or \
                          force-quit System Events",
@@ -298,9 +302,13 @@ pub(crate) fn run_with_privileges_timeout(
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            Err(e) => return Err(format!("osascript try_wait failed: {}", e)),
+            Err(e) => break Err(format!("osascript try_wait failed: {}", e)),
         }
-    }
+    };
+
+    // SAFE TO REMOVE NOW: osascript has exited and won't exec sh again.
+    let _ = std::fs::remove_file(&path);
+    outcome
 }
 
 /// **fix（disabling-after-network-switch）**：capture the user's original DNS
@@ -538,7 +546,12 @@ fn get_active_network_device() -> Option<String> {
 /// **fix（H1, issue #90）**：从 /tmp 迁移到 ~/Library/Application Support/mHost/.runtime/，
 /// mode 从 0o666 改 0o600。/tmp 旧路径在 cleanup_stale_proxy 启动时清理。
 pub fn enable_dns_mode(dns_port: u16, original: &OriginalDns) -> Result<(), PlatformError> {
+    tracing::info!("enable_dns_mode: entered (dns_port={})", dns_port);
     let interface = get_active_network_interface()?;
+    tracing::info!(
+        "enable_dns_mode: get_active_network_interface returned: {}",
+        interface
+    );
     validate_interface_name(&interface)?;
 
     // 0. 确保 runtime dir 存在（mode 0o700）
