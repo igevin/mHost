@@ -264,13 +264,30 @@ impl AppState {
         // 正常退出 proxy 自己恢复了，标记文件被删，到不了这里。
         #[cfg(target_os = "macos")]
         {
-            if std::path::Path::new("/tmp/mhost-dns-disable-recovery.marker").exists() {
+            // **fix (issue #152, root cause 1)**: marker is written by
+            // `platform::disable_dns_mode` to `runtime_dir()/mhost-dns-disable-recovery.marker`
+            // (see `mhost_dns::platform::disable_recovery_marker_file()`,
+            // `platform.rs:82`). The hard-coded `/tmp/...` path here was
+            // dead code — `disable_dns_mode` never wrote to `/tmp`, so
+            // this `if` branch never fired, and `force_dns_restore_if_needed`
+            // was never called from this site. After a failed disable the
+            // marker sat orphaned on disk while system DNS stayed at
+            // 127.0.0.1.
+            //
+            // Use the canonical helper to read the same path the disable
+            // path writes to.
+            let marker_path = mhost_dns::platform::disable_recovery_marker_file();
+            if marker_path.exists() {
                 eprintln!(
-                    "[mHost] try_recover_dns: disable recovery marker found, forcing restore"
+                    "[mHost] try_recover_dns: disable recovery marker found at {}, forcing restore",
+                    marker_path.display()
                 );
                 if let Err(e) = mhost_dns::platform::force_dns_restore_if_needed() {
                     eprintln!("[mHost] force restore failed: {}", e);
                 }
+                // `force_dns_restore_if_needed` deletes the marker itself
+                // on success; if it failed, the marker remains and we
+                // will retry next launch.
             }
         }
         // 1. 优先从 manifest.original_dns 恢复（避免再次问系统 —— 系统 DNS

@@ -498,7 +498,18 @@ fn networksetup_get_dns(port: &str) -> Result<Vec<String>, PlatformError> {
             stderr
         )));
     }
-    parse_dns_servers(&String::from_utf8_lossy(&output.stdout))
+    let raw = parse_dns_servers(&String::from_utf8_lossy(&output.stdout))?;
+    // **fix (issue #152, root cause 2)**: `127.0.0.1` / `::1` are
+    // mHost's own proxy address injected by `enable_dns_mode`. If they
+    // are read back via `capture_dns_state` (e.g., enable → partial-fail
+    // disable → re-enable before marker recovery), they get persisted
+    // to `mhost-dns-original.txt` and `manifest.original_dns` as the
+    // "user's original DNS", which silently corrupts future restores.
+    //
+    // `is_local_resolver` is already used by `get_upstream_resolvers`
+    // (issue #103 fix) for the same reason. Reuse here.
+    let filtered: Vec<String> = raw.into_iter().filter(|s| !is_local_resolver(s)).collect();
+    Ok(filtered)
 }
 
 /// `ipconfig getoption <device> domain_name_server` —— DHCP 推的 DNS。
@@ -1997,6 +2008,49 @@ Ethernet Address: aa:bb:cc:dd:ee:ff
             platform_src.contains("proxy_ready_file()")
                 && platform_src.contains("remove_file(proxy_ready_file())"),
             "enable_dns_mode 必须在启动前清掉残留 ready 文件（避免上轮的 ready 触发误判）"
+        );
+    }
+
+    /// **fix (issue #152, root cause 2)**: `networksetup_get_dns` must strip
+    /// mHost's own loopback proxy addresses. Without this, capture_dns_state
+    /// records `127.0.0.1` as the user's "original DNS", silently corrupting
+    /// future restores.
+    ///
+    /// Same source-grep technique as
+    /// `test_enable_dns_mode_rejects_missing_proxy_binary`: the actual filter
+    /// logic is exercised at runtime via the full enable/disable path,
+    /// which we cannot easily mock in unit tests.
+    #[test]
+    fn test_capture_dns_state_filters_mhost_loopback() {
+        let platform_src = include_str!("platform.rs");
+        assert!(
+            platform_src.contains("filter(|s| !is_local_resolver(s))"),
+            "networksetup_get_dns must filter loopback via is_local_resolver (issue #152)"
+        );
+    }
+
+    /// **fix (issue #152, root cause 1)**: `try_recover_dns` must read the
+    /// recovery marker via `disable_recovery_marker_file()`, NOT from a
+    /// hard-coded `/tmp/...` path. The disable path writes to the former;
+    /// the recovery path used to read from the latter. The two sides have
+    /// always disagreed on the path, making the recovery branch dead code.
+    ///
+    /// `state/mod.rs` and `platform.rs` live in different crates, so we
+    /// use the source-grep technique to verify the reader path.
+    #[test]
+    fn test_try_recover_dns_reads_canonical_marker_path() {
+        let state_src = include_str!("../../../src/state/mod.rs");
+        assert!(
+            !state_src.contains("/tmp/mhost-dns-disable-recovery.marker"),
+            "state/mod.rs try_recover_dns must not hard-code /tmp/... for the recovery \
+             marker (issue #152). Use mhost_dns::platform::disable_recovery_marker_file() \
+             instead."
+        );
+        assert!(
+            state_src.contains("disable_recovery_marker_file()"),
+            "state/mod.rs try_recover_dns must call \
+             mhost_dns::platform::disable_recovery_marker_file() to locate the recovery \
+             marker (issue #152)"
         );
     }
 
