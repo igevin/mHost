@@ -626,6 +626,15 @@ pub async fn cleanup_dns_on_exit(state: &AppState, interactive: bool) -> Result<
     // （SIGINT + Tauri ExitRequested + tray Quit 三条路径竞态时）走 no-op。
     state.dns_enabled.store(false, Ordering::Relaxed);
 
+    // **fix (issue #148)**：set_dns_mode_disable 的 signal-file protocol
+    // 假设 proxy 还在跑（写 "shutdown" → proxy 轮询 → 自我恢复 DNS）。
+    // 但 proxy 可能因为上一轮 enable 被 osascript Cancel 留下来成孤儿
+    // —— 早就 disown + trap-没装 → 现在还在占 UDP 53 + 系统 DNS 指向
+    // 127.0.0.1。先 sudo-kill 孤儿,让 signal-file protocol 有干净起点;
+    // interactive=true 时 pop sudo,false 时 no-op(proxy 还活着就让
+    // signal-file protocol 走自我恢复路径)。
+    mhost_dns::platform::sudo_kill_orphan_dns_proxies(interactive);
+
     match set_dns_mode_disable(state, interactive).await {
         Ok(()) => Ok(()),
         Err(e) => {
