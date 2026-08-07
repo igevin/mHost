@@ -1341,12 +1341,16 @@ mod tests {
         // 主要断言：调用不 panic 且返回 Ok
     }
 
-    /// 串行化 runtime dir 相关测试的 helper。**fix H1**：之前用本地
-    /// `serial_runtime_dir_test` mutex，与 proxy.rs 测试的 `TEST_LOCK`
-    /// 不同 —— 两边同时改 `MHOST_RUNTIME_DIR` 会 race，导致测试
-    /// 读写错的路径。统一用 `proxy::tests::TEST_LOCK` 保证串行化。
+    /// 串行化 runtime dir 相关测试的 helper。
+    ///
+    /// **fix (issue #148 review 🟡 #2)**：改用 crate 顶层 pub 的
+    /// `RUNTIME_DIR_TEST_LOCK`,让 mhost crate 里的 `cleanup_dns_on_exit` 测试
+    /// 也能引用同一把锁 —— `proxy::tests::TEST_LOCK` 是 pub(crate),跨 crate
+    /// binary 不可见。
     fn serial_runtime_dir_test() -> std::sync::MutexGuard<'static, ()> {
-        crate::proxy::tests::test_lock()
+        crate::RUNTIME_DIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     // -----------------------------------------------------------------------

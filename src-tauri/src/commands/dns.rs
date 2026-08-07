@@ -713,8 +713,12 @@ mod tests {
     fn test_is_expected_proxy_alive_handles_missing_or_stale_pid_file() {
         use mhost_dns::platform::{is_expected_proxy_alive, proxy_pid_file};
 
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // **fix (issue #148 review 🟡 #2)**：跟 mhost-dns 平台测试共用
+        // mhost_dns::RUNTIME_DIR_TEST_LOCK,避免跨 crate binary 的 env var
+        // race(proxy pid_file 在一边被写,另一边同时改 runtime_dir)。
+        let _guard = mhost_dns::RUNTIME_DIR_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let dir = tempfile::TempDir::new().unwrap();
         std::env::set_var("MHOST_RUNTIME_DIR", dir.path());
