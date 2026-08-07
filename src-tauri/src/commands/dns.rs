@@ -701,21 +701,39 @@ mod tests {
     /// 这条 test 直接验证 helper 在没有 pid_file / pid_file 内容损坏 /
     /// pid_file 指向一个已死 PID 这三种场景下都返回 false —— 这些是
     /// cleanup_dns_on_exit 走 sudo-kill 分支的入口条件。
+    ///
+    /// **fix (CI regression)**：必须通过 `MHOST_RUNTIME_DIR` 把 runtime
+    /// 路径重定向到 tempdir —— 在 CI runner 上 `dirs::data_dir()` 解析不到
+    /// 真实用户目录,`runtime_dir()` 退到 `/tmp`,而 pid_file 的父目录
+    /// 还没创建,直接 `std::fs::write` 会 NotFound panic。
+    /// 用本地 `static LOCK` 串行化(避免与并行 test 共享 env var race),
+    /// 不复用 mhost-dns crate 的 `serial_runtime_dir_test()`(跨 crate 锁
+    /// 不可达)。
     #[test]
     fn test_is_expected_proxy_alive_handles_missing_or_stale_pid_file() {
         use mhost_dns::platform::{is_expected_proxy_alive, proxy_pid_file};
 
-        // 1. 没有 pid_file → false
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let dir = tempfile::TempDir::new().unwrap();
+        std::env::set_var("MHOST_RUNTIME_DIR", dir.path());
+
         let pid_path = proxy_pid_file();
+        assert_eq!(
+            pid_path.parent().unwrap(),
+            dir.path(),
+            "MHOST_RUNTIME_DIR must redirect runtime_dir()"
+        );
+
+        // 1. 没有 pid_file → false
         let _ = std::fs::remove_file(&pid_path);
         assert!(
             !is_expected_proxy_alive(),
             "missing pid_file must report proxy as not alive"
         );
 
-        // 2. pid_file 指向自己(测试进程),kill(pid, 0) 当然成功 →
-        //    true。但我们不用这个测试这个分支,因为它依赖当前进程 PID。
-        //    改成测试「指向一个肯定不存在的 PID」(fake pid 999999999)。
+        // 2. pid_file 指向一个肯定不存在的 PID
         std::fs::write(&pid_path, "999999999 /usr/local/bin/mhost-dns-proxy\n").unwrap();
         assert!(
             !is_expected_proxy_alive(),
@@ -730,6 +748,9 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&pid_path);
+
+        // 清理 env var,避免污染后续 test。
+        std::env::remove_var("MHOST_RUNTIME_DIR");
     }
 
     /// 回归测试（bug 1 + bug 4 + disabling-after-network-switch fix）：
