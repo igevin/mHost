@@ -624,7 +624,12 @@ fn get_active_network_device() -> Option<String> {
 ///     `~/Library/Application Support/...` 这种带空格路径不会截断
 ///   - `trap ... EXIT` 在 networksetup 成功前清掉 disowned proxy + PID 文件
 pub fn enable_dns_mode(dns_port: u16, original: &OriginalDns) -> Result<(), PlatformError> {
+    tracing::info!("enable_dns_mode: entered (dns_port={})", dns_port);
     let interface = get_active_network_interface()?;
+    tracing::info!(
+        "enable_dns_mode: get_active_network_interface returned: {}",
+        interface
+    );
     validate_interface_name(&interface)?;
 
     // 0.5 **fix（issue #155）**：先验证 `mhost-dns-proxy` sidecar binary
