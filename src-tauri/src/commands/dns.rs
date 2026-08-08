@@ -466,7 +466,17 @@ async fn set_dns_mode_disable(
         .save_manifest(&manifest)
         .map_err(MhostError::from)?;
 
-    // 3. 持久化成功后，做实际 stop：先恢复系统 DNS，再 stop server。
+    // 3. **fix (issue #152 follow-up, A)**：先把 in-memory `dns_enabled`
+    //    标 false，让 UI truth-fetch 跟用户意图一致，**不管**后面对
+    //    `disable_dns_mode` 的调用是 Ok 还是 Err。背景：旧顺序里
+    //    `dns_enabled.store(false)` 在 line 502 才跑，如果 privileged
+    //    step 返回 Err，IPC 在 line 480 早返回 → in-memory 仍是 true →
+    //    UI catch 路径调 `getDnsMode()` 拿到 true → 显示 "Running"，
+    //    但系统 DNS 实际还卡在 127.0.0.1。系统 DNS 没被恢复由
+    //    recovery marker 兜底（下次启动 `try_recover_dns` 强退）。
+    state.dns_enabled.store(false, Ordering::Relaxed);
+
+    // 4. 持久化成功后，做实际 stop：先恢复系统 DNS，再 stop server。
     //    restore_dns 失败会让用户留在「系统 DNS 指向 127.0.0.1」状态，
     //    但 in-memory 状态已经标 false，下次启动会按 dns_enabled=false
     //    处理；这是可恢复的。
@@ -475,8 +485,9 @@ async fn set_dns_mode_disable(
     //    cancel=Some（用户 disable 路径）：5s 等待里每 100ms 检查 cancel，
     //    一旦触发就立刻 return Ok；proxy 后续退出靠 recovery marker 兜底。
     if let Err(e) = mhost_dns::platform::disable_dns_mode(&original, interactive, cancel) {
-        // 已经成功写了 manifest 标 false，所以这里只用 InvalidInput
-        // 提示用户「系统 DNS 没恢复成功，需要手动检查」。
+        // 已经成功写了 manifest 标 false + in-memory dns_enabled=false，
+        // 所以这里只用 InvalidInput 提示用户「系统 DNS 没恢复成功，需要
+        // 手动检查」。in-memory 已经正确反映用户意图，UI 不会撒谎。
         return Err(MhostError::InvalidInput(format!(
             "Failed to restore system DNS: {}. \
              Manually run `networksetup -setdnsservers <interface> {}`",
@@ -485,7 +496,7 @@ async fn set_dns_mode_disable(
         )));
     }
 
-    // 4. 停 server（清空 in-memory dns_server）
+    // 5. 停 server（清空 in-memory dns_server）
     let server_opt = lock_or_recover(&state.dns_server).take();
     if let Some(server) = server_opt {
         if let Err(e) = server.stop().await {
@@ -497,9 +508,6 @@ async fn set_dns_mode_disable(
             )));
         }
     }
-
-    // 5. 清 in-memory dns_enabled
-    state.dns_enabled.store(false, Ordering::Relaxed);
 
     // 6. 终止广告屏蔽后台刷新 task（issue #130, #138）。enable 时 spawn，
     //    disable 必须 abort；不 abort 会让 task 继续跑并尝试 reload
@@ -785,8 +793,10 @@ pub async fn reload_dns_rules(state: State<'_, AppState>) -> Result<(), MhostErr
 ///     early-return 走 no-op 分支。
 ///   - cleanup 本身失败（proxy 进程早死、osascript 兜底失败）是可恢复的：
 ///     `disable_dns_mode` 已经写了 recovery marker，下次启动
-///     `try_recover_dns` 会兜底强退。所以这里**返回 Ok**，只在 stderr
-///     留一条 warning，避免退出时连续刷两条「DNS cleanup failed」误导用户。
+///     `try_recover_dns` 会兜底强退。Err 必须 propagate，让 lib.rs 在
+///     `lib.rs:91 / 273 / 381` 记录真实的清理失败状态（之前被 swallow
+///     成 Ok + warning，导致 tray Quit / Cmd-Q 退出时日志显示「DNS
+///     cleanup ok」而实际系统 DNS 还卡在 127.0.0.1）。
 ///
 /// `interactive` 参数语义：
 ///   - `true`：调用方确认用户在场，proxy 没恢复时走 osascript sudo 兜底，
@@ -816,19 +826,13 @@ pub async fn cleanup_dns_on_exit(state: &AppState, interactive: bool) -> Result<
         mhost_dns::platform::sudo_kill_orphan_dns_proxies(interactive);
     }
 
-    match set_dns_mode_disable(state, interactive, None).await {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            // 清理失败一般是 proxy 早死或 osascript 失败 —— 留给下次启动
-            // 的 recovery marker 兜底。这里只记一条 warning，不返回 Err
-            // （避免 lib.rs 的「DNS cleanup on signal/exit failed」误导用户）。
-            eprintln!(
-                "[mHost] DNS cleanup on exit: {} (recovery marker preserved for next launch)",
-                e
-            );
-            Ok(())
-        }
-    }
+    // **fix (issue #152 follow-up, C)**：propagate `set_dns_mode_disable` 的
+    // Err。`disable_dns_mode` 已经在内部为下次启动写好了 recovery marker
+    // （fix #152 Step 3），下次启动 `try_recover_dns` 会兜底强退。所以这里
+    // surface Err 给 lib.rs，让 tray Quit / Cmd-Q / SIGINT 路径在退出前
+    // 记录真实状态（旧实现 swallow 成 Ok + warning，掩盖系统 DNS 卡在
+    // 127.0.0.1 的事实）。
+    set_dns_mode_disable(state, interactive, None).await
 }
 
 #[cfg(test)]
@@ -974,15 +978,16 @@ mod tests {
         // cleanup_dns_on_exit → set_dns_mode_disable(interactive=false)
         //   - original 是 DhcpEmpty → 只打印 warning（不返回 Err，bug 1 修复）
         //   - manifest 写 dns_enabled=false → 走 disable_dns_mode
-        //   - 测试环境没有真 proxy + non-interactive → 保留 marker
-        //     + 返回 Ok（fix issue #67 bug 4：cleanup 失败转 warning，
-        //       避免 SIGINT + ExitRequested 两条路径刷两条 failed 误导用户；
-        //       DNS 真没恢复由 recovery marker 兜底，下次启动 try_recover_dns 强退）
+        //   - 测试环境没有真 proxy + non-interactive → `disable_dns_mode`
+        //     返回 Err（保留 marker，下次启动 `try_recover_dns` 强退）→
+        //     **fix (issue #152 follow-up, C)**：`cleanup_dns_on_exit`
+        //     现在 propagate Err，不再 swallow 成 Ok + warning。
         let result = cleanup_dns_on_exit(&state, false).await;
         assert!(
-            result.is_ok(),
-            "cleanup_dns_on_exit should return Ok even on proxy failure (recovery marker \
-             handles actual restoration); got {:?}",
+            result.is_err(),
+            "cleanup_dns_on_exit must propagate disable Err (was {:?}); \
+             swallow behavior was the #152 leak — lib.rs and tray Quit \
+             path need to see the real failure for accurate logging",
             result
         );
 
@@ -995,6 +1000,12 @@ mod tests {
             vec!["Empty".to_string()],
             "DhcpEmpty snapshot 必须产生 Empty restore target"
         );
+
+        // 注：recovery marker 的契约由 `disable_dns_mode` 内部保证（fix
+        // #152 Step 3），不在这里断言 —— marker 写到共享 runtime_dir，
+        // 并行测试间会互相覆盖。marker 的真正合约在 mhost-dns crate 的
+        // `test_disable_recovery_marker_file_path_is_canonical` /
+        // `test_set_dns_mode_disable_cancellable_*` 测试里覆盖。
     }
 
     /// 回归测试（app-close DNS cleanup）：
@@ -1032,9 +1043,15 @@ mod tests {
         // 弹 sudo 密码框，CI 无人点击会永远卡住。`cleanup_dns_on_exit`
         // 入口 (line 321) 已经在调 `set_dns_mode_disable` 之前把
         // `dns_enabled` 标 false，所以 disable 走 non-interactive
-        // 分支（返回 Err）也满足幂等性测试的核心断言。
+        // 分支。disable_dns_mode 找不到 proxy → 返回 Err → **fix (issue
+        // #152 follow-up, C)**：`cleanup_dns_on_exit` 现在 propagate Err。
+        // 关键断言：dns_enabled 必须在第一次调用后被清成 false（即使 IPC
+        // 返 Err —— 这是 fix A 的核心合约）。
         let r1 = cleanup_dns_on_exit(&state, false).await;
-        assert!(r1.is_ok());
+        assert!(
+            r1.is_err(),
+            "first cleanup must propagate Err when proxy is not running"
+        );
         assert!(
             !state.dns_enabled.load(Ordering::Relaxed),
             "first cleanup must clear dns_enabled"
@@ -1056,6 +1073,160 @@ mod tests {
         // 第三次（同样）
         let r3 = cleanup_dns_on_exit(&state, false).await;
         assert!(r3.is_ok(), "third cleanup must also be a no-op");
+
+        // Cleanup
+        let _ = std::fs::remove_file(mhost_dns::platform::disable_recovery_marker_file());
+    }
+
+    // -------------------------------------------------------------------
+    // Issue #152 follow-up (fix A): set_dns_mode_disable must clear the
+    // in-memory `dns_enabled` flag EVEN WHEN `disable_dns_mode` returns Err.
+    //
+    // Reproduces the IPC-Err-leaves-UI-lying leak: when the privileged
+    // disable step fails (proxy hung past 5s, sudo rejected, networksetup
+    // hiccup), the IPC handler returns Err to the frontend *before*
+    // reaching the line that flips in-memory `dns_enabled` to false. The
+    // frontend's catch path then truth-fetches `getDnsMode()`, which
+    // returns `true` (line 502 never ran), sets `dnsEnabledAtom = true`,
+    // and the UI shows "Running" while system DNS is stuck at 127.0.0.1.
+    //
+    // Expected behaviour after fix: regardless of whether the privileged
+    // step succeeded, the in-memory flag mirrors user intent ("user wants
+    // DNS off"), so UI truth-fetch shows the correct state. The system
+    // DNS may still be at 127.0.0.1, but that's exactly what the recovery
+    // marker is for — `try_recover_dns` on next launch forces it back.
+    // -------------------------------------------------------------------
+
+    /// Helper: build a minimal AppState with `dns_enabled=true` and a
+    /// DhcpEmpty snapshot — the same state `set_dns_mode_enable` would
+    /// leave behind on success. Used by both `test_set_dns_mode_disable_*`
+    /// tests below.
+    fn make_state_dns_enabled(temp: &TempDir) -> AppState {
+        let storage = Arc::new(FileStorage::new(temp.path()))
+            as Arc<dyn mhost_storage::storage::Storage + Send + Sync>;
+        storage
+            .save_manifest(&mhost_storage::manifest::Manifest::new(env!(
+                "CARGO_PKG_VERSION"
+            )))
+            .expect("seed manifest");
+        AppState {
+            storage,
+            writer: Arc::new(HostsWriter::new()),
+            apply_lock: ApplyLock::new(),
+            snapshot_lock: ApplyLock::new(),
+            last_profile_ids: Mutex::new(Vec::new()),
+            dns_server: Arc::new(Mutex::new(None)),
+            dns_enabled: AtomicBool::new(true),
+            original_dns: Mutex::new(OriginalDns::DhcpEmpty),
+            dns_lock: ApplyLock::new(),
+            dns_cancel: Mutex::new(None),
+            ad_block_state: Arc::new(tokio::sync::RwLock::new(mhost_core::AdBlockState::default())),
+            ad_block_refresh_task: Mutex::new(None),
+            ad_block_refresh_cancel: Mutex::new(CancellationToken::new()),
+        }
+    }
+
+    /// **fix (issue #152 follow-up, Step A)**:
+    /// `set_dns_mode_disable` must clear the in-memory `dns_enabled` flag
+    /// even when `disable_dns_mode` returns Err.
+    ///
+    /// Setup: no proxy pid file, `interactive=false`. The non-interactive
+    /// branch of `disable_dns_mode` returns Err when there's no proxy and
+    /// we explicitly don't want to pop sudo. This guarantees the function
+    /// takes the early-return path at `commands/dns.rs:480`.
+    ///
+    /// Pre-fix: `state.dns_enabled` stays `true` because line 502 is
+    /// unreachable. UI truth-fetch sees `true` → user sees "Running".
+    /// Post-fix: `state.dns_enabled` is `false` after the call regardless
+    /// of the Err.
+    #[tokio::test]
+    async fn test_set_dns_mode_disable_clears_in_memory_flag_even_on_disable_failure() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let state = make_state_dns_enabled(&temp);
+
+        // Sanity: starts enabled.
+        assert!(
+            state.dns_enabled.load(Ordering::Relaxed),
+            "fixture precondition: dns_enabled starts as true"
+        );
+
+        // Trigger the bug surface: disable with no proxy + interactive=false.
+        // `disable_dns_mode` returns Err here (no pid file, no sudo path),
+        // which is exactly the situation where pre-fix the function
+        // early-returns before flipping the in-memory flag.
+        let result = set_dns_mode_disable(&state, false, None).await;
+
+        // Post-fix assertion — the contract:
+        // The IPC may return Err (that's fine — it surfaces the underlying
+        // failure to the UI). But the in-memory flag MUST match user intent.
+        assert!(
+            !state.dns_enabled.load(Ordering::Relaxed),
+            "set_dns_mode_disable must clear in-memory dns_enabled even when \
+             disable_dns_mode fails; otherwise UI truth-fetch shows 'Running' \
+             while system DNS is stuck at 127.0.0.1. Got result: {:?}",
+            result
+        );
+
+        // Manifest on disk already records dns_enabled=false (line 463 runs
+        // before disable_dns_mode). So in-memory and on-disk are consistent
+        // after the fix — recovery marker covers the system DNS state.
+        let manifest = state.storage.load_manifest().expect("load manifest");
+        assert_eq!(
+            manifest.dns_enabled,
+            Some(false),
+            "manifest must record dns_enabled=false (persisted before disable_dns_mode)"
+        );
+
+        // 注：recovery marker 的写盘/清理由 `disable_dns_mode` 内部负责
+        // （fix #152 Step 3）。不在这里断言 / 清理 —— marker 写到共享
+        // runtime_dir，并行测试间会互相覆盖。marker 契约的真实合约在
+        // mhost-dns crate 的测试里覆盖。
+    }
+
+    // -------------------------------------------------------------------
+    // Issue #152 follow-up (fix C): cleanup_dns_on_exit must NOT swallow
+    // disable failures. The function currently maps `set_dns_mode_disable`'s
+    // Err to Ok with a single eprintln, claiming the recovery marker will
+    // handle next-launch restoration. That's correct for the recovery, but
+    // it hides the in-session degraded state from lib.rs / the OS exit code.
+    //
+    // Specifically: tray Quit / Cmd-Q / SIGINT all log "DNS cleanup ok"
+    // when the cleanup actually failed and system DNS is stuck at 127.0.0.1.
+    // lib.rs already has explicit Err-handling at lib.rs:91, 273, 381; we
+    // can simply propagate the Err without changing the exit behavior.
+    //
+    // Setup: AppState with `dns_enabled=true`, no proxy pid_file. The
+    // non-interactive branch of `disable_dns_mode` returns Err (no proxy,
+    // no sudo path), which `cleanup_dns_on_exit` propagates verbatim.
+    // Pre-fix: returns Ok (error swallowed).
+    // Post-fix: returns Err.
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_cleanup_dns_on_exit_propagates_disable_failure() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let state = make_state_dns_enabled(&temp);
+
+        // Trigger the bug surface: no proxy pid file, interactive=false.
+        // `disable_dns_mode` returns Err here — `cleanup_dns_on_exit` MUST
+        // propagate it instead of swallowing into Ok.
+        let result = cleanup_dns_on_exit(&state, false).await;
+
+        // Post-fix assertion — the contract:
+        // The function MUST return Err when disable actually failed, so
+        // lib.rs (line 91, 273, 381) can log the failure accurately.
+        assert!(
+            result.is_err(),
+            "cleanup_dns_on_exit must propagate disable failure (was {:?}); \
+             swallowing means tray Quit / Cmd-Q / SIGINT log 'DNS cleanup ok' \
+             while system DNS is actually stuck at 127.0.0.1",
+            result
+        );
+
+        // 注：recovery marker 契约由 `disable_dns_mode` 内部保证
+        // （fix #152 Step 3）。不在这里断言 —— marker 写到共享
+        // runtime_dir，并行测试间会互相覆盖。marker 合约的真实覆盖在
+        // mhost-dns crate 的测试里。
     }
 
     // -------------------------------------------------------------------
