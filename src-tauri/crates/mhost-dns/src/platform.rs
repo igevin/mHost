@@ -192,12 +192,18 @@ fn run_with_privileges(script_body: &str) -> Result<std::process::Output, String
 /// 调 osascript 让它以管理员权限执行临时脚本。脚本路径已写盘，
 /// 字符串拼接只发生在 AppleScript 字面量内，并用 `quoted form of POSIX path of`
 /// 走 AppleScript 自身的转义机制，不依赖手工 shell escape。
+///
+/// **fix (issue follow-up: force TCC re-prompt every time)**：复用
+/// `build_osascript_command` 注入 nonce,让 macOS TCC 5min 缓存不命中,
+/// disable / recovery 路径也每次重新弹授权框（与 `spawn_osascript` 一致）。
 fn invoke_osascript(path: &std::path::Path) -> Result<std::process::Output, String> {
     let path_str = path.to_string_lossy();
-    let apple_script = format!(
-        "do shell script \"sh \" & quoted form of POSIX path of \"{}\" with administrator privileges",
-        // 双重 escape 是因为我们要塞进 AppleScript 字符串字面量
-        path_str.replace('\\', "\\\\").replace('"', "\\\"")
+    let nonce = generate_nonce();
+    let apple_script = build_osascript_command(&path_str, &nonce);
+    tracing::debug!(
+        "invoke_osascript: nonce={}, script_path={}",
+        nonce,
+        path_str
     );
     Command::new("osascript")
         .args(["-e", &apple_script])
@@ -215,18 +221,64 @@ pub(crate) struct OsascriptRun {
     pub pid: i32,
 }
 
+/// Build the AppleScript that `osascript -e` will execute. Pure function
+/// (no I/O, no spawning) so it's directly unit-testable.
+///
+/// **fix (issue follow-up: force TCC re-prompt every time)**：每次调用
+/// 都注入一个唯一 nonce 到 elevated shell 命令里（作为 shell 注释
+/// `#nonce<value>`）。macOS TCC 的 authorization cache key 基于实际
+/// 被提权的命令字符串 —— nonce 不同 → cache key 不同 → TCC 必须重新弹
+/// 授权框而不是静默放行（5min 缓存窗口失效）。
+///
+/// 注释形式 `#nonce<value>` 保证 nonce 不影响脚本执行（shell 注释），但
+/// 仍能让 macOS TCC 看到不同的命令字符串。
+///
+/// Path escaping：AppleScript 字符串里 `\` 和 `"` 需要分别转义为 `\\`
+/// 和 `\"`（AppleScript 的 escape 规则）。
+#[cfg(target_os = "macos")]
+pub(crate) fn build_osascript_command(script_path: &str, nonce: &str) -> String {
+    let escaped_path = script_path.replace('\\', "\\\\").replace('"', "\\\"");
+    format!(
+        "do shell script \"sh \" & quoted form of POSIX path of \"{}\" \
+         & \" #nonce{}\" with administrator privileges",
+        escaped_path, nonce
+    )
+}
+
+/// Generate a unique nonce for one osascript invocation. Uses nanosecond
+/// timestamp + PID + monotonic counter so even rapid-fire calls (same
+/// nanosecond, same process) yield distinct values.
+///
+/// Format: `<nanos_hex>-<pid>-<counter>` —— 紧凑、易读、跨进程+进程内唯一。
+#[cfg(target_os = "macos")]
+fn generate_nonce() -> String {
+    use std::sync::atomic::Ordering;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{:x}-{}-{}", nanos, pid, counter)
+}
+
 /// Spawn osascript and return the running `Child` so the caller can kill
 /// it on timeout. Replaces the previous fire-and-forget `.output()` call.
 ///
 /// Stdio pipes are set explicitly (`Stdio::piped()`) so the Rust side
 /// owns valid pipes; without them `wait_with_output` would fail.
+///
+/// **fix (issue follow-up: force TCC re-prompt every time)**：每次 spawn
+/// 都通过 `generate_nonce()` 注入一个唯一 nonce 到 AppleScript 命令，
+/// 让 macOS TCC 不会用 5min 缓存静默放行。详见 `build_osascript_command`。
 #[cfg(target_os = "macos")]
 pub(crate) fn spawn_osascript(path: &std::path::Path) -> Result<OsascriptRun, String> {
+    let nonce = generate_nonce();
     let path_str = path.to_string_lossy();
-    let apple_script = format!(
-        "do shell script \"sh \" & quoted form of POSIX path of \"{}\" with administrator privileges",
-        path_str.replace('\\', "\\\\").replace('"', "\\\""),
-    );
+    let apple_script = build_osascript_command(&path_str, &nonce);
+    tracing::debug!("spawn_osascript: nonce={}, script_path={}", nonce, path_str);
     let child = Command::new("osascript")
         .args(["-e", &apple_script])
         .stdout(std::process::Stdio::piped())
@@ -2841,6 +2893,98 @@ exit 1
             "trap must kill sleep 30 child; found pids still alive: {:?}",
             sleep_pids_after
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Force TCC re-prompt every time (defeat TCC cache)
+    // -----------------------------------------------------------------------
+    //
+    // **fix (issue follow-up)**:`spawn_osascript` 的 AppleScript 命令必须
+    // 每次带不同 nonce,否则 macOS TCC 在 5min 缓存窗口内会静默放行,
+    // 用户看到「没弹授权框」但实际上 enable 已经完成,造成 UI 状态混乱
+    // (用户以为卡住,其实 mhost 在 OS 层面已经 enabled)。
+
+    /// 纯函数:每次生成的 AppleScript 命令必须包含传入的 nonce。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_build_osascript_command_includes_nonce() {
+        let cmd = super::build_osascript_command("/tmp/mhost-script.sh", "abc123def");
+        assert!(
+            cmd.contains("abc123def"),
+            "command must include nonce, got: {}",
+            cmd
+        );
+        assert!(
+            cmd.contains("/tmp/mhost-script.sh"),
+            "command must include script path"
+        );
+        assert!(
+            cmd.contains("with administrator privileges"),
+            "must still request TCC elevation"
+        );
+    }
+
+    /// 纯函数:不同 nonce 必须生成不同命令(否则 nonce 就没意义了)。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_build_osascript_command_unique_per_nonce() {
+        let cmd1 = super::build_osascript_command("/tmp/x.sh", "nonce-aaa");
+        let cmd2 = super::build_osascript_command("/tmp/x.sh", "nonce-bbb");
+        assert_ne!(
+            cmd1, cmd2,
+            "different nonces must yield different commands (otherwise \
+             TCC cache bypass is not defeated)"
+        );
+    }
+
+    /// 路径含双引号时必须正确转义(防御性 —— 正常 temp path 不会含,但
+    /// $TMPDIR 自定义 / ~/ 路径含特殊字符理论上可能)。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_build_osascript_command_escapes_quotes_in_path() {
+        let cmd = super::build_osascript_command("/tmp/has\"quote.sh", "abc");
+        // 双引号在 AppleScript 字符串里需要 \"(注意:AppleScript parser
+        // 把 \" 视为字面 ",不是 delimiter)
+        assert!(
+            cmd.contains("has\\\"quote.sh"),
+            "double quote must be escaped to \\\", got: {}",
+            cmd
+        );
+        // 路径里 literal " 字符必须仍然存在(只是被 \ 转义,不能消失)
+        let original_quote_count = "/tmp/has\"quote.sh".matches('"').count();
+        let escaped_quote_count = cmd.matches("\\\"").count();
+        assert_eq!(
+            original_quote_count, escaped_quote_count,
+            "every input quote must produce exactly one escaped quote in output"
+        );
+    }
+
+    /// 路径含反斜杠时也正确转义。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_build_osascript_command_escapes_backslash_in_path() {
+        let cmd = super::build_osascript_command("/tmp/has\\back.sh", "abc");
+        // 反斜杠在 AppleScript 字符串里需要 \\
+        assert!(
+            cmd.contains("has\\\\back.sh"),
+            "backslash must be escaped: {}",
+            cmd
+        );
+    }
+
+    /// nonce 的纯随机源必须足够唯一 —— 连续两次调用 spawn_osascript
+    /// 拿到的 nonce 必须不同(否则 mhost 在 1 秒内连点两次 Enable 会
+    /// 拿到同一 nonce → TCC 还是缓存命中 → 还是看不到 prompt)。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_generate_nonce_is_unique_across_calls() {
+        let n1 = super::generate_nonce();
+        let n2 = super::generate_nonce();
+        let n3 = super::generate_nonce();
+        assert!(!n1.is_empty(), "nonce must be non-empty");
+        assert_ne!(n1, n2, "nonce must differ across calls");
+        assert_ne!(n2, n3, "nonce must differ across calls");
+        assert_ne!(n1, n3, "nonce must differ across calls");
     }
 
     /// **fix (issue #148 review)**:`set -e` + `for pid in $(pgrep -x nothing-running)`
