@@ -77,6 +77,22 @@ pub struct AppState {
     pub original_dns: Mutex<OriginalDns>,
     /// 串行化 DNS 模式切换操作。
     pub dns_lock: ApplyLock,
+    /// Cooperative cancellation signal for the in-flight DNS enable/disable
+    /// operation (issue #149).
+    ///
+    /// `set_dns_mode` allocates a fresh `CancellationToken` on entry and
+    /// swaps it into this slot; `cancel_dns_mode` fires the token so the
+    /// long-running enable path can observe cancellation at its phase
+    /// boundaries and roll back. The token is cleared on `set_dns_mode`
+    /// completion.
+    ///
+    /// Like `ad_block_refresh_cancel` (issue #138), this is wrapped in a
+    /// `Mutex` so callers can replace the slot (rather than mutate a
+    /// shared token) — `CancellationToken::cancel()` is sticky, so a
+    /// disable → re-enable cycle must not hand the new operation the
+    /// previously-cancelled token. See `dns::set_dns_mode` for the swap
+    /// contract and tests for the rollback behavior.
+    pub dns_cancel: Mutex<Option<CancellationToken>>,
     // 广告屏蔽 (issue #130)
     /// 当前广告屏蔽状态。`tokio::sync::RwLock` 让热重载可以并发读。
     /// 写操作集中在 `commands/adblock.rs`（原子写文件 + 内存 + 推引擎）。
@@ -199,6 +215,7 @@ impl AppState {
             dns_enabled: AtomicBool::new(dns_enabled),
             original_dns: Mutex::new(original_dns),
             dns_lock: ApplyLock(tokio::sync::Mutex::new(())),
+            dns_cancel: Mutex::new(None),
             ad_block_state: ad_block_state_lock,
             ad_block_refresh_task: refresh_task_slot,
             ad_block_refresh_cancel: Mutex::new(CancellationToken::new()),
@@ -247,13 +264,30 @@ impl AppState {
         // 正常退出 proxy 自己恢复了，标记文件被删，到不了这里。
         #[cfg(target_os = "macos")]
         {
-            if std::path::Path::new("/tmp/mhost-dns-disable-recovery.marker").exists() {
+            // **fix (issue #152, root cause 1)**: marker is written by
+            // `platform::disable_dns_mode` to `runtime_dir()/mhost-dns-disable-recovery.marker`
+            // (see `mhost_dns::platform::disable_recovery_marker_file()`,
+            // `platform.rs:82`). The hard-coded `/tmp/...` path here was
+            // dead code — `disable_dns_mode` never wrote to `/tmp`, so
+            // this `if` branch never fired, and `force_dns_restore_if_needed`
+            // was never called from this site. After a failed disable the
+            // marker sat orphaned on disk while system DNS stayed at
+            // 127.0.0.1.
+            //
+            // Use the canonical helper to read the same path the disable
+            // path writes to.
+            let marker_path = mhost_dns::platform::disable_recovery_marker_file();
+            if marker_path.exists() {
                 eprintln!(
-                    "[mHost] try_recover_dns: disable recovery marker found, forcing restore"
+                    "[mHost] try_recover_dns: disable recovery marker found at {}, forcing restore",
+                    marker_path.display()
                 );
                 if let Err(e) = mhost_dns::platform::force_dns_restore_if_needed() {
                     eprintln!("[mHost] force restore failed: {}", e);
                 }
+                // `force_dns_restore_if_needed` deletes the marker itself
+                // on success; if it failed, the marker remains and we
+                // will retry next launch.
             }
         }
         // 1. 优先从 manifest.original_dns 恢复（避免再次问系统 —— 系统 DNS

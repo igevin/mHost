@@ -983,6 +983,7 @@ mod tests {
             dns_enabled: std::sync::atomic::AtomicBool::new(false),
             original_dns: std::sync::Mutex::new(mhost_core::OriginalDns::DhcpEmpty),
             dns_lock: crate::state::ApplyLock::new(),
+            dns_cancel: std::sync::Mutex::new(None),
             ad_block_state: Arc::new(tokio::sync::RwLock::new(AdBlockState::default())),
             ad_block_refresh_task: std::sync::Mutex::new(None),
             ad_block_refresh_cancel: std::sync::Mutex::new(

@@ -123,7 +123,13 @@ describe("Settings", () => {
       fireEvent.click(enableButton);
     });
 
-    expect(mockSetDnsMode).toHaveBeenCalledWith(true);
+    // issue #149: setDnsMode now accepts an optional `{ signal }` for the
+    // AbortController wired by toggleDnsModeAtom. The toggle intent
+    // (true / false) is the first positional arg.
+    expect(mockSetDnsMode).toHaveBeenCalledWith(
+      true,
+      expect.objectContaining({ signal: expect.anything() }),
+    );
   });
 
   it("clicks Disable DNS Mode button and triggers toggle", async () => {
@@ -147,7 +153,10 @@ describe("Settings", () => {
       fireEvent.click(disableButton);
     });
 
-    expect(mockSetDnsMode).toHaveBeenCalledWith(false);
+    expect(mockSetDnsMode).toHaveBeenCalledWith(
+      false,
+      expect.objectContaining({ signal: expect.anything() }),
+    );
   });
 
   // ---- issue #123: Quick Apply toggle on Settings page ----
