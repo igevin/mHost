@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -366,12 +366,44 @@ pub enum OriginalDns {
     DhcpEmpty,
 }
 
+/// **fix (issue #152 hardening)**：判定一个 DNS server 字符串是否指向
+/// 本地 loopback / unspecified。和 `mhost_dns::platform::is_local_resolver`
+/// 语义一致，但放在 `mhost-core` 是为了避免 `mhost-core ← mhost-dns`
+/// 反向依赖（mhost-dns 已经依赖 mhost-core）。
+///
+/// 同时容忍 `host:port` / `[host]:port`（v6 bracketed）形式；解析不出来
+/// 按「非本地」处理，留给上层校验兜底。
+fn is_local_resolver(server: &str) -> bool {
+    let host = server
+        .parse::<SocketAddr>()
+        .map(|sa| sa.ip())
+        .or_else(|_| server.parse::<IpAddr>());
+    matches!(host, Ok(ip) if ip.is_loopback() || ip.is_unspecified())
+}
+
 impl OriginalDns {
     /// Args to pass to `networksetup -setdnsservers <iface> ...` on restore.
     /// DhcpEmpty → `["Empty"]` (= DHCP default).
+    ///
+    /// **fix (issue #152 hardening)**：`Manual(s)` 在返回前过滤掉
+    /// `127.0.0.1` / `::1` / unspecified，避免 legacy on-disk 污染（早期
+    /// 版本 capture 没过滤）被再次写回系统 DNS。如果过滤后列表为空，
+    /// 退回 DhcpEmpty 语义（返回 `["Empty"]`），永远不向 networksetup
+    /// 传 `127.0.0.1`。
     pub fn restore_argv(&self) -> Vec<String> {
         match self {
-            Self::Manual(s) => s.clone(),
+            Self::Manual(s) => {
+                let filtered: Vec<String> = s
+                    .iter()
+                    .filter(|x| !is_local_resolver(x))
+                    .cloned()
+                    .collect();
+                if filtered.is_empty() {
+                    vec!["Empty".to_string()]
+                } else {
+                    filtered
+                }
+            }
             Self::DhcpEmpty => vec!["Empty".to_string()],
         }
     }
@@ -408,11 +440,15 @@ impl Serialize for OriginalDns {
 
 /// Accepts BOTH the new tagged form AND the legacy bare `Vec<String>`
 /// (used in pre-v2.1 manifests). Migration rules:
-///   - `{"kind":"manual","servers":[...]}` → Manual
+///   - `{"kind":"manual","servers":[...]}` → Manual (loopback-filtered)
 ///   - `{"kind":"dhcp_empty"}`               → DhcpEmpty
 ///   - `[]`                                  → DhcpEmpty
 ///   - `["Empty"]`                           → DhcpEmpty (v2.0 placeholder)
-///   - `["1.1.1.1", ...]`                    → Manual(vec)
+///   - `["1.1.1.1", ...]`                    → Manual(vec) (loopback-filtered)
+///
+/// **fix (issue #152 hardening)**：所有路径在构造 `Manual` 前过滤掉
+/// `127.0.0.1` / `::1` / unspecified，防止 pre-fix manifest 的污染数据
+/// 被 migrate 后再次写回系统 DNS。
 impl<'de> Deserialize<'de> for OriginalDns {
     fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
@@ -428,13 +464,29 @@ impl<'de> Deserialize<'de> for OriginalDns {
             DhcpEmpty,
         }
         match Repr::deserialize(de)? {
-            Repr::Tagged(Tagged::Manual { servers }) => Ok(OriginalDns::Manual(servers)),
+            Repr::Tagged(Tagged::Manual { servers }) => {
+                // **fix (issue #152 hardening)**：legacy bare Vec<String>
+                // 也可能在 capture 没过滤 loopback 的早期版本里被写过
+                // `["127.0.0.1", "1.1.1.1"]`。反序列化时同样过滤，
+                // 否则 mhost 把污染数据重新写回系统 DNS，链路 2 复发。
+                let filtered: Vec<String> = servers
+                    .into_iter()
+                    .filter(|x| !is_local_resolver(x))
+                    .collect();
+                Ok(OriginalDns::Manual(filtered))
+            }
             Repr::Tagged(Tagged::DhcpEmpty) => Ok(OriginalDns::DhcpEmpty),
             Repr::Legacy(vec) => {
-                if vec.is_empty() || vec.iter().any(|s| s == "Empty") {
+                // **fix (issue #152 hardening)**：legacy bare Vec<String>
+                // 在做 `is_empty()` / `"Empty"` 判定前先过滤 loopback。
+                // - `["127.0.0.1", "1.1.1.1"]` → `["1.1.1.1"]` → Manual
+                // - `["127.0.0.1"]`             → `[]`          → DhcpEmpty
+                let filtered: Vec<String> =
+                    vec.into_iter().filter(|x| !is_local_resolver(x)).collect();
+                if filtered.is_empty() || filtered.iter().any(|s| s == "Empty") {
                     Ok(OriginalDns::DhcpEmpty)
                 } else {
-                    Ok(OriginalDns::Manual(vec))
+                    Ok(OriginalDns::Manual(filtered))
                 }
             }
         }
@@ -910,6 +962,91 @@ mod tests {
             OriginalDns::DhcpEmpty.restore_argv(),
             vec!["Empty".to_string()]
         );
+    }
+
+    /// **fix (issue #152 hardening)**：`restore_argv` 必须过滤 loopback，
+    /// 防止 legacy on-disk 污染数据被写回系统 DNS。
+    #[test]
+    fn test_original_dns_restore_argv_strips_loopback() {
+        // 混合：保留非 loopback，过滤掉 127.0.0.1 和 ::1
+        assert_eq!(
+            OriginalDns::Manual(vec![
+                "127.0.0.1".to_string(),
+                "8.8.8.8".to_string(),
+                "::1".to_string(),
+                "1.1.1.1".to_string(),
+            ])
+            .restore_argv(),
+            vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()]
+        );
+
+        // 全 loopback → 退回 DhcpEmpty 语义（["Empty"]），绝不传 127.0.0.1
+        assert_eq!(
+            OriginalDns::Manual(vec!["127.0.0.1".to_string(), "::1".to_string()]).restore_argv(),
+            vec!["Empty".to_string()]
+        );
+
+        // unspecified 也算「本地」（0.0.0.0 是某些 OS 的 placeholder）
+        assert_eq!(
+            OriginalDns::Manual(vec!["0.0.0.0".to_string(), "8.8.8.8".to_string()]).restore_argv(),
+            vec!["8.8.8.8".to_string()]
+        );
+
+        // host:port 形式也能识别
+        assert_eq!(
+            OriginalDns::Manual(vec!["127.0.0.1:53".to_string(), "8.8.8.8".to_string()])
+                .restore_argv(),
+            vec!["8.8.8.8".to_string()]
+        );
+
+        // DhcpEmpty 路径不受影响
+        assert_eq!(
+            OriginalDns::DhcpEmpty.restore_argv(),
+            vec!["Empty".to_string()]
+        );
+    }
+
+    /// **fix (issue #152 hardening)**：legacy bare Vec<String> 反序列化
+    /// 时同样过滤 loopback；legacy `["127.0.0.1"]` 必须迁移成 DhcpEmpty。
+    #[test]
+    fn test_original_dns_deserialize_legacy_vec_with_loopback_filters() {
+        // 混合：保留非 loopback
+        let legacy = r#"["127.0.0.1", "8.8.8.8"]"#;
+        let restored: OriginalDns = serde_json::from_str(legacy).unwrap();
+        assert_eq!(restored, OriginalDns::Manual(vec!["8.8.8.8".to_string()]));
+
+        // 全 loopback → DhcpEmpty
+        let legacy = r#"["127.0.0.1"]"#;
+        let restored: OriginalDns = serde_json::from_str(legacy).unwrap();
+        assert_eq!(restored, OriginalDns::DhcpEmpty);
+
+        // 全 unspecified → DhcpEmpty
+        let legacy = r#"["0.0.0.0"]"#;
+        let restored: OriginalDns = serde_json::from_str(legacy).unwrap();
+        assert_eq!(restored, OriginalDns::DhcpEmpty);
+
+        // 全 loopback + "Empty" placeholder → DhcpEmpty（filter 不该破坏
+        // "Empty" 占位符的语义）
+        let legacy = r#"["Empty", "127.0.0.1"]"#;
+        let restored: OriginalDns = serde_json::from_str(legacy).unwrap();
+        assert_eq!(restored, OriginalDns::DhcpEmpty);
+    }
+
+    /// **fix (issue #152 hardening)**：tagged `Manual{servers}` 反序列化
+    /// 也过滤 loopback。覆盖 pre-fix manifest 写过的
+    /// `{"kind":"manual","servers":["127.0.0.1","8.8.8.8"]}` 这种污染数据。
+    #[test]
+    fn test_original_dns_deserialize_tagged_manual_with_loopback_filters() {
+        let json = r#"{"kind":"manual","servers":["127.0.0.1", "8.8.8.8"]}"#;
+        let restored: OriginalDns = serde_json::from_str(json).unwrap();
+        assert_eq!(restored, OriginalDns::Manual(vec!["8.8.8.8".to_string()]));
+
+        // 全 loopback → 过滤后 vec 为空 → Manual(vec![]) 保留，调用方
+        // restore_argv() 会进一步退回 ["Empty"]。
+        let json = r#"{"kind":"manual","servers":["127.0.0.1"]}"#;
+        let restored: OriginalDns = serde_json::from_str(json).unwrap();
+        assert_eq!(restored, OriginalDns::Manual(vec![]));
+        assert_eq!(restored.restore_argv(), vec!["Empty".to_string()]);
     }
 
     #[test]
