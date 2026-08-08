@@ -575,11 +575,26 @@ pub fn enable_dns_mode(dns_port: u16, original: &OriginalDns) -> Result<(), Plat
     // 关键：仅当用户**手动配过** DNS（Manual）才写文件。
     // DhcpEmpty 不写 → proxy 启动时 read_original_dns_from_file 返回空 →
     // restore 走 Empty 分支（不会泄漏 DHCP 推的 IP）。
+    //
+    // **fix (issue #152 hardening)**：写盘前最后再过滤一次 loopback。
+    // 上游 `capture_dns_state` 已经过滤；这里多一道是 belt-and-suspenders，
+    // 防止未来新增的 capture 路径忘了过滤把 127.0.0.1 写进 original.txt。
     let original_path = original_dns_file();
     if let OriginalDns::Manual(servers) = original {
-        let original_content = servers.join("\n");
-        write_atomic_0600(&original_path, original_content.as_bytes())
-            .map_err(|e| PlatformError::SetDns(format!("write original dns file: {}", e)))?;
+        let filtered: Vec<String> = servers
+            .iter()
+            .filter(|s| !is_local_resolver(s))
+            .cloned()
+            .collect();
+        if filtered.is_empty() {
+            // 过滤后变空（极端情况：用户原本的 Manual 只有 loopback）→
+            // 视为 DhcpEmpty，不写文件。
+            let _ = std::fs::remove_file(&original_path);
+        } else {
+            let original_content = filtered.join("\n");
+            write_atomic_0600(&original_path, original_content.as_bytes())
+                .map_err(|e| PlatformError::SetDns(format!("write original dns file: {}", e)))?;
+        }
     } else {
         // DhcpEmpty: 确保没有残留的旧文件（从前一次 Manual enable 留下来）。
         let _ = std::fs::remove_file(&original_path);
@@ -737,13 +752,42 @@ trap cleanup EXIT INT TERM
 # ---- fix A: inline sudo-level orphan cleanup (already-elevated shell) ----
 # 在起新 proxy 之前先把上一轮残留的同名孤儿杀掉 —— 既然脚本已经 root,
 # TERM/KILL 一定能送达,不需要再来一次 sudo 弹窗。
-for pid in $(pgrep -x mhost-dns-proxy); do
-    kill -TERM "$pid" 2>/dev/null || true
-done
+#
+# **fix (issue #152 hardening, Step 2)**：避免盲扫 `pgrep -x mhost-dns-proxy`。
+# 上一轮的 expected proxy 正在 self-restore（disable 中途发起的
+# restore_dns_and_exit 调用 networksetup 还没返回）时，如果 disable→re-enable
+# 在 ~1s 内发生，broad pgrep 会 TERM 掉还在跑 networksetup 的 proxy →
+# 系统 DNS 卡在 127.0.0.1。所以这里改成 PID-targeted kill：只对 pid_file
+# 里记录的 expected PID 做 TERM，且先用 `ps -o comm=` 精确匹配 basename
+# 防 PID 重用误杀（与 Rust 端 `cleanup_stale_proxy` 同样的语义）。
+# 只有 pid_file 缺失或陈旧（>30s）才退回 broad pgrep 兜底（针对真正的孤儿，
+# 不是 expected proxy）。
+if [ -f "{pid_file}" ]; then
+    pid=$(awk '{{print $1}}' "{pid_file}")
+    expected=$(awk '{{print $2}}' "{pid_file}")
+    expected_bn=$(basename "$expected" 2>/dev/null || echo "$expected")
+    if [ -n "$pid" ] && [ -n "$expected_bn" ]; then
+        current=$(ps -p "$pid" -o comm= 2>/dev/null | xargs -I{{}} basename {{}} 2>/dev/null || echo "")
+        if [ "$current" = "$expected_bn" ]; then
+            kill -TERM "$pid" 2>/dev/null || true
+        fi
+    fi
+fi
 sleep 1
-for pid in $(pgrep -x mhost-dns-proxy); do
-    kill -KILL "$pid" 2>/dev/null || true
-done
+# Broad sweep 只在 pid_file 缺失或陈旧（>30s）时才跑 —— 保护 expected proxy
+# 不被「快速 re-enable」误杀，但真正的孤儿（pid_file 已经被自己的 cleanup
+# 清掉、或者 30s 前就死掉的）会被清理。
+pid_file_age=999
+if [ -f "{pid_file}" ]; then
+    pid_file_mtime=$(stat -f %m "{pid_file}" 2>/dev/null || echo "0")
+    now=$(date +%s)
+    pid_file_age=$((now - pid_file_mtime))
+fi
+if [ "$pid_file_age" -gt 30 ]; then
+    for pid in $(pgrep -x mhost-dns-proxy); do
+        kill -KILL "$pid" 2>/dev/null || true
+    done
+fi
 
 # ---- enable: launch proxy, wait for ready, hand off to system ----
 # Critical: redirect all three FDs to /dev/null BEFORE backgrounding.
@@ -948,13 +992,62 @@ pub fn disable_dns_mode(
                 }
 
                 if unsafe { libc::kill(proxy_pid as libc::pid_t, 0) != 0 } {
-                    // proxy 已退出 → restore_dns_and_exit 已恢复系统 DNS。
-                    // 全部临时文件 + marker 都可以清掉。
-                    let _ = std::fs::remove_file(proxy_pid_file());
-                    let _ = std::fs::remove_file(original_dns_file());
-                    // signal 文件由 proxy 自己清理（restore_dns_and_exit）
-                    let _ = std::fs::remove_file(disable_recovery_marker_file());
-                    return Ok(());
+                    // proxy 已退出。**fix (issue #152 hardening, Step 3)**：
+                    // 不要无条件认为成功 —— proxy 退出前 networksetup 失败
+                    // 也算「正常退出」。post-restore 验证一次：当前 DNS 还有
+                    // loopback 就按 5s 超时的兜底路径升级（interactive 弹 sudo，
+                    // !interactive / 兜底失败 → 保留 marker）。
+                    match verify_dns_restored_against_loopback() {
+                        Ok(true) => {
+                            // 真的恢复了。清文件 + marker。
+                            let _ = std::fs::remove_file(proxy_pid_file());
+                            let _ = std::fs::remove_file(original_dns_file());
+                            // signal 文件由 proxy 自己清理（restore_dns_and_exit）
+                            let _ = std::fs::remove_file(disable_recovery_marker_file());
+                            return Ok(());
+                        }
+                        Ok(false) => {
+                            // proxy 死了但 DNS 还卡在 loopback
+                            eprintln!(
+                                "[mHost] dns mode disable: proxy exited but system DNS \
+                                 still points at loopback; escalating to sudo fallback"
+                            );
+                            let _ = std::fs::remove_file(proxy_pid_file());
+                            let _ = std::fs::remove_file(original_dns_file());
+                            let _ = std::fs::remove_file(shutdown_signal_file());
+                            // marker 必须保留给下次启动 try_recover_dns
+                            if interactive && osascript_restore(original).is_ok() {
+                                let _ = std::fs::remove_file(disable_recovery_marker_file());
+                                return Ok(());
+                            }
+                            return Err(PlatformError::RestoreDns(format!(
+                                "proxy exited but system DNS still points at loopback; \
+                                 recovery marker left at {}",
+                                disable_recovery_marker_file().display()
+                            )));
+                        }
+                        Err(e) => {
+                            // 验证本身失败（networksetup 也卡了），按失败处理
+                            eprintln!(
+                                "[mHost] dns mode disable: post-restore verify failed ({}); \
+                                 preserving recovery marker",
+                                e
+                            );
+                            let _ = std::fs::remove_file(proxy_pid_file());
+                            let _ = std::fs::remove_file(original_dns_file());
+                            let _ = std::fs::remove_file(shutdown_signal_file());
+                            // marker 必须保留给下次启动 try_recover_dns
+                            if interactive && osascript_restore(original).is_ok() {
+                                let _ = std::fs::remove_file(disable_recovery_marker_file());
+                                return Ok(());
+                            }
+                            return Err(PlatformError::RestoreDns(format!(
+                                "post-restore verify failed: {}; recovery marker left at {}",
+                                e,
+                                disable_recovery_marker_file().display()
+                            )));
+                        }
+                    }
                 }
             }
             // 5s 超时：proxy 还活着但没自管恢复
@@ -1051,6 +1144,39 @@ pub fn force_dns_restore_if_needed() -> Result<(), PlatformError> {
 
     let _ = std::fs::remove_file(disable_recovery_marker_file());
     Ok(())
+}
+
+/// **fix (issue #152 hardening, Step 3)**：post-restore 验证的纯逻辑部分。
+///
+/// 把「servers 里是否有 loopback」抽成纯函数，便于单测覆盖各种
+/// 输入组合（`networksetup_get_dns` 本身要走 `Command::new`，纯单测
+/// 不能跑到）。
+///
+/// 返回 `true` 表示「仍有 loopback」 → caller 应当升级到兜底路径。
+pub(crate) fn any_local_resolver(servers: &[String]) -> bool {
+    servers.iter().any(|s| is_local_resolver(s))
+}
+
+/// **fix (issue #152 hardening, Step 3)**：post-restore 验证。
+///
+/// proxy self-restore 走 `networksetup -setdnsservers` 时可能因为
+/// configd 抖动 / Wi-Fi handoff / TCC 缓存等原因静默失败；proxy 进程
+/// 仍然正常退出（`restore_dns_and_exit` 把 `networksetup` 错误当 warning
+/// 处理），mhost 端的 `kill(pid,0)!=0` 也跟着认为 disable 成功。
+///
+/// 验证：proxy 退出后从 networksetup 读回 DNS，如果还有任何
+/// loopback（`127.0.0.1` / `::1` / unspecified），说明 proxy 自管
+/// 失败 → 不要清 marker，按 5s 超时的兜底路径升级。
+///
+/// 返回语义：
+/// - `Ok(true)`：当前 DNS 没有 loopback（安全，可清 marker）
+/// - `Ok(false)`：当前 DNS 仍有 loopback（proxy 自管失败）
+/// - `Err(_)`：networksetup 自己失败（按失败处理，最保守）
+fn verify_dns_restored_against_loopback() -> Result<bool, PlatformError> {
+    let interface = get_active_network_interface()?;
+    validate_interface_name(&interface)?;
+    let servers = networksetup_get_dns(&interface)?;
+    Ok(!any_local_resolver(&servers))
 }
 
 /// 从 PID 文件读出 proxy 的 PID（如果可读 + 可解析）。
@@ -2012,21 +2138,59 @@ Ethernet Address: aa:bb:cc:dd:ee:ff
     }
 
     /// **fix (issue #152, root cause 2)**: `networksetup_get_dns` must strip
-    /// mHost's own loopback proxy addresses. Without this, capture_dns_state
-    /// records `127.0.0.1` as the user's "original DNS", silently corrupting
-    /// future restores.
-    ///
-    /// Same source-grep technique as
-    /// `test_enable_dns_mode_rejects_missing_proxy_binary`: the actual filter
-    /// logic is exercised at runtime via the full enable/disable path,
-    /// which we cannot easily mock in unit tests.
+    /// **fix (issue #152 hardening, Step 3)**：post-restore 验证纯逻辑。
+    /// `any_local_resolver(&Vec<String>)` 是 `verify_dns_restored_against_loopback`
+    /// 内部的纯函数，单元测试可覆盖。`networksetup_get_dns` 本身要走
+    /// `Command::new`，纯单测跑不到，但 filter 逻辑就是
+    /// `into_iter().filter(|s| !is_local_resolver(s))`，已由
+    /// `test_is_local_resolver_*` + `test_parse_dns_servers_then_filter_loopback`
+    /// 覆盖。
     #[test]
-    fn test_capture_dns_state_filters_mhost_loopback() {
-        let platform_src = include_str!("platform.rs");
-        assert!(
-            platform_src.contains("filter(|s| !is_local_resolver(s))"),
-            "networksetup_get_dns must filter loopback via is_local_resolver (issue #152)"
-        );
+    fn test_post_restore_verify_helper_detects_loopback() {
+        // 无 loopback → 安全（Ok(true) at 调用方）
+        assert!(!any_local_resolver(&[]));
+        assert!(!any_local_resolver(&["8.8.8.8".to_string()]));
+        assert!(!any_local_resolver(&[
+            "8.8.8.8".to_string(),
+            "1.1.1.1".to_string()
+        ]));
+
+        // 任何 loopback 出现 → 升级兜底
+        assert!(any_local_resolver(&["127.0.0.1".to_string()]));
+        assert!(any_local_resolver(&["::1".to_string()]));
+        assert!(any_local_resolver(&["0.0.0.0".to_string()]));
+        // 混合：只要有一个 loopback 就算失败
+        assert!(any_local_resolver(&[
+            "127.0.0.1".to_string(),
+            "8.8.8.8".to_string()
+        ]));
+        // host:port 形式也算
+        assert!(any_local_resolver(&[
+            "127.0.0.1:53".to_string(),
+            "8.8.8.8".to_string()
+        ]));
+    }
+
+    /// **fix (issue #152, root cause 2)**：`networksetup_get_dns` 的内部
+    /// 行为 —— `parse_dns_servers` 输出后必须 filter 掉 loopback。
+    /// 这是行为测试（不是 source-grep）：直接构造 parse + filter 流水线，
+    /// 覆盖 wrapper 的语义。
+    #[test]
+    fn test_networksetup_get_dns_filter_pipeline() {
+        // 模拟「DNS mode 启用后 networksetup -getdnsservers」输出
+        let raw = parse_dns_servers("127.0.0.1\n1.1.1.1\n").unwrap();
+        let filtered: Vec<String> = raw.into_iter().filter(|s| !is_local_resolver(s)).collect();
+        assert_eq!(filtered, vec!["1.1.1.1".to_string()]);
+
+        // 全部 loopback → filter 后空 → 调用方应退回 DhcpEmpty
+        let raw = parse_dns_servers("127.0.0.1\n::1\n0.0.0.0\n").unwrap();
+        let filtered: Vec<String> = raw.into_iter().filter(|s| !is_local_resolver(s)).collect();
+        assert!(filtered.is_empty());
+
+        // 没 loopback → 原样保留
+        let raw = parse_dns_servers("8.8.8.8\n1.1.1.1\n").unwrap();
+        let filtered: Vec<String> = raw.into_iter().filter(|s| !is_local_resolver(s)).collect();
+        assert_eq!(filtered, vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()]);
     }
 
     /// **fix (issue #152, root cause 1)**: `try_recover_dns` must read the
@@ -2051,6 +2215,35 @@ Ethernet Address: aa:bb:cc:dd:ee:ff
             "state/mod.rs try_recover_dns must call \
              mhost_dns::platform::disable_recovery_marker_file() to locate the recovery \
              marker (issue #152)"
+        );
+    }
+
+    /// **fix (issue #152 hardening)**：disable 路径写 marker 的位置和
+    /// try_recover_dns 读 marker 的位置必须在同一路径（同一个 helper），
+    /// 否则再次出现「写一处、读另一处 → recovery branch 是死代码」。
+    /// 行为测试（不是 source-grep）：验证 helper 自洽。
+    #[test]
+    fn test_disable_recovery_marker_file_path_is_canonical() {
+        let path = disable_recovery_marker_file();
+        // 必须不是 `/tmp/...`
+        assert!(
+            !path.starts_with("/tmp/"),
+            "recovery marker path must not live in /tmp; got {}",
+            path.display()
+        );
+        // 必须在 runtime_dir() 下
+        let runtime = runtime_dir();
+        assert!(
+            path.starts_with(&runtime),
+            "recovery marker must live under runtime_dir ({}); got {}",
+            runtime.display(),
+            path.display()
+        );
+        // 文件名必须是固定的 marker 名
+        assert!(
+            path.file_name().and_then(|n| n.to_str()) == Some("mhost-dns-disable-recovery.marker"),
+            "recovery marker filename must be mhost-dns-disable-recovery.marker; got {:?}",
+            path.file_name()
         );
     }
 
@@ -2368,6 +2561,114 @@ rm -f /tmp/mhost-dns-nonexistent.pid
         assert!(
             script.contains(r#"echo "$proxy_pid /usr/local/bin/mhost-dns-proxy" > "#),
             "PID file write must still occur"
+        );
+    }
+
+    /// **fix (issue #152 hardening, Step 2)**：top-of-script inline 杀
+    /// 进程必须 PID-targeted：读 pid_file → 验证 ps comm basename 匹配
+    /// 再 TERM。否则 disable→re-enable 之间可能误杀正在 self-restore
+    /// 的 expected proxy，让系统 DNS 卡在 127.0.0.1。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_enable_script_inline_orphan_kill_uses_pid_file() {
+        let script = super::build_enable_script_body(
+            "/usr/local/bin/mhost-dns-proxy",
+            1053,
+            std::path::Path::new("/tmp/test.pid"),
+            std::path::Path::new("/tmp/test.ready"),
+            "Wi-Fi",
+        );
+
+        // 必须读 pid_file（awk 提取 PID + expected binary path）
+        // 注：测试断言是渲染后的 shell 内容（单 brace），不是 Rust format!
+        // 源码里的转义（双 brace）。
+        assert!(
+            script.contains("awk '{print $1}' \"/tmp/test.pid\""),
+            "inline block must extract PID from pid_file via awk (issue #152 Step 2)\n{}",
+            script
+        );
+        assert!(
+            script.contains("awk '{print $2}' \"/tmp/test.pid\""),
+            "inline block must extract expected binary path from pid_file via awk (issue #152 Step 2)\n{}",
+            script
+        );
+
+        // 必须用 `ps -p $pid -o comm=` 精确验证进程 basename 再杀
+        assert!(
+            script.contains(r#"ps -p "$pid" -o comm="#),
+            "inline block must verify ps comm matches recorded binary basename \
+             before kill (issue #152 Step 2 — same pattern as cleanup_stale_proxy)\n{}",
+            script
+        );
+
+        // 必须有 pid_file freshness gate（stat -f %m）兜底才走 broad pgrep
+        assert!(
+            script.contains("stat -f %m"),
+            "inline block must gate broad pgrep behind a pid_file freshness check (issue #152 Step 2)\n{}",
+            script
+        );
+
+        // broad sweep 必须保留（在 pid_file 缺失/陈旧时仍然能清掉真正的孤儿）
+        assert!(
+            script.contains("pgrep -x mhost-dns-proxy"),
+            "broad pgrep sweep must remain for true orphans (issue #152 Step 2 keeps this in cleanup())\n{}",
+            script
+        );
+    }
+
+    /// **fix (issue #152 hardening, Step 2)** 反向回归 pin：
+    /// top-of-script inline block 不能盲目 pgrep 杀所有 mhost-dns-proxy。
+    /// 只在 trap-cleanup()（post-enable-failure 路径）和「pid_file 缺失/
+    /// 陈旧时」的兜底路径里允许 pgrep —— inline block 主体必须 PID-targeted。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_enable_script_inline_orphan_kill_does_not_blind_pgrep() {
+        let script = super::build_enable_script_body(
+            "/usr/local/bin/mhost-dns-proxy",
+            1053,
+            std::path::Path::new("/tmp/test.pid"),
+            std::path::Path::new("/tmp/test.ready"),
+            "Wi-Fi",
+        );
+
+        // inline block 范围：`# ---- fix A: ...` 到 `# ---- enable: launch proxy ...`
+        let inline_start = script
+            .find("# ---- fix A: inline sudo-level orphan cleanup")
+            .expect("inline block section header must exist");
+        let inline_end = script
+            .find("# ---- enable: launch proxy")
+            .expect("next section header must exist");
+        assert!(
+            inline_start < inline_end,
+            "section ordering is wrong: inline_start={inline_start}, inline_end={inline_end}"
+        );
+        let inline_block = &script[inline_start..inline_end];
+
+        // inline block 主体（stat -f %m 兜底之前的部分）不能有 blind pgrep
+        // —— 把它放在 freshness-gate 之后才允许。
+        //
+        // 简单实现：把 inline block 在 `pid_file_age` 出现之前切成两半，
+        // 前半（PID-targeted 部分）必须没有 pgrep，后半（freshness-gate
+        // 兜底部分）允许 pgrep。
+        let freshness_gate = inline_block
+            .find("pid_file_age")
+            .expect("freshness gate variable must exist");
+        let targeted_part = &inline_block[..freshness_gate];
+        let sweep_part = &inline_block[freshness_gate..];
+
+        assert!(
+            !targeted_part.contains("$(pgrep"),
+            "PID-targeted part of inline block must not invoke `pgrep` (the comment \
+             in the same block mentions pgrep as a thing-to-avoid — that's fine, \
+             but the actual command must not be there). issue #152 Step 2 would \
+             kill expected proxy mid-self-restore.\n\
+             targeted_part:\n{targeted_part}"
+        );
+        assert!(
+            sweep_part.contains("$(pgrep -x mhost-dns-proxy)"),
+            "freshness-gated sweep part must keep blind pgrep for true orphans \
+             (issue #152 Step 2)\n\
+             sweep_part:\n{sweep_part}"
         );
     }
 
