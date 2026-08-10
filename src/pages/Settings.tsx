@@ -19,7 +19,20 @@ function Settings() {
   const isDnsLoading = useAtomValue(isDnsLoadingAtom);
   const dnsError = useAtomValue(dnsErrorAtom);
   const toggleDnsMode = useSetAtom(toggleDnsModeAtom);
-  const { onPointerDown } = useWebKitPointerDown();
+  // issue #149 / #123 follow-up: DNS toggle must dedupe pointerdown + click.
+  // The `useWebKitPointerDown.onPointerDown` wrapper is NOT used here —
+  // pairing it with a raw onClick double-fires the toggle (the wrapper
+  // already calls `fire()`, and re-clicking calls the handler again before
+  // `firedRef` resets). Sidebar/DrawerProfileCard hit the same bug in
+  // commit 88641c6 and were fixed by routing both events through one
+  // handler that owns `fire()` + `releaseSoon()`. We do the same here —
+  // without it, the second invocation overwrites the active
+  // AbortController slot, and the synchronous re-render (Enable →
+  // Cancel) causes the trailing click event to fire `handleCancelDns`,
+  // which cancels the in-flight Rust `set_dns_mode` future before the
+  // TCC prompt can appear. Symptom: Enable click hangs forever with
+  // "Enable DNS mode" UI state and no macOS authorization dialog.
+  const { fire, releaseSoon } = useWebKitPointerDown();
 
   // Update check state
   const [updateStatus, setUpdateStatus] = useState<"idle" | "checking" | "available" | "up-to-date" | "error">("idle");
@@ -51,9 +64,19 @@ function Settings() {
 
   const handleToggleDns = useCallback(
     (enabled: boolean) => {
+      // WebKit pointerdown/click dedupe — see comment on the
+      // `useWebKitPointerDown` destructuring above. Without this guard
+      // a single click fires `toggleDnsMode(enabled)` twice; the second
+      // call overwrites the active AbortController slot, and the
+      // pointerdown-triggered `set(isDnsLoadingAtom, true)` re-renders
+      // Enable → Cancel before the click event fires. The trailing
+      // click then lands on the newly-mounted Cancel button and cancels
+      // the in-flight Rust enable — no TCC prompt ever appears.
+      if (!fire()) return;
+      releaseSoon();
       toggleDnsMode(enabled);
     },
-    [toggleDnsMode],
+    [fire, releaseSoon, toggleDnsMode],
   );
 
   // issue #149: Settings cancel button. Aborts the in-flight `set_dns_mode`
@@ -162,29 +185,53 @@ function Settings() {
                 in-flight `set_dns_mode` IPC and fires the backend
                 rollback — the user sees the UI revert without an
                 error toast. */}
-            {isDnsLoading ? (
+            {dnsEnabled ? (
+              <button
+                className="btn btn-danger"
+                disabled={isDnsLoading}
+                onClick={() => handleToggleDns(false)}
+                onPointerDown={(e) => {
+                  if (e.button !== 0) return;
+                  handleToggleDns(false);
+                }}
+              >
+                {isDnsLoading ? "Disabling…" : "Disable DNS Mode"}
+              </button>
+            ) : (
+              <button
+                className="btn btn-primary"
+                disabled={isDnsLoading}
+                onClick={() => handleToggleDns(true)}
+                onPointerDown={(e) => {
+                  if (e.button !== 0) return;
+                  handleToggleDns(true);
+                }}
+              >
+                {isDnsLoading ? "Enabling…" : "Enable DNS Mode"}
+              </button>
+            )}
+            {/*
+              Cancel button is rendered as a SIBLING — never as a swap-in
+              replacement for the Enable/Disable button. The previous
+              layout `{isDnsLoading ? <Cancel/> : <Enable/>}` mounted
+              Cancel at the same DOM coordinate as Enable the instant
+              pointerdown fired; the trailing synthetic `click` event
+              then landed on the newly-mounted Cancel button and called
+              `cancelActiveDnsToggle()` against the in-flight
+              AbortController — the TCC dialog never appeared because
+              the Rust CancellationToken was cancelled before
+              spawn_blocking ran. Disabling the toggle button (instead
+              of unmounting it) swallows the phantom click (disabled
+              buttons fire no events) without losing the user's
+              explicit Cancel intent.
+            */}
+            {isDnsLoading && (
               <button
                 className="btn btn-danger"
                 onClick={handleCancelDns}
                 data-testid="dns-cancel-button"
               >
                 Cancel
-              </button>
-            ) : dnsEnabled ? (
-              <button
-                className="btn btn-danger"
-                onClick={() => handleToggleDns(false)}
-                onPointerDown={onPointerDown(() => handleToggleDns(false))}
-              >
-                Disable DNS Mode
-              </button>
-            ) : (
-              <button
-                className="btn btn-primary"
-                onClick={() => handleToggleDns(true)}
-                onPointerDown={onPointerDown(() => handleToggleDns(true))}
-              >
-                Enable DNS Mode
               </button>
             )}
           </div>
