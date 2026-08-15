@@ -1,9 +1,24 @@
 use mhost_apply::writer::HostsWriter;
-use mhost_core::{MhostError, OriginalDns, ProfileMode};
+use mhost_core::{AdBlockState, MhostError, OriginalDns, ProfileMode};
 use mhost_storage::migration::migrate_v1_to_v2;
 use mhost_storage::storage::{FileStorage, Storage};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use tokio::task::JoinHandle;
+
+/// Poison-recovery helper for `std::sync::Mutex` (issue #130, PR #131
+/// re-review). Returns the inner guard even if a previous holder panicked.
+///
+/// `tokio::sync::Mutex` (used by [`ApplyLock`]) does not have poison — a
+/// panicked holder releases the lock automatically — so this helper is
+/// only needed for plain `std::sync::Mutex` slots (e.g. the ad block
+/// refresh task slot and cancel slot).
+pub(crate) fn lock_or_recover<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
 
 /// Async mutex to serialize apply operations and prevent concurrent writes to /etc/hosts.
 /// Security fix (#16): Prevents race conditions when user rapidly toggles profiles.
@@ -54,6 +69,23 @@ pub struct AppState {
     pub original_dns: Mutex<OriginalDns>,
     /// 串行化 DNS 模式切换操作。
     pub dns_lock: ApplyLock,
+
+    // -------------------------------------------------------------------
+    // 广告屏蔽（issue #130）
+    // -------------------------------------------------------------------
+    /// 当前持久化的 ad block 状态（含 sources / whitelist / refresh 配置）。
+    /// 命令层 `set_*` 操作通过 `tokio::sync::RwLock::write().await` 修改，
+    /// DNS 集成读路径用 `.read().await` 拿 snapshot 喂给
+    /// `DnsServer::reload_ad_block_rules`。
+    pub ad_block_state: Arc<tokio::sync::RwLock<AdBlockState>>,
+    /// 后台 ad block 定时刷新 task 句柄（`spawn_ad_block_refresh_task`）。
+    /// `set_dns_mode_disable` / `cleanup_dns_on_exit` 时 `take()` 出来 abort。
+    pub ad_block_refresh_task: Mutex<Option<JoinHandle<()>>>,
+    /// ad block 定时刷新 task 的 cancel 令牌。
+    /// `cancel()` 唤醒 `select!` 中的 sleep 分支，让 disable / cleanup 立即
+    /// 生效；`spawn_ad_block_refresh_task` 在 spawn 前 swap 一个新 token
+    /// 避免上次 token 的 stickiness 干扰下次启用（issue #138）。
+    pub ad_block_refresh_cancel: Mutex<tokio_util::sync::CancellationToken>,
 }
 
 impl AppState {
@@ -88,6 +120,7 @@ impl AppState {
         }
 
         let storage = Arc::new(file_storage);
+        let storage_root = storage.root().to_path_buf();
         let writer = Arc::new(HostsWriter::new());
 
         // 从 manifest 恢复 DNS 模式状态（不存在则创建默认）
@@ -131,17 +164,66 @@ impl AppState {
             }
         }
 
-        Ok(Self {
+        let dns_server = Arc::new(Mutex::new(dns_server_opt));
+
+        let state = Self {
             storage,
             writer,
             apply_lock: ApplyLock(tokio::sync::Mutex::new(())),
             snapshot_lock: ApplyLock(tokio::sync::Mutex::new(())),
             last_profile_ids: Mutex::new(Vec::new()),
-            dns_server: Arc::new(Mutex::new(dns_server_opt)),
+            dns_server,
             dns_enabled: AtomicBool::new(dns_enabled),
             original_dns: Mutex::new(original_dns),
             dns_lock: ApplyLock(tokio::sync::Mutex::new(())),
-        })
+            // Ad block（issue #130）：从 adblock.json 恢复，损坏时自动备份。
+            ad_block_state: Arc::new(tokio::sync::RwLock::new(
+                mhost_storage::adblock::read_state_or_default_with_backup(&storage_root),
+            )),
+            ad_block_refresh_task: Mutex::new(None),
+            ad_block_refresh_cancel: Mutex::new(tokio_util::sync::CancellationToken::new()),
+        };
+
+        // 冷启动自动恢复（PR #131 review P1-1）：如果上次退出时
+        // dns_enabled=true，DNS server 已经起来 + 持久化的 ad-block
+        // 状态已加载；立即 hot-reload 当前规则到刚构造的 engine，并启动
+        // 定时刷新 task。否则会有一段「DNS 通了但 ad-block 没生效」的空窗。
+        //
+        // **PR #154 review (P2) defensive**: `classify_rules` is sync and
+        // reads each source's cache file from disk + parses 100k+ domains.
+        // On a slow filesystem (network mount, encrypted APFS) this could
+        // block `AppState::new` for seconds. Wrap the read+parse+reload
+        // in `spawn_blocking` so it runs on a dedicated blocking thread.
+        // `spawn_ad_block_refresh_task` itself is async (it spawns a
+        // tokio task + schedules a select!), so it stays on the async
+        // runtime — only the sync pipeline needs the offload.
+        if state.dns_enabled.load(Ordering::Relaxed) {
+            let snap = state.ad_block_state.read().await.clone();
+            let storage_root = state.storage.root().to_path_buf();
+            let dns_server = Arc::clone(&state.dns_server);
+            let result = tokio::task::spawn_blocking(move || {
+                let (za, nx, wl) = crate::commands::adblock::classify_rules(&snap, &storage_root);
+                if let Some(server) = crate::state::lock_or_recover(&dns_server).as_ref() {
+                    server.reload_ad_block_rules(za, nx, wl);
+                }
+            })
+            .await;
+            if let Err(e) = result {
+                eprintln!(
+                    "[mHost] cold-start ad-block reload join error: {} (continuing without hot-reload)",
+                    e
+                );
+            }
+            crate::commands::dns::spawn_ad_block_refresh_task(
+                &state.ad_block_refresh_task,
+                &state.ad_block_state,
+                &state.dns_server,
+                &state.storage,
+                &state.ad_block_refresh_cancel,
+            );
+        }
+
+        Ok(state)
     }
 
     /// 尝试自动恢复 DNS 服务。

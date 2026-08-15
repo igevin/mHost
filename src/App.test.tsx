@@ -22,6 +22,14 @@ vi.mock("./lib/tauri", () => ({
   rollbackHosts: vi.fn(),
   exportProfileToFile: vi.fn(),
   duplicateProfile: vi.fn(),
+  // AdBlock IPCs (issue #130) — App fetches ad-block state on mount.
+  getAdBlockState: vi.fn().mockResolvedValue({
+    enabled: false,
+    sources: [],
+    whitelist: [],
+    auto_refresh_enabled: true,
+    refresh_interval_hours: 24,
+  }),
 }));
 
 vi.mock("@tauri-apps/plugin-dialog", () => ({
@@ -49,9 +57,22 @@ describe("App", () => {
       );
     });
 
-    expect(listenMock).toHaveBeenCalledTimes(1);
-    expect(listenMock).toHaveBeenCalledWith(
+    // PR #154 review (P2): keep total call count so a double-registration
+// regression is caught. We register 2 listeners per mount: `tray:profiles-updated`
+// (profile refresh) and `navigate` (issue #130 tray deep-link). React
+// StrictMode in dev causes double mount → 2 × 2 = 4 calls. Use `>=` to
+// tolerate the StrictMode double-mount while still catching obvious
+// regression cases (e.g. a third registration).
+expect(listenMock.mock.calls.length).toBeGreaterThanOrEqual(2);
+expect(listenMock).toHaveBeenCalledWith(
       "tray:profiles-updated",
+      expect.any(Function),
+    );
+    // issue #130: also listens for the tray-driven `navigate` event so the
+    // "广告屏蔽" menu item can deep-link to /ad-block without coupling
+    // backend to router.
+    expect(listenMock).toHaveBeenCalledWith(
+      "navigate",
       expect.any(Function),
     );
   });
@@ -93,7 +114,8 @@ describe("App", () => {
       unmountFn = unmount;
     });
 
-    expect(listenMock).toHaveBeenCalledTimes(1);
+    // Same count assertion as the first test — guards against double-register.
+    expect(listenMock.mock.calls.length).toBeGreaterThanOrEqual(2);
 
     await act(async () => {
       unmountFn();

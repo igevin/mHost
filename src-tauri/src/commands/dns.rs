@@ -1,9 +1,12 @@
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 
 use mhost_core::{MhostError, OriginalDns, ProfileMode};
 use tauri::State;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
-use crate::state::AppState;
+use crate::state::{lock_or_recover, AppState};
 
 /// 启动/停止 DNS 模式。
 ///
@@ -182,6 +185,30 @@ async fn set_dns_mode_enable(state: &AppState) -> Result<(), MhostError> {
     }
     state.dns_enabled.store(true, Ordering::Relaxed);
 
+    // 9. 广告屏蔽（issue #130）：启用 DNS 后立即把当前 ad-block 状态
+    //    hot-reload 到新 server，并启动定时刷新 task。task 在 disable
+    //    时被 abort。
+    //
+    //    9a. 即时 reload：spawn_ad_block_refresh_task 在
+    //    auto_refresh_enabled=false 或 interval=0 时不会 spawn，但用户
+    //    仍期望持久化的 ad-block 规则立即生效。所以这里显式做一次
+    //    classify + reload，与 AppState::new 冷启动路径一致。
+    //
+    //    9b. 这里复用了 commands::adblock 的 `classify_rules` + 重载路径
+    //    的等价逻辑（避免循环依赖和 IPC 边界），不经过 IPC handler。
+    let snap = state.ad_block_state.read().await.clone();
+    let (za, nx, wl) = crate::commands::adblock::classify_rules(&snap, state.storage.root());
+    if let Some(server) = lock_or_recover(&state.dns_server).as_ref() {
+        server.reload_ad_block_rules(za, nx, wl);
+    }
+    spawn_ad_block_refresh_task(
+        &state.ad_block_refresh_task,
+        &state.ad_block_state,
+        &state.dns_server,
+        &state.storage,
+        &state.ad_block_refresh_cancel,
+    );
+
     Ok(())
 }
 
@@ -264,6 +291,16 @@ async fn set_dns_mode_disable(state: &AppState, interactive: bool) -> Result<(),
 
     // 5. 清 in-memory dns_enabled
     state.dns_enabled.store(false, Ordering::Relaxed);
+
+    // 6. 终止广告屏蔽后台刷新 task（issue #130, #138）。enable 时 spawn，
+    //    disable 必须 abort；不 abort 会让 task 继续跑并尝试 reload
+    //    已停的 server。**先 cancel 再 abort**：cancel 让 refresh loop
+    //    的 `select!` 醒来并把 spawn_blocking 闭包里的
+    //    `is_cancelled()` check 触发，从而避免在已停的 server 上
+    //    reload。abort 是兜底：如果 task 还卡在 select 之外（比如
+    //    spawn_blocking 闭包刚起来），cancel() 的 wake 不会传到那里。
+    cancel_ad_block_refresh_task(&state.ad_block_refresh_cancel);
+    abort_ad_block_refresh_task(&state.ad_block_refresh_task);
 
     Ok(())
 }
@@ -384,6 +421,9 @@ mod tests {
             dns_enabled: AtomicBool::new(false),
             original_dns: Mutex::new(OriginalDns::DhcpEmpty),
             dns_lock: ApplyLock::new(),
+            ad_block_state: Arc::new(tokio::sync::RwLock::new(mhost_core::AdBlockState::default())),
+            ad_block_refresh_task: Mutex::new(None),
+            ad_block_refresh_cancel: Mutex::new(tokio_util::sync::CancellationToken::new()),
         };
         // dns_enabled = false → cleanup 应直接返回 Ok
         let result = cleanup_dns_on_exit(&state, false).await;
@@ -422,6 +462,9 @@ mod tests {
             dns_enabled: AtomicBool::new(true), // 假装启用 → cleanup 会走 disable 路径
             original_dns: Mutex::new(OriginalDns::DhcpEmpty), // DhcpEmpty → 写 Empty
             dns_lock: ApplyLock::new(),
+            ad_block_state: Arc::new(tokio::sync::RwLock::new(mhost_core::AdBlockState::default())),
+            ad_block_refresh_task: Mutex::new(None),
+            ad_block_refresh_cancel: Mutex::new(tokio_util::sync::CancellationToken::new()),
         };
         // cleanup_dns_on_exit → set_dns_mode_disable(interactive=false)
         //   - original 是 DhcpEmpty → 只打印 warning（不返回 Err，bug 1 修复）
@@ -473,6 +516,9 @@ mod tests {
             dns_enabled: AtomicBool::new(true),
             original_dns: Mutex::new(OriginalDns::DhcpEmpty),
             dns_lock: ApplyLock::new(),
+            ad_block_state: Arc::new(tokio::sync::RwLock::new(mhost_core::AdBlockState::default())),
+            ad_block_refresh_task: Mutex::new(None),
+            ad_block_refresh_cancel: Mutex::new(tokio_util::sync::CancellationToken::new()),
         };
 
         // 第一次 cleanup：跑 disable 路径。注意必须用 interactive=false
@@ -545,4 +591,229 @@ pub async fn get_dns_status(
         Err(poisoned) => build(poisoned.into_inner().as_ref(), original_dns),
     };
     Ok(status)
+}
+/// Abort the periodic ad-block refresh task if one is registered.
+///
+/// The disable path (issue #130) is the only legitimate caller:
+/// `spawn_ad_block_refresh_task` registers a `JoinHandle` on enable, and
+/// `set_dns_mode_disable` MUST cancel it — otherwise the task keeps
+/// running and tries to `reload_ad_block_rules` on a server that's
+/// already been stopped, surfacing confusing errors at the next refresh
+/// tick.
+///
+/// Extracted from the inline `if let Some(h) = ...take() { h.abort() }`
+/// in `set_dns_mode_disable` so the abort behavior is unit-testable
+/// without going through the full disable path (issue #134). The full
+/// path calls `mhost_dns::platform::disable_dns_mode` which returns Err
+/// in unit tests (no proxy + non-interactive), short-circuiting before
+/// the abort step — so testing through the public API would not
+/// actually exercise the abort contract.
+///
+/// **This helper only signals cancellation.** It does NOT wait for the
+/// task to actually terminate, and it does NOT abort any `spawn_blocking`
+/// closure the task may have entered (Tokio explicitly does not support
+/// aborting blocking work once started). The full "refresh work is dead
+/// by the time we return" guarantee is a separate concern tracked as a
+/// follow-up issue; see the test module's section comment for context.
+///
+/// Returns `true` if a task was found and `abort()` was called on it,
+/// `false` if the slot was empty (idempotent re-disable, or
+/// disable-before-enable).
+fn abort_ad_block_refresh_task(slot: &Mutex<Option<JoinHandle<()>>>) -> bool {
+    if let Some(handle) = lock_or_recover(slot).take() {
+        handle.abort();
+        true
+    } else {
+        false
+    }
+}
+
+/// Cooperatively cancel the periodic ad-block refresh task.
+///
+/// Pair to `abort_ad_block_refresh_task`. Where the latter force-cancels
+/// the outer task via `JoinHandle::abort()` (which cannot interrupt
+/// in-flight `spawn_blocking` closures — see issue #138), the cancel
+/// token lets the task's `tokio::select!` wake up immediately and lets
+/// any `spawn_blocking` closure observe `is_cancelled()` and bail before
+/// mutating a stopped `DnsServer`.
+///
+/// The disable path calls cancel **before** abort so the cooperative
+/// path runs first; the abort is the fallback for any work that is past
+/// the select point.
+///
+/// Idempotent: calling on an already-cancelled token is a no-op.
+fn cancel_ad_block_refresh_task(slot: &Mutex<CancellationToken>) {
+    lock_or_recover(slot).cancel();
+}
+
+/// Spawn the periodic ad-block refresh task (issue #130).
+///
+/// Called from two places:
+///   1. `set_dns_mode_enable` after the DNS server comes up — the
+///      "normal" hot path.
+///   2. `AppState::new` after `try_recover_dns` succeeds — PR #131
+///      review finding 0.1: previously, an auto-recovered DNS session
+///      lost its periodic refresh because the task was only spawned on
+///      the user-driven enable path.
+///
+/// The function takes individual Arcs rather than `&AppState` so it can
+/// be invoked while `AppState` is being constructed (item 2).
+///
+/// **Issue #138 follow-up (re-enable):** the cancel slot is **swapped**
+/// for a fresh, uncancelled token on every spawn — `CancellationToken`
+/// is sticky, so without this swap a disable → re-enable cycle would
+/// hand the new task the old (already cancelled) token, causing its
+/// `select!` to match `cancel.cancelled()` on iter 0 and exit
+/// immediately. See `test_re_enable_after_disable_respawns_with_fresh_token`.
+///
+/// The task:
+/// 1. Reads `refresh_interval_hours` from `ad_block_state`.
+/// 2. Sleeps for the interval (or until the cancel token fires).
+/// 3. Refreshes all enabled sources + hot-reloads the engine.
+/// 4. Exits cleanly when the current `ad_block_refresh_cancel` is cancelled.
+///
+/// `refresh_interval_hours == 0` or `auto_refresh_enabled == false` short-
+/// circuits — task is not spawned at all (callers don't need to abort it).
+///
+/// **Issue #138:** The disable path now signals a `CancellationToken` (see
+/// `cancel_ad_block_refresh_task`) *before* aborting. The select! below
+/// wakes on `token.cancelled()` and the loop exits without relying on
+/// `JoinHandle::abort()` reaching a yield point. The `spawn_blocking`
+/// closure inside the loop also checks `token.is_cancelled()` immediately
+/// before calling `reload_ad_block_rules` — that's the layer that protects
+/// against an in-flight `classify_rules` that started before cancel
+/// landed. `spawn_blocking` work cannot be interrupted by `JoinHandle::
+/// abort()` (tokio explicitly documents this), so the self-check is the
+/// only reliable way to avoid a `reload_ad_block_rules` call landing on
+/// a `DnsServer` that's already been stopped. The `lock_or_recover`
+/// on `dns_server` already serializes against the disable path's `.take()`,
+/// so the cancel check is mainly an early-exit optimization against a
+/// `reload_ad_block_rules` racing with `server.stop()`.
+pub(crate) fn spawn_ad_block_refresh_task(
+    task_slot: &std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    ad_block_state: &Arc<tokio::sync::RwLock<mhost_core::AdBlockState>>,
+    dns_server: &Arc<std::sync::Mutex<Option<mhost_dns::DnsServer>>>,
+    storage: &Arc<dyn mhost_storage::storage::Storage + Send + Sync>,
+    cancel_slot: &Mutex<CancellationToken>,
+) {
+    let cfg = match ad_block_state.try_read() {
+        Ok(g) => (g.auto_refresh_enabled, g.refresh_interval_hours),
+        Err(_) => return,
+    };
+    if !cfg.0 || cfg.1 == 0 {
+        return;
+    }
+
+    // Issue #138 follow-up (re-enable): swap the cancel slot for a fresh
+    // token so this task is unaffected by a previous disable's `cancel()`.
+    // `CancellationToken::cancel()` is sticky — if we just cloned the
+    // existing (already cancelled) token, the spawned task's first
+    // `select!` arm would match `cancel.cancelled()` on iter 0 and break
+    // out of the loop without ever ticking.
+    let cancel = CancellationToken::new();
+    *lock_or_recover(cancel_slot) = cancel.clone();
+
+    // Clone the few Arcs we need into the task closure. We don't share the
+    // whole AppState (which contains unrelated Mutexes like snapshot_lock)
+    // to keep the lock-contention surface minimal. The cancel token is
+    // cheap to clone (it's a refcount + an atomic flag).
+    let storage = storage.clone();
+    let ad_block_state = ad_block_state.clone();
+    let dns_server = dns_server.clone();
+
+    let interval_secs = (cfg.1 as u64).saturating_mul(3600).max(3600); // floor 1h
+    let handle = tokio::spawn(async move {
+        loop {
+            // Sleep OR cancellation. The select! is the **first** thing
+            // the loop checks so disable can interrupt even a long
+            // inter-tick sleep.
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(interval_secs)) => {}
+                _ = cancel.cancelled() => {
+                    // Disable path fired the token. Exit the loop cleanly.
+                    break;
+                }
+            }
+
+            // Re-read config — user may have changed interval or disabled
+            // auto-refresh since the last tick.
+            let (auto, interval_h, enabled) = {
+                let Ok(g) = ad_block_state.try_read() else {
+                    continue;
+                };
+                (g.auto_refresh_enabled, g.refresh_interval_hours, g.enabled)
+            };
+            if !auto || interval_h == 0 || !enabled {
+                continue;
+            }
+
+            // Snapshot IDs (best-effort; failures logged not propagated).
+            let ids: Vec<mhost_core::SourceId> = {
+                let Ok(g) = ad_block_state.try_read() else {
+                    continue;
+                };
+                g.sources
+                    .iter()
+                    .filter(|s| s.enabled)
+                    .map(|s| s.source_id.clone())
+                    .collect()
+            };
+
+            // Concurrent fetch — bounded by REFRESH_CONCURRENCY. PR #131
+            // review finding 1.4: serial loop meant a multi-source list
+            // could block for `N × FETCH_TIMEOUT_SECS` while the next
+            // periodic tick waited its turn.
+            //
+            // Note: `fetch_sources_concurrent` is a regular async fn, not
+            // spawn_blocking, so `cancel.cancelled()` racing with it would
+            // not interrupt it. We accept that one fetch round may run to
+            // completion after disable; the spawn_blocking step below is
+            // the critical one (it mutates the server), and that's where
+            // the self-check lives.
+            crate::commands::adblock::fetch_sources_concurrent(
+                &storage,
+                &ad_block_state,
+                &ids,
+                crate::commands::adblock::REFRESH_CONCURRENCY,
+            )
+            .await;
+
+            // Bail before spawn_blocking if the token is already set —
+            // the per-tick check above the fetch is informational only,
+            // cancel may have landed during the fetch.
+            if cancel.is_cancelled() {
+                break;
+            }
+
+            // Hot-reload engine if DNS still on. We use the dns_server
+            // slot as the proxy signal AND the cancel token as the
+            // authoritative one — the slot can race with the disable
+            // path between the check and the reload call below.
+            if lock_or_recover(&dns_server).is_some() {
+                let snap = ad_block_state.read().await.clone();
+                let root = storage.root().to_path_buf();
+                let dns_server_clone = Arc::clone(&dns_server);
+                let cancel_in_closure = cancel.clone();
+                // Issue #133: classify_rules reads + parses each source's
+                // cache file synchronously — 100k+ domains can block a
+                // tokio worker for seconds. Move it off the async runtime.
+                let _ = tokio::task::spawn_blocking(move || {
+                    // Self-check (issue #138) — abort() can't reach us; bail on cancel.
+                    if cancel_in_closure.is_cancelled() {
+                        return;
+                    }
+                    let (za, nx, wl) = crate::commands::adblock::classify_rules(&snap, &root);
+                    if cancel_in_closure.is_cancelled() {
+                        return;
+                    }
+                    if let Some(server) = lock_or_recover(&dns_server_clone).as_ref() {
+                        server.reload_ad_block_rules(za, nx, wl);
+                    }
+                })
+                .await;
+            }
+        }
+    });
+
+    *lock_or_recover(task_slot) = Some(handle);
 }

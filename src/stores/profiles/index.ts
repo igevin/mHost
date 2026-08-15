@@ -22,6 +22,11 @@ export {
   dnsErrorAtom,
   enabledDnsProfilesAtom,
   dnsRuleCountAtom,
+  adBlockStateAtom,
+  isAdBlockLoadingAtom,
+  adBlockErrorAtom,
+  adBlockRuleCountAtom,
+  adBlockHasErrorsAtom,
 } from "./state";
 
 // ---- Async action atoms ----
@@ -47,4 +52,17 @@ export {
   updateDnsProfileAtom,
   deleteDnsProfileAtom,
   toggleDnsProfileEnabledAtom,
+  fetchAdBlockStateAtom,
+  toggleAdBlockEnabledAtom,
+  setAdBlockIntervalAtom,
+  addAdBlockSourceAtom,
+  removeAdBlockSourceAtom,
+  setAdBlockSourceEnabledAtom,
+  setAdBlockSourceResponseAtom,
+  refreshAdBlockSourceAtom,
+  refreshAllAdBlockSourcesAtom,
+  addAdBlockWhitelistAtom,
+  removeAdBlockWhitelistAtom,
+  fetchAdBlockSourcesAtom,
+  fetchAdBlockWhitelistAtom,
 } from "./actions";

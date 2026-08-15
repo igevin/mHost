@@ -1,5 +1,16 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Profile, ApplyPlan, ValidateResult, ExportFormat, SnapshotMeta, DnsStatus, ProfileMode } from "../types";
+import type {
+  Profile,
+  ApplyPlan,
+  ValidateResult,
+  ExportFormat,
+  SnapshotMeta,
+  DnsStatus,
+  ProfileMode,
+  AdBlockState,
+  AdBlockSource,
+  AdBlockResponse,
+} from "../types";
 
 // ---- Profile commands ----
 
@@ -147,6 +158,78 @@ export async function getDnsStatus(): Promise<DnsStatus> {
 
 export async function listDnsProfiles(): Promise<Profile[]> {
   return invoke("list_dns_profiles");
+}
+
+// ---- AdBlock commands (issue #130) ----
+
+export async function getAdBlockState(): Promise<AdBlockState> {
+  return invoke<AdBlockState>("get_ad_block_state");
+}
+
+export async function setAdBlockEnabled(enabled: boolean): Promise<void> {
+  return invoke<void>("set_ad_block_enabled", { enabled });
+}
+
+export async function setAdBlockRefreshInterval(hours: number): Promise<void> {
+  return invoke<void>("set_ad_block_refresh_interval", { hours });
+}
+
+export async function listAdBlockSources(): Promise<AdBlockSource[]> {
+  return invoke<AdBlockSource[]>("list_ad_block_sources");
+}
+
+export async function addAdBlockSource(
+  name: string,
+  url: string,
+  response: AdBlockResponse,
+): Promise<AdBlockSource> {
+  return invoke<AdBlockSource>("add_ad_block_source", { name, url, response });
+}
+
+export async function removeAdBlockSource(sourceId: string): Promise<void> {
+  return invoke<void>("remove_ad_block_source", { sourceId });
+}
+
+export async function setAdBlockSourceEnabled(
+  sourceId: string,
+  enabled: boolean,
+): Promise<AdBlockSource> {
+  return invoke<AdBlockSource>("set_ad_block_source_enabled", {
+    sourceId,
+    enabled,
+  });
+}
+
+export async function setAdBlockSourceResponse(
+  sourceId: string,
+  response: AdBlockResponse,
+): Promise<AdBlockSource> {
+  return invoke<AdBlockSource>("set_ad_block_source_response", {
+    sourceId,
+    response,
+  });
+}
+
+export async function refreshAdBlockSource(
+  sourceId: string,
+): Promise<AdBlockSource> {
+  return invoke<AdBlockSource>("refresh_ad_block_source", { sourceId });
+}
+
+export async function refreshAllAdBlockSources(): Promise<AdBlockSource[]> {
+  return invoke<AdBlockSource[]>("refresh_all_ad_block_sources");
+}
+
+export async function listAdBlockWhitelist(): Promise<string[]> {
+  return invoke<string[]>("list_ad_block_whitelist");
+}
+
+export async function addAdBlockWhitelist(domain: string): Promise<string[]> {
+  return invoke<string[]>("add_ad_block_whitelist", { domain });
+}
+
+export async function removeAdBlockWhitelist(domain: string): Promise<string[]> {
+  return invoke<string[]>("remove_ad_block_whitelist", { domain });
 }
 
 // ---- Update commands ----

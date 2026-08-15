@@ -17,6 +17,7 @@ use tokio::task::JoinHandle;
 
 use crate::config::DnsConfig;
 use crate::resolver::RuleEngine;
+use crate::AdBlockEngine;
 
 /// DNS 服务错误。
 #[derive(Debug, thiserror::Error)]
@@ -88,6 +89,11 @@ pub struct DnsServer {
     ///   - 锁从 `std::sync::Mutex` 换 `parking_lot::Mutex`：parking_lot 比 std
     ///     Mutex 在非竞争路径更快、poison-free（这里我们不需要处理 poison）。
     cache: Arc<PlMutex<LruCache<Box<str>, CacheEntry>>>,
+    /// Ad block engine（issue #130）。Lookup 在 `handle_address_query`
+    /// 第一步执行（在本地 `rule_engine.resolve` 之前），拦截广告域名
+    /// 返回 0.0.0.0 / NXDOMAIN。共享 `Arc` 让 spawn 任务零锁读 + 命令
+    /// 层通过 `reload_ad_block_rules` 在外面 hot-reload。
+    ad_block_engine: Arc<AdBlockEngine>,
 }
 
 impl DnsServer {
@@ -114,6 +120,7 @@ impl DnsServer {
             refresh_handle: Mutex::new(None),
             refresh_shutdown: Arc::new(tokio::sync::Notify::new()),
             cache: Arc::new(PlMutex::new(LruCache::new(cache_size))),
+            ad_block_engine: Arc::new(AdBlockEngine::new()),
         })
     }
 
@@ -171,6 +178,7 @@ impl DnsServer {
         // 也不阻塞 refresh task 的 write 锁。
         let resolver_slot = Arc::clone(&self.resolver);
         let cache = self.cache.clone();
+        let ad_block_engine = self.ad_block_engine.clone();
 
         let handle = tokio::spawn(async move {
             let mut buf = vec![0u8; UDP_BUF_SIZE];
@@ -187,6 +195,7 @@ impl DnsServer {
                         let response_data = match handle_dns_request(
                             request_data,
                             &rule_engine,
+                            &ad_block_engine,
                             &resolver,
                             &cache,
                         ).await {
@@ -335,6 +344,38 @@ impl DnsServer {
         self.cache.lock().clear();
     }
 
+    /// 重新加载广告屏蔽规则（issue #130）。
+    ///
+    /// 与 `reload_rules` 同等语义：rebuild 引擎后清空 LRU 缓存，
+    /// 否则 reload 前向上游查过并缓存的域名仍会返回 stale upstream IP，
+    /// 覆盖新的 ad-block 命中（issue #132 follow-up）。
+    pub fn reload_ad_block_rules(
+        &self,
+        zero_addr_rules: std::collections::HashMap<String, std::net::IpAddr>,
+        nxdomain_rules: std::collections::HashSet<String>,
+        whitelist: std::collections::HashSet<String>,
+    ) {
+        self.ad_block_engine
+            .rebuild(zero_addr_rules, nxdomain_rules, whitelist);
+        self.cache.lock().clear();
+    }
+
+    /// 广告屏蔽规则数量（含 nxdomain + zero_addr，**不含** whitelist）。
+    pub fn ad_block_rule_count(&self) -> usize {
+        self.ad_block_engine.rule_count()
+    }
+
+    /// 白名单条目数量。
+    pub fn ad_block_whitelist_size(&self) -> usize {
+        self.ad_block_engine.whitelist_size()
+    }
+
+    /// 测试用：直接拿到 AdBlockEngine。
+    #[doc(hidden)]
+    pub fn ad_block_engine_for_test(&self) -> Arc<crate::adblock::AdBlockEngine> {
+        Arc::clone(&self.ad_block_engine)
+    }
+
     /// 是否正在运行。
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::SeqCst)
@@ -386,6 +427,7 @@ impl DnsServer {
 async fn handle_dns_request(
     request_data: &[u8],
     rule_engine: &RuleEngine,
+    ad_block_engine: &AdBlockEngine,
     resolver: &Arc<TokioAsyncResolver>,
     cache: &Arc<PlMutex<LruCache<Box<str>, CacheEntry>>>,
 ) -> Option<Vec<u8>> {
@@ -465,7 +507,16 @@ async fn handle_dns_request(
         return build_notimp_response(&request, &query);
     }
 
-    match handle_address_query(name_str, query.name(), record_type, rule_engine, resolver).await {
+    match handle_address_query(
+        name_str,
+        query.name(),
+        record_type,
+        rule_engine,
+        ad_block_engine,
+        resolver,
+    )
+    .await
+    {
         QueryResult::Answer(record) => {
             let ttl = record.ttl();
             // **fix (P-R2, issue #90)**: `*record.clone()` 之前是 `clone Box + deref`
@@ -483,6 +534,7 @@ async fn handle_dns_request(
             response_bytes
         }
         QueryResult::NoError => build_noerror_response(&request, &query),
+        QueryResult::NxDomain => build_nxdomain_response(&request, &query),
         QueryResult::ServFail => build_servfail_response(&request, &query),
     }
 }
@@ -564,6 +616,25 @@ fn build_servfail_response(request: &Message, query: &Query) -> Option<Vec<u8>> 
     }
 }
 
+/// 构造 NXDOMAIN 响应（issue #130 ad block NxDomain 响应类型专用）。
+fn build_nxdomain_response(request: &Message, query: &Query) -> Option<Vec<u8>> {
+    let mut header = Header::response_from_request(request.header());
+    header.set_authoritative(false);
+    header.set_recursion_available(true);
+    header.set_response_code(ResponseCode::NXDomain);
+    let mut response = Message::new();
+    response.set_header(header);
+    response.set_id(request.id());
+    response.add_query(query.clone());
+    match response.to_bytes() {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            tracing::warn!("Failed to encode NXDOMAIN response: {}", e);
+            None
+        }
+    }
+}
+
 /// 构造 NotImp 响应（不支持的查询类型）。
 fn build_notimp_response(request: &Message, query: &Query) -> Option<Vec<u8>> {
     let mut header = Header::response_from_request(request.header());
@@ -586,6 +657,8 @@ fn build_notimp_response(request: &Message, query: &Query) -> Option<Vec<u8>> {
 enum QueryResult {
     Answer(Box<Record>),
     NoError,
+    /// NXDOMAIN 响应（ad block NxDomain 响应类型专用）。
+    NxDomain,
     ServFail,
 }
 
@@ -595,8 +668,45 @@ async fn handle_address_query(
     name: &Name,
     qtype: RecordType,
     rule_engine: &RuleEngine,
+    ad_block_engine: &AdBlockEngine,
     resolver: &Arc<TokioAsyncResolver>,
 ) -> QueryResult {
+    // 0. 广告屏蔽（issue #130）：在常规规则之前拦截。
+    if let Some(action) = ad_block_engine.check(name_str) {
+        match action {
+            crate::adblock::AdBlockAction::NxDomain => return QueryResult::NxDomain,
+            crate::adblock::AdBlockAction::ZeroAddress(ip) => {
+                let record = match (qtype, ip) {
+                    (RecordType::A, IpAddr::V4(v4)) => Some(Record::from_rdata(
+                        name.clone(),
+                        LOCAL_RULE_TTL,
+                        RData::A(A(v4)),
+                    )),
+                    (RecordType::AAAA, IpAddr::V6(v6)) => {
+                        use hickory_proto::rr::rdata::AAAA;
+                        Some(Record::from_rdata(
+                            name.clone(),
+                            LOCAL_RULE_TTL,
+                            RData::AAAA(AAAA(v6)),
+                        ))
+                    }
+                    // qtype 与规则 IP family 不匹配（如 AAAA 命中 IPv4 规则）：
+                    // 返回 NxDomain 而非 NoError。NoError + 空答案在 RFC 2308
+                    // 语义里是「name 存在但无此 type 记录」，等于放行让
+                    // 上游继续解析 —— 把广告屏蔽的意图完全绕开了。
+                    // （review feedback：PR #154 P1）
+                    _ => return QueryResult::NxDomain,
+                };
+                return match record {
+                    Some(r) => QueryResult::Answer(Box::new(r)),
+                    // 同样不可能到这里（family mismatch 已返回 NxDomain），
+                    // 但保留分支以防御未来新增的 family 类型。
+                    None => QueryResult::NxDomain,
+                };
+            }
+        }
+    }
+
     // 1. 优先匹配本地规则
     if let Some(ip) = rule_engine.resolve(name_str) {
         let record = match (qtype, ip) {
@@ -1552,7 +1662,7 @@ mod tests {
         // 所以两次都是 cache miss（首次）。但本地规则对 AAAA 不匹配 →
         // 返回 NoError。如果 cache key 没区分 type，第二次 A 查询可能
         // 拿到 AAAA 的 NoError 响应（错误）。
-        async fn query_once(server: &DnsServer, port: u16, qtype: RecordType) -> Vec<u8> {
+        async fn query_once(_server: &DnsServer, port: u16, qtype: RecordType) -> Vec<u8> {
             let query_name = Name::from_utf8("typed.example.com.").unwrap();
             let query = Query::query(query_name, qtype);
             let mut request = Message::new();

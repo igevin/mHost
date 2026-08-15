@@ -1,5 +1,5 @@
 import { atom } from "jotai";
-import type { Profile, DnsStatus } from "../../types";
+import type { Profile, DnsStatus, AdBlockState } from "../../types";
 import { countRealRules } from "../../lib/rules";
 
 // ---- Base atoms ----
@@ -60,3 +60,23 @@ export const applyTargetAtom = atom<{ id: string; enabled: boolean } | null>(nul
 export const snapshotsAtom = atom<import("../../types").SnapshotMeta[]>([]);
 export const isLoadingSnapshotsAtom = atom(false);
 export const snapshotErrorAtom = atom<string | null>(null);
+
+// ---- AdBlock atoms (issue #130) ----
+
+export const adBlockStateAtom = atom<AdBlockState | null>(null);
+export const isAdBlockLoadingAtom = atom(false);
+export const adBlockErrorAtom = atom<string | null>(null);
+
+export const adBlockRuleCountAtom = atom((get) => {
+  const state = get(adBlockStateAtom);
+  if (!state) return 0;
+  return state.sources
+    .filter((s) => s.enabled)
+    .reduce((sum, s) => sum + s.rule_count, 0);
+});
+
+export const adBlockHasErrorsAtom = atom((get) => {
+  const state = get(adBlockStateAtom);
+  if (!state) return false;
+  return state.sources.some((s) => s.last_error !== null);
+});

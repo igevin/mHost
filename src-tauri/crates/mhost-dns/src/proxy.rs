@@ -504,6 +504,14 @@ pub(crate) mod tests {
     pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     /// 持锁 guard，测试结束时自动 drop。
+    ///
+    /// **lint 抑制**：`await_holding_lock` lint 会触发，但我们**故意**
+    /// 让 guard 跨越 `.await` —— 这些测试共享文件系统（runtime_dir、
+    /// signal file），用 Mutex 串行化保证它们不会和并行运行的其他测试
+    /// 相互覆盖。`.drop(test_lock())` 会破坏这个序列化（已验证：drop
+    /// 后 `test_check_shutdown_signal` + `test_read_original_dns_from_file`
+    /// 并行跑会偶发失败）。
+    #[allow(clippy::await_holding_lock)]
     pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
         TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -543,6 +551,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_proxy_concurrent_clients() {
         // 关键测试：两个 client 并发，proxy 不能把 response 交叉
         let query_a = b"QUERY_A".to_vec();
@@ -624,9 +633,16 @@ pub(crate) mod tests {
         // 简化版集成测试：spawn proxy，**不**写 file signal，proxy
         // 应该持续运行（不主动退出）。验证 poll 不会让 proxy 误退出。
         // 完整 shutdown 行为用 dev 模式手动验证。
+        //
+        // **lint 选择**：lock 只用于序列化 setup（清理 signal file + 写
+        // tempdir + 启动 proxy）。后续的 `sleep(1500ms)` 不再触及共享
+        // 文件系统状态，提前 drop 避免 `await_holding_lock`。
         let _lock = test_lock();
         let _tmp = set_test_runtime_dir();
         let _ = std::fs::remove_file(crate::platform::shutdown_signal_file());
+        // 释放 lock：setup 已完成（tempdir + signal file + port），
+        // 接下来的 `UdpSocket::bind().await` + spawn 不需要再串行化。
+        drop(_lock);
 
         let listen_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let listen_port = listen_socket.local_addr().unwrap().port();
@@ -634,8 +650,6 @@ pub(crate) mod tests {
         let mut proxy = DnsProxy::new(listen_port, 1053);
         let _ = proxy.take_shutdown_sender();
         let proxy_handle = tokio::spawn(async move { proxy.run().await });
-        drop(_lock);
-
         // 等 1.5s（覆盖至少 1 个 poll tick）。proxy 不应该退出。
         tokio::time::sleep(Duration::from_millis(1500)).await;
         assert!(
@@ -667,7 +681,7 @@ pub(crate) mod tests {
         tokio::spawn(async move {
             let mut buf = vec![0u8; 4096];
             // 仅 recv 不 reply，让每个 query 等待 5s 超时
-            while let Ok(_) = upstream_socket.recv_from(&mut buf).await {}
+            while upstream_socket.recv_from(&mut buf).await.is_ok() {}
         });
 
         let listen_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -715,6 +729,7 @@ pub(crate) mod tests {
     /// `available_permits()` 验证首批 N 个 query 正好占满了所有 permit，
     /// 后续 query 被丢弃。
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_proxy_semaphore_blocks_excess_spawns() {
         let _lock = test_lock();
         let _tmp = set_test_runtime_dir();
@@ -727,7 +742,7 @@ pub(crate) mod tests {
         let upstream_port = upstream_socket.local_addr().unwrap().port();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 4096];
-            while let Ok(_) = upstream_socket.recv_from(&mut buf).await {}
+            while upstream_socket.recv_from(&mut buf).await.is_ok() {}
         });
 
         let listen_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
