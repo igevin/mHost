@@ -2,7 +2,7 @@ use mhost_apply::writer::HostsWriter;
 use mhost_core::{AdBlockState, MhostError, OriginalDns, ProfileMode};
 use mhost_storage::migration::migrate_v1_to_v2;
 use mhost_storage::storage::{FileStorage, Storage};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::task::JoinHandle;
 
@@ -164,13 +164,15 @@ impl AppState {
             }
         }
 
-        Ok(Self {
+        let dns_server = Arc::new(Mutex::new(dns_server_opt));
+
+        let state = Self {
             storage,
             writer,
             apply_lock: ApplyLock(tokio::sync::Mutex::new(())),
             snapshot_lock: ApplyLock(tokio::sync::Mutex::new(())),
             last_profile_ids: Mutex::new(Vec::new()),
-            dns_server: Arc::new(Mutex::new(dns_server_opt)),
+            dns_server,
             dns_enabled: AtomicBool::new(dns_enabled),
             original_dns: Mutex::new(original_dns),
             dns_lock: ApplyLock(tokio::sync::Mutex::new(())),
@@ -180,7 +182,28 @@ impl AppState {
             )),
             ad_block_refresh_task: Mutex::new(None),
             ad_block_refresh_cancel: Mutex::new(tokio_util::sync::CancellationToken::new()),
-        })
+        };
+
+        // 冷启动自动恢复（PR #131 review P1-1）：如果上次退出时
+        // dns_enabled=true，DNS server 已经起来 + 持久化的 ad-block
+        // 状态已加载；立即 hot-reload 当前规则到刚构造的 engine，并启动
+        // 定时刷新 task。否则会有一段「DNS 通了但 ad-block 没生效」的空窗。
+        if state.dns_enabled.load(Ordering::Relaxed) {
+            let snap = state.ad_block_state.read().await.clone();
+            let (za, nx, wl) = crate::commands::adblock::classify_rules(&snap, state.storage.root());
+            if let Some(server) = crate::state::lock_or_recover(&state.dns_server).as_ref() {
+                server.reload_ad_block_rules(za, nx, wl);
+            }
+            crate::commands::dns::spawn_ad_block_refresh_task(
+                &state.ad_block_refresh_task,
+                &state.ad_block_state,
+                &state.dns_server,
+                &state.storage,
+                &state.ad_block_refresh_cancel,
+            );
+        }
+
+        Ok(state)
     }
 
     /// 尝试自动恢复 DNS 服务。
