@@ -45,6 +45,36 @@ export type RuleSource =
   | { type: "Remote"; source_id: string; source_name: string }
   | { type: "AdBlock"; source_id: string; source_name: string };
 
+// ---------------------------------------------------------------------------
+// AdBlock (issue #130)
+//
+// Mirrors `mhost_core::AdBlockResponse` / `AdBlockSource` / `AdBlockState`.
+// Keep wire format in sync: snake_case from serde rename_all = "snake_case"
+// gives us "zero_address" and "nx_domain" on the wire.
+// ---------------------------------------------------------------------------
+
+export type AdBlockResponse = "zero_address" | "nx_domain";
+
+export interface AdBlockSource {
+  source_id: string;
+  name: string;
+  url: string;
+  enabled: boolean;
+  response: AdBlockResponse;
+  last_fetched_at: string | null;
+  last_error: string | null;
+  rule_count: number;
+  etag: string | null;
+}
+
+export interface AdBlockState {
+  enabled: boolean;
+  sources: AdBlockSource[];
+  whitelist: string[];
+  auto_refresh_enabled: boolean;
+  refresh_interval_hours: number;
+}
+
 export interface ApplyPlan {
   rules: ResolvedRule[];
   conflicts: RuleConflict[];

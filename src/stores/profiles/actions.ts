@@ -1,5 +1,5 @@
 import { atom } from "jotai";
-import type { Profile } from "../../types";
+import type { Profile, AdBlockResponse } from "../../types";
 import {
   listProfiles,
   getProfile,
@@ -19,6 +19,19 @@ import {
   setDnsMode,
   reloadDnsRules,
   listDnsProfiles,
+  getAdBlockState,
+  setAdBlockEnabled,
+  setAdBlockRefreshInterval,
+  listAdBlockSources,
+  addAdBlockSource,
+  removeAdBlockSource,
+  setAdBlockSourceEnabled,
+  setAdBlockSourceResponse,
+  refreshAdBlockSource,
+  refreshAllAdBlockSources,
+  listAdBlockWhitelist,
+  addAdBlockWhitelist,
+  removeAdBlockWhitelist,
 } from "../../lib/tauri";
 import { extractErrorMessage } from "../../lib/error";
 import {
@@ -40,6 +53,9 @@ import {
   dnsStatusAtom,
   isDnsLoadingAtom,
   dnsErrorAtom,
+  adBlockStateAtom,
+  isAdBlockLoadingAtom,
+  adBlockErrorAtom,
 } from "./state";
 
 // ---- Async action atoms ----
@@ -383,3 +399,188 @@ export const toggleDnsProfileEnabledAtom = atom(
     }
   },
 );
+// 每个 mutating action 在 await 成功后立刻拉一次 `getAdBlockState` 重写
+// `adBlockStateAtom`，避免前端手动维护 sources 列表的不变量。读操作的
+// fetch（mount 时 / 路由进入时）走 `fetchAdBlockStateAtom`。
+
+export const fetchAdBlockStateAtom = atom(null, async (_get, set) => {
+  set(isAdBlockLoadingAtom, true);
+  set(adBlockErrorAtom, null);
+  try {
+    const state = await getAdBlockState();
+    set(adBlockStateAtom, state);
+  } catch (err) {
+    set(adBlockErrorAtom, extractErrorMessage(err));
+    throw err;
+  } finally {
+    set(isAdBlockLoadingAtom, false);
+  }
+});
+
+export const toggleAdBlockEnabledAtom = atom(
+  null,
+  async (_get, set, enabled: boolean) => {
+    set(isAdBlockLoadingAtom, true);
+    set(adBlockErrorAtom, null);
+    try {
+      await setAdBlockEnabled(enabled);
+      const state = await getAdBlockState();
+      set(adBlockStateAtom, state);
+    } catch (err) {
+      set(adBlockErrorAtom, extractErrorMessage(err));
+      throw err;
+    } finally {
+      set(isAdBlockLoadingAtom, false);
+    }
+  },
+);
+
+export const setAdBlockIntervalAtom = atom(
+  null,
+  async (_get, set, hours: number) => {
+    set(adBlockErrorAtom, null);
+    try {
+      await setAdBlockRefreshInterval(hours);
+      const state = await getAdBlockState();
+      set(adBlockStateAtom, state);
+    } catch (err) {
+      set(adBlockErrorAtom, extractErrorMessage(err));
+      throw err;
+    }
+  },
+);
+
+export const addAdBlockSourceAtom = atom(
+  null,
+  async (_get, set, args: { name: string; url: string; response: AdBlockResponse }) => {
+    set(isAdBlockLoadingAtom, true);
+    set(adBlockErrorAtom, null);
+    try {
+      await addAdBlockSource(args.name, args.url, args.response);
+      const state = await getAdBlockState();
+      set(adBlockStateAtom, state);
+    } catch (err) {
+      set(adBlockErrorAtom, extractErrorMessage(err));
+      throw err;
+    } finally {
+      set(isAdBlockLoadingAtom, false);
+    }
+  },
+);
+
+export const removeAdBlockSourceAtom = atom(
+  null,
+  async (_get, set, sourceId: string) => {
+    set(adBlockErrorAtom, null);
+    try {
+      await removeAdBlockSource(sourceId);
+      const state = await getAdBlockState();
+      set(adBlockStateAtom, state);
+    } catch (err) {
+      set(adBlockErrorAtom, extractErrorMessage(err));
+      throw err;
+    }
+  },
+);
+
+export const setAdBlockSourceEnabledAtom = atom(
+  null,
+  async (_get, set, args: { sourceId: string; enabled: boolean }) => {
+    set(adBlockErrorAtom, null);
+    try {
+      await setAdBlockSourceEnabled(args.sourceId, args.enabled);
+      const state = await getAdBlockState();
+      set(adBlockStateAtom, state);
+    } catch (err) {
+      set(adBlockErrorAtom, extractErrorMessage(err));
+      throw err;
+    }
+  },
+);
+
+export const setAdBlockSourceResponseAtom = atom(
+  null,
+  async (_get, set, args: { sourceId: string; response: AdBlockResponse }) => {
+    set(adBlockErrorAtom, null);
+    try {
+      await setAdBlockSourceResponse(args.sourceId, args.response);
+      const state = await getAdBlockState();
+      set(adBlockStateAtom, state);
+    } catch (err) {
+      set(adBlockErrorAtom, extractErrorMessage(err));
+      throw err;
+    }
+  },
+);
+
+export const refreshAdBlockSourceAtom = atom(
+  null,
+  async (_get, set, sourceId: string) => {
+    set(isAdBlockLoadingAtom, true);
+    set(adBlockErrorAtom, null);
+    try {
+      await refreshAdBlockSource(sourceId);
+      const state = await getAdBlockState();
+      set(adBlockStateAtom, state);
+    } catch (err) {
+      set(adBlockErrorAtom, extractErrorMessage(err));
+      throw err;
+    } finally {
+      set(isAdBlockLoadingAtom, false);
+    }
+  },
+);
+
+export const refreshAllAdBlockSourcesAtom = atom(null, async (_get, set) => {
+  set(isAdBlockLoadingAtom, true);
+  set(adBlockErrorAtom, null);
+  try {
+    await refreshAllAdBlockSources();
+    const state = await getAdBlockState();
+    set(adBlockStateAtom, state);
+  } catch (err) {
+    set(adBlockErrorAtom, extractErrorMessage(err));
+    throw err;
+  } finally {
+    set(isAdBlockLoadingAtom, false);
+  }
+});
+
+export const addAdBlockWhitelistAtom = atom(
+  null,
+  async (_get, set, domain: string) => {
+    set(adBlockErrorAtom, null);
+    try {
+      await addAdBlockWhitelist(domain);
+      const state = await getAdBlockState();
+      set(adBlockStateAtom, state);
+    } catch (err) {
+      set(adBlockErrorAtom, extractErrorMessage(err));
+      throw err;
+    }
+  },
+);
+
+export const removeAdBlockWhitelistAtom = atom(
+  null,
+  async (_get, set, domain: string) => {
+    set(adBlockErrorAtom, null);
+    try {
+      await removeAdBlockWhitelist(domain);
+      const state = await getAdBlockState();
+      set(adBlockStateAtom, state);
+    } catch (err) {
+      set(adBlockErrorAtom, extractErrorMessage(err));
+      throw err;
+    }
+  },
+);
+
+// Re-export whitelist helpers that don't need state refresh.
+export const fetchAdBlockWhitelistAtom = atom(null, async () => {
+  return listAdBlockWhitelist();
+});
+
+export const fetchAdBlockSourcesAtom = atom(null, async () => {
+  return listAdBlockSources();
+});
