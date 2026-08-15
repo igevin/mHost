@@ -1656,7 +1656,7 @@ mod tests {
         // 所以两次都是 cache miss（首次）。但本地规则对 AAAA 不匹配 →
         // 返回 NoError。如果 cache key 没区分 type，第二次 A 查询可能
         // 拿到 AAAA 的 NoError 响应（错误）。
-        async fn query_once(server: &DnsServer, port: u16, qtype: RecordType) -> Vec<u8> {
+        async fn query_once(_server: &DnsServer, port: u16, qtype: RecordType) -> Vec<u8> {
             let query_name = Name::from_utf8("typed.example.com.").unwrap();
             let query = Query::query(query_name, qtype);
             let mut request = Message::new();

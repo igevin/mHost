@@ -197,8 +197,7 @@ async fn set_dns_mode_enable(state: &AppState) -> Result<(), MhostError> {
     //    9b. 这里复用了 commands::adblock 的 `classify_rules` + 重载路径
     //    的等价逻辑（避免循环依赖和 IPC 边界），不经过 IPC handler。
     let snap = state.ad_block_state.read().await.clone();
-    let (za, nx, wl) =
-        crate::commands::adblock::classify_rules(&snap, state.storage.root());
+    let (za, nx, wl) = crate::commands::adblock::classify_rules(&snap, state.storage.root());
     if let Some(server) = lock_or_recover(&state.dns_server).as_ref() {
         server.reload_ad_block_rules(za, nx, wl);
     }
