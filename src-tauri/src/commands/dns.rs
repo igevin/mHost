@@ -384,6 +384,11 @@ mod tests {
             dns_enabled: AtomicBool::new(false),
             original_dns: Mutex::new(OriginalDns::DhcpEmpty),
             dns_lock: ApplyLock::new(),
+            ad_block_state: Arc::new(tokio::sync::RwLock::new(
+                mhost_core::AdBlockState::default(),
+            )),
+            ad_block_refresh_task: Mutex::new(None),
+            ad_block_refresh_cancel: Mutex::new(tokio_util::sync::CancellationToken::new()),
         };
         // dns_enabled = false → cleanup 应直接返回 Ok
         let result = cleanup_dns_on_exit(&state, false).await;
@@ -422,6 +427,11 @@ mod tests {
             dns_enabled: AtomicBool::new(true), // 假装启用 → cleanup 会走 disable 路径
             original_dns: Mutex::new(OriginalDns::DhcpEmpty), // DhcpEmpty → 写 Empty
             dns_lock: ApplyLock::new(),
+            ad_block_state: Arc::new(tokio::sync::RwLock::new(
+                mhost_core::AdBlockState::default(),
+            )),
+            ad_block_refresh_task: Mutex::new(None),
+            ad_block_refresh_cancel: Mutex::new(tokio_util::sync::CancellationToken::new()),
         };
         // cleanup_dns_on_exit → set_dns_mode_disable(interactive=false)
         //   - original 是 DhcpEmpty → 只打印 warning（不返回 Err，bug 1 修复）
@@ -473,6 +483,11 @@ mod tests {
             dns_enabled: AtomicBool::new(true),
             original_dns: Mutex::new(OriginalDns::DhcpEmpty),
             dns_lock: ApplyLock::new(),
+            ad_block_state: Arc::new(tokio::sync::RwLock::new(
+                mhost_core::AdBlockState::default(),
+            )),
+            ad_block_refresh_task: Mutex::new(None),
+            ad_block_refresh_cancel: Mutex::new(tokio_util::sync::CancellationToken::new()),
         };
 
         // 第一次 cleanup：跑 disable 路径。注意必须用 interactive=false

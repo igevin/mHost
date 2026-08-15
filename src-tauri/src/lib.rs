@@ -7,7 +7,7 @@ pub mod tray_logic;
 
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
-use commands::{apply::*, dns::*, profile::*, profile_io::*, snapshot::*, update::*, validate::*};
+use commands::{adblock::*, apply::*, dns::*, profile::*, profile_io::*, snapshot::*, update::*, validate::*};
 use state::AppState;
 use tauri::{Manager, RunEvent};
 
@@ -157,6 +157,20 @@ pub fn run() {
             reload_dns_rules,
             get_dns_status,
             list_dns_profiles,
+            // 广告屏蔽（issue #130）
+            get_ad_block_state,
+            set_ad_block_enabled,
+            set_ad_block_refresh_interval,
+            list_ad_block_sources,
+            add_ad_block_source,
+            remove_ad_block_source,
+            set_ad_block_source_enabled,
+            set_ad_block_source_response,
+            refresh_ad_block_source,
+            refresh_all_ad_block_sources,
+            list_ad_block_whitelist,
+            add_ad_block_whitelist,
+            remove_ad_block_whitelist,
             check_update,
         ])
         .setup(|app| {
