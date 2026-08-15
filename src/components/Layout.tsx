@@ -120,11 +120,9 @@ function DnsIcon() {
 
 const toolNavItems: NavItem[] = [
   {
-    to: "#adblock",
+    to: "/ad-block",
     label: "Ad Block",
     icon: <ShieldIcon />,
-    badge: 10,
-    disabled: true,
   },
   {
     to: "#remote",

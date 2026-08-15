@@ -192,7 +192,7 @@ describe("Layout", () => {
 
   it("renders disabled tool items with 'Soon' badge", () => {
     renderWithProviders(<Layout />);
-    expect(screen.getAllByText("Soon").length).toBeGreaterThanOrEqual(2);
+    expect(screen.getAllByText("Soon").length).toBeGreaterThanOrEqual(1);
   });
 
   it("navigates to profile page when profile item is clicked", async () => {

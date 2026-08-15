@@ -22,6 +22,14 @@ vi.mock("./lib/tauri", () => ({
   rollbackHosts: vi.fn(),
   exportProfileToFile: vi.fn(),
   duplicateProfile: vi.fn(),
+  // AdBlock IPCs (issue #130) — App fetches ad-block state on mount.
+  getAdBlockState: vi.fn().mockResolvedValue({
+    enabled: false,
+    sources: [],
+    whitelist: [],
+    auto_refresh_enabled: true,
+    refresh_interval_hours: 24,
+  }),
 }));
 
 vi.mock("@tauri-apps/plugin-dialog", () => ({
@@ -49,9 +57,15 @@ describe("App", () => {
       );
     });
 
-    expect(listenMock).toHaveBeenCalledTimes(1);
     expect(listenMock).toHaveBeenCalledWith(
       "tray:profiles-updated",
+      expect.any(Function),
+    );
+    // issue #130: also listens for the tray-driven `navigate` event so the
+    // "广告屏蔽" menu item can deep-link to /ad-block without coupling
+    // backend to router.
+    expect(listenMock).toHaveBeenCalledWith(
+      "navigate",
       expect.any(Function),
     );
   });
@@ -93,7 +107,10 @@ describe("App", () => {
       unmountFn = unmount;
     });
 
-    expect(listenMock).toHaveBeenCalledTimes(1);
+    expect(listenMock).toHaveBeenCalledWith(
+      "tray:profiles-updated",
+      expect.any(Function),
+    );
 
     await act(async () => {
       unmountFn();

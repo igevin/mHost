@@ -90,7 +90,7 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>) -> Result<Menu<R>, Box<dyn std::er
         Submenu::with_id_and_items(app, PROFILES_SUBMENU_ID, "环境配置", true, &profile_refs)?;
 
     let sep1 = PredefinedMenuItem::separator(app)?;
-    let adblock = MenuItem::with_id(app, "adblock", "广告屏蔽（即将推出）", false, None::<&str>)?;
+    let adblock = MenuItem::with_id(app, "adblock", "广告屏蔽（仅 DNS 模式）", true, None::<&str>)?;
     let sep2 = PredefinedMenuItem::separator(app)?;
     let refresh = MenuItem::with_id(app, "refresh_rules", "刷新远程规则", true, Some("CmdOrR"))?;
     let open_window = MenuItem::with_id(app, "open_window", "打开主窗口", true, Some("CmdOrO"))?;
@@ -212,7 +212,16 @@ pub fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::Men
             });
         }
         tray_logic::TrayMenuAction::AdBlock => {
-            // Placeholder: ad block is coming soon
+            // 跳转到 Ad Block 页面（issue #130）。仅在 DNS 模式下生效 —
+            // 前端会显示「DNS off」横幅并禁用表单提交。
+            #[cfg(target_os = "macos")]
+            crate::platform::macos::set_activation_policy_regular();
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+                let _ = window.emit("navigate", "/ad-block");
+            }
         }
         tray_logic::TrayMenuAction::Unknown => {
             println!("[mHost] Unknown tray menu action: {:?}", event.id);
