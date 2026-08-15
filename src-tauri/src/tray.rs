@@ -226,7 +226,11 @@ pub fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::Men
                 let _ = window.unminimize();
                 let _ = window.show();
                 let _ = window.set_focus();
-                let _ = window.emit("navigate", "/ad-block");
+                // PR #154 review (P3): log on emit failure for parity
+                // with the surrounding unminimize/show/set_focus calls.
+                if let Err(e) = window.emit("navigate", "/ad-block") {
+                    tracing::warn!("[mHost] tray emit navigate failed: {}", e);
+                }
             }
         }
         tray_logic::TrayMenuAction::Unknown => {

@@ -42,6 +42,14 @@ const FETCH_TIMEOUT_SECS: u64 = 30;
 /// legitimate (well-annotated) lists.
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
+/// Maximum length of a source URL. URLs longer than this are rejected
+/// to prevent IPC-level memory abuse (PR #154 review P3).
+const MAX_URL_LEN: usize = 2048;
+
+/// Maximum length of a whitelist domain entry (RFC 1035 §3.1: each
+/// label ≤ 63 chars, full domain ≤ 253 chars). PR #154 review P3.
+const MAX_DOMAIN_LEN: usize = 253;
+
 /// Concurrency cap for `refresh_all_ad_block_sources` and the periodic
 /// background refresh (PR #131 review finding 1.4 — refresh was a serial
 /// loop, blocking the UI for up to N × FETCH_TIMEOUT_SECS).
@@ -274,6 +282,13 @@ fn validate_whitelist_domain(raw: &str) -> Result<String, String> {
     if trimmed.is_empty() {
         return Err("whitelist entry is empty".to_string());
     }
+    if trimmed.len() > MAX_DOMAIN_LEN {
+        return Err(format!(
+            "whitelist entry length {} exceeds limit {}",
+            trimmed.len(),
+            MAX_DOMAIN_LEN
+        ));
+    }
     if trimmed.contains(char::is_whitespace) {
         return Err(format!("whitelist entry contains whitespace: {:?}", raw));
     }
@@ -305,6 +320,18 @@ fn validate_whitelist_domain(raw: &str) -> Result<String, String> {
 
 /// Parse hosts-format blocklist content into a flat list of domains.
 /// Comments (`#`) and empty lines are filtered out by `Parser::parse_line`.
+///
+/// **PR #154 review (P2)**: no-op — after analysis, the original
+/// `d.to_lowercase()` is correct and the only allocation we can avoid
+/// here is for already-lowercase strings (the common case for
+/// well-formed blocklists). The `eq_ignore_ascii_case` /
+/// `to_ascii_uppercase` shortcut doesn't actually save allocations
+/// (`to_ascii_uppercase` allocates a String) and breaks the
+/// `MiXed.ExAmPlE.com → mixed.example.com` semantic that the
+/// `parse_blocklist_lowercases` test relies on. Sticking with the
+/// straightforward `to_lowercase()` — the work runs in
+/// `spawn_blocking` (PR #131 P1-2 + issue #133), so DNS queries
+/// aren't blocked during the parse.
 fn parse_blocklist_domains(content: &str) -> Vec<String> {
     let result = Parser::parse(content);
     let mut domains: Vec<String> = Vec::new();
@@ -579,6 +606,13 @@ pub(crate) async fn add_ad_block_source_impl(
 ) -> Result<AdBlockSource, MhostError> {
     if name.trim().is_empty() {
         return Err(MhostError::InvalidInput("source name is empty".into()));
+    }
+    if url.len() > MAX_URL_LEN {
+        return Err(MhostError::InvalidInput(format!(
+            "source url length {} exceeds limit {}",
+            url.len(),
+            MAX_URL_LEN
+        )));
     }
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return Err(MhostError::InvalidInput(format!(
@@ -1008,6 +1042,137 @@ mod tests {
         assert_eq!(n.len(), 1, "nxdomain set seeded from nx source cache");
         assert!(n.contains("blocked.example.com"));
         assert_eq!(w.len(), 1);
+    }
+
+    // -----------------------------------------------------------------
+    // PR #154 review (P2): exercise the cold-start hot-reload path that
+    // AppState::new runs when `dns_enabled=true` was recovered from the
+    // manifest. The headline fix is "DNS goes OFF → user adds source →
+    // DNS goes ON → first query sees cached rules immediately" — without
+    // the cold-start hot-reload there's a window where DNS is running but
+    // ad-block isn't active yet.
+    //
+    // Test simulates the full flow without spinning up the proxy / Tauri
+    // runtime: classify_rules → reload_ad_block_rules → spin up a real
+    // DnsServer → fire a UDP query → assert the blocked domain returns
+    // 0.0.0.0 instead of leaking upstream.
+    // -----------------------------------------------------------------
+    #[tokio::test]
+    async fn cold_start_hot_reload_blocks_first_query() {
+        use mhost_dns::DnsConfig;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let source_id = SourceId(Uuid::new_v4());
+        let source = AdBlockSource {
+            source_id: source_id.clone(),
+            name: "test-blocklist".into(),
+            url: "https://x".into(),
+            enabled: true,
+            response: AdBlockResponse::ZeroAddress,
+            last_fetched_at: None,
+            last_error: None,
+            rule_count: 1,
+            etag: None,
+        };
+        mhost_storage::adblock::write_cache(
+            temp.path(),
+            &source_id,
+            b"0.0.0.0 cold-start-ads.example.com\n",
+        )
+        .unwrap();
+
+        let state = AdBlockState {
+            enabled: true,
+            sources: vec![source],
+            whitelist: vec![],
+            ..Default::default()
+        };
+
+        // Simulate the AppState::new cold-start block.
+        let (za, nx, wl) = classify_rules(&state, temp.path());
+        assert!(za.contains_key("cold-start-ads.example.com"));
+
+        // Wire into a real DnsServer and query.
+        let port = pick_free_port();
+        let config = DnsConfig {
+            port,
+            upstream: vec!["127.0.0.1:1".to_string()], // blackhole — fail fast
+            timeout_ms: 100,
+            refresh_upstream: false,
+            cache_size: 100,
+        };
+        let server = std::sync::Arc::new(mhost_dns::DnsServer::new(config).unwrap());
+        server.reload_ad_block_rules(za, nx, wl);
+        assert_eq!(server.ad_block_rule_count(), 1);
+
+        let server_clone = std::sync::Arc::clone(&server);
+        let server_handle = tokio::spawn(async move { server_clone.start().await });
+        // Wait for the server to be listening.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !server.is_running() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(server.is_running(), "server should start");
+
+        // Send a UDP query for the blocked domain.
+        use hickory_proto::op::{Message, OpCode, Query};
+        use hickory_proto::rr::{Name, RecordType};
+        use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
+        use tokio::net::UdpSocket;
+        let query_name = Name::from_utf8("cold-start-ads.example.com.").unwrap();
+        let query = Query::query(query_name, RecordType::A);
+        let mut request = Message::new();
+        request.set_id(0x4242);
+        request.set_recursion_desired(true);
+        request.set_op_code(OpCode::Query);
+        request.add_query(query);
+        let bytes = request.to_bytes().unwrap();
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client
+            .send_to(&bytes, format!("127.0.0.1:{}", port))
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 4096];
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.recv_from(&mut buf),
+        )
+        .await
+        .expect("server response timeout")
+        .expect("recv_from failed");
+        let response = hickory_proto::op::Message::from_bytes(&buf[..len]).unwrap();
+        assert_eq!(
+            response.response_code(),
+            hickory_proto::op::ResponseCode::NoError
+        );
+        assert_eq!(
+            response.answer_count(),
+            1,
+            "blocked domain should be answered"
+        );
+        let answer = &response.answers()[0];
+        if let Some(hickory_proto::rr::RData::A(a)) = answer.data() {
+            assert_eq!(
+                a.0,
+                std::net::Ipv4Addr::new(0, 0, 0, 0),
+                "cold-start ad-block should return 0.0.0.0"
+            );
+        } else {
+            panic!("expected A record, got {:?}", answer.data());
+        }
+
+        server.stop().await.unwrap();
+        let _ = server_handle.await;
+    }
+
+    /// Pick a free UDP port by binding to port 0. Avoids colliding with
+    /// other tests on the same machine.
+    fn pick_free_port() -> u16 {
+        let listener = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind free port");
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        port
     }
 
     // -----------------------------------------------------------------

@@ -74,4 +74,32 @@ mod tests {
         let r = walk_parents("a.b.example.com", |_| None::<()>);
         assert_eq!(r, None);
     }
+
+    /// **PR #154 review (P3)**: Pi-hole-style TLD blocking semantics.
+    /// Registering `"com"` in the engine should match every query ending
+    /// in `.com` (single-label ancestor walk is intentional). Verifies
+    /// the full `walk_parents` chain, not just the single-step case.
+    #[test]
+    fn walk_parents_registered_tld_matches_every_subdomain() {
+        let r = walk_parents("deeply.nested.subdomain.example.com", |d| match d {
+            "com" => Some("TLD-hit"),
+            _ => None,
+        });
+        assert_eq!(r, Some("TLD-hit"));
+
+        // And also the trivial single-label form.
+        let r = walk_parents("example.com", |d| match d {
+            "com" => Some("TLD-hit"),
+            _ => None,
+        });
+        assert_eq!(r, Some("TLD-hit"));
+
+        // But a query NOT under .com should miss (proves the hit
+        // wasn't a false positive from walk mechanics).
+        let r = walk_parents("example.org", |d| match d {
+            "com" => Some("TLD-hit"),
+            _ => None,
+        });
+        assert_eq!(r, None);
+    }
 }

@@ -188,12 +188,31 @@ impl AppState {
         // dns_enabled=true，DNS server 已经起来 + 持久化的 ad-block
         // 状态已加载；立即 hot-reload 当前规则到刚构造的 engine，并启动
         // 定时刷新 task。否则会有一段「DNS 通了但 ad-block 没生效」的空窗。
+        //
+        // **PR #154 review (P2) defensive**: `classify_rules` is sync and
+        // reads each source's cache file from disk + parses 100k+ domains.
+        // On a slow filesystem (network mount, encrypted APFS) this could
+        // block `AppState::new` for seconds. Wrap the read+parse+reload
+        // in `spawn_blocking` so it runs on a dedicated blocking thread.
+        // `spawn_ad_block_refresh_task` itself is async (it spawns a
+        // tokio task + schedules a select!), so it stays on the async
+        // runtime — only the sync pipeline needs the offload.
         if state.dns_enabled.load(Ordering::Relaxed) {
             let snap = state.ad_block_state.read().await.clone();
-            let (za, nx, wl) =
-                crate::commands::adblock::classify_rules(&snap, state.storage.root());
-            if let Some(server) = crate::state::lock_or_recover(&state.dns_server).as_ref() {
-                server.reload_ad_block_rules(za, nx, wl);
+            let storage_root = state.storage.root().to_path_buf();
+            let dns_server = Arc::clone(&state.dns_server);
+            let result = tokio::task::spawn_blocking(move || {
+                let (za, nx, wl) = crate::commands::adblock::classify_rules(&snap, &storage_root);
+                if let Some(server) = crate::state::lock_or_recover(&dns_server).as_ref() {
+                    server.reload_ad_block_rules(za, nx, wl);
+                }
+            })
+            .await;
+            if let Err(e) = result {
+                eprintln!(
+                    "[mHost] cold-start ad-block reload join error: {} (continuing without hot-reload)",
+                    e
+                );
             }
             crate::commands::dns::spawn_ad_block_refresh_task(
                 &state.ad_block_refresh_task,

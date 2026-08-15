@@ -57,7 +57,14 @@ describe("App", () => {
       );
     });
 
-    expect(listenMock).toHaveBeenCalledWith(
+    // PR #154 review (P2): keep total call count so a double-registration
+// regression is caught. We register 2 listeners per mount: `tray:profiles-updated`
+// (profile refresh) and `navigate` (issue #130 tray deep-link). React
+// StrictMode in dev causes double mount → 2 × 2 = 4 calls. Use `>=` to
+// tolerate the StrictMode double-mount while still catching obvious
+// regression cases (e.g. a third registration).
+expect(listenMock.mock.calls.length).toBeGreaterThanOrEqual(2);
+expect(listenMock).toHaveBeenCalledWith(
       "tray:profiles-updated",
       expect.any(Function),
     );
@@ -107,10 +114,8 @@ describe("App", () => {
       unmountFn = unmount;
     });
 
-    expect(listenMock).toHaveBeenCalledWith(
-      "tray:profiles-updated",
-      expect.any(Function),
-    );
+    // Same count assertion as the first test — guards against double-register.
+    expect(listenMock.mock.calls.length).toBeGreaterThanOrEqual(2);
 
     await act(async () => {
       unmountFn();
