@@ -994,6 +994,77 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // PR #154 review (P2): validate_whitelist_domain test coverage.
+    // Each rejection branch + the happy path + the MAX_DOMAIN_LEN
+    // guard. These are pure sync tests — no AppState / DnsServer
+    // needed.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn validate_whitelist_domain_happy_path_lowercases_and_trims() {
+        assert_eq!(
+            validate_whitelist_domain("  Example.COM  ").unwrap(),
+            "example.com"
+        );
+        assert_eq!(
+            validate_whitelist_domain("foo.example.com").unwrap(),
+            "foo.example.com"
+        );
+    }
+
+    #[test]
+    fn validate_whitelist_domain_rejects_empty_or_whitespace_only() {
+        assert!(validate_whitelist_domain("").is_err());
+        assert!(validate_whitelist_domain("   ").is_err());
+        let err = validate_whitelist_domain("").unwrap_err();
+        assert!(err.contains("empty"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn validate_whitelist_domain_rejects_whitespace_inside() {
+        assert!(validate_whitelist_domain("foo bar.com").is_err());
+        assert!(validate_whitelist_domain("foo\tbar.com").is_err());
+    }
+
+    #[test]
+    fn validate_whitelist_domain_rejects_path_separator() {
+        assert!(validate_whitelist_domain("example.com/path").is_err());
+        assert!(validate_whitelist_domain("example.com\\path").is_err());
+        let err = validate_whitelist_domain("example.com/path").unwrap_err();
+        assert!(err.contains("URL/path"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn validate_whitelist_domain_rejects_wildcard() {
+        assert!(validate_whitelist_domain("*.example.com").is_err());
+        let err = validate_whitelist_domain("*.example.com").unwrap_err();
+        assert!(err.contains("*"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn validate_whitelist_domain_rejects_leading_dot() {
+        assert!(validate_whitelist_domain(".example.com").is_err());
+    }
+
+    #[test]
+    fn validate_whitelist_domain_rejects_unicode() {
+        assert!(validate_whitelist_domain("例え.com").is_err());
+        assert!(validate_whitelist_domain("café.example.com").is_err());
+    }
+
+    #[test]
+    fn validate_whitelist_domain_rejects_oversize() {
+        // 254 chars — exceeds RFC 1035 max of 253.
+        let huge = "a".repeat(254);
+        assert!(validate_whitelist_domain(&huge).is_err());
+        let err = validate_whitelist_domain(&huge).unwrap_err();
+        assert!(err.contains("exceeds limit"), "unexpected error: {}", err);
+        // 253 chars — exactly at the boundary, should pass.
+        let at_limit = "a".repeat(253);
+        assert!(validate_whitelist_domain(&at_limit).is_ok());
+    }
+
+    // -----------------------------------------------------------------
     // PR #131 re-review P1-1: the cold-start fix in `set_dns_mode_enable`
     // and `AppState::new` relies on `classify_rules` turning a source's
     // cached blocklist into non-empty rule sets, then `reload_ad_block_rules`

@@ -192,10 +192,10 @@
 /* ---- Layout helpers (PR #154 review P2: was inline styles) ---- */
 
 .bannerText {
-  flex: 1;
   display: flex;
-  flex-direction: column;
-  gap: 2px;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
 }
 
 .bannerTitle {
