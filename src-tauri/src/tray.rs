@@ -90,7 +90,13 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>) -> Result<Menu<R>, Box<dyn std::er
         Submenu::with_id_and_items(app, PROFILES_SUBMENU_ID, "环境配置", true, &profile_refs)?;
 
     let sep1 = PredefinedMenuItem::separator(app)?;
-    let adblock = MenuItem::with_id(app, "adblock", "广告屏蔽（仅 DNS 模式）", true, None::<&str>)?;
+    let adblock = MenuItem::with_id(
+        app,
+        "adblock",
+        "广告屏蔽（仅 DNS 模式）",
+        true,
+        None::<&str>,
+    )?;
     let sep2 = PredefinedMenuItem::separator(app)?;
     let refresh = MenuItem::with_id(app, "refresh_rules", "刷新远程规则", true, Some("CmdOrR"))?;
     let open_window = MenuItem::with_id(app, "open_window", "打开主窗口", true, Some("CmdOrO"))?;

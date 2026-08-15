@@ -189,8 +189,19 @@ async fn set_dns_mode_enable(state: &AppState) -> Result<(), MhostError> {
     //    hot-reload 到新 server，并启动定时刷新 task。task 在 disable
     //    时被 abort。
     //
-    //    这里复用了 commands::adblock 的 `classify_rules` + 重载路径的
-    //    等价逻辑（避免循环依赖和 IPC 边界），不经过 IPC handler。
+    //    9a. 即时 reload：spawn_ad_block_refresh_task 在
+    //    auto_refresh_enabled=false 或 interval=0 时不会 spawn，但用户
+    //    仍期望持久化的 ad-block 规则立即生效。所以这里显式做一次
+    //    classify + reload，与 AppState::new 冷启动路径一致。
+    //
+    //    9b. 这里复用了 commands::adblock 的 `classify_rules` + 重载路径
+    //    的等价逻辑（避免循环依赖和 IPC 边界），不经过 IPC handler。
+    let snap = state.ad_block_state.read().await.clone();
+    let (za, nx, wl) =
+        crate::commands::adblock::classify_rules(&snap, state.storage.root());
+    if let Some(server) = lock_or_recover(&state.dns_server).as_ref() {
+        server.reload_ad_block_rules(za, nx, wl);
+    }
     spawn_ad_block_refresh_task(
         &state.ad_block_refresh_task,
         &state.ad_block_state,
@@ -411,9 +422,7 @@ mod tests {
             dns_enabled: AtomicBool::new(false),
             original_dns: Mutex::new(OriginalDns::DhcpEmpty),
             dns_lock: ApplyLock::new(),
-            ad_block_state: Arc::new(tokio::sync::RwLock::new(
-                mhost_core::AdBlockState::default(),
-            )),
+            ad_block_state: Arc::new(tokio::sync::RwLock::new(mhost_core::AdBlockState::default())),
             ad_block_refresh_task: Mutex::new(None),
             ad_block_refresh_cancel: Mutex::new(tokio_util::sync::CancellationToken::new()),
         };
@@ -454,9 +463,7 @@ mod tests {
             dns_enabled: AtomicBool::new(true), // 假装启用 → cleanup 会走 disable 路径
             original_dns: Mutex::new(OriginalDns::DhcpEmpty), // DhcpEmpty → 写 Empty
             dns_lock: ApplyLock::new(),
-            ad_block_state: Arc::new(tokio::sync::RwLock::new(
-                mhost_core::AdBlockState::default(),
-            )),
+            ad_block_state: Arc::new(tokio::sync::RwLock::new(mhost_core::AdBlockState::default())),
             ad_block_refresh_task: Mutex::new(None),
             ad_block_refresh_cancel: Mutex::new(tokio_util::sync::CancellationToken::new()),
         };
@@ -510,9 +517,7 @@ mod tests {
             dns_enabled: AtomicBool::new(true),
             original_dns: Mutex::new(OriginalDns::DhcpEmpty),
             dns_lock: ApplyLock::new(),
-            ad_block_state: Arc::new(tokio::sync::RwLock::new(
-                mhost_core::AdBlockState::default(),
-            )),
+            ad_block_state: Arc::new(tokio::sync::RwLock::new(mhost_core::AdBlockState::default())),
             ad_block_refresh_task: Mutex::new(None),
             ad_block_refresh_cancel: Mutex::new(tokio_util::sync::CancellationToken::new()),
         };
@@ -813,4 +818,3 @@ pub(crate) fn spawn_ad_block_refresh_task(
 
     *lock_or_recover(task_slot) = Some(handle);
 }
-

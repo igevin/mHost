@@ -190,7 +190,8 @@ impl AppState {
         // 定时刷新 task。否则会有一段「DNS 通了但 ad-block 没生效」的空窗。
         if state.dns_enabled.load(Ordering::Relaxed) {
             let snap = state.ad_block_state.read().await.clone();
-            let (za, nx, wl) = crate::commands::adblock::classify_rules(&snap, state.storage.root());
+            let (za, nx, wl) =
+                crate::commands::adblock::classify_rules(&snap, state.storage.root());
             if let Some(server) = crate::state::lock_or_recover(&state.dns_server).as_ref() {
                 server.reload_ad_block_rules(za, nx, wl);
             }

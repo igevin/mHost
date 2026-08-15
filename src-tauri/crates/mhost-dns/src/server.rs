@@ -15,9 +15,9 @@ use parking_lot::{Mutex as PlMutex, RwLock as PlRwLock};
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 
-use crate::AdBlockEngine;
 use crate::config::DnsConfig;
 use crate::resolver::RuleEngine;
+use crate::AdBlockEngine;
 
 /// DNS 服务错误。
 #[derive(Debug, thiserror::Error)]

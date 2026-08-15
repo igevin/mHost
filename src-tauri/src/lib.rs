@@ -7,7 +7,9 @@ pub mod tray_logic;
 
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
-use commands::{adblock::*, apply::*, dns::*, profile::*, profile_io::*, snapshot::*, update::*, validate::*};
+use commands::{
+    adblock::*, apply::*, dns::*, profile::*, profile_io::*, snapshot::*, update::*, validate::*,
+};
 use state::AppState;
 use tauri::{Manager, RunEvent};
 
