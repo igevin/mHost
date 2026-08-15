@@ -1,5 +1,6 @@
 import { useCallback, useState, useEffect } from "react";
 import { useAtomValue, useSetAtom } from "jotai";
+import { confirm as confirmDialog } from "@tauri-apps/plugin-dialog";
 import {
   adBlockStateAtom,
   isAdBlockLoadingAtom,
@@ -19,6 +20,7 @@ import {
   addAdBlockWhitelistAtom,
   removeAdBlockWhitelistAtom,
 } from "../stores/profiles";
+import { useNavigate } from "react-router-dom";
 import { useWebKitPointerDown } from "../hooks/useWebKitPointerDown";
 import type { AdBlockResponse } from "../types";
 import styles from "./AdBlock.module.css";
@@ -44,6 +46,7 @@ function AdBlock() {
   const removeWhitelist = useSetAtom(removeAdBlockWhitelistAtom);
 
   const { onPointerDown } = useWebKitPointerDown();
+  const navigate = useNavigate();
 
   // Local form state
   const [newName, setNewName] = useState("");
@@ -135,7 +138,7 @@ function AdBlock() {
           </span>
           <button
             className="btn btn-sm btn-primary"
-            onClick={() => (window.location.hash = "#/settings")}
+            onClick={() => navigate("/settings")}
             onPointerDown={onPointerDown(() => {})}
           >
             Open Settings
@@ -146,16 +149,9 @@ function AdBlock() {
       <div className={styles.pageBody}>
         {/* Master switch + summary */}
         <div className="card">
-          <div
-            style={{
-              display: "flex",
-              justifyContent: "space-between",
-              alignItems: "center",
-              gap: 12,
-            }}
-          >
+          <div className={styles.bannerText}>
             <div>
-              <div style={{ fontWeight: 600 }}>Enable Ad Block</div>
+              <div className={styles.bannerTitle}>Enable Ad Block</div>
               <div className={styles.muted}>
                 When enabled, the DNS server returns 0.0.0.0 / NXDOMAIN for
                 domains in any enabled source.
@@ -190,10 +186,7 @@ function AdBlock() {
           </div>
 
           {hasErrors && (
-            <div
-              className={styles.muted}
-              style={{ marginTop: 10, color: "var(--danger)" }}
-            >
+            <div className={styles.dangerTextGap}>
               One or more sources have a fetch error — see badges below.
             </div>
           )}
@@ -202,7 +195,7 @@ function AdBlock() {
         {/* Add source form */}
         <div className="card">
           <h2 className="card-title">Sources</h2>
-          <p className={styles.muted} style={{ marginBottom: 10 }}>
+          <p className={styles.mutedGap}>
             Hosts-format blocklist URLs (one domain per line, IP ignored).
           </p>
 
@@ -257,14 +250,14 @@ function AdBlock() {
           {state.sources.length === 0 ? (
             <div className={styles.empty}>No sources yet.</div>
           ) : (
-            <div style={{ display: "flex", flexDirection: "column", gap: 10, marginTop: 14 }}>
+            <div className={styles.columnGap}>
               {state.sources.map((src) => (
                 <div
                   key={src.source_id}
                   className={`${styles.sourceCard} ${!src.enabled ? styles.dimmed : ""}`}
                 >
                   <div className={styles.sourceHeader}>
-                    <div style={{ flex: 1, minWidth: 0 }}>
+                    <div className={styles.flexGrow}>
                       <div className={styles.sourceTitle}>
                         <span>{src.name}</span>
                         {src.last_error && (
@@ -284,7 +277,7 @@ function AdBlock() {
                         {src.last_error && (
                           <>
                             {" · "}
-                            <span style={{ color: "var(--danger)" }}>
+                            <span className={styles.dangerText}>
                               {src.last_error}
                             </span>
                           </>
@@ -309,7 +302,7 @@ function AdBlock() {
                       </label>
 
                       <select
-                        className="input"
+                        className={`input ${styles.badgeSm}`}
                         value={src.response}
                         onChange={(e) =>
                           setSourceResponse({
@@ -317,7 +310,6 @@ function AdBlock() {
                             response: e.target.value as AdBlockResponse,
                           }).catch(() => {})
                         }
-                        style={{ fontSize: 12, padding: "2px 6px" }}
                         disabled={isLoading}
                       >
                         <option value="zero_address">0.0.0.0</option>
@@ -337,9 +329,12 @@ function AdBlock() {
                       <button
                         className="btn btn-sm btn-danger"
                         onClick={() => {
-                          if (confirm(`Remove source "${src.name}"?`)) {
-                            removeSource(src.source_id).catch(() => {});
-                          }
+                          confirmDialog(
+                            `Remove source "${src.name}"?`,
+                            { title: "Remove Source", kind: "warning" },
+                          ).then((ok) => {
+                            if (ok) removeSource(src.source_id).catch(() => {});
+                          }).catch(() => {});
                         }}
                         disabled={isLoading}
                         onPointerDown={onPointerDown(() => {})}
@@ -363,7 +358,7 @@ function AdBlock() {
             <code>api.example.com</code>.
           </p>
 
-          <div className={styles.inlineForm} style={{ marginTop: 10 }}>
+          <div className={`${styles.inlineForm} ${styles.sectionGap}`}>
             <input
               className="input"
               type="text"
@@ -413,17 +408,16 @@ function AdBlock() {
             Background refresh keeps sources up to date without manual
             intervention. Set to 0 to disable (refresh manually instead).
           </p>
-          <div className={styles.inlineForm} style={{ marginTop: 10 }}>
-            <label className="form-label" style={{ margin: 0 }}>
+          <div className={`${styles.inlineForm} ${styles.sectionGap}`}>
+            <label className={`form-label ${styles.labelReset}`}>
               Every
             </label>
             <select
-              className="input"
+              className={`input ${styles.width120}`}
               value={state.refresh_interval_hours}
               onChange={(e) =>
                 handleIntervalChange(parseInt(e.target.value, 10))
               }
-              style={{ width: 120 }}
               disabled={isLoading}
             >
               <option value="0">Manual only</option>

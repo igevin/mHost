@@ -250,6 +250,59 @@ pub(crate) fn domains_for_source(root: &std::path::Path, source: &AdBlockSource)
     }
 }
 
+/// Validate a whitelist entry. Returns the canonical form (trimmed +
+/// lowercased) on success, or an error message describing why the
+/// input is invalid.
+///
+/// **PR #154 review (P2):** the original code only checked for empty
+/// input, so entries like `*.example.com`, `example.com/path`, or
+/// `not a domain at all` were persisted silently and never matched in
+/// `walk_parents` (it does literal `HashSet::contains`). They also
+/// didn't surface in `last_error`, so the user had no signal that the
+/// entry was broken.
+///
+/// Rules enforced:
+/// - non-empty after trim
+/// - no whitespace anywhere (`*.example.com` etc. → reject)
+/// - no path separator (`example.com/path` → reject)
+/// - no leading dot (`.example.com` — engines don't expect this; the
+///   suffix-walk covers the case anyway)
+/// - no wildcard chars `*` (suffix-walk handles hierarchical match)
+/// - only ASCII letters / digits / `-` / `.`
+fn validate_whitelist_domain(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim().to_lowercase();
+    if trimmed.is_empty() {
+        return Err("whitelist entry is empty".to_string());
+    }
+    if trimmed.contains(char::is_whitespace) {
+        return Err(format!("whitelist entry contains whitespace: {:?}", raw));
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') {
+        return Err(format!("whitelist entry looks like a URL/path: {:?}", raw));
+    }
+    if trimmed.starts_with('.') {
+        return Err(format!(
+            "whitelist entry must not start with '.': {:?}",
+            raw
+        ));
+    }
+    if trimmed.contains('*') {
+        return Err(format!(
+            "whitelist entry must not contain '*' (suffix-walk matches subdomains): {:?}",
+            raw
+        ));
+    }
+    for ch in trimmed.chars() {
+        if !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '.') {
+            return Err(format!(
+                "whitelist entry has invalid character {:?}: {:?}",
+                ch, raw
+            ));
+        }
+    }
+    Ok(trimmed)
+}
+
 /// Parse hosts-format blocklist content into a flat list of domains.
 /// Comments (`#`) and empty lines are filtered out by `Parser::parse_line`.
 fn parse_blocklist_domains(content: &str) -> Vec<String> {
@@ -741,10 +794,7 @@ pub async fn add_ad_block_whitelist(
     domain: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<String>, MhostError> {
-    let normalized = domain.trim().to_lowercase();
-    if normalized.is_empty() {
-        return Err(MhostError::InvalidInput("domain is empty".into()));
-    }
+    let normalized = validate_whitelist_domain(&domain).map_err(MhostError::InvalidInput)?;
     {
         let mut guard = state.ad_block_state.write().await;
         if !guard.whitelist.contains(&normalized) {
@@ -760,6 +810,9 @@ pub async fn remove_ad_block_whitelist(
     domain: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<String>, MhostError> {
+    // Removal tolerates the same input the user typed when adding (i.e.
+    // no validation — silently no-op on missing). This matches the
+    // contract of "remove what matches; ignore the rest".
     let normalized = domain.trim().to_lowercase();
     {
         let mut guard = state.ad_block_state.write().await;

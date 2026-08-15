@@ -41,12 +41,23 @@ function App() {
       fetchProfiles();
     });
     // issue #130: tray "广告屏蔽" menu item emits this event with the
-    // target route. Lets the tray drive deep-linking to /ad-block (and any
-    // future route-driven tray entries) without coupling backend to router.
+    // target route. Lets the tray drive deep-linking to /ad-block without
+    // coupling backend to router.
+    //
+    // **security (PR #154 review P2)**: whitelist allowed routes. The
+    // backend emitter (tray.rs `TrayMenuAction::AdBlock`) is trusted but
+    // any future payload source — including a malformed emitter or a
+    // future debug/test hook — must not be able to push the router into
+    // arbitrary paths (which would silently no-op render or, worse, leak
+    // some future route meant for in-app use only).
+    const ALLOWED_TRAY_ROUTES: ReadonlySet<string> = new Set(["/ad-block"]);
     const unlistenNavigate = listen<string>("navigate", (event) => {
       const target = event.payload;
-      if (typeof target === "string" && target.startsWith("/")) {
+      if (typeof target === "string" && ALLOWED_TRAY_ROUTES.has(target)) {
         navigate(target);
+      } else if (typeof target === "string" && target.startsWith("/")) {
+        // Unknown path — log and ignore.
+        console.warn(`[mHost] tray navigate: refused unknown route "${target}"`);
       }
     });
     return () => {

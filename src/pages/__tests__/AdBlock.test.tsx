@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, act } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { getDefaultStore, Provider as JotaiProvider } from "jotai";
 import {
   adBlockStateAtom,
@@ -72,7 +73,11 @@ function makeSource(overrides: Partial<AdBlockSource> = {}): AdBlockSource {
 }
 
 function renderWithProviders(ui: React.ReactElement) {
-  return render(<JotaiProvider store={getDefaultStore()}>{ui}</JotaiProvider>);
+  return render(
+    <MemoryRouter>
+      <JotaiProvider store={getDefaultStore()}>{ui}</JotaiProvider>
+    </MemoryRouter>,
+  );
 }
 
 function setStore(fn: (s: ReturnType<typeof getDefaultStore>) => void) {

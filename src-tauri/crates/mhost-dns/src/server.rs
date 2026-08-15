@@ -690,12 +690,18 @@ async fn handle_address_query(
                             RData::AAAA(AAAA(v6)),
                         ))
                     }
-                    // qtype 与规则 IP family 不匹配：视为 NoError（不算错）
-                    _ => None,
+                    // qtype 与规则 IP family 不匹配（如 AAAA 命中 IPv4 规则）：
+                    // 返回 NxDomain 而非 NoError。NoError + 空答案在 RFC 2308
+                    // 语义里是「name 存在但无此 type 记录」，等于放行让
+                    // 上游继续解析 —— 把广告屏蔽的意图完全绕开了。
+                    // （review feedback：PR #154 P1）
+                    _ => return QueryResult::NxDomain,
                 };
                 return match record {
                     Some(r) => QueryResult::Answer(Box::new(r)),
-                    None => QueryResult::NoError,
+                    // 同样不可能到这里（family mismatch 已返回 NxDomain），
+                    // 但保留分支以防御未来新增的 family 类型。
+                    None => QueryResult::NxDomain,
                 };
             }
         }

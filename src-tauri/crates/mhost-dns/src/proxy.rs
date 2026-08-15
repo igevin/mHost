@@ -629,14 +629,20 @@ pub(crate) mod tests {
     // 循环不因 poll 阻塞。完整退出流程靠手动 smoke test 在 dev 环境验证。
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn test_proxy_shutdown_signal_during_init() {
         // 简化版集成测试：spawn proxy，**不**写 file signal，proxy
         // 应该持续运行（不主动退出）。验证 poll 不会让 proxy 误退出。
         // 完整 shutdown 行为用 dev 模式手动验证。
+        //
+        // **lint 选择**：lock 只用于序列化 setup（清理 signal file + 写
+        // tempdir + 启动 proxy）。后续的 `sleep(1500ms)` 不再触及共享
+        // 文件系统状态，提前 drop 避免 `await_holding_lock`。
         let _lock = test_lock();
         let _tmp = set_test_runtime_dir();
         let _ = std::fs::remove_file(crate::platform::shutdown_signal_file());
+        // 释放 lock：setup 已完成（tempdir + signal file + port），
+        // 接下来的 `UdpSocket::bind().await` + spawn 不需要再串行化。
+        drop(_lock);
 
         let listen_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let listen_port = listen_socket.local_addr().unwrap().port();
