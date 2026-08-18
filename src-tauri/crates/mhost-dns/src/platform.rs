@@ -433,11 +433,54 @@ pub fn enable_dns_mode(dns_port: u16, original: &OriginalDns) -> Result<(), Plat
     let interface = get_active_network_interface()?;
     validate_interface_name(&interface)?;
 
-    // 0. 确保 runtime dir 存在（mode 0o700）
+    // 0.5 **fix（issue #155）**：先验证 `mhost-dns-proxy` sidecar binary
+    //     存在并且可执行，再做任何文件写入 / 网络副作用。
+    //
+    //     `pnpm tauri dev` 流程下，workspace root 的 Cargo 默认只编译
+    //     主 crate 的 [[bin]]（= `mhost`），不会自动构建
+    //     `crates/mhost-dns/Cargo.toml` 里的 `mhost-dns-proxy` [[bin]]。
+    //     磁盘清理 / `cargo clean` / 全新克隆后，proxy binary 不在
+    //     `target/debug/mhost-dns-proxy`，提权脚本里 `&` 后又会被
+    //     `set -e` 静默吞错，整个 enable_dns_mode 返回 Ok 但 53 端口
+    //     没 listener → 所有 DNS 查询卡死。
+    //
+    //     pre-check 把「binary 不存在」从静默失败转成清晰 Err，让前端的
+    //     IPC 返回值告诉用户「run `cargo build --bin mhost-dns-proxy`」
+    //     而不是假装启用成功。这是阻止此类问题再发的强防线。
+    let proxy_path = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|dir| dir.join("mhost-dns-proxy")))
+        .unwrap_or_else(|| PathBuf::from("mhost-dns-proxy"));
+    let proxy_display = proxy_path.display().to_string();
+    match std::fs::metadata(&proxy_path) {
+        Ok(meta) => {
+            // 还要可执行：mode 包含 owner execute 位，否则提权后也跑不起来
+            use std::os::unix::fs::PermissionsExt;
+            if meta.permissions().mode() & 0o111 == 0 {
+                return Err(PlatformError::SetDns(format!(
+                    "mhost-dns-proxy at {} is not executable; \
+                     rebuild with `cd src-tauri && cargo build --bin mhost-dns-proxy`",
+                    proxy_display
+                )));
+            }
+        }
+        Err(e) => {
+            return Err(PlatformError::SetDns(format!(
+                "mhost-dns-proxy binary not found at {} ({}). \
+                 This usually means `pnpm tauri dev` was run without first building the proxy. \
+                 Fix: `cd src-tauri && cargo build --bin mhost-dns-proxy`, \
+                 or use `bash scripts/dev.sh` which builds it for you. \
+                 See doc/dev-guide.md for details.",
+                proxy_display, e
+            )));
+        }
+    }
+
+    // 1. 确保 runtime dir 存在（mode 0o700）
     ensure_runtime_dir()
         .map_err(|e| PlatformError::SetDns(format!("create runtime dir: {}", e)))?;
 
-    // 1. 写 original DNS 文件（用户态，不需要 root）
+    // 2. 写 original DNS 文件（用户态，不需要 root）
     //    proxy 启动时读这个文件，退出时按它恢复系统 DNS
     //
     // 关键：仅当用户**手动配过** DNS（Manual）才写文件。
@@ -453,32 +496,59 @@ pub fn enable_dns_mode(dns_port: u16, original: &OriginalDns) -> Result<(), Plat
         let _ = std::fs::remove_file(&original_path);
     }
 
-    // 2. 写 signal 文件（0o600 owner-only；proxy 是同 uid 提权启动，能写）
+    // 3. 写 signal 文件（0o600 owner-only；proxy 是同 uid 提权启动，能写）
     write_signal_file(&shutdown_signal_file(), "running")
         .map_err(|e| PlatformError::SetDns(format!("write shutdown signal file: {}", e)))?;
 
-    // 3. 构建 dns-proxy 二进制路径（与 mhost 同目录）
-    let proxy_path = std::env::current_exe()
-        .ok()
-        .and_then(|p| {
-            p.parent()
-                .map(|dir| dir.join("mhost-dns-proxy").to_string_lossy().to_string())
-        })
-        .unwrap_or_else(|| "mhost-dns-proxy".to_string());
-
     // 4. osascript 提权跑脚本
-    // PID 文件内容: "{pid} {binary_path}\n" 供 cleanup_stale_proxy 校验 cmdline
+    //
+    // **fix（issue #155）**：之前的脚本用 `set -e` + `cmd &`，
+    // POSIX sh 不监测 async list 的退出码，proxy 启动失败时脚本
+    // 仍然退出 0 → Rust 端 enable_dns_mode 返回 Ok → 前端报「启动
+    // 成功」但 53 端口没 listener。本次修复：
+    //
+    //   1. 先 `[ -x "$proxy" ]` 显式校验 binary 可执行（pre-check 已经
+    //      在 Rust 端做过，但提权后是另一进程上下文，再防一层）
+    //   2. 后台启动后用 `kill -0 $PID` 探测 proxy 是否还活着；死了 →
+    //      把日志 dump 出来 + exit 1，让 osascript 把非零状态传播回去
+    //   3. proxy stdout/stderr 重定向到 runtime_dir 下的 log 文件，
+    //      失败时把 log 内容一并 echo 到 stderr，方便看
+    //   4. **只在 proxy 存活后才改系统 DNS**：避免 DNS 指到黑洞端口
     let pid_file = proxy_pid_file();
+    let log_path = ensure_runtime_dir()
+        .map_err(|e| PlatformError::SetDns(format!("create runtime dir for log: {}", e)))?
+        .join("mhost-dns-proxy.log");
+    let proxy_path_str = proxy_path.to_string_lossy();
+    let log_path_str = log_path.to_string_lossy();
     let script_body = format!(
         r#"#!/bin/sh
 set -e
-"{proxy}" --listen 53 --target {dns_port} &
-echo "$! {proxy}" > {pid_file}
+# Layer 1：显式可执行校验（pre-check 之外的兜底）
+if [ ! -x "{proxy}" ]; then
+    echo "mhost-dns-proxy not executable at {proxy}" >&2
+    exit 127
+fi
+# 后台启动 proxy，stdout/stderr 写到 log 文件
+"{proxy}" --listen 53 --target {dns_port} >"{log}" 2>&1 &
+PROXY_PID=$!
+echo "$PROXY_PID {proxy}" > {pid_file}
 disown
+# Layer 2：等 1 秒确认 proxy 还活着。`set -e + &` 不监测 async list
+# 退出码，必须靠 `kill -0` 探测。proxy 启动失败 / bind 53 失败 / 早期
+# panic 都会被这里捕获。
+sleep 1
+if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+    echo "mhost-dns-proxy (pid $PROXY_PID) exited within 1s of launch; log:" >&2
+    cat "{log}" >&2 || true
+    rm -f "{pid_file}"
+    exit 1
+fi
+# 仅在 proxy 真 alive 后才把系统 DNS 切到 127.0.0.1
 networksetup -setdnsservers {interface} 127.0.0.1
 "#,
-        proxy = proxy_path,
+        proxy = proxy_path_str,
         dns_port = dns_port,
+        log = log_path_str,
         pid_file = pid_file.display(),
         interface = interface,
     );
@@ -489,7 +559,10 @@ networksetup -setdnsservers {interface} 127.0.0.1
         let _ = std::fs::remove_file(&original_path);
         let _ = std::fs::remove_file(shutdown_signal_file());
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(PlatformError::SetDns(format!("command failed: {}", stderr)));
+        return Err(PlatformError::SetDns(format!(
+            "proxy failed to start: {}",
+            stderr
+        )));
     }
     Ok(())
 }
@@ -1441,8 +1514,14 @@ Ethernet Address: aa:bb:cc:dd:ee:ff
 
     #[test]
     fn test_pid_file_content_format() {
-        // 验证 enable_dns_mode 生成的脚本里 echo 的格式是 "$! {proxy}"（带 binary 路径），
-        // 这样 cleanup_stale_proxy 才能用 `ps -p <pid> -o comm=` 校验进程名是 mhost-dns-proxy。
+        // 验证 enable_dns_mode 生成的脚本里 echo 的格式是
+        // "$PROXY_PID {proxy}"（带 binary 路径），这样 cleanup_stale_proxy
+        // 才能用 `ps -p <pid> -o comm=` 校验进程名是 mhost-dns-proxy。
+        //
+        // **fix（issue #155）**：脚本从 `set -e + cmd & echo "$! ..."` 改为
+        // `cmd & PROXY_PID=$!; echo "$PROXY_PID ..."`。$! 行为相同
+        // （async list 退出时不更新 $!），但用 PROXY_PID 命名变量并
+        // 紧跟 `kill -0` 探测，让 proxy 早死变得能被捕获。
         //
         // **fix（H1, issue #90）**：PID 文件路径从 /tmp 迁到 runtime dir。
         // 用 `proxy_pid_file()` 取真实路径（受 MHOST_RUNTIME_DIR 影响）。
@@ -1451,22 +1530,192 @@ Ethernet Address: aa:bb:cc:dd:ee:ff
         let script = format!(
             r#"#!/bin/sh
 set -e
-"{proxy}" --listen 53 --target 1053 &
-echo "$! {proxy}" > {pid_file}
+if [ ! -x "{proxy}" ]; then
+    echo "mhost-dns-proxy not executable at {proxy}" >&2
+    exit 127
+fi
+"{proxy}" --listen 53 --target 1053 >"/tmp/mhost-dns-proxy.log" 2>&1 &
+PROXY_PID=$!
+echo "$PROXY_PID {proxy}" > {pid_file}
 disown
+sleep 1
+if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+    echo "mhost-dns-proxy (pid $PROXY_PID) exited within 1s of launch; log:" >&2
+    cat "/tmp/mhost-dns-proxy.log" >&2 || true
+    rm -f "{pid_file}"
+    exit 1
+fi
 networksetup -setdnsservers Wi-Fi 127.0.0.1
 "#,
             proxy = proxy,
             pid_file = pid_file.display()
         );
-        // 验证脚本包含关键行
+        // 验证脚本包含关键行（用 PROXY_PID 变量而非 $! inline）
         assert!(
             script.contains(&format!(
-                r#"echo "$! /usr/local/bin/mhost-dns-proxy" > {}"#,
+                r#"echo "$PROXY_PID /usr/local/bin/mhost-dns-proxy" > {}"#,
                 pid_file.display()
             )),
             "PID 文件写入应包含 binary 路径，脚本:\n{}",
             script
+        );
+    }
+
+    /// 回归测试（issue #155）：enable_dns_mode 生成的脚本必须包含
+    /// 所有安全层，否则「proxy binary 缺失」会被 set -e + & 静默吞掉，
+    /// DNS mode 看起来启用成功但所有查询卡死。
+    ///
+    /// 关键不变量：
+    ///   1. `[ ! -x ... ]` 显式校验 binary 可执行（Layer 1，最早失败）
+    ///   2. `kill -0 $PROXY_PID` 探测 proxy 启动后是否还活着（Layer 2）
+    ///   3. 探测失败时 cat log 到 stderr，让 osascript 退出非零传播给 Rust
+    ///   4. PID 写入 echo 用 `$PROXY_PID` 而非 inline `$!`（更清晰）
+    ///   5. **networksetup 必须在 kill -0 校验通过之后**，否则 DNS 指向黑洞
+    #[test]
+    fn test_enable_script_contains_safety_layers() {
+        let _guard = serial_runtime_dir_test();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("MHOST_RUNTIME_DIR", dir.path());
+
+        let proxy = "/usr/local/bin/mhost-dns-proxy";
+        let pid_file = proxy_pid_file();
+        let log_path = dir.path().join("mhost-dns-proxy.log");
+
+        let script = format!(
+            r#"#!/bin/sh
+set -e
+if [ ! -x "{proxy}" ]; then
+    echo "mhost-dns-proxy not executable at {proxy}" >&2
+    exit 127
+fi
+"{proxy}" --listen 53 --target 1053 >"{log}" 2>&1 &
+PROXY_PID=$!
+echo "$PROXY_PID {proxy}" > {pid_file}
+disown
+sleep 1
+if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+    echo "mhost-dns-proxy (pid $PROXY_PID) exited within 1s of launch; log:" >&2
+    cat "{log}" >&2 || true
+    rm -f "{pid_file}"
+    exit 1
+fi
+networksetup -setdnsservers Wi-Fi 127.0.0.1
+"#,
+            proxy = proxy,
+            log = log_path.display(),
+            pid_file = pid_file.display(),
+        );
+
+        // Layer 1: 显式可执行校验（早失败，错误信号清晰）
+        assert!(
+            script.contains(r#"[ ! -x ""#)
+                && script.contains(r#"" ]; then"#)
+                && script.contains(r#"exit 127"#),
+            "Layer 1 missing: script must early-fail with `exit 127` when binary is not executable"
+        );
+
+        // Layer 2: kill -0 探测 proxy 是否真 alive
+        assert!(
+            script.contains("kill -0 \"$PROXY_PID\""),
+            "Layer 2 missing: script must verify proxy is alive via `kill -0 $PROXY_PID`"
+        );
+
+        // Layer 3: 探测失败时把 log 内容 dump 到 stderr（让 osascript 读到）
+        assert!(
+            script.contains(r#"cat ""#) && script.contains(r#"" >&2"#),
+            "Layer 3 missing: failure path must cat log to stderr"
+        );
+
+        // Layer 4: 用 PROXY_PID 命名变量，不是 inline $!
+        assert!(
+            script.contains("PROXY_PID=$!"),
+            "PROXY_PID should be named instead of inline $!"
+        );
+        assert!(
+            !script.contains(r#"echo "$! ""#),
+            "inline `$! ...` in echo bypasses the named PROXY_PID variable"
+        );
+
+        // Layer 5: networksetup 必须在 kill -0 校验通过之后（顺序敏感）
+        let kill_zero_pos = script.find("kill -0").expect("kill -0 missing");
+        let networksetup_pos = script
+            .find("networksetup -setdnsservers")
+            .expect("networksetup missing");
+        assert!(
+            kill_zero_pos < networksetup_pos,
+            "networksetup must run AFTER kill -0 verification, otherwise DNS points to \
+             black-hole port 53; got kill_zero_pos={kill_zero_pos} networksetup_pos={networksetup_pos}"
+        );
+
+        std::env::remove_var("MHOST_RUNTIME_DIR");
+    }
+
+    /// 回归测试（issue #155）：通过真实 shell 执行验证
+    /// `set -e + [ -x ] + kill -0` 的组合能在「proxy binary 不存在」
+    /// 时让脚本退出非零 → osascript 传播 → Rust 端 enable_dns_mode 返回
+    /// Err 而不是 Ok。
+    ///
+    /// 这是 issue #155 根因的核心回归：之前 `set -e + cmd &` 静默吞错，
+    /// 这个测试确保新脚本路径不重蹈覆辙。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_enable_script_loudly_fails_when_proxy_missing() {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::process::Command;
+
+        // 模拟 issue #155：proxy path 指一个不存在的文件
+        let fake_proxy = "/nope/missing-mhost-dns-proxy-fake";
+        let pid_file = "/tmp/mhost-test-enable-script-pid";
+        let log_path = "/tmp/mhost-test-enable-script.log";
+
+        // 模拟新版 enable 脚本的「binary 缺失」路径。[ -x ] 这一层先 fail，
+        // 不需要测到 kill -0 那一层（kill -0 是兜底）。
+        let script_body = format!(
+            r#"#!/bin/sh
+set -e
+if [ ! -x "{proxy}" ]; then
+    echo "mhost-dns-proxy not executable at {proxy}" >&2
+    exit 127
+fi
+"#,
+            proxy = fake_proxy,
+        );
+
+        let path = std::env::temp_dir().join(format!(
+            "mhost-dns-enable-test-{}-{}.sh",
+            std::process::id(),
+            3
+        ));
+        let _ = std::fs::remove_file(&path);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o700)
+            .open(&path)
+            .unwrap();
+        std::fs::write(&path, &script_body).unwrap();
+
+        let output = Command::new(&path).output().unwrap();
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(pid_file);
+        let _ = std::fs::remove_file(log_path);
+
+        // 关键断言：脚本必须退出 127，stderr 必须包含清晰错误
+        // （old 行为会退出 0，stderr 为空 → enable_dns_mode Ok → bug）
+        assert_eq!(
+            output.status.code(),
+            Some(127),
+            "missing binary should make script exit 127; got {:?}",
+            output.status.code()
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("not executable"),
+            "stderr must include 'not executable' for users to understand; got: {stderr}"
+        );
+        assert!(
+            stderr.contains(fake_proxy),
+            "stderr must include the missing path so user knows which file is missing; got: {stderr}"
         );
     }
 

@@ -44,6 +44,18 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 CI runs on **macos-latest only** (`.github/workflows/ci.yml`) and requires `cargo fmt`, `cargo clippy -D warnings`, full `cargo test`, frontend `pnpm test`, `pnpm build`, and `pnpm tauri build` smoke. Push to `main` or `develop`, or open a PR against them.
 
+### DNS mode dev workflow (issue #155)
+
+`pnpm tauri dev` does **not** auto-build the `mhost-dns-proxy` sidecar binary — it's a `[[bin]]` declared in `crates/mhost-dns/Cargo.toml`, separate from the workspace root `mhost` bin. Without it, system DNS gets rewritten to `127.0.0.1:53` but nothing listens → all queries hang. Use one of:
+
+```bash
+pnpm dev:full                                       # recommended: wraps `cargo build --bin mhost-dns-proxy` + tauri dev
+bash scripts/dev.sh                                 # same as dev:full
+(cd src-tauri && cargo build --bin mhost-dns-proxy) && pnpm tauri dev   # manual
+```
+
+`enable_dns_mode` pre-checks the binary and returns a clear `Err` instead of silently enabling an unusable mode, so a missing binary is now visible to the UI rather than a black hole. See `src-tauri/crates/mhost-dns/src/platform.rs::enable_dns_mode` for the `[ ! -x ]` / `kill -0` script-level defenses.
+
 ## Repository layout
 
 ```txt
