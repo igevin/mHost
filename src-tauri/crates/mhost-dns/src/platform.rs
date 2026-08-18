@@ -429,69 +429,230 @@ fn get_active_network_device() -> Option<String> {
 ///
 /// **fix（H1, issue #90）**：从 /tmp 迁移到 ~/Library/Application Support/mHost/.runtime/，
 /// mode 从 0o666 改 0o600。/tmp 旧路径在 cleanup_stale_proxy 启动时清理。
+///
+/// **fix（issue #155 + PR #156 review）**：
+///   - pre-check proxy binary 存在且可执行（Rust side，return Err）
+///   - 提权脚本用 `[ -x ]` 二次校验 + `kill -0` post-launch 探测
+///   - 所有 path 走单引号包裹（POSIX shell-quoting idiom），保证
+///     `~/Library/Application Support/...` 这种带空格路径不会截断
+///   - `trap ... EXIT` 在 networksetup 成功前清掉 disowned proxy + PID 文件
 pub fn enable_dns_mode(dns_port: u16, original: &OriginalDns) -> Result<(), PlatformError> {
     let interface = get_active_network_interface()?;
     validate_interface_name(&interface)?;
 
-    // 0. 确保 runtime dir 存在（mode 0o700）
+    // 0.5 **fix（issue #155）**：先验证 `mhost-dns-proxy` sidecar binary
+    //     存在并且可执行，再做任何文件写入 / 网络副作用。
+    let proxy_path = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|dir| dir.join("mhost-dns-proxy")))
+        .unwrap_or_else(|| PathBuf::from("mhost-dns-proxy"));
+    validate_proxy_binary(&proxy_path)?;
+
+    // 1. 确保 runtime dir 存在（mode 0o700）
     ensure_runtime_dir()
         .map_err(|e| PlatformError::SetDns(format!("create runtime dir: {}", e)))?;
 
-    // 1. 写 original DNS 文件（用户态，不需要 root）
-    //    proxy 启动时读这个文件，退出时按它恢复系统 DNS
-    //
-    // 关键：仅当用户**手动配过** DNS（Manual）才写文件。
-    // DhcpEmpty 不写 → proxy 启动时 read_original_dns_from_file 返回空 →
-    // restore 走 Empty 分支（不会泄漏 DHCP 推的 IP）。
+    // 2. 写 original DNS 文件 + signal 文件（同 issue #155 老逻辑）
     let original_path = original_dns_file();
     if let OriginalDns::Manual(servers) = original {
         let original_content = servers.join("\n");
         write_atomic_0600(&original_path, original_content.as_bytes())
             .map_err(|e| PlatformError::SetDns(format!("write original dns file: {}", e)))?;
     } else {
-        // DhcpEmpty: 确保没有残留的旧文件（从前一次 Manual enable 留下来）。
         let _ = std::fs::remove_file(&original_path);
     }
-
-    // 2. 写 signal 文件（0o600 owner-only；proxy 是同 uid 提权启动，能写）
     write_signal_file(&shutdown_signal_file(), "running")
         .map_err(|e| PlatformError::SetDns(format!("write shutdown signal file: {}", e)))?;
 
-    // 3. 构建 dns-proxy 二进制路径（与 mhost 同目录）
-    let proxy_path = std::env::current_exe()
-        .ok()
-        .and_then(|p| {
-            p.parent()
-                .map(|dir| dir.join("mhost-dns-proxy").to_string_lossy().to_string())
-        })
-        .unwrap_or_else(|| "mhost-dns-proxy".to_string());
-
-    // 4. osascript 提权跑脚本
-    // PID 文件内容: "{pid} {binary_path}\n" 供 cleanup_stale_proxy 校验 cmdline
+    // 3. 构造并执行脚本。脚本体在 `build_enable_script` 里（pub(crate)
+    //    暴露给 tests，免得测试再 format! 一份独立脚本造成回归盲区）。
     let pid_file = proxy_pid_file();
-    let script_body = format!(
-        r#"#!/bin/sh
-set -e
-"{proxy}" --listen 53 --target {dns_port} &
-echo "$! {proxy}" > {pid_file}
-disown
-networksetup -setdnsservers {interface} 127.0.0.1
-"#,
-        proxy = proxy_path,
-        dns_port = dns_port,
-        pid_file = pid_file.display(),
-        interface = interface,
-    );
+    let log_path = ensure_runtime_dir()
+        .map_err(|e| PlatformError::SetDns(format!("create runtime dir for log: {}", e)))?
+        .join("mhost-dns-proxy.log");
+    let inputs = EnableScriptInputs {
+        proxy_path: &proxy_path,
+        dns_port,
+        pid_file: &pid_file,
+        log_path: &log_path,
+        interface: &interface,
+    };
+    let script_body = build_enable_script(&inputs);
+
     let output = run_with_privileges(&script_body)
         .map_err(|e| PlatformError::SetDns(format!("enable dns mode failed: {}", e)))?;
     if !output.status.success() {
-        // 回滚：清理刚才写的文件
         let _ = std::fs::remove_file(&original_path);
         let _ = std::fs::remove_file(shutdown_signal_file());
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(PlatformError::SetDns(format!("command failed: {}", stderr)));
+        return Err(PlatformError::SetDns(format!(
+            "proxy failed to start: {}",
+            stderr
+        )));
     }
     Ok(())
+}
+
+/// 验证 `mhost-dns-proxy` sidecar binary 存在且可执行。
+///
+/// **fix（issue #155）**：从 `enable_dns_mode` 抽出供测试直接调用，
+/// 否则测试会再 format! 一份独立脚本 → 真实代码改坏了测试还过。
+pub(crate) fn validate_proxy_binary(proxy_path: &Path) -> Result<(), PlatformError> {
+    let display = proxy_path.display().to_string();
+    match std::fs::metadata(proxy_path) {
+        Ok(meta) => {
+            use std::os::unix::fs::PermissionsExt;
+            if meta.permissions().mode() & 0o111 == 0 {
+                return Err(PlatformError::SetDns(format!(
+                    "mhost-dns-proxy at {display} is not executable; \
+                     rebuild with `{PROXY_BUILD_INSTR}`",
+                )));
+            }
+        }
+        Err(e) => {
+            return Err(PlatformError::SetDns(format!(
+                "mhost-dns-proxy binary not found at {display} ({e}). \
+                 This usually means `pnpm tauri dev` was run without first building the proxy. \
+                 Fix: `{PROXY_BUILD_INSTR}`, \
+                 or use `bash scripts/dev.sh` which builds it for you. \
+                 See doc/dev-guide.md for details.",
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// 用户告诉用户「重建」时该敲的精确命令（含 `-p mhost-dns`，因为
+/// workspace root 不识别跨 crate [[bin]]）。
+///
+/// **fix（F5, PR #156 review）**：之前各文档里散落的
+/// `cargo build --bin mhost-dns-proxy` 在 workspace root 会 fail 报
+/// "no bin target named 'mhost-dns-proxy' in default-run packages"，
+/// 把用户从「silent failure」摆渡到「更难修的 explicit failure」。
+/// 把命令集中在这里，所有错误消息 + 文档都引用它。
+pub(crate) const PROXY_BUILD_INSTR: &str =
+    "cd src-tauri && cargo build -p mhost-dns --bin mhost-dns-proxy";
+
+/// 输入参数让 `build_enable_script` 拼出提权脚本。
+///
+/// **fix（F1 + F2, PR #156 review）**：从 `enable_dns_mode` 抽出，
+/// 让测试直接调用生产 builder 而不是 format! 一份独立脚本（防止
+/// 「脚本结构变了测试还能过」的回归盲区）。同时结构化输入避免
+/// 函数签名膨胀。
+#[derive(Debug)]
+pub(crate) struct EnableScriptInputs<'a> {
+    pub proxy_path: &'a Path,
+    pub dns_port: u16,
+    pub pid_file: &'a Path,
+    pub log_path: &'a Path,
+    pub interface: &'a str,
+}
+
+/// POSIX-shell 单引号包裹：把字符串裹在 `'…'` 里，内部每个
+/// `'` 替换成 `'\''`（end-quote / escaped-quote / re-quote 三段）。
+///
+/// 用途（**fix F2, PR #156 review**）：把路径注入 shell 脚本时不能用
+/// 字符串插值 —— `~/Library/Application Support/...` 这种带空格的
+/// 路径在裸替换下会触发 word splitting，把 redirect `> {pid_file}`
+/// 变成 `> ~/Library/Application` + `Support/...` 残留为 echo args。
+/// `>` 这种 POSIX-shell 唯一安全的传递方式是单引号（任何字节都能传，
+/// 没有变量展开、不受 metacharacter 影响）。
+///
+/// 测试：见 `test_shell_single_quote_*`。
+pub(crate) fn shell_single_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str(r"'\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// 生成 `enable_dns_mode` 执行的 sh 脚本。
+///
+/// 暴露为 `pub(crate)` 主要是给测试调用 —— 见 `test_*_pid_file_content*` 和
+/// `test_*_safety_layers*`。不要在这两个测试里再 format! 一份独立脚本。
+///
+/// 脚本语义（**fix F2/F4, PR #156 review**）：
+///   1. **path 安全**：proxy / pid / log / interface 全部走
+///      `shell_single_quote` 注入，避免带空格路径截断
+///   2. **transactional**：注册 EXIT trap，在 `networksetup` 成功前
+///      任意失败 → 杀掉 disowned proxy + 删 PID 文件，保证不留下
+///      占着 53 端口的 orphan。`networksetup` 成功后 `trap - EXIT` 解除，
+///      proxy + PID 文件保留供 `disable_dns_mode` 用
+///   3. **Layer 1 [ -x ]**：和 Rust pre-check 重复一次，提权后是另一个
+///      uid 上下文，pre-check 的 metadata 不能复用
+///   4. **Layer 2 kill -0**：proxy 启动后 1s 探测存活，覆盖
+///      bind 失败 / 早期 panic / 立即退出 等 set -e + & 吞错的场景
+pub(crate) fn build_enable_script(inputs: &EnableScriptInputs) -> String {
+    let proxy = shell_single_quote(&inputs.proxy_path.to_string_lossy());
+    let pid_file = shell_single_quote(&inputs.pid_file.to_string_lossy());
+    let log = shell_single_quote(&inputs.log_path.to_string_lossy());
+    let interface = shell_single_quote(inputs.interface);
+
+    format!(
+        r#"#!/bin/sh
+set -e
+
+PROXY={proxy}
+PID_FILE={pid_file}
+LOG_FILE={log}
+IFACE={interface}
+
+PROXY_PID=""
+
+# **fix（F4, PR #156 review）**：EXIT trap 在 networksetup 成功之前
+# 把 disowned root proxy 杀掉 + 删 PID 文件。否则 bind 成功 + networksetup
+# 失败会让 53 端口被占着、找不到 PID 来 kill，恢复不到原状。
+cleanup() {{
+    rc=$?
+    if [ -n "$PROXY_PID" ] && kill -0 "$PROXY_PID" 2>/dev/null; then
+        kill "$PROXY_PID" 2>/dev/null || true
+    fi
+    rm -f "$PID_FILE"
+    exit "$rc"
+}}
+trap cleanup EXIT
+
+# Layer 1：显式可执行校验（提权后是另一 uid 上下文，再防一层）
+if [ ! -x "$PROXY" ]; then
+    echo "mhost-dns-proxy not executable at $PROXY" >&2
+    exit 127
+fi
+
+# 后台启动 proxy，stdout/stderr 重定向到 log 文件
+"$PROXY" --listen 53 --target {dns_port} >"$LOG_FILE" 2>&1 &
+PROXY_PID=$!
+echo "$PROXY_PID $PROXY" > "$PID_FILE"
+disown
+
+# Layer 2：等 1 秒确认 proxy 还活着。`set -e + &` 不监测 async list
+# 退出码，必须靠 `kill -0` 探测。proxy 启动失败 / bind 53 失败 /
+# 早期 panic 都会被这里捕获。
+sleep 1
+if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+    echo "mhost-dns-proxy (pid $PROXY_PID) exited within 1s of launch; log:" >&2
+    cat "$LOG_FILE" >&2 || true
+    exit 1
+fi
+
+# 仅在 proxy 真 alive + 可执行 + bind 后才把系统 DNS 切到 127.0.0.1
+networksetup -setdnsservers "$IFACE" 127.0.0.1
+
+# 成功：解除 trap，proxy + PID 文件保留供 disable 路径使用
+trap - EXIT
+"#,
+        proxy = proxy,
+        dns_port = inputs.dns_port,
+        pid_file = pid_file,
+        log = log,
+        interface = interface,
+    )
 }
 
 /// 原子写入文件，mode 0o600（owner only）。
@@ -1441,33 +1602,402 @@ Ethernet Address: aa:bb:cc:dd:ee:ff
 
     #[test]
     fn test_pid_file_content_format() {
-        // 验证 enable_dns_mode 生成的脚本里 echo 的格式是 "$! {proxy}"（带 binary 路径），
-        // 这样 cleanup_stale_proxy 才能用 `ps -p <pid> -o comm=` 校验进程名是 mhost-dns-proxy。
+        // **fix（F1 + F2 + F4, PR #156 review）**：tests 直接调用
+        // 生产 `build_enable_script(...)` 而不是自己 format! 一份脚本，
+        // 防止「脚本改了测试还能过」的回归盲区。
         //
-        // **fix（H1, issue #90）**：PID 文件路径从 /tmp 迁到 runtime dir。
-        // 用 `proxy_pid_file()` 取真实路径（受 MHOST_RUNTIME_DIR 影响）。
-        let proxy = "/usr/local/bin/mhost-dns-proxy";
-        let pid_file = proxy_pid_file();
-        let script = format!(
-            r#"#!/bin/sh
-set -e
-"{proxy}" --listen 53 --target 1053 &
-echo "$! {proxy}" > {pid_file}
-disown
-networksetup -setdnsservers Wi-Fi 127.0.0.1
-"#,
-            proxy = proxy,
-            pid_file = pid_file.display()
+        // 验证内容：
+        //   1. PID 文件写入用 `$PROXY_PID` + 完整 single-quoted 路径
+        //   2. cleanup_stale_proxy 能用 `ps -p <pid> -o comm=` 校验 cmdline
+        let proxy = PathBuf::from("/usr/local/bin/mhost-dns-proxy");
+        let pid_file = PathBuf::from("/tmp/fake/pid file with space/mhost-dns-proxy.pid");
+        let log_path = PathBuf::from("/tmp/fake/log path/mhost-dns-proxy.log");
+        let script = build_enable_script(&EnableScriptInputs {
+            proxy_path: &proxy,
+            dns_port: 1053,
+            pid_file: &pid_file,
+            log_path: &log_path,
+            interface: "Wi-Fi",
+        });
+
+        // PID 文件行：使用变量 `$PROXY_PID` + `$PROXY`，本身不带字面量路径；
+        // 真正的字面量放在变量赋值（PROXY='...', PID_FILE='...'）里用 single-quote 包裹。
+        assert!(
+            script.contains(r#"echo "$PROXY_PID $PROXY" > "$PID_FILE""#),
+            "PID file write must use $PROXY_PID + $PROXY + $PID_FILE variables (literal paths \
+             belong in the assignment at the top, not here). Script:\n{script}",
         );
-        // 验证脚本包含关键行
+        // 同时：变量赋值必须用 single-quote（word-splitting 防御）
         assert!(
             script.contains(&format!(
-                r#"echo "$! /usr/local/bin/mhost-dns-proxy" > {}"#,
-                pid_file.display()
+                "PROXY={}",
+                shell_single_quote("/usr/local/bin/mhost-dns-proxy")
             )),
-            "PID 文件写入应包含 binary 路径，脚本:\n{}",
-            script
+            "PROXY must be assigned via single-quoted form to handle spaces"
         );
+        assert!(
+            script.contains(&format!(
+                "PID_FILE={}",
+                shell_single_quote(pid_file.to_string_lossy().as_ref())
+            )),
+            "PID_FILE must be assigned via single-quoted form (path has spaces)"
+        );
+    }
+
+    /// 回归测试（issue #155 + F1 + F2, PR #156 review）：enable_dns_mode 脚本
+    /// 必须包含所有安全层。**直接调用生产 builder**，防止测试改不到真实改动。
+    ///
+    /// 关键不变量：
+    ///   1. `[ ! -x ... ]` 显式校验 binary 可执行（Layer 1）
+    ///   2. `kill -0 $PROXY_PID` 探测 proxy 启动后是否还活着（Layer 2）
+    ///   3. 探测失败时 cat log 到 stderr
+    ///   4. PID 写入 echo 用 `$PROXY_PID` 而非 inline `$!`
+    ///   5. **networksetup 必须在 kill -0 校验通过之后**
+    ///   6. **EXIT trap 必须在 networksetup 前 + 注册**（F4：transactional）
+    ///   7. **path 都用 single-quote 包裹**（F2：抵抗带空格路径）
+    #[test]
+    fn test_enable_script_contains_safety_layers() {
+        let _guard = serial_runtime_dir_test();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("MHOST_RUNTIME_DIR", dir.path());
+
+        // 故意用带空格路径模拟「~/Library/Application Support/...」
+        let proxy = PathBuf::from("/Users/test/Library/Application Support/mHost/mhost-dns-proxy");
+        let pid_file = proxy_pid_file();
+        let log_path = dir.path().join("log file with space.log");
+        let interface = "Thunderbolt Ethernet";
+
+        let script = build_enable_script(&EnableScriptInputs {
+            proxy_path: &proxy,
+            dns_port: 1053,
+            pid_file: &pid_file,
+            log_path: &log_path,
+            interface,
+        });
+
+        // Layer 1: 显式可执行校验（带空格路径也必须 quoted）
+        assert!(
+            script.contains("[ ! -x \"$PROXY\" ]") && script.contains("exit 127"),
+            "Layer 1 missing: script must early-fail with `exit 127` when binary is not executable"
+        );
+
+        // Layer 2: kill -0 探测 proxy 是否真 alive
+        assert!(
+            script.contains("kill -0 \"$PROXY_PID\""),
+            "Layer 2 missing: kill -0 verification"
+        );
+
+        // Layer 3: 探测失败时把 log 内容 dump 到 stderr
+        assert!(
+            script.contains("cat \"$LOG_FILE\" >&2"),
+            "Layer 3 missing: failure-path cat to stderr"
+        );
+
+        // Layer 4: 用 PROXY_PID 命名变量，不是 inline $!
+        assert!(
+            script.contains("PROXY_PID=$!"),
+            "PROXY_PID must be named variable"
+        );
+        assert!(
+            !script.contains("echo \"$! "),
+            "inline `$! ...` would bypass the named PROXY_PID variable"
+        );
+
+        // Layer 5: networksetup 必须在 kill -0 校验通过之后
+        let kill_zero_pos = script.find("kill -0").expect("kill -0 missing");
+        let networksetup_pos = script
+            .find("networksetup -setdnsservers")
+            .expect("networksetup missing");
+        assert!(
+            kill_zero_pos < networksetup_pos,
+            "networksetup must run AFTER kill -0 (kill_zero={kill_zero_pos} \
+             networksetup={networksetup_pos}), otherwise DNS points to black hole"
+        );
+
+        // Layer 6 (F4): EXIT trap 注册 + 在 networksetup 成功后才 disarm
+        assert!(
+            script.contains("trap cleanup EXIT"),
+            "F4: EXIT trap must be registered before spawning proxy"
+        );
+        assert!(
+            script.contains("trap - EXIT"),
+            "F4: trap must be disarmed after networksetup succeeds"
+        );
+        // disarm 必须在 networksetup 之后
+        let networksetup_end = script
+            .find("networksetup -setdnsservers")
+            .map(|p| {
+                script[p..]
+                    .find('\n')
+                    .map(|nl| p + nl)
+                    .unwrap_or(script.len())
+            })
+            .unwrap();
+        let disarm_pos = script.find("trap - EXIT").expect("disarm missing");
+        assert!(
+            disarm_pos > networksetup_end,
+            "disarm must come AFTER networksetup succeeds (disarm={disarm_pos} \
+             networksetup_end={networksetup_end})"
+        );
+
+        // Layer 7 (F2): 所有 path 都用 single-quote 注入；运行变量都是双引号访问
+        assert!(
+            script.contains(&format!(
+                "PROXY={}",
+                shell_single_quote(&proxy.to_string_lossy())
+            )),
+            "F2: PROXY must be single-quoted (path with spaces)"
+        );
+        assert!(
+            script.contains(&format!(
+                "PID_FILE={}",
+                shell_single_quote(&pid_file.to_string_lossy())
+            )),
+            "F2: PID_FILE must be single-quoted"
+        );
+        assert!(
+            script.contains(&format!(
+                "LOG_FILE={}",
+                shell_single_quote(&log_path.to_string_lossy())
+            )),
+            "F2: LOG_FILE must be single-quoted"
+        );
+        assert!(
+            script.contains(&format!("IFACE='{interface}'")),
+            "F2: IFACE must be single-quoted (interface with spaces)"
+        );
+
+        std::env::remove_var("MHOST_RUNTIME_DIR");
+    }
+
+    // -----------------------------------------------------------------------
+    // shell_single_quote 单元测试（F2, PR #156 review）
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_shell_single_quote_basic() {
+        assert_eq!(shell_single_quote("hello"), "'hello'");
+        assert_eq!(shell_single_quote("/usr/bin/foo"), "'/usr/bin/foo'");
+        assert_eq!(shell_single_quote(""), "''");
+    }
+
+    #[test]
+    fn test_shell_single_quote_with_apostrophe() {
+        // POSIX 单引号包裹里内嵌 ' 必须用 '\'' 三段拼接
+        assert_eq!(shell_single_quote("can't"), "'can'\\''t'");
+        // 路径里有引号
+        assert_eq!(
+            shell_single_quote("/foo/'bar'/baz"),
+            "'/foo/'\\''bar'\\''/baz'"
+        );
+    }
+
+    #[test]
+    fn test_shell_single_quote_injection_safe() {
+        // shell metacharacters 在单引号包裹下都是字面量
+        let evil_inputs = [
+            "; rm -rf /",
+            "$(whoami)",
+            "`id`",
+            "$PATH",
+            "foo && bar",
+            "foo | bar",
+            "foo > /etc/passwd",
+            "foo\nbar",
+            "\\x00\\x01",
+        ];
+        for input in evil_inputs {
+            let quoted = shell_single_quote(input);
+            // 关键是：input 字符串中除了 ' 以外的字符都不应该有 escape；
+            // shell eval 时单引号包裹确保任何字节都按字面量解析
+            assert!(
+                quoted.starts_with('\'') && quoted.ends_with('\''),
+                "shell_single_quote({input:?}) must be wrapped in single quotes; got {quoted}"
+            );
+            // 通过 POSIX 测试：对 quoted 中的非 ' 部分脱壳后应该等于 input
+            // 这里抽简化断言：quoted 中的每个字符（去掉最外层单引号和中间 '\'' 三段）可逆
+            let mut s = quoted.as_str();
+            assert!(s.starts_with('\'') && s.ends_with('\''));
+            s = &s[1..s.len() - 1];
+            // 抽出 \' 三段替换回 '
+            let restored = s.replace(r"'\''", "'");
+            assert_eq!(restored, input, "quoting for {input:?} must round-trip");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // build_enable_script 端到端执行（F1, PR #156 review）
+    // -----------------------------------------------------------------------
+
+    /// 回归测试（issue #155 + F1）：**直接消费生产 builder 的输出**
+    /// 写到 disk + 用 /bin/sh 执行，验证「proxy binary 不存在」时退出 127。
+    ///
+    /// 这是 #155 根因的核心回归。之前的 `set -e + cmd &` 静默吞错让
+    /// osascript 返回 0 → enable_dns_mode 返回 Ok → 前端报成功但 53 端口
+    /// 没 listener。本测试通过真实 sh 执行确保：
+    ///   1. 缺失 binary 时脚本**不**像 old 那样退出 0
+    ///   2. stderr 含清晰错误信息（含 missing path）
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_enable_script_loudly_fails_when_proxy_missing() {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::process::Command;
+
+        // 用 tempdir 在 /tmp 下；proxy 路径**故意不创建文件**
+        let dir = tempfile::tempdir().unwrap();
+        let fake_proxy = dir.path().join("mhost-dns-proxy-does-not-exist");
+        let pid_file = dir.path().join("proxy.pid");
+        let log_path = dir.path().join("proxy.log");
+
+        // 关键：消费生产 builder，不是自己 format!
+        let script_body = build_enable_script(&EnableScriptInputs {
+            proxy_path: &fake_proxy,
+            dns_port: 1053,
+            pid_file: &pid_file,
+            log_path: &log_path,
+            interface: "Wi-Fi",
+        });
+
+        let path = std::env::temp_dir().join(format!(
+            "mhost-dns-enable-test-{}-{}.sh",
+            std::process::id(),
+            3
+        ));
+        let _ = std::fs::remove_file(&path);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o700)
+            .open(&path)
+            .unwrap();
+        std::fs::write(&path, &script_body).unwrap();
+
+        let output = Command::new(&path).output().unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        // 关键断言：脚本退出 127，而不是 old buggy 行为的 0
+        assert_eq!(
+            output.status.code(),
+            Some(127),
+            "missing binary should make script exit 127; got {:?}; \
+             stderr=\"{}\" stdout=\"{}\"",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout),
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("not executable"),
+            "stderr must include 'not executable' for users; got: {stderr}"
+        );
+        // single-quote 包裹后，路径字符串里 fake_proxy 应当完整出现在 stderr
+        assert!(
+            stderr.contains(fake_proxy.to_string_lossy().as_ref()),
+            "stderr must include the missing path so user knows which file; got: {stderr}"
+        );
+
+        // EXIT trap 应清掉 PID 文件（虽然这里 proxy 根本没启动，trap 的
+        // PROXY_PID 还是空，但 rm -f "$PID_FILE" 仍然执行一次，无害）
+        assert!(
+            !pid_file.exists(),
+            "F4: PID file should be cleaned up even on Layer 1 exit path"
+        );
+    }
+
+    /// 回归测试（F1）：路径含空格 + 接口名含空格时，脚本能正确把路径
+    /// 传给后续 shell 工具而不被 word splitting 截断。
+    ///
+    /// 模拟 macOS 默认路径 `~/Library/Application Support/mHost/...`，
+    /// 验证：
+    ///   1. 脚本生成出来后 `~/Library/Application` 这种 sub-string 永远不会
+    ///      裸出现（必须被 `'…'` 包裹）
+    ///   2. 真正执行时（缺失 proxy 会走 Layer 1 fail），stderr 包含完整路径
+    ///      —— 而不是被截断成 `~/Library/Application`
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_enable_script_with_spaces_in_path_loudly_fails() {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::process::Command;
+
+        // 路径含两个空格 + 接口名含一个空格
+        let dir = tempfile::Builder::new()
+            .prefix("mhost enable script test")
+            .tempdir()
+            .unwrap();
+        let proxy_with_space = dir.path().join("proxy binary");
+        let pid_with_space = dir.path().join("pid file");
+        let log_with_space = dir.path().join("log file");
+        let interface_with_space = "Thunderbolt Ethernet";
+
+        let script_body = build_enable_script(&EnableScriptInputs {
+            proxy_path: &proxy_with_space,
+            dns_port: 1053,
+            pid_file: &pid_with_space,
+            log_path: &log_with_space,
+            interface: interface_with_space,
+        });
+
+        // F2 静态保证：脚本里所有含空格的 path 必须被 single-quote 包裹
+        // 不能裸出现
+        let unquoted_path_str = proxy_with_space.to_string_lossy();
+        // 找到第一个空格之后的子串（"mhost enable..."）—— 必须整个在 '…' 之内
+        if let Some(space_idx) = unquoted_path_str.find(' ') {
+            // 这个子串不应该在脚本里裸出现（在某两个 ' 之间）
+            // 我们接受它在 quoted form 里，但不允许 "*...$ unquoted form..."
+            // 简化断言：全路径必须以 single-quote 边界包围
+            let quoted = shell_single_quote(&unquoted_path_str);
+            assert!(
+                script_body.contains(&quoted),
+                "F2: path with spaces must be single-quoted in script; expected {quoted:?} in {script_body}"
+            );
+        }
+
+        // 真正执行：缺失 binary → 走 Layer 1 → 退出 127
+        let path = std::env::temp_dir().join(format!(
+            "mhost-dns-enable-spaces-test-{}.sh",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o700)
+            .open(&path)
+            .unwrap();
+        std::fs::write(&path, &script_body).unwrap();
+
+        let output = Command::new(&path).output().unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            output.status.code(),
+            Some(127),
+            "spaces-in-path script should still exit 127 on missing proxy; \
+             got stderr=\"{}\"",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // 关键 F2 断言：完整路径（带空格）必须出现在 stderr，证明 quoting 起效
+        assert!(
+            stderr.contains(unquoted_path_str.as_ref()),
+            "F2: stderr must contain FULL path including spaces (proves quoting didn't truncate); \
+             got stderr=\"{stderr}\""
+        );
+        // 反向断言：用 simple sh 词法模拟器跑一次脚本，看 stderr 是不是
+        // 因为 word splitting 被截断。这里不强求（bash 行为复杂），改为
+        // 静态检查：script 里所有含空格 path 必须被 single-quote 包裹
+        // （这部分在 test_enable_script_contains_safety_layers 已覆盖）。
+        // 这里只验证 dynamic exec 的不可截断性。
+        if let Some(space_idx) = unquoted_path_str.find(' ') {
+            // 截断检测：stderr 末尾不应该停在 `<truncated> \n` 这种状态
+            // （即：被 truncate 后残留的 prefix + space + \n）
+            let truncated_with_space = format!("{} ", &unquoted_path_str[..space_idx]);
+            assert!(
+                !stderr.trim_end().ends_with(truncated_with_space.trim_end()),
+                "F2: stderr ended at '{truncated_with_space}' which suggests path was truncated \
+                 at the space; full={unquoted_path_str:?} got stderr={stderr:?}"
+            );
+        }
     }
 
     /// 回归测试（fix: code review B1）：disable_dns_mode 脚本必须有 `set -e`，

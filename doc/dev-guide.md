@@ -69,11 +69,57 @@ pnpm install
 
 ### 开发模式（推荐日常使用）
 
+> **⚠️ DNS mode 用户必读（issue #155）**：`pnpm tauri dev` **不会**自动
+> 构建 `mhost-dns-proxy` 这个独立 sidecar binary（它在 workspace member
+> `crates/mhost-dns/` 里，是一个 `[[bin]]`）。第一次启用 DNS mode 时，
+> 如果 `src-tauri/target/debug/mhost-dns-proxy` 不存在，DNS 查询会
+> 全部卡死（系统 DNS 被改成 127.0.0.1:53 但 53 端口没人监听）。
+
+**推荐工作流**（一键构建 proxy + 启动 dev）：
+
+```bash
+pnpm dev:full
+```
+
+或直接调脚本：
+
+```bash
+bash scripts/dev.sh
+```
+
+等价于：
+
+```bash
+cd src-tauri && cargo build -p mhost-dns --bin mhost-dns-proxy
+pnpm tauri dev
+```
+
+> 必须用 `-p mhost-dns --bin ...` 显式指定包：从 workspace root 跑
+> `cargo build --bin mhost-dns-proxy` 会 fail 报
+> "no bin target named 'mhost-dns-proxy' in default-run packages"
+> （mhost-dns 是 workspace member 而不是 default-run package）。
+
+临时用普通 dev 模式时，单独构建一次 proxy 也行：
+
+```bash
+(cd src-tauri && cargo build -p mhost-dns --bin mhost-dns-proxy) && pnpm tauri dev
+```
+
+构建完成后 `src-tauri/target/debug/mhost-dns-proxy` 就在 `current_exe()`
+同目录下，被 `enable_dns_mode` 通过 `current_exe().parent().join(...)`
+定位到。
+
 ```bash
 pnpm tauri dev
 ```
 
 同时启动 Vite 热更新（http://localhost:1420）和 Rust 后端，弹出桌面窗口。前端改代码自动刷新，Rust 改代码自动重编译。
+
+> 注：`pnpm tauri dev` 之后修改 Rust 代码不需要重新构建 proxy —— proxy
+> 是常驻 root 进程，编码由 release/commit 时决定的 `#[bin]` 形态决定；
+> 普通 Rust 修改走的是 `cargo run` 路径（主 binary `mhost`），proxy
+> binary 不参与热重载。需要重新构建 proxy 的场景只有修改了
+> `crates/mhost-dns/` 源码本身。
 
 ### 运行测试
 
