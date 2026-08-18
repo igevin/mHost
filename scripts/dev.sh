@@ -2,46 +2,72 @@
 # ---------------------------------------------------------------------------
 # scripts/dev.sh — 一键启动 dev 模式
 #
-# issue #155 的临时缓解：`pnpm tauri dev` 默认不会构建 `mhost-dns-proxy`
-# 这个独立 sidecar binary；磁盘清理 / 全新克隆后 binary 不在
-# target/debug/，DNS mode 会被静默失败。本文先构建 proxy 再启 dev。
+# issue #155 的工作流：`pnpm tauri dev` 默认不会构建 `mhost-dns-proxy`
+# 这个独立 sidecar binary；本文先 build proxy 再启 dev，避免磁盘清理
+# / 新克隆后 dev 模式拿不到 53 端口的 listener。
 #
 # 用法：
-#   bash scripts/dev.sh                    # debug 构建 + 启动 dev
-#   bash scripts/dev.sh --release          # release 构建 + dev（少见）
+#   bash scripts/dev.sh                  # debug 构建 + 启动 dev（默认）
+#   bash scripts/dev.sh --release        # release 构建 + 启动 dev
+#   bash scripts/dev.sh -h|--help        # 打印用法
 #
-# 不写 `pnpm dev:full` 是因为 build-and-version.md / dev-guide.md 这些文档里
-# 已经到处引用 `pnpm tauri dev` / `pnpm tauri build`，改文档比改工具链风险
-# 小。脚本化的入口更明确、不会让 `pnpm tauri` 系列命令泄漏到工程别处。
+# Bash 兼容性（F6, PR #156 review）：
+#   * 不在 `set -u` 下展开空数组 —— macOS 自带的 /bin/bash 3.2.57 会
+#     把 "${arr[@]}" 在空数组时当成 unbound variable
+#   * 用 `case` + `if` 显式分流，避免 silent ignore（F7）
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_ROOT"
 
-# 1. 选 profile
-PROFILE_FLAGS=()
-if [[ "${1:-}" == "--release" ]]; then
-    PROFILE_FLAGS=(--release)
-    TARGET_DIR="release"
-    echo "==> Building in --release profile"
-else
-    TARGET_DIR="debug"
-fi
+# 1. 参数解析（F6/F7）
+case "${1:-}" in
+    "")
+        CARGO_FLAGS=()
+        TARGET_DIR="debug"
+        PROFILE_LABEL="debug"
+        ;;
+    "--release")
+        CARGO_FLAGS=(--release)
+        TARGET_DIR="release"
+        PROFILE_LABEL="--release"
+        ;;
+    "-h"|"--help")
+        cat <<USAGE
+Usage: $0 [OPTIONS]
+
+Build the mhost-dns-proxy sidecar binary and start 'pnpm tauri dev'.
+Without arguments, builds the debug profile (target/debug/mhost-dns-proxy).
+
+OPTIONS:
+  --release      build the release profile and invoke 'pnpm tauri dev --release'
+  -h, --help     print this help and exit
+
+USAGE
+        exit 0
+        ;;
+    *)
+        echo "$0: unknown argument: $1" >&2
+        echo "Try '$0 --help' for usage." >&2
+        exit 2
+        ;;
+esac
+
 SRC_TAURI_TARGET="src-tauri/target/${TARGET_DIR}"
 
-# 2. 构建 mhost-dns-proxy sidecar binary
-#    `cargo build --bin mhost-dns-proxy` 只是构建 [[bin]] target；workspace
-#    root 的 [[bin]] (mhost) 由 pnpm tauri dev 自己跑 cargo run 的时候会构建，
-#    不会重复构建已 up-to-date 的依赖。
-echo "==> Building mhost-dns-proxy (debug)..."
+echo "==> Building mhost-dns-proxy (${PROFILE_LABEL} profile)..."
 (
     cd src-tauri
-    # 注意：必须用 `-p mhost-dns --bin ...` 显式指定包。
-    # `cargo build --bin mhost-dns-proxy` 在 workspace root 会失败：
-    # "no bin target named `mhost-dns-proxy` in default-run packages"，
-    # 因为 mhost-dns 是 workspace member、不是 default-run package。
-    cargo build --package mhost-dns --bin mhost-dns-proxy "${PROFILE_FLAGS[@]}"
+    # 必须用 `-p mhost-dns --bin ...` 显式指定包：workspace root 的
+    # `cargo build --bin mhost-dns-proxy` 会 fail 报 "no bin target named
+    # 'mhost-dns-proxy' in default-run packages"，因为 mhost-dns 是
+    # workspace member、不是 default-run package。
+    if [ "${#CARGO_FLAGS[@]}" -gt 0 ]; then
+        cargo build --package mhost-dns --bin mhost-dns-proxy "${CARGO_FLAGS[@]}"
+    else
+        cargo build --package mhost-dns --bin mhost-dns-proxy
+    fi
 )
 
 PROXY_BIN="${SRC_TAURI_TARGET}/mhost-dns-proxy"
@@ -50,7 +76,12 @@ if [[ ! -x "$PROXY_BIN" ]]; then
     exit 1
 fi
 
-# 3. 启动 dev
+# 2. 启动 dev
 echo "==> mhost-dns-proxy ready at ${PROXY_BIN}"
-echo "==> Starting pnpm tauri dev..."
-exec pnpm tauri dev "${PROFILE_FLAGS[@]}"
+echo "==> Starting pnpm tauri dev (${PROFILE_LABEL})..."
+# F6 fix：不在 set -u 下展开空数组
+if [ "${#CARGO_FLAGS[@]}" -gt 0 ]; then
+    exec pnpm tauri dev "${CARGO_FLAGS[@]}"
+else
+    exec pnpm tauri dev
+fi

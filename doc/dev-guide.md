@@ -90,14 +90,19 @@ bash scripts/dev.sh
 等价于：
 
 ```bash
-cd src-tauri && cargo build --bin mhost-dns-proxy
+cd src-tauri && cargo build -p mhost-dns --bin mhost-dns-proxy
 pnpm tauri dev
 ```
+
+> 必须用 `-p mhost-dns --bin ...` 显式指定包：从 workspace root 跑
+> `cargo build --bin mhost-dns-proxy` 会 fail 报
+> "no bin target named 'mhost-dns-proxy' in default-run packages"
+> （mhost-dns 是 workspace member 而不是 default-run package）。
 
 临时用普通 dev 模式时，单独构建一次 proxy 也行：
 
 ```bash
-(cd src-tauri && cargo build --bin mhost-dns-proxy) && pnpm tauri dev
+(cd src-tauri && cargo build -p mhost-dns --bin mhost-dns-proxy) && pnpm tauri dev
 ```
 
 构建完成后 `src-tauri/target/debug/mhost-dns-proxy` 就在 `current_exe()`
