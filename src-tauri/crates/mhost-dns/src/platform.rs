@@ -2148,4 +2148,680 @@ rm -f /tmp/mhost-dns-nonexistent.pid
             );
         }
     }
+
+    // -----------------------------------------------------------------------
+    // 端到端执行测试基础设施 + 测试（issue #158）
+    //
+    // F1/F2 fix（PR #156 review）已经把 build_enable_script 抽出成
+    // pub(crate)，结构测试都直接消费生产 builder。但「执行测试」只覆盖
+    // Layer 1 fail（binary 缺失）—— 成功路径 / bind 失败 / networksetup
+    // 失败 / 路径含空格端到端 这些场景都没跑过 production builder 的真实
+    // 输出。这里补一组端到端执行测试，方法：
+    //
+    //   1. 在 tempdir 里写 fake `mhost-dns-proxy`（参数 caller 给，可控
+    //      行为：长跑 / 立即退出 / 延迟启动）+ fake `networksetup`（写参数
+    //      到 log + caller 控制 exit code）
+    //   2. 把 tempdir 加到 PATH 前面，fake `networksetup` 通过 PATH 解析生效
+    //   3. fake `mhost-dns-proxy` 用 full path 传入（不走 PATH）
+    //   4. 真实执行 build_enable_script() 的产物（不是手 format! 出来的）
+    //
+    // 这些测试守护 #155 的根因：旧 `set -e + cmd & echo "$! ..."` 形式
+    // 会让 osascript 返回 0 但 53 端口没 listener —— 一个显式违反契约的
+    // silent failure。本组测试用 production builder + fake binaries 模拟
+    // 各种边界，确保修过的代码路径真的触发且修过。
+    // -----------------------------------------------------------------------
+
+    /// RAII env-var restore（fix #158）：任何修改 MHOST_RUNTIME_DIR / PATH
+    /// 的测试都应持一个 `EnvRestore::snapshot()`，避免中途 panic 时污染
+    /// 全局 env，导致后续测试 race / 失败。
+    struct EnvRestore {
+        saved_runtime_dir: Option<String>,
+        saved_path: Option<String>,
+    }
+
+    impl EnvRestore {
+        fn snapshot() -> Self {
+            Self {
+                saved_runtime_dir: std::env::var("MHOST_RUNTIME_DIR").ok(),
+                saved_path: std::env::var("PATH").ok(),
+            }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match self.saved_runtime_dir.take() {
+                Some(v) => std::env::set_var("MHOST_RUNTIME_DIR", v),
+                None => std::env::remove_var("MHOST_RUNTIME_DIR"),
+            }
+            match self.saved_path.take() {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+    }
+
+    /// Fake-binary 测试基础设施（fix #158）：写 fake `mhost-dns-proxy` +
+    /// fake `networksetup` 到 tempdir，把 tempdir 加到 PATH 前面。
+    ///
+    /// 返回 `(TempDir, fake_bin_path)`。TempDir drop 时清理 fake_bin
+    /// 目录，但 fake proxy 通过 `disown` 后是 detached 进程，caller 仍
+    /// 需自己 SIGTERM 清理（见 `kill_proxy_from_pid_file`）。
+    ///
+    /// **必须**持 `serial_runtime_dir_test()` 锁 —— 这函数改 PATH，
+    /// 和 proxy.rs 测试改 MHOST_RUNTIME_DIR 必须串行化。
+    #[cfg(target_os = "macos")]
+    fn setup_fake_bin_env(
+        proxy_contents: &str,
+        networksetup_contents: &str,
+    ) -> (tempfile::TempDir, PathBuf) {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let dir = tempfile::Builder::new()
+            .prefix("mhost-fake-bin")
+            .tempdir()
+            .unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+
+        for (name, contents) in [
+            ("mhost-dns-proxy", proxy_contents),
+            ("networksetup", networksetup_contents),
+        ] {
+            let path = bin.join(name);
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o755)
+                .open(&path)
+                .unwrap();
+            f.write_all(contents.as_bytes()).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        // 把 fake bin 加到 PATH 前面 → bare `networksetup` 调用 resolve 到 fake
+        let original_path = std::env::var("PATH").unwrap_or_default();
+        let new_path = format!("{}:{}", bin.display(), original_path);
+        std::env::set_var("PATH", &new_path);
+
+        (dir, bin)
+    }
+
+    /// 把 shell 脚本写到 0o700 temp 文件 + /bin/sh 执行，返回 `Output`。
+    ///
+    /// `name_prefix` 用于区分调用方（e.g. `"enable"` / `"old-buggy"`），避免
+    /// 并发 test 之间文件名碰撞。文件名还包含 PID + nanos + 调用方 line!()
+    /// 做 salt，确保真正并发也安全。
+    #[cfg(target_os = "macos")]
+    fn write_and_exec_script(name_prefix: &str, body: &str) -> std::process::Output {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::process::Command;
+
+        let script_path = std::env::temp_dir().join(format!(
+            "mhost-dns-{name_prefix}-{}-{}-{}.sh",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            line!(),
+        ));
+        let _ = std::fs::remove_file(&script_path);
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o700)
+                .open(&script_path)
+                .unwrap();
+            f.write_all(body.as_bytes()).unwrap();
+            f.sync_all().unwrap();
+        }
+        let output = Command::new(&script_path).output().unwrap();
+        let _ = std::fs::remove_file(&script_path);
+        output
+    }
+
+    /// 把 `build_enable_script` 的输出写到 0o700 temp 文件 + /bin/sh 执行，
+    /// 返回 `Output`。这是 5 个端到端测试的主入口。
+    #[cfg(target_os = "macos")]
+    fn exec_production_enable_script(inputs: &EnableScriptInputs) -> std::process::Output {
+        let script_body = build_enable_script(inputs);
+        write_and_exec_script("enable", &script_body)
+    }
+
+    /// 从 PID 文件读出 proxy PID 并 kill（SIGTERM → SIGKILL fallback）；happy-path
+    /// 测试清理用。silent ignore（PID 文件可能已被 trap 清掉）。
+    ///
+    /// SIGTERM-first 是因为 `sleep`、Rust runtime 都默认响应 SIGTERM，能干净
+    /// 退出（跑析构 / flush log）。如果目标进程 trap 了 SIGTERM 或已僵尸，
+    /// 150ms 后升级到 SIGKILL。两次都 silent ignore（PID 已被 reap 返回 ESRCH）。
+    #[cfg(target_os = "macos")]
+    fn kill_proxy_from_pid_file(pid_file: &Path) {
+        let Ok(content) = std::fs::read_to_string(pid_file) else {
+            return;
+        };
+        let Some(pid_str) = content.split_whitespace().next() else {
+            return;
+        };
+        let Ok(pid) = pid_str.parse::<i32>() else {
+            return;
+        };
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        // SIGTERM 不响应 / 进程已 zombie → 升级到 SIGKILL
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 端到端 happy path（issue #158 #1）
+    //
+    // fake proxy 长跑（模拟真实 proxy 启动后 bind + 服务 DNS）+
+    // fake networksetup 写 args + 退出 0。
+    //
+    // 验证 production builder 产出的脚本：
+    //   1. 退出 0
+    //   2. PID 文件写入 + 格式正确（"PID FULL_PROXY_PATH\n"，#81 安全格式）
+    //   3. fake networksetup 收到 -setdnsservers <IFACE> 127.0.0.1
+    //   4. EXIT trap **disarm** 后 proxy + PID 文件都保留
+    //      （kill -0 在记录的 PID 上成功，证明 proxy 还活着 = trap 没清）
+    //   5. stderr 不含 "exited within 1s"（proxy 没被 kill -0 误杀）
+    // -----------------------------------------------------------------------
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_enable_script_happy_path_with_fakes() {
+        let _guard = serial_runtime_dir_test();
+        let _env = EnvRestore::snapshot();
+
+        // **fix #158**：tempdir prefix 不能含空格 —— PID file 解析用
+        // `split_whitespace()`，fake_proxy 路径含空格会被切碎。路径含
+        // 空格的场景在 `test_enable_script_end_to_end_with_spaces_in_paths`
+        // 单独覆盖（那里 PID file 断言走 string contains，不依赖 split）。
+        let dir = tempfile::Builder::new()
+            .prefix("mhost-happy-path")
+            .tempdir()
+            .unwrap();
+        std::env::set_var("MHOST_RUNTIME_DIR", dir.path());
+
+        // fake proxy 把自己的 PID 写到 marker file，便于 cleanup 验证
+        let proxy_pid_marker = dir.path().join("fake_proxy.pid");
+        let proxy_contents = format!(
+            "#!/bin/sh\necho $$ > '{marker}'\nsleep 30\n",
+            marker = proxy_pid_marker.to_string_lossy()
+        );
+        // fake networksetup 写 args 到 log + 退出 0
+        let ns_log = dir.path().join("fake_ns.log");
+        let ns_contents = format!(
+            "#!/bin/sh\necho \"$@\" >> '{log}'\nexit 0\n",
+            log = ns_log.to_string_lossy()
+        );
+        let (_bin_dir, bin_path) = setup_fake_bin_env(&proxy_contents, &ns_contents);
+
+        let fake_proxy = bin_path.join("mhost-dns-proxy");
+        let pid_file = proxy_pid_file();
+        let log_path = dir.path().join("mhost-dns-proxy.log");
+
+        let inputs = EnableScriptInputs {
+            proxy_path: &fake_proxy,
+            dns_port: 1053,
+            pid_file: &pid_file,
+            log_path: &log_path,
+            interface: "Wi-Fi",
+        };
+
+        let output = exec_production_enable_script(&inputs);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        // 1. 脚本退出 0
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "happy path should exit 0; got {:?}\nstderr={stderr}\nstdout={stdout}",
+            output.status.code(),
+        );
+
+        // 2. PID 文件存在 + 格式 = "PID FULL_PROXY_PATH\n"
+        assert!(pid_file.exists(), "F4: PID file must remain after success");
+        let pid_content = std::fs::read_to_string(&pid_file).unwrap();
+        let mut parts = pid_content.split_whitespace();
+        let recorded_pid: u32 = parts.next().expect("PID").parse().expect("PID parse");
+        let recorded_path = parts.next().expect("binary path in PID file");
+        assert_eq!(
+            recorded_path,
+            fake_proxy.to_string_lossy(),
+            "PID file must record FULL proxy path (fix #81 safe format)"
+        );
+
+        // 3. fake networksetup 收到正确 args
+        let ns_log_content = std::fs::read_to_string(&ns_log).unwrap();
+        assert!(
+            ns_log_content.contains("-setdnsservers"),
+            "fake networksetup must receive -setdnsservers flag; got: {ns_log_content:?}"
+        );
+        assert!(
+            ns_log_content.contains("Wi-Fi"),
+            "fake networksetup must receive interface name; got: {ns_log_content:?}"
+        );
+        assert!(
+            ns_log_content.contains("127.0.0.1"),
+            "fake networksetup must receive 127.0.0.1 target; got: {ns_log_content:?}"
+        );
+
+        // 4. EXIT trap 已 disarm —— recorded PID 必须还活着（proxy 还在 sleep）。
+        //    必须在 kill cleanup **之前**做这个断言，否则 kill 把 proxy
+        //    杀掉后 kill -0 当然失败，断言无意义。
+        let alive = unsafe { libc::kill(recorded_pid as libc::pid_t, 0) == 0 };
+        assert!(
+            alive,
+            "after happy-path success, recorded PID {recorded_pid} must still be alive \
+             (proves EXIT trap was disarmed by `trap - EXIT` after networksetup)"
+        );
+
+        // 5. stderr 不应包含 Layer 2 失败信息
+        assert!(
+            !stderr.contains("exited within 1s"),
+            "happy path should NOT trigger kill -0 failure; stderr={stderr}"
+        );
+
+        // 所有断言通过后，cleanup 残留 fake proxy（避免下一个 test 撞上 zombie）
+        kill_proxy_from_pid_file(&pid_file);
+    }
+
+    // -----------------------------------------------------------------------
+    // kill -0 捕获 proxy 立即退出（issue #158 #2）
+    //
+    // fake proxy 用 `exit 1` 立刻死（模拟 bind 53 失败 / 早期 panic /
+    // 任何"启动后瞬间死掉"的场景）。
+    //
+    // 验证：
+    //   1. 脚本退出 1（不是 0，**不是** silent failure）
+    //   2. stderr 含 "exited within 1s" + log dump
+    //   3. PID 文件被 EXIT trap 清掉（不留 orphan）
+    // -----------------------------------------------------------------------
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_enable_script_kill_zero_catches_immediate_exit() {
+        let _guard = serial_runtime_dir_test();
+        let _env = EnvRestore::snapshot();
+
+        let dir = tempfile::Builder::new()
+            .prefix("mhost kill zero")
+            .tempdir()
+            .unwrap();
+        std::env::set_var("MHOST_RUNTIME_DIR", dir.path());
+
+        // fake proxy 立刻死；写一行到 log 让 Layer 2 dump 出来能验证
+        let proxy_contents = "#!/bin/sh\necho 'bind 53 failed: EADDRINUSE' >&2\nexit 1\n";
+        let ns_contents = "#!/bin/sh\necho \"$@\" >> /dev/null\nexit 0\n";
+        let (_bin_dir, bin_path) = setup_fake_bin_env(proxy_contents, ns_contents);
+
+        let fake_proxy = bin_path.join("mhost-dns-proxy");
+        let pid_file = proxy_pid_file();
+        let log_path = dir.path().join("mhost-dns-proxy.log");
+
+        let inputs = EnableScriptInputs {
+            proxy_path: &fake_proxy,
+            dns_port: 1053,
+            pid_file: &pid_file,
+            log_path: &log_path,
+            interface: "Wi-Fi",
+        };
+
+        let output = exec_production_enable_script(&inputs);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        // 1. 退出码 != 0（关键回归 —— 旧脚本会退出 0，#155 silent failure）
+        let code = output.status.code();
+        assert!(
+            code != Some(0),
+            "script must exit non-zero when proxy dies; got {code:?}\nstderr={stderr}"
+        );
+
+        // 2. stderr 含 Layer 2 错误消息
+        assert!(
+            stderr.contains("exited within 1s"),
+            "stderr must report kill -0 detection; got: {stderr}"
+        );
+        // log dump 应把 fake proxy 的 stderr 也带出来（"bind 53 failed"）
+        assert!(
+            stderr.contains("bind 53 failed"),
+            "stderr must include log dump from failed proxy; got: {stderr}"
+        );
+
+        // 3. PID 文件被 EXIT trap 清掉
+        assert!(
+            !pid_file.exists(),
+            "F4: PID file must be removed by EXIT trap on Layer 2 fail path"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // networksetup 失败 → EXIT trap transactional cleanup（issue #158 #3）
+    //
+    // fake proxy 长跑成功（kill -0 通过）+ fake networksetup 失败
+    // （模拟「proxy 真起来了但 DNS 切换被拒」场景）。
+    //
+    // 验证：
+    //   1. 脚本退出非 0（propagate networksetup 的失败）
+    //   2. EXIT trap 把**还在跑**的 proxy 杀掉（不留 orphan 占 53 端口）
+    //   3. EXIT trap 把 PID 文件清掉
+    //   4. fake networksetup 收到正确 args（确实被调到，不是早死）
+    // -----------------------------------------------------------------------
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_enable_script_transactional_cleanup_on_networksetup_failure() {
+        let _guard = serial_runtime_dir_test();
+        let _env = EnvRestore::snapshot();
+
+        let dir = tempfile::Builder::new()
+            .prefix("mhost ns fail")
+            .tempdir()
+            .unwrap();
+        std::env::set_var("MHOST_RUNTIME_DIR", dir.path());
+
+        // fake proxy 长跑 + 记录自己 PID（用于事后验证"已被 trap 清掉"）
+        let proxy_pid_marker = dir.path().join("fake_proxy.pid");
+        let proxy_contents = format!(
+            "#!/bin/sh\necho $$ > '{marker}'\nsleep 30\n",
+            marker = proxy_pid_marker.to_string_lossy()
+        );
+        // fake networksetup 写 args + 退出 1（模拟 setdnsservers 失败）
+        let ns_log = dir.path().join("fake_ns.log");
+        let ns_contents = format!(
+            "#!/bin/sh\necho \"$@\" >> '{log}'\nexit 1\n",
+            log = ns_log.to_string_lossy()
+        );
+        let (_bin_dir, bin_path) = setup_fake_bin_env(&proxy_contents, &ns_contents);
+
+        let fake_proxy = bin_path.join("mhost-dns-proxy");
+        let pid_file = proxy_pid_file();
+        let log_path = dir.path().join("mhost-dns-proxy.log");
+
+        let inputs = EnableScriptInputs {
+            proxy_path: &fake_proxy,
+            dns_port: 1053,
+            pid_file: &pid_file,
+            log_path: &log_path,
+            interface: "Wi-Fi",
+        };
+
+        let output = exec_production_enable_script(&inputs);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        // 0. 先读 fake proxy PID —— 之后 trap 应该把它杀掉
+        let proxy_pid_str = std::fs::read_to_string(&proxy_pid_marker)
+            .expect("fake proxy should have recorded its PID");
+        let proxy_pid: i32 = proxy_pid_str.trim().parse().expect("fake proxy PID parse");
+
+        // 1. 脚本退出非 0
+        let code = output.status.code();
+        assert!(
+            code != Some(0),
+            "script must propagate networksetup failure; got {code:?}\nstderr={stderr}"
+        );
+
+        // 2. fake proxy 必须已被 trap kill 掉（kill -0 应该失败）。
+        //    **不能**在此之前调 SIGKILL 兜底 —— 否则会遮盖「trap 没杀」的回归。
+        let proxy_alive = unsafe { libc::kill(proxy_pid, 0) == 0 };
+        assert!(
+            !proxy_alive,
+            "F4: EXIT trap must SIGTERM the proxy when networksetup fails; \
+             but kill -0 on PID {proxy_pid} still succeeds"
+        );
+
+        // 3. PID 文件被 EXIT trap 清掉
+        assert!(
+            !pid_file.exists(),
+            "F4: EXIT trap must rm -f the PID file on transactional cleanup"
+        );
+
+        // 4. fake networksetup 确实被调到（不是 Layer 1/2 早死）
+        let ns_log_content = std::fs::read_to_string(&ns_log).unwrap();
+        assert!(
+            ns_log_content.contains("-setdnsservers"),
+            "fake networksetup must have been called (proves script reached networksetup step); \
+             log: {ns_log_content:?}"
+        );
+
+        // 所有断言通过后，**兜底** kill ——万一未来 trap 行为偏离预期，
+        // 留个 zombie 也得清掉（这里 trap 已杀过，SIGKILL 是 no-op）。
+        unsafe {
+            libc::kill(proxy_pid, libc::SIGKILL);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 路径含空格端到端（issue #158 #4：覆盖「Production default path」
+    // ~/Library/Application Support/mHost/...）
+    //
+    // runtime_dir / pid_file / log_path 全都含空格 + interface 含空格，
+    // 跑 happy path，验证：
+    //   1. 脚本退出 0（不被 word splitting 截断）
+    //   2. PID 文件在带空格路径下**真的**被创建
+    //   3. PID 文件内容包含完整带空格的 proxy 路径（路径没被切碎）
+    //   4. fake networksetup 收到完整带空格的 interface 名
+    // -----------------------------------------------------------------------
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_enable_script_end_to_end_with_spaces_in_paths() {
+        let _guard = serial_runtime_dir_test();
+        let _env = EnvRestore::snapshot();
+
+        // Runtime_dir 用带空格前缀 → 所有 pid / log / shutdown file 都跟着带空格
+        let dir = tempfile::Builder::new()
+            .prefix("mhost runtime with spaces")
+            .tempdir()
+            .unwrap();
+        std::env::set_var("MHOST_RUNTIME_DIR", dir.path());
+
+        // 进一步让 fake proxy 二进制本身路径也带空格（worst case）
+        let bin_with_space = dir.path().join("fake bin dir");
+        std::fs::create_dir_all(&bin_with_space).unwrap();
+
+        let proxy_contents = "#!/bin/sh\nsleep 30\n";
+        let ns_log = dir.path().join("fake_ns.log");
+        let ns_contents = format!(
+            "#!/bin/sh\necho \"$@\" >> '{log}'\nexit 0\n",
+            log = ns_log.to_string_lossy()
+        );
+
+        let bin_path = bin_with_space.clone();
+        for (name, contents) in [
+            ("mhost-dns-proxy", proxy_contents),
+            ("networksetup", ns_contents.as_str()),
+        ] {
+            let path = bin_path.join(name);
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o755)
+                .open(&path)
+                .unwrap();
+            f.write_all(contents.as_bytes()).unwrap();
+        }
+        // PATH 加 fake bin 前面
+        let original_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var(
+            "PATH",
+            format!("{}:{}", bin_with_space.display(), original_path),
+        );
+
+        let fake_proxy = bin_path.join("mhost-dns-proxy");
+        // PID file 在 runtime_dir（已经带空格），log path 也带空格
+        let pid_file = proxy_pid_file();
+        let log_path = dir.path().join("log file with space.log");
+        let interface_with_space = "Thunderbolt Ethernet";
+
+        let inputs = EnableScriptInputs {
+            proxy_path: &fake_proxy,
+            dns_port: 1053,
+            pid_file: &pid_file,
+            log_path: &log_path,
+            interface: interface_with_space,
+        };
+
+        let output = exec_production_enable_script(&inputs);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        kill_proxy_from_pid_file(&pid_file);
+
+        // 1. 退出 0
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "spaces-in-path happy path should exit 0; got {:?}\nstderr={stderr}\nstdout={stdout}",
+            output.status.code()
+        );
+
+        // 2. PID 文件真的在带空格路径下被创建出来
+        assert!(
+            pid_file.exists(),
+            "F2: PID file must exist at the path-with-spaces; path={:?}",
+            pid_file
+        );
+
+        // 3. PID 文件内容含完整带空格 proxy 路径（路径没被切碎）
+        let pid_content = std::fs::read_to_string(&pid_file).unwrap();
+        assert!(
+            pid_content.contains(fake_proxy.to_string_lossy().as_ref()),
+            "F2: PID file must contain FULL proxy path with spaces; got: {pid_content:?}"
+        );
+
+        // 4. fake networksetup 收到完整带空格 interface
+        let ns_log_content = std::fs::read_to_string(&ns_log).unwrap();
+        assert!(
+            ns_log_content.contains("Thunderbolt Ethernet"),
+            "F2: fake networksetup must receive FULL interface name with spaces; got: {ns_log_content:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #155 silent-failure 文档测试（issue #158 #5）
+    //
+    // 手工拼出 #155 修复**之前**的 enable 脚本形式（无 [ -x ]、无
+    // kill -0、无 EXIT trap），跑同样的 fake proxy + fake networksetup：
+    //
+    //   - fake proxy = `exit 1`（bind 失败模拟）
+    //   - fake networksetup = 退出 0
+    //
+    // 验证旧脚本确实有 silent failure：
+    //   - 退出 0（脚本认为"enable 成功"）
+    //   - PID 文件**存在**但里面记录的 PID **不存活**（proxy 没真起来）
+    //   - 系统 DNS 被切到 127.0.0.1，但 53 端口实际没 listener
+    //
+    // **注意**：本测试**不**是 regression guard。如果 production builder
+    // 退回旧 `set -e + cmd & echo "$! ..."` 形式，已经由
+    // `test_pid_file_content_format` / `test_enable_script_contains_safety_layers`
+    // 这两个结构测试 catch（它们直接断言 `[ -x ]` / `kill -0` /
+    // `trap cleanup EXIT` / `PROXY_PID` 命名变量等结构特征 —— 这些
+    // 在旧形式中全部缺席）。
+    //
+    // 本测试的价值是 **pedagogical**：把 #155 的 silent failure 模式
+    // 具象化为一个可运行 demo，让后续维护者能直观看到「如果不修，
+    // 会发生什么」，降低对 issue 描述的依赖。
+    // -----------------------------------------------------------------------
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_old_buggy_script_silently_succeeds_with_dead_pid() {
+        let _guard = serial_runtime_dir_test();
+        let _env = EnvRestore::snapshot();
+
+        let dir = tempfile::Builder::new()
+            .prefix("mhost old buggy")
+            .tempdir()
+            .unwrap();
+        std::env::set_var("MHOST_RUNTIME_DIR", dir.path());
+
+        // fake proxy: 立刻 exit（bind 失败模拟）
+        let proxy_contents = "#!/bin/sh\nexit 1\n";
+        let ns_log = dir.path().join("fake_ns.log");
+        let ns_contents = format!(
+            "#!/bin/sh\necho \"$@\" >> '{log}'\nexit 0\n",
+            log = ns_log.to_string_lossy()
+        );
+        let (_bin_dir, bin_path) = setup_fake_bin_env(proxy_contents, &ns_contents);
+        let fake_proxy = bin_path.join("mhost-dns-proxy");
+
+        // 手工拼出 #155 修复**之前**的 buggy enable 脚本。
+        // 缺：no [ -x ] pre-check / no kill -0 post-launch / no EXIT trap /
+        // no networksetup-after-kill-zero ordering / no transactional cleanup。
+        let pid_file = dir.path().join("pid file");
+        let log_path = dir.path().join("log file");
+        let buggy_script = format!(
+            r#"#!/bin/sh
+set -e
+PROXY='{proxy}'
+PID_FILE='{pid_file}'
+LOG_FILE='{log}'
+IFACE='{iface}'
+
+# Old behavior: trust `&` swallow the exit code, no detection layer
+"$PROXY" --listen 53 --target 1053 >"$LOG_FILE" 2>&1 &
+PID=$!
+echo "$PID $PROXY" > "$PID_FILE"
+
+# Old: no kill -0, no EXIT trap, just trust
+networksetup -setdnsservers "$IFACE" 127.0.0.1
+"#,
+            proxy = fake_proxy.to_string_lossy(),
+            pid_file = pid_file.to_string_lossy(),
+            log = log_path.to_string_lossy(),
+            iface = "Wi-Fi",
+        );
+
+        let output = write_and_exec_script("old-buggy", &buggy_script);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        // 关键断言 #1：旧脚本退出 0（silent failure！）
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "演示 #155 的 silent failure 模式：旧脚本应该退出 0；got {:?} stderr={stderr}",
+            output.status.code(),
+        );
+
+        // 关键断言 #2：PID 文件被写了（旧脚本信任 `&` 的 PID）
+        assert!(
+            pid_file.exists(),
+            "旧脚本应该会把 `$!` 写到文件，演示 PID file 撒谎；got 不存在"
+        );
+        let pid_content = std::fs::read_to_string(&pid_file).unwrap();
+        let recorded_pid: u32 = pid_content
+            .split_whitespace()
+            .next()
+            .expect("PID")
+            .parse()
+            .expect("PID parse");
+
+        // 关键断言 #3：记录的 PID **不存活** —— 这就是 silent failure：
+        // 文件说有 proxy 在跑，实际 proxy 早就 exit 了，53 端口没 listener。
+        // 这是 #158 整个 issue 想防止的失败模式。
+        let recorded_alive = unsafe { libc::kill(recorded_pid as libc::pid_t, 0) == 0 };
+        assert!(
+            !recorded_alive,
+            "演示 silent failure：PID file 记录 PID {recorded_pid}，但这个进程早死了；\
+             旧 production builder 的 silent failure 在这里表现为：exit 0 + PID file 撒谎。"
+        );
+
+        // sanity check：fake networksetup 真的被调到（说明脚本跑完了，不是早期死）
+        let ns_log_content = std::fs::read_to_string(&ns_log).unwrap();
+        assert!(
+            ns_log_content.contains("-setdnsservers"),
+            "fake networksetup 必须被调到（说明旧脚本完整跑完了 enable 流程）；got: {ns_log_content:?}"
+        );
+    }
 }
