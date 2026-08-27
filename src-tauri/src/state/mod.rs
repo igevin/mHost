@@ -241,8 +241,19 @@ impl AppState {
                 eprintln!(
                     "[mHost] try_recover_dns: disable recovery marker found, forcing restore"
                 );
-                if let Err(e) = mhost_dns::platform::force_dns_restore_if_needed() {
-                    eprintln!("[mHost] force restore failed: {}", e);
+                // fix：force_dns_restore_if_needed 内部走 osascript，
+                // 同步裸调会阻塞 tokio worker。挪到 spawn_blocking。
+                let force_restore_result = tokio::task::spawn_blocking(|| {
+                    mhost_dns::platform::force_dns_restore_if_needed()
+                })
+                .await;
+                match force_restore_result {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => eprintln!("[mHost] force restore failed: {}", e),
+                    Err(join_err) => eprintln!(
+                        "[mHost] force_dns_restore_if_needed blocking task join failed: {}",
+                        join_err
+                    ),
                 }
             }
         }
@@ -316,7 +327,25 @@ impl AppState {
         // 5. 启动 dns-proxy 并设置系统 DNS
         // fix（proxy self-cleanup）：把 original 传给 proxy，让它
         // 退出时能自己恢复系统 DNS。
-        if let Err(e) = mhost_dns::platform::enable_dns_mode(dns_port, &original) {
+        //
+        // fix：与 commands/dns.rs set_dns_mode_enable 第 6 步同理，
+        // enable_dns_mode 内部走 osascript 同步阻塞，挪到 spawn_blocking。
+        let enable_result = tokio::task::spawn_blocking({
+            let original = original.clone();
+            move || mhost_dns::platform::enable_dns_mode(dns_port, &original)
+        })
+        .await;
+        let enable_outcome = match enable_result {
+            Ok(inner) => inner,
+            Err(join_err) => {
+                let _ = server.stop().await;
+                return Err(MhostError::InvalidInput(format!(
+                    "Failed to enable DNS mode (blocking task join failed): {}",
+                    join_err
+                )));
+            }
+        };
+        if let Err(e) = enable_outcome {
             let _ = server.stop().await;
             return Err(MhostError::InvalidInput(format!(
                 "Failed to enable DNS mode: {}",

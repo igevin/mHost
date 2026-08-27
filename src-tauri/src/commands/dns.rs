@@ -133,7 +133,29 @@ async fn set_dns_mode_enable(state: &AppState) -> Result<(), MhostError> {
     //    这是不可逆的副作用；失败必须 stop server 并返回 Err。
     //    fix（proxy self-cleanup）：把 &OriginalDns 传给 proxy，让它在
     //    退出时能自己恢复系统 DNS（DhcpEmpty → 写 Empty；Manual → 写回 list）。
-    if let Err(e) = mhost_dns::platform::enable_dns_mode(dns_port, &original) {
+    //
+    //    fix（regression from #155）：enable_dns_mode 内部走
+    //    osascript 弹 sudo 密码框，`Command::output()` 同步阻塞。直接裸调
+    //    会卡死当前 tokio worker，进而让 IPC handler 永远不 resolve、
+    //    前端 `isDnsLoadingAtom` 永远 true。挪到 spawn_blocking，让阻塞
+    //    syscall 跑在 blocking thread pool 上，tokio worker 保持响应。
+    //    前端 invoke 仍带 30s timeout 兜底（见 src/lib/tauri.ts）。
+    let enable_result = tokio::task::spawn_blocking({
+        let original = original.clone();
+        move || mhost_dns::platform::enable_dns_mode(dns_port, &original)
+    })
+    .await;
+    let enable_outcome = match enable_result {
+        Ok(inner) => inner,
+        Err(join_err) => {
+            let _ = server.stop().await;
+            return Err(MhostError::InvalidInput(format!(
+                "Failed to enable DNS mode (blocking task join failed): {}",
+                join_err
+            )));
+        }
+    };
+    if let Err(e) = enable_outcome {
         let _ = server.stop().await;
         return Err(MhostError::InvalidInput(format!(
             "Failed to enable DNS mode: {}",
@@ -160,7 +182,21 @@ async fn set_dns_mode_enable(state: &AppState) -> Result<(), MhostError> {
         // 尽力回滚：恢复系统 DNS + 停 server。
         // 用户刚接受了 enable 的 sudo 弹窗，回滚也用 interactive=true
         // 让 proxy 死了时也能走 osascript 兜底（同样弹 sudo 框）。
-        let restore_err = mhost_dns::platform::disable_dns_mode(&original, true);
+        //
+        // 同样包 spawn_blocking —— 见 set_dns_mode_enable 第 6 步注释，
+        // disable_dns_mode 内部走 osascript 也会阻塞 tokio worker。
+        let restore_result = tokio::task::spawn_blocking({
+            let original = original.clone();
+            move || mhost_dns::platform::disable_dns_mode(&original, true)
+        })
+        .await;
+        let restore_err = match restore_result {
+            Ok(inner) => inner,
+            Err(join_err) => Err(mhost_dns::platform::PlatformError::SetDns(format!(
+                "rollback disable task join failed: {}",
+                join_err
+            ))),
+        };
         let _ = server.stop().await;
         return Err(match restore_err {
             Ok(_) => e,
@@ -262,7 +298,22 @@ async fn set_dns_mode_disable(state: &AppState, interactive: bool) -> Result<(),
     //    restore_dns 失败会让用户留在「系统 DNS 指向 127.0.0.1」状态，
     //    但 in-memory 状态已经标 false，下次启动会按 dns_enabled=false
     //    处理；这是可恢复的。
-    if let Err(e) = mhost_dns::platform::disable_dns_mode(&original, interactive) {
+    //
+    //    包 spawn_blocking —— 见 set_dns_mode_enable 第 6 步注释，
+    //    disable_dns_mode 内部走 osascript 也会阻塞 tokio worker。
+    let disable_result = tokio::task::spawn_blocking({
+        let original = original.clone();
+        move || mhost_dns::platform::disable_dns_mode(&original, interactive)
+    })
+    .await;
+    let disable_outcome = match disable_result {
+        Ok(inner) => inner,
+        Err(join_err) => Err(mhost_dns::platform::PlatformError::SetDns(format!(
+            "blocking task join failed: {}",
+            join_err
+        ))),
+    };
+    if let Err(e) = disable_outcome {
         // 已经成功写了 manifest 标 false，所以这里只用 InvalidInput
         // 提示用户「系统 DNS 没恢复成功，需要手动检查」。
         return Err(MhostError::InvalidInput(format!(

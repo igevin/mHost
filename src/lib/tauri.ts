@@ -140,8 +140,46 @@ export async function deleteSnapshot(id: string): Promise<void> {
 
 // ---- DNS commands ----
 
+const DNS_MODE_TIMEOUT_MS = 30_000;
+
+/**
+ * Wraps a Promise-returning function with a timeout. The returned promise
+ * rejects with `message` if the inner function hasn't settled after `ms`.
+ *
+ * Note: rejecting does NOT cancel the inner operation — the underlying
+ * invoke/child-process continues running until it completes or the page
+ * is unloaded. Used here to recover the UI from a stuck osascript sudo
+ * prompt (the actual cancel-via-kill is a known macOS osascript
+ * limitation tracked separately).
+ */
+async function withTimeout<T>(
+  fn: () => Promise<T>,
+  ms: number,
+  message: string,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      fn(),
+      new Promise<T>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), ms);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 export async function setDnsMode(enabled: boolean): Promise<void> {
-  return invoke("set_dns_mode", { enabled });
+  return withTimeout(
+    () => invoke<void>("set_dns_mode", { enabled }),
+    DNS_MODE_TIMEOUT_MS,
+    `DNS mode ${enabled ? "enable" : "disable"} timed out after ${
+      DNS_MODE_TIMEOUT_MS / 1000
+    }s. ` +
+      `The sudo prompt may have been dismissed or never shown. ` +
+      `If your system DNS still points at 127.0.0.1, run \`networksetup -setdnsservers <interface> Empty\` manually.`,
+  );
 }
 
 export async function getDnsMode(): Promise<boolean> {
