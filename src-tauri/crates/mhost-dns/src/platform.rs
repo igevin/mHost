@@ -655,6 +655,63 @@ trap - EXIT
     )
 }
 
+/// `build_disable_script` 的输入参数。镜像 `EnableScriptInputs` 的风格。
+///
+/// **fix（issue #163 re-fix of PR #164）**：`proxy_pid` 在 5s 超时分支为
+/// Some；proxy-not-running / 首次 disable 路径为 None。
+/// `expected_basename`：PID 文件里记录的 binary path 的 basename，用于
+/// `#81` 精确匹配 comm 校验（防 PID 重用误杀）。老格式 PID 文件（仅 PID
+/// 没 binary 路径）传 None，跳过 comm 校验。
+pub(crate) struct DisableScriptInputs<'a> {
+    pub interface: &'a str,
+    /// `"Empty"` 或空格分隔的 IP 列表，由 `osascript_restore` 从
+    /// `OriginalDns::restore_argv()` 计算后传入。
+    pub target: String,
+    pub proxy_pid: Option<u32>,
+    pub expected_basename: Option<String>,
+}
+
+/// 构造 disable 时 `run_with_privileges` 跑的 sh 脚本。
+///
+/// **fix（issue #163 re-fix of PR #164）**：当 `proxy_pid` 为 Some，脚本
+/// 在 `networksetup` 之前先做 `#81` comm 校验 + sudo-escalated `kill -9`：
+///
+/// ```sh
+/// EXPECTED=<basename>
+/// ACTUAL=$(ps -p <pid> -o comm= 2>/dev/null | xargs -I{} basename {} 2>/dev/null)
+/// if [ "$ACTUAL" = "$EXPECTED" ]; then kill -9 <pid> 2>/dev/null; fi
+/// true
+/// networksetup -setdnsservers <iface> <target>
+/// ```
+///
+/// 整个 kill 在 `osascript ... with administrator privileges` 提权上下文
+/// 里执行，能干掉 root 跑的 proxy（用户态 `libc::kill` 因 EPERM 静默失
+/// 败 —— 这就是 PR #164 没工作的根因）。`2>/dev/null` + `if` + 尾部 `true`
+/// 三重保险：ESRCH / EPERM / comm 不匹配都不会让脚本非零退出，
+/// `networksetup` 仍能跑。
+pub(crate) fn build_disable_script(inputs: &DisableScriptInputs<'_>) -> String {
+    let kill_block = match (inputs.proxy_pid, inputs.expected_basename.as_deref()) {
+        (Some(pid), Some(expected)) => format!(
+            "EXPECTED={expected}\n\
+             ACTUAL=$(ps -p {pid} -o comm= 2>/dev/null | xargs -I{{}} basename {{}} 2>/dev/null)\n\
+             if [ \"$ACTUAL\" = \"$EXPECTED\" ]; then kill -9 {pid} 2>/dev/null; fi\n\
+             true\n"
+        ),
+        (Some(pid), None) => format!(
+            // 老格式 PID 文件（只 PID，没 binary 路径）→ 跳过 comm 校验；
+            // `; true` 兜底让 ESRCH 不影响 networksetup。
+            "kill -9 {pid} 2>/dev/null; true\n"
+        ),
+        (None, _) => String::new(),
+    };
+    format!(
+        "{kill_block}networksetup -setdnsservers {iface} {target}",
+        kill_block = kill_block,
+        iface = inputs.interface,
+        target = inputs.target,
+    )
+}
+
 /// 原子写入文件，mode 0o600（owner only）。
 ///
 /// 流程：写 `<path>.tmp`（mode 0o600）→ sync → rename 到目标。
@@ -727,6 +784,27 @@ pub(crate) fn write_signal_file(path: &Path, content: &str) -> std::io::Result<(
 ///   保留 marker + 返回 Err，让下次启动 try_recover_dns 走
 ///   `force_dns_restore_if_needed`。
 ///
+/// **fix（issue #163, disable-time stuck proxy SIGKILL, re-fix of PR #164）**：
+/// - PR #164 用用户态 `libc::kill(pid, SIGKILL)` 强退 proxy，但 **proxy
+///   以 root 跑、mhost 是用户态**，user → root 的 `kill(pid, SIGKILL)`
+///   静默返回 EPERM，proxy 继续占 53 端口，下一次 enable 仍拿到
+///   `EADDRINUSE (os error 48)`。同样的，`kill(pid, 0)` 从用户态查 root
+///   进程也 EPERM，被现有代码误判为「进程已死」（`alive = false`），直接
+///   跳过 5s 超时分支，根本走不到 PR #164 的 SIGKILL。
+/// - **正确做法**：把 `kill -9 <pid>`（带 `#81` comm 校验防 PID 重用）
+///   拼进 `build_disable_script` 生成的 sh 脚本，让 kill 在 `osascript ...
+///   with administrator privileges` 的 sudo 提权上下文里以 root 执行。
+///   跟 `networksetup` 共用同一个 sudo 弹窗，零额外授权。
+/// - 用户态 `kill_proxy_via_pid_file` 保留为 fast-path / 防御层（PR #164
+///   的契约，对 root proxy 会 EPERM 失败但 cheap + harmless；未来若 proxy
+///   改回用户态跑仍能起作用）。
+/// - 两个分支都传 PID 进 `osascript_restore`：5s 超时分支传 `Some(proxy_pid)`
+///   必杀；proxy-not-running 分支传 `proxy_pid_at_start`（即使 kill(pid,0)
+///   因 EPERM 让我们误判为「死」，sudo 提权的 kill 仍能把 root proxy 干掉）。
+/// - kill 失败（PID reuse, `#81` comm 不匹配）只 log warning，不影响 DNS
+///   恢复路径；marker 兜底逻辑保持不变。修复后所有四条退出路径（UI Disable
+///   / Tray Quit / Cmd-Q / SIGINT/SIGTERM）都不再泄漏 53 端口。
+///
 /// 注：参数 `servers` 保留 API 兼容：proxy 用自己的 original.txt 恢复，
 /// 但 interactive 分支用 `servers` 决定要恢复成什么 IP（proxy 不在的
 /// 兜底场景）。
@@ -740,10 +818,31 @@ pub fn disable_dns_mode(original: &OriginalDns, interactive: bool) -> Result<(),
     write_recovery_marker()
         .map_err(|e| PlatformError::RestoreDns(format!("write recovery marker: {}", e)))?;
 
+    // **fix（issue #163 re-fix）**：把 PID 提到外层 scope，让两个
+    // osascript_restore 调用点（5s 超时 + proxy-not-running）都能拿到。
+    // proxy-not-running 路径也传 Some(pid) 而不是 None —— 即使
+    // `kill(pid, 0)` 返回 EPERM 让我们误判为「死」，sudo 提权的 kill
+    // 仍能把 root proxy 干掉。
+    let proxy_pid_at_start: Option<u32> = read_proxy_pid();
+    let expected_basename_at_start: Option<String> = read_proxy_expected_basename();
+
     // 内部 helper：interactive 分支用 osascript 兜底恢复系统 DNS。
-    // 只负责调 networksetup；marker / 临时文件的清理由调用方根据
-    // 成功 / 失败统一处理。
-    fn osascript_restore(original: &OriginalDns) -> Result<(), PlatformError> {
+    //
+    // **fix（issue #163 re-fix of PR #164）**：当 `proxy_pid` 为
+    // `Some(pid)`，脚本会先做 `#81` comm 校验 + sudo-escalated `kill -9`，
+    // 再 `networksetup -setdnsservers`。kill 在
+    // `osascript ... with administrator privileges` 提权上下文里以 root
+    // 执行 —— 干掉 root 跑的 proxy（用户态 `libc::kill` 因 EPERM 静默
+    // 失败，这就是 PR #164 没工作的根因）。整个操作在同一个 sudo 弹窗
+    // 内完成，零额外授权。
+    //
+    // 只负责调 networksetup + 可选 kill；marker / 临时文件的清理由调用方
+    // 根据成功 / 失败统一处理。
+    fn osascript_restore(
+        original: &OriginalDns,
+        proxy_pid: Option<u32>,
+        expected_basename: Option<&str>,
+    ) -> Result<(), PlatformError> {
         let interface = get_active_network_interface()?;
         validate_interface_name(&interface)?;
         let argv = original.restore_argv();
@@ -752,11 +851,12 @@ pub fn disable_dns_mode(original: &OriginalDns, interactive: bool) -> Result<(),
         } else {
             argv.join(" ")
         };
-        let script_body = format!(
-            "networksetup -setdnsservers {iface} {target}",
-            iface = interface,
-            target = target
-        );
+        let script_body = build_disable_script(&DisableScriptInputs {
+            interface: &interface,
+            target,
+            proxy_pid,
+            expected_basename: expected_basename.map(str::to_string),
+        });
         let out = run_with_privileges(&script_body).map_err(|e| {
             PlatformError::RestoreDns(format!("invoke osascript for disable-time restore: {}", e))
         })?;
@@ -772,7 +872,7 @@ pub fn disable_dns_mode(original: &OriginalDns, interactive: bool) -> Result<(),
 
     // 1. 检查 proxy 是否真的在跑 —— 如果在跑，写 signal 让它自管；
     //    如果不在（已崩溃/没启过），跳到分支 2。
-    if let Some(proxy_pid) = read_proxy_pid() {
+    if let Some(proxy_pid) = proxy_pid_at_start {
         // proxy 存在（PID 文件可读）。检查进程是否还活。
         let alive = unsafe { libc::kill(proxy_pid as libc::pid_t, 0) == 0 };
         if alive {
@@ -802,8 +902,44 @@ pub fn disable_dns_mode(original: &OriginalDns, interactive: bool) -> Result<(),
                 PROXY_SHUTDOWN_TIMEOUT_SECS
             );
             if interactive {
-                // UI 路径：弹 sudo 让用户当场恢复
-                if osascript_restore(original).is_ok() {
+                // ISSUE #163：5s 超时后 proxy 还活着 —— 它还占着
+                // 127.0.0.1:53/UDP。
+                //
+                // **fix（issue #163 re-fix of PR #164）**：PR #164 用用户
+                // 态 `libc::kill(pid, SIGKILL)` 强退，但 proxy 以 root
+                // 跑 → user → root 的 kill 静默 EPERM，proxy 不死。
+                //
+                // 现在的层次：
+                // 1. user-space `kill_proxy_via_pid_file` 作为 fast-path
+                //    / defense-in-depth（root proxy 时 EPERM 失败但 cheap
+                //    + harmless；未来若 proxy 改回用户态跑仍能起作用）
+                // 2. **主杀**：`osascript_restore` 的 sudo 提权脚本里 kill，
+                //    跟 networksetup 共用一次 sudo 弹窗（见 build_disable_script）
+                match kill_proxy_via_pid_file(&proxy_pid_file()) {
+                    KillOutcome::Killed => {
+                        eprintln!(
+                            "[mHost] dns mode disable: killed via user-space fast-path (issue #163)"
+                        );
+                    }
+                    KillOutcome::PidReusedOrMismatch => {
+                        eprintln!(
+                            "[mHost] dns mode disable: user-space kill skipped (likely EPERM on root proxy); \
+                             relying on sudo kill"
+                        );
+                    }
+                    KillOutcome::PidDeadAlready | KillOutcome::FileMissing => {
+                        // polling 已检测 proxy 退出但 PID 文件没清（race）；无事可做
+                    }
+                }
+
+                // UI 路径：弹 sudo 让用户当场恢复（脚本里同时 kill proxy + 恢复 DNS）
+                if osascript_restore(
+                    original,
+                    Some(proxy_pid),
+                    expected_basename_at_start.as_deref(),
+                )
+                .is_ok()
+                {
                     // 兜底成功：清全部文件 + marker
                     let _ = std::fs::remove_file(proxy_pid_file());
                     let _ = std::fs::remove_file(original_dns_file());
@@ -825,9 +961,19 @@ pub fn disable_dns_mode(original: &OriginalDns, interactive: bool) -> Result<(),
     }
 
     // 2. proxy 不在（早死 / 从没启过 / PID 死后到这里）
+    //
+    // **fix（issue #163 re-fix）**：传 `Some(proxy_pid_at_start)` 而不是
+    // `None` —— 即使 `kill(pid, 0)` 因 EPERM 让我们误判为「死」，sudo
+    // 提权的 kill 仍能把潜在的 root proxy 干掉。
     if interactive {
         // UI 路径：proxy 都没在，肯定没人恢复 DNS，必须 sudo 兜底
-        if osascript_restore(original).is_ok() {
+        if osascript_restore(
+            original,
+            proxy_pid_at_start,
+            expected_basename_at_start.as_deref(),
+        )
+        .is_ok()
+        {
             let _ = std::fs::remove_file(original_dns_file());
             let _ = std::fs::remove_file(shutdown_signal_file());
             let _ = std::fs::remove_file(disable_recovery_marker_file());
@@ -898,6 +1044,23 @@ fn read_proxy_pid() -> Option<u32> {
     content.split_whitespace().next()?.parse().ok()
 }
 
+/// 从 PID 文件读出记录的 binary path 的 basename（#81 安全格式）。
+///
+/// **fix（issue #163 re-fix）**：传给 `build_disable_script` 在 sudo 提权
+/// 上下文里做 comm 校验，防止 PID 重用时被误杀。返回 `None` 表示：
+/// - PID 文件不存在 / 不可读
+/// - PID 文件只有 PID 没有 binary path（老格式）
+fn read_proxy_expected_basename() -> Option<String> {
+    let content = std::fs::read_to_string(proxy_pid_file()).ok()?;
+    let recorded_binary = content.split_whitespace().nth(1)?;
+    if recorded_binary.is_empty() {
+        return None;
+    }
+    std::path::Path::new(recorded_binary)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+}
+
 /// 清理残留的 dns-proxy 进程（应用启动时调用）。
 ///
 /// **安全修复（#81）**：PID 文件不再仅含 PID，还含 `mhost-dns-proxy` 路径。
@@ -908,69 +1071,144 @@ fn read_proxy_pid() -> Option<u32> {
 /// 模糊匹配，攻击者或巧合的二进制名（如 `not-mhost-dns-proxy`）会被错杀。
 /// 现在从 PID 文件读出原始 binary_path，与 `ps -o comm=` 做**精确相等比较**。
 ///
+/// **fix（issue #163, SIGKILL escalation）**：之前只 SIGTERM，proxy trap SIGTERM
+/// 后会留半死状态占着 53 端口。现在调 `kill_proxy_via_pid_file`，里面有
+/// SIGTERM → 150ms → SIGKILL 升级，与 disable 路径用同一份 helper，行为一致。
+///
 /// **fix（H1, issue #90）**：启动时也清掉老 /tmp 路径下的残留文件
 /// （用户从老版本升级过来时会留有这些孤儿文件，world-readable 可能含 DNS 信息）。
+///
+/// **fix（issue #163 re-fix, known limitation at startup）**：
+/// `kill_proxy_via_pid_file` 内部调用户态 `libc::kill`。如果 proxy 当前
+/// 以 root 跑（生产场景：enable 时 osascript 提权起的），kill 静默 EPERM
+/// 失败，stale proxy 不会被启动清理杀掉。**不在 startup 路径上弹 sudo 框**
+/// （intrusive UX），依赖用户的下一次 Disable 点击触发 `disable_dns_mode`
+/// 走 sudo 升级的 `kill -9`（见 `disable_dns_mode` 文档）。这是已知
+/// trade-off；不影响功能正确性，只是清理时机推迟到下次 disable。
 pub fn cleanup_stale_proxy() {
     // H1: 先清理老 /tmp 路径下的孤儿文件
     cleanup_legacy_tmp_files();
 
     let pid_path = proxy_pid_file();
-    let content = match std::fs::read_to_string(&pid_path) {
+    // Issue #163：helper 内部 SIGTERM → SIGKILL 升级。返回 `Killed` 才说明
+    // 真有进程被强退（之前只用 SIGTERM，trap 后留 zombie 不可见）。
+    let outcome = kill_proxy_via_pid_file(&pid_path);
+    if outcome == KillOutcome::Killed {
+        eprintln!(
+            "[mHost] Killed stale dns-proxy process via {}",
+            pid_path.display()
+        );
+    }
+    // 与旧行为兼容：启动清理永远该清 PID 文件（无论是否真的 kill）。
+    let _ = std::fs::remove_file(pid_path);
+}
+
+/// Issue #163 + #81 综合 helper：
+///   - 读 PID 文件（"{pid} {binary_path}\n"，#81 安全格式）
+///   - `kill(pid, 0)` 检查存活
+///   - `ps -p <pid> -o comm=` 校验进程 basename 与 recorded binary_path
+///     basename **精确相等**（#81 防御 PID 重用）
+///   - 仅在匹配时 SIGTERM → 150ms → SIGKILL 升级
+///
+/// **为什么 SIGKILL 升级**：disable 路径下 proxy 可能 trap SIGTERM 或卡在
+/// 阻塞 syscall（`restore_dns_and_exit` 内部的 `std::process::Command::output()`
+/// 无超时）。150ms 给 Rust runtime / tokio 时间反应；不响应就强退，避免下次
+/// enable 拿到 `EADDRINUSE` (os error 48)。
+///
+/// **为什么不删 PID 文件**：disable 路径 caller 已经在集中清理一组 temp 文件
+/// （pid / original / signal / marker），成败分支对 marker 处理不同；让 helper
+/// 不动 PID 文件，caller 一次性统一处理更可读。
+///
+/// **fix（issue #163 re-fix, role demoted）**：原 PR #164 把此 helper 作为
+/// disable 5s 超时分支的 **主** kill 路径。实测发现：proxy 以 root 跑时，
+/// 用户态 `kill(pid, SIGKILL)` 静默 EPERM，proxy 不死。修法是 disable
+/// 5s 超时分支改成在 `build_disable_script` 生成的 sudo 脚本里 kill；
+/// 本 helper 退化为：
+/// - **fast-path**：用户态 kill 能成功时（proxy 是用户态跑）直接干掉，
+///   省一次 sudo 弹窗
+/// - **defense-in-depth**：root proxy 时 EPERM 失败，无副作用
+/// - **startup cleanup**：`cleanup_stale_proxy` 仍用它，避开 startup
+///   sudo 弹窗
+///
+/// helper 自身契约（SIGTERM → SIGKILL、`#81` comm 校验、不删 PID 文件）
+/// 不变。disable 路径的主杀是 `osascript_restore` 里的 sudo 脚本，
+/// 不是这个 helper。
+fn kill_proxy_via_pid_file(pid_file: &Path) -> KillOutcome {
+    // 1. 读 PID 文件 + parse "{pid} {binary_path}"
+    let content = match std::fs::read_to_string(pid_file) {
         Ok(c) => c,
-        Err(_) => return,
+        Err(_) => return KillOutcome::FileMissing,
     };
-    // 格式："{pid} {binary_path}\n"
     let mut parts = content.split_whitespace();
-    if let Some(pid_str) = parts.next() {
-        if let Ok(pid) = pid_str.trim().parse::<u32>() {
-            // 取出当时记录的 binary_path，用于精确比对
-            let recorded_binary = parts.collect::<Vec<_>>().join(" ");
-            let expected_comm = std::path::Path::new(&recorded_binary)
+    let Some(pid_str) = parts.next() else {
+        return KillOutcome::FileMissing;
+    };
+    let Ok(pid) = pid_str.parse::<u32>() else {
+        return KillOutcome::FileMissing;
+    };
+    // 即使老格式（仅 PID，no binary），recorded_binary 为空 → expected_comm
+    // 为空 → is_proxy 永远 false → 安全 no-op，与旧 `cleanup_stale_proxy`
+    // 行为一致。
+    let recorded_binary: String = parts.collect::<Vec<_>>().join(" ");
+
+    // 2. liveness
+    let alive = unsafe { libc::kill(pid as libc::pid_t, 0) == 0 };
+    if !alive {
+        return KillOutcome::PidDeadAlready;
+    }
+
+    // 3. exact-match comm 校验（与 cleanup_stale_proxy 同款语义）
+    let expected_comm = std::path::Path::new(&recorded_binary)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| recorded_binary.clone());
+    if expected_comm.is_empty() {
+        return KillOutcome::PidReusedOrMismatch;
+    }
+    let is_proxy = match Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            let comm = String::from_utf8_lossy(&out.stdout);
+            let comm_basename = std::path::Path::new(comm.trim())
                 .file_name()
                 .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| recorded_binary.clone());
+                .unwrap_or_else(|| comm.trim().to_string());
+            comm_basename == expected_comm
+        }
+        _ => false,
+    };
+    if !is_proxy {
+        return KillOutcome::PidReusedOrMismatch;
+    }
 
-            let alive = unsafe { libc::kill(pid as libc::pid_t, 0) == 0 };
-            if !alive {
-                eprintln!(
-                    "[mHost] Stale dns-proxy pid {} not alive, skipping kill",
-                    pid
-                );
-            } else {
-                // 校验进程名精确匹配当时记录的 binary_path basename。
-                // 防止 PID 重用时被同 PID 的其他进程（如 `not-mhost-dns-proxy`）误杀。
-                //
-                // 注：macOS 的 `ps -o comm=` 返回完整可执行路径，Linux 只
-                // 返回 basename。两侧都取 basename 做精确比较，跨平台语义一致。
-                let ps_output = Command::new("ps")
-                    .args(["-p", &pid.to_string(), "-o", "comm="])
-                    .output();
-                let is_proxy = match ps_output {
-                    Ok(out) if out.status.success() => {
-                        let comm = String::from_utf8_lossy(&out.stdout);
-                        let comm_basename = std::path::Path::new(comm.trim())
-                            .file_name()
-                            .map(|s| s.to_string_lossy().to_string())
-                            .unwrap_or_else(|| comm.trim().to_string());
-                        comm_basename == expected_comm
-                    }
-                    _ => false,
-                };
-                if is_proxy {
-                    unsafe {
-                        libc::kill(pid as libc::pid_t, libc::SIGTERM);
-                    }
-                    eprintln!("[mHost] Killed stale dns-proxy process (pid {})", pid);
-                } else {
-                    eprintln!(
-                        "[mHost] pid {} alive but cmdline basename != expected '{}', skipping kill",
-                        pid, expected_comm
-                    );
-                }
-            }
+    // 4. SIGTERM → 150ms → SIGKILL 升级
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGKILL);
         }
     }
-    let _ = std::fs::remove_file(pid_path);
+    KillOutcome::Killed
+}
+
+/// `kill_proxy_via_pid_file` 的返回结果。disable 路径 caller 用它来决定
+/// 日志级别 / 是否上报；不携带 Err —— I/O 错误折叠成 `FileMissing`，ps
+/// 失败折叠成 `PidReusedOrMismatch`（保守：宁可漏杀也不误杀）。
+#[derive(Debug, PartialEq, Eq)]
+enum KillOutcome {
+    /// SIGTERM 或 SIGKILL 成功发出 —— PID 文件上的进程已死。
+    Killed,
+    /// liveness 通过但 comm 不匹配 —— PID 被重用，#81 安全网生效，没杀。
+    PidReusedOrMismatch,
+    /// `kill(pid, 0)` 返回非 0 —— 进程已死但 PID 文件没清。
+    PidDeadAlready,
+    /// PID 文件不存在或不可解析（race / trap 已清）。
+    FileMissing,
 }
 
 /// 获取当前活跃的网络接口名（Hardware Port）。
@@ -2823,5 +3061,462 @@ networksetup -setdnsservers "$IFACE" 127.0.0.1
             ns_log_content.contains("-setdnsservers"),
             "fake networksetup 必须被调到（说明旧脚本完整跑完了 enable 流程）；got: {ns_log_content:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // issue #163 — disable-time SIGKILL 兜底
+    //
+    // Bug 复现：disable 路径 5s 超时后，proxy 还占着 53/UDP。
+    // `kill_proxy_via_pid_file` 是修复的核心 helper；本节测试其契约。
+    //
+    // 与 #158 同款测试套路：写 fake 二进制到 tempdir 的 bin/，加进 PATH，
+    // 通过 spawn 真实进程（不 mock signal）。每个测试拿自己的 tempdir +
+    // serial_runtime_dir_test 锁 + EnvRestore，避免污染全局 env。
+    // -----------------------------------------------------------------------
+
+    /// 起一个 fake "stuck" proxy：trap SIGTERM + sleep，让 SIGTERM 不响应
+    /// （issue #163 的根因）。返回子进程 handle。
+    ///
+    /// **实现细节**：用 `/bin/sh` 当 fake binary，因为 shell 脚本经 shebang
+    /// 启动后 `ps -o comm=` 返回解释器路径（macOS 行为）。所以 PID 文件的
+    /// `recorded_binary` 必须是 `/bin/sh`，expected_comm = "sh"，ps 返回的
+    /// basename 也是 "sh"，才能通过 #81 精确匹配。生产环境 proxy 是编译后
+    /// 的 Mach-O 二进制，`ps` 直接返回 binary 路径，不需要这层对齐。
+    #[cfg(target_os = "macos")]
+    fn spawn_stuck_fake_proxy(_bin_dir: &Path, marker_file: &Path) -> std::process::Child {
+        let contents = format!(
+            "trap '' TERM\n\
+             echo $$ > '{marker}'\n\
+             sleep 30 &\n\
+             wait $!\n",
+            marker = marker_file.to_string_lossy()
+        );
+        std::process::Command::new("/bin/sh")
+            .args(["-c", &contents])
+            .spawn()
+            .expect("spawn stuck proxy")
+    }
+
+    /// 等 marker 文件出现并 parse 出 PID。最多等 2 秒。
+    #[cfg(target_os = "macos")]
+    fn wait_for_proxy_pid(marker: &Path) -> u32 {
+        for _ in 0..100 {
+            if let Ok(content) = std::fs::read_to_string(marker) {
+                if let Ok(pid) = content.trim().parse::<u32>() {
+                    return pid;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        panic!("fake proxy didn't write PID marker in time");
+    }
+
+    /// 起一个 cooperative fake proxy（响应 SIGTERM，没有 trap）。用于
+    /// 验证 SIGTERM 单独就够的场景。同样以 /bin/sh 启动，PID 文件的
+    /// `recorded_binary` 用 `/bin/sh` 才能通过 #81 comm 匹配。
+    #[cfg(target_os = "macos")]
+    fn spawn_cooperative_fake_proxy(_bin_dir: &Path, marker_file: &Path) -> std::process::Child {
+        let contents = format!(
+            "echo $$ > '{marker}'\n\
+             sleep 30 &\n\
+             wait $!\n",
+            marker = marker_file.to_string_lossy()
+        );
+        std::process::Command::new("/bin/sh")
+            .args(["-c", &contents])
+            .spawn()
+            .expect("spawn cooperative proxy")
+    }
+
+    /// bug 复现：stuck proxy trap SIGTERM → SIGKILL 升级必须生效
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_kill_proxy_via_pid_file_stuck_proxy_sigkill_escalates() {
+        let _guard = serial_runtime_dir_test();
+        let _env = EnvRestore::snapshot();
+        let dir = tempfile::Builder::new()
+            .prefix("mhost-issue-163-stuck")
+            .tempdir()
+            .unwrap();
+        std::env::set_var("MHOST_RUNTIME_DIR", dir.path());
+
+        let bin_dir = dir.path().join("bin");
+        std::fs::create_dir(&bin_dir).unwrap();
+        let pid_marker = dir.path().join("fake_proxy.pid");
+
+        let mut child = spawn_stuck_fake_proxy(&bin_dir, &pid_marker);
+        let stuck_pid = wait_for_proxy_pid(&pid_marker);
+
+        // 写 PID 文件成 #81 格式：recorded_binary 必须是 `/bin/sh`（spawn 时
+        // 的实际解释器），因为 shell 脚本经 shebang 启动后 `ps -o comm=` 返回
+        // `/bin/sh`。
+        let pid_file = proxy_pid_file();
+        std::fs::write(&pid_file, format!("{stuck_pid} /bin/sh\n")).unwrap();
+
+        // Act
+        let outcome = kill_proxy_via_pid_file(&pid_file);
+
+        // Assert 1: 进程必须死了（SIGKILL 升级生效）
+        assert_eq!(outcome, KillOutcome::Killed, "stuck proxy 必须被强退");
+        // reap zombie 才能让 PID 真正释放（生产中 proxy 的父进程是
+        // osascript-spawned sh，最终 reap；测试里 cargo test 是父进程）
+        let _ = child.wait();
+        let still_alive = unsafe { libc::kill(stuck_pid as libc::pid_t, 0) == 0 };
+        assert!(
+            !still_alive,
+            "stuck proxy (pid {stuck_pid}) 必须被 SIGKILL，但还活着"
+        );
+
+        // helper 不删 PID 文件 —— caller 自己清（contract）
+        assert!(pid_file.exists(), "helper 不应删 PID 文件（caller 自己清）");
+        let _ = std::fs::remove_file(&pid_file);
+    }
+
+    /// PID 文件指向已死 PID：安全返回 PidDeadAlready，不发任何信号
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_kill_proxy_via_pid_file_pid_dead() {
+        let _guard = serial_runtime_dir_test();
+        let _env = EnvRestore::snapshot();
+        let dir = tempfile::Builder::new()
+            .prefix("mhost-issue-163-pid-dead")
+            .tempdir()
+            .unwrap();
+        std::env::set_var("MHOST_RUNTIME_DIR", dir.path());
+
+        // 拿一个肯定不存在的 PID（PID 上限 ~4M，10M 必不存在）
+        let dead_pid: u32 = 9_999_999;
+        let pid_file = proxy_pid_file();
+        std::fs::write(
+            &pid_file,
+            format!("{dead_pid} /nonexistent/mhost-dns-proxy\n"),
+        )
+        .unwrap();
+
+        let outcome = kill_proxy_via_pid_file(&pid_file);
+        assert_eq!(outcome, KillOutcome::PidDeadAlready);
+        let _ = std::fs::remove_file(&pid_file);
+    }
+
+    /// PID 文件不存在：返回 FileMissing
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_kill_proxy_via_pid_file_missing() {
+        let _guard = serial_runtime_dir_test();
+        let _env = EnvRestore::snapshot();
+        let dir = tempfile::Builder::new()
+            .prefix("mhost-issue-163-missing")
+            .tempdir()
+            .unwrap();
+        std::env::set_var("MHOST_RUNTIME_DIR", dir.path());
+
+        let pid_file = proxy_pid_file();
+        assert!(!pid_file.exists(), "PID 文件必须不存在");
+
+        let outcome = kill_proxy_via_pid_file(&pid_file);
+        assert_eq!(outcome, KillOutcome::FileMissing);
+    }
+
+    /// PID 被其他进程重用：comm 不匹配 → #81 安全网生效，不杀
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_kill_proxy_via_pid_file_comm_mismatch_blocks_kill() {
+        let _guard = serial_runtime_dir_test();
+        let _env = EnvRestore::snapshot();
+        let dir = tempfile::Builder::new()
+            .prefix("mhost-issue-163-mismatch")
+            .tempdir()
+            .unwrap();
+        std::env::set_var("MHOST_RUNTIME_DIR", dir.path());
+
+        // 起一个不是 mhost-dns-proxy 的进程
+        let mut other_child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exec sleep 30"])
+            .spawn()
+            .expect("spawn sleep");
+        let other_pid = other_child.id();
+
+        // PID 文件写 other_pid，但 recorded_binary 是 mhost-dns-proxy
+        // → expected_comm = "mhost-dns-proxy"
+        // → ps 查 sleep 的 basename = "sleep"
+        // → comm_basename != expected_comm → PidReusedOrMismatch
+        let pid_file = proxy_pid_file();
+        std::fs::write(
+            &pid_file,
+            format!("{other_pid} /usr/local/bin/mhost-dns-proxy\n"),
+        )
+        .unwrap();
+
+        let outcome = kill_proxy_via_pid_file(&pid_file);
+
+        // Assert 1: 不杀
+        assert_eq!(
+            outcome,
+            KillOutcome::PidReusedOrMismatch,
+            "comm 不匹配时必须返回 PidReusedOrMismatch 而不是 Killed"
+        );
+
+        // Assert 2: sleep 进程必须还活着
+        let still_alive = unsafe { libc::kill(other_pid as libc::pid_t, 0) == 0 };
+        assert!(
+            still_alive,
+            "PID 重用的 sleep ({other_pid}) 必须没被杀 —— #81 安全网生效"
+        );
+
+        // cleanup
+        let _ = std::fs::remove_file(&pid_file);
+        unsafe {
+            libc::kill(other_pid as libc::pid_t, libc::SIGKILL);
+        }
+        let _ = other_child.wait();
+    }
+
+    /// 重复调用：第二次必须 no-op（不重复发信号给已死的进程）
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_kill_proxy_via_pid_file_idempotent() {
+        let _guard = serial_runtime_dir_test();
+        let _env = EnvRestore::snapshot();
+        let dir = tempfile::Builder::new()
+            .prefix("mhost-issue-163-idempotent")
+            .tempdir()
+            .unwrap();
+        std::env::set_var("MHOST_RUNTIME_DIR", dir.path());
+
+        let bin_dir = dir.path().join("bin");
+        std::fs::create_dir(&bin_dir).unwrap();
+        let pid_marker = dir.path().join("fake_proxy.pid");
+
+        let mut child = spawn_cooperative_fake_proxy(&bin_dir, &pid_marker);
+        let pid = wait_for_proxy_pid(&pid_marker);
+
+        // recorded_binary 用 `/bin/sh`（spawn 的实际解释器，ps 返回这个）
+        let pid_file = proxy_pid_file();
+        std::fs::write(&pid_file, format!("{pid} /bin/sh\n")).unwrap();
+
+        // 第一次：杀
+        let outcome1 = kill_proxy_via_pid_file(&pid_file);
+        assert_eq!(outcome1, KillOutcome::Killed);
+        // reap zombie 才能让 PID 释放
+        let _ = child.wait();
+        let still_alive = unsafe { libc::kill(pid as libc::pid_t, 0) == 0 };
+        assert!(!still_alive);
+
+        // 第二次：PID 文件还在但进程已死 → PidDeadAlready（无副作用）
+        let outcome2 = kill_proxy_via_pid_file(&pid_file);
+        assert_eq!(outcome2, KillOutcome::PidDeadAlready);
+
+        let _ = std::fs::remove_file(&pid_file);
+    }
+
+    /// helper contract：Killed 路径下 PID 文件**不被**删除（caller 自己清）
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_kill_proxy_via_pid_file_does_not_remove_pid_file() {
+        let _guard = serial_runtime_dir_test();
+        let _env = EnvRestore::snapshot();
+        let dir = tempfile::Builder::new()
+            .prefix("mhost-issue-163-no-rm")
+            .tempdir()
+            .unwrap();
+        std::env::set_var("MHOST_RUNTIME_DIR", dir.path());
+
+        let bin_dir = dir.path().join("bin");
+        std::fs::create_dir(&bin_dir).unwrap();
+        let pid_marker = dir.path().join("fake_proxy.pid");
+
+        let _child = spawn_cooperative_fake_proxy(&bin_dir, &pid_marker);
+        let pid = wait_for_proxy_pid(&pid_marker);
+
+        // recorded_binary 用 `/bin/sh`（spawn 的实际解释器，ps 返回这个）
+        let pid_file = proxy_pid_file();
+        std::fs::write(&pid_file, format!("{pid} /bin/sh\n")).unwrap();
+
+        let outcome = kill_proxy_via_pid_file(&pid_file);
+        assert_eq!(outcome, KillOutcome::Killed);
+
+        // 关键：PID 文件必须还在（disable 路径 caller 统一清一组 temp 文件）
+        assert!(
+            pid_file.exists(),
+            "helper contract：Killed 路径下 PID 文件不被 helper 删除"
+        );
+        let _ = std::fs::remove_file(&pid_file);
+    }
+
+    /// 防御性回归：issue #163 re-fix 把 kill 移进 `build_disable_script`
+    /// 生成的 sudo 脚本。结构断言验证 `disable_dns_mode` 把 PID 透传给
+    /// `osascript_restore` 的两个调用点（5s 超时 + proxy-not-running），
+    /// 而不是把它们丢成 `None`（那会让 sudo 杀逻辑失效）。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_disable_dns_mode_passes_pid_to_osascript_restore() {
+        let source = include_str!("platform.rs");
+
+        // 断言 0: build_disable_script 必须 pub(crate)（测试性）
+        assert!(
+            source.contains("pub(crate) fn build_disable_script"),
+            "build_disable_script must be pub(crate) for testability"
+        );
+
+        let fn_start = source
+            .find("pub fn disable_dns_mode")
+            .expect("disable_dns_mode 必须存在");
+        let fn_end_rel = source[fn_start..]
+            .find("\npub fn ")
+            .unwrap_or(source.len() - fn_start);
+        let fn_body = &source[fn_start..fn_start + fn_end_rel];
+
+        // 断言 1: proxy_pid 必须提到外层 scope
+        assert!(
+            fn_body.contains("let proxy_pid_at_start"),
+            "issue #163 re-fix: proxy_pid must be lifted to outer scope via \
+             'let proxy_pid_at_start' so both osascript_restore call sites see it"
+        );
+
+        // 断言 2: 5s 超时分支必须把 Some(proxy_pid) 传给 osascript_restore
+        // （call site 是多行格式，只查"Some(proxy_pid)"子串即可定位）
+        assert!(
+            fn_body.contains("Some(proxy_pid)"),
+            "issue #163 re-fix: 5s-timeout branch must pass Some(proxy_pid) to \
+             osascript_restore so the sudo-escalated kill runs"
+        );
+
+        // 断言 3: proxy_pid_at_start 必须出现（外层 scope 变量名），说明
+        // PID 被提到了 disable_dns_mode 函数顶部（而不是死在嵌套 block 里），
+        // 且 proxy-not-running 分支的 osascript_restore 调用能拿到它
+        assert!(
+            fn_body.contains("proxy_pid_at_start"),
+            "issue #163 re-fix: proxy_pid_at_start must be referenced (outer scope) \
+             and passed through one of the osascript_restore call sites"
+        );
+
+        // 断言 4: PR #164 user-space kill 留作 defense-in-depth
+        assert!(
+            fn_body.contains("kill_proxy_via_pid_file(&proxy_pid_file())"),
+            "issue #163 re-fix: user-space kill_proxy_via_pid_file block must \
+             remain as defense-in-depth"
+        );
+
+        // 断言 5: 必须处理所有四个 KillOutcome 变体（不漏 match arm）
+        for variant in [
+            "Killed",
+            "PidReusedOrMismatch",
+            "PidDeadAlready",
+            "FileMissing",
+        ] {
+            assert!(
+                fn_body.contains(variant),
+                "disable_dns_mode 必须 match KillOutcome::{variant}；漏 arm 会导致 \
+                 重要事件没 log"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // build_disable_script 单元测试
+    //
+    // 直接消费生产 builder（不 format! 平行副本），保证 #156 review 的
+    // 「修过的脚本结构真的触发」契约。
+    // -----------------------------------------------------------------------
+
+    /// None pid → 脚本里没有 kill 行
+    #[test]
+    fn test_build_disable_script_no_pid_no_kill_line() {
+        let script = build_disable_script(&DisableScriptInputs {
+            interface: "Wi-Fi",
+            target: "Empty".to_string(),
+            proxy_pid: None,
+            expected_basename: None,
+        });
+        assert!(
+            !script.contains("kill -9"),
+            "None pid must NOT produce kill line; got: {script}"
+        );
+        assert!(script.contains("networksetup -setdnsservers Wi-Fi Empty"));
+        assert!(
+            script.starts_with("networksetup"),
+            "script must start with networksetup when no pid; got: {script}"
+        );
+    }
+
+    /// Some(pid) + Some(basename) → #81 comm 校验 + kill + true 兜底
+    #[test]
+    fn test_build_disable_script_some_pid_with_comm_check() {
+        let script = build_disable_script(&DisableScriptInputs {
+            interface: "Wi-Fi",
+            target: "8.8.8.8 1.1.1.1".to_string(),
+            proxy_pid: Some(12345),
+            expected_basename: Some("mhost-dns-proxy".to_string()),
+        });
+        assert!(
+            script.contains("EXPECTED=mhost-dns-proxy"),
+            "must set EXPECTED env var for comm check; got: {script}"
+        );
+        assert!(
+            script.contains("ps -p 12345 -o comm="),
+            "must use ps -p <pid> -o comm= for verification; got: {script}"
+        );
+        assert!(
+            script
+                .contains("if [ \"$ACTUAL\" = \"$EXPECTED\" ]; then kill -9 12345 2>/dev/null; fi"),
+            "must wrap kill in if-guarded comm check; got: {script}"
+        );
+        // 尾部 `true` 让 ESRCH/EPERM/comm 不匹配都不让脚本非零退出
+        assert!(
+            script.contains("\ntrue\n"),
+            "must include trailing 'true' to guarantee exit 0; got: {script}"
+        );
+        // 顺序：kill block 必须在 networksetup 之前（kill-then-restore 契约）
+        let kill_pos = script.find("kill -9").expect("kill line");
+        let ns_pos = script.find("networksetup").expect("networksetup");
+        assert!(
+            kill_pos < ns_pos,
+            "kill block must precede networksetup; \
+             kill_pos={kill_pos} ns_pos={ns_pos} script={script}"
+        );
+        assert!(script.contains("networksetup -setdnsservers Wi-Fi 8.8.8.8 1.1.1.1"));
+    }
+
+    /// Some(pid) + None(basename) → 跳过 comm 校验（老格式 PID 文件）
+    #[test]
+    fn test_build_disable_script_legacy_pid_file_no_comm_check() {
+        let script = build_disable_script(&DisableScriptInputs {
+            interface: "Wi-Fi",
+            target: "Empty".to_string(),
+            proxy_pid: Some(12345),
+            expected_basename: None, // legacy PID file: only PID, no binary path
+        });
+        assert!(
+            !script.contains("EXPECTED="),
+            "legacy PID file must NOT produce EXPECTED env var; got: {script}"
+        );
+        assert!(
+            script.starts_with("kill -9 12345 2>/dev/null; true\n"),
+            "legacy PID file must produce plain 'kill -9 ... ; true' line; \
+             got first line: {:?}",
+            script.lines().next()
+        );
+        assert!(script.contains("networksetup -setdnsservers Wi-Fi Empty"));
+    }
+
+    /// PID 必须 decimal 格式化（无 padding / 无 hex）
+    #[test]
+    fn test_build_disable_script_pid_format_is_decimal() {
+        for pid in [0u32, 1, 99999, u32::MAX] {
+            let script = build_disable_script(&DisableScriptInputs {
+                interface: "Wi-Fi",
+                target: "Empty".to_string(),
+                proxy_pid: Some(pid),
+                expected_basename: Some("mhost-dns-proxy".to_string()),
+            });
+            assert!(
+                script.contains(&format!("ps -p {pid} -o comm=")),
+                "pid {pid} must format as decimal in ps arg; got: {script}"
+            );
+            assert!(
+                script.contains(&format!("kill -9 {pid} 2>/dev/null")),
+                "pid {pid} must appear verbatim in kill line; got: {script}"
+            );
+        }
     }
 }
