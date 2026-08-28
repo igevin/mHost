@@ -32,7 +32,7 @@ function Settings() {
   // which cancels the in-flight Rust `set_dns_mode` future before the
   // TCC prompt can appear. Symptom: Enable click hangs forever with
   // "Enable DNS mode" UI state and no macOS authorization dialog.
-  const { fire, release } = useWebKitPointerDown();
+  const { fire, releaseSoon } = useWebKitPointerDown();
 
   // Update check state
   const [updateStatus, setUpdateStatus] = useState<"idle" | "checking" | "available" | "up-to-date" | "error">("idle");
@@ -73,10 +73,10 @@ function Settings() {
       // click then lands on the newly-mounted Cancel button and cancels
       // the in-flight Rust enable — no TCC prompt ever appears.
       if (!fire()) return;
-      release();
+      releaseSoon();
       toggleDnsMode(enabled);
     },
-    [fire, release, toggleDnsMode],
+    [fire, releaseSoon, toggleDnsMode],
   );
 
   // issue #149: Settings cancel button. Aborts the in-flight `set_dns_mode`

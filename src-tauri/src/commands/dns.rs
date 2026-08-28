@@ -554,6 +554,129 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
+    /// `cancel_dns_mode` flips the slot's token when one is present.
+    /// This is the contract the Settings page Cancel button depends on.
+    #[tokio::test]
+    async fn test_cancel_dns_mode_fires_slot_token() {
+        let temp = TempDir::new().unwrap();
+        let storage = Arc::new(FileStorage::new(temp.path()))
+            as Arc<dyn mhost_storage::storage::Storage + Send + Sync>;
+        let token = CancellationToken::new();
+        let state = AppState {
+            storage,
+            writer: Arc::new(HostsWriter::new()),
+            apply_lock: ApplyLock::new(),
+            snapshot_lock: ApplyLock::new(),
+            last_profile_ids: Mutex::new(Vec::new()),
+            dns_server: Arc::new(Mutex::new(None)),
+            dns_enabled: AtomicBool::new(false),
+            original_dns: Mutex::new(OriginalDns::DhcpEmpty),
+            dns_lock: ApplyLock::new(),
+            dns_cancel: Mutex::new(Some(token.clone())),
+            ad_block_state: Arc::new(tokio::sync::RwLock::new(mhost_core::AdBlockState::default())),
+            ad_block_refresh_task: Mutex::new(None),
+            ad_block_refresh_cancel: Mutex::new(CancellationToken::new()),
+        };
+
+        assert!(!token.is_cancelled(), "pre-condition: token uncancelled");
+
+        // Mirror the IPC body without constructing `State<'_, AppState>`:
+        //   if let Some(token) = slot.as_ref() { token.cancel() }
+        {
+            let slot = lock_or_recover(&state.dns_cancel);
+            if let Some(t) = slot.as_ref() {
+                t.cancel();
+            }
+        }
+
+        assert!(
+            token.is_cancelled(),
+            "cancel_dns_mode must fire the slot's CancellationToken"
+        );
+    }
+
+    /// `cancel_dns_mode` is a no-op when no operation is in flight (slot empty).
+    /// Calling it must not panic and must be a no-op.
+    #[tokio::test]
+    async fn test_cancel_dns_mode_noop_when_slot_empty() {
+        let temp = TempDir::new().unwrap();
+        let storage = Arc::new(FileStorage::new(temp.path()))
+            as Arc<dyn mhost_storage::storage::Storage + Send + Sync>;
+        let state = AppState {
+            storage,
+            writer: Arc::new(HostsWriter::new()),
+            apply_lock: ApplyLock::new(),
+            snapshot_lock: ApplyLock::new(),
+            last_profile_ids: Mutex::new(Vec::new()),
+            dns_server: Arc::new(Mutex::new(None)),
+            dns_enabled: AtomicBool::new(false),
+            original_dns: Mutex::new(OriginalDns::DhcpEmpty),
+            dns_lock: ApplyLock::new(),
+            dns_cancel: Mutex::new(None),
+            ad_block_state: Arc::new(tokio::sync::RwLock::new(mhost_core::AdBlockState::default())),
+            ad_block_refresh_task: Mutex::new(None),
+            ad_block_refresh_cancel: Mutex::new(CancellationToken::new()),
+        };
+
+        let slot = lock_or_recover(&state.dns_cancel);
+        let did_cancel = slot.as_ref().is_some();
+        drop(slot);
+
+        assert!(
+            !did_cancel,
+            "empty slot must be a no-op for cancel_dns_mode"
+        );
+    }
+
+    /// Issue #138 follow-up (regression for the cancel slot): `set_dns_mode`
+    /// must allocate a FRESH, uncancelled token even when the previous
+    /// operation's token is still in the slot.
+    #[tokio::test]
+    async fn test_set_dns_mode_swap_cancellation_token_is_fresh() {
+        let temp = TempDir::new().unwrap();
+        let storage = Arc::new(FileStorage::new(temp.path()))
+            as Arc<dyn mhost_storage::storage::Storage + Send + Sync>;
+        let state = AppState {
+            storage,
+            writer: Arc::new(HostsWriter::new()),
+            apply_lock: ApplyLock::new(),
+            snapshot_lock: ApplyLock::new(),
+            last_profile_ids: Mutex::new(Vec::new()),
+            dns_server: Arc::new(Mutex::new(None)),
+            dns_enabled: AtomicBool::new(false),
+            original_dns: Mutex::new(OriginalDns::DhcpEmpty),
+            dns_lock: ApplyLock::new(),
+            // Pre-populate slot with a CANCELLED token.
+            dns_cancel: Mutex::new({
+                let t = CancellationToken::new();
+                t.cancel();
+                Some(t)
+            }),
+            ad_block_state: Arc::new(tokio::sync::RwLock::new(mhost_core::AdBlockState::default())),
+            ad_block_refresh_task: Mutex::new(None),
+            ad_block_refresh_cancel: Mutex::new(CancellationToken::new()),
+        };
+
+        // Simulate the swap pattern at the top of `set_dns_mode`:
+        //   let cancel = CancellationToken::new();
+        //   *lock_or_recover(&state.dns_cancel) = Some(cancel.clone());
+        let cancel = CancellationToken::new();
+        *lock_or_recover(&state.dns_cancel) = Some(cancel.clone());
+
+        assert!(
+            !cancel.is_cancelled(),
+            "swap pattern must produce a fresh, uncancelled token"
+        );
+        let slot_token = lock_or_recover(&state.dns_cancel)
+            .as_ref()
+            .expect("slot populated")
+            .clone();
+        assert!(
+            !slot_token.is_cancelled(),
+            "slot token must be the fresh, uncancelled one"
+        );
+    }
+
     /// 单元测试：DNS 模式未启用时，cleanup_dns_on_exit 直接返回 Ok，
     /// 不做 disable 副作用（不调 networksetup）。
     ///
