@@ -182,12 +182,18 @@ fn run_with_privileges(script_body: &str) -> Result<std::process::Output, String
 /// 调 osascript 让它以管理员权限执行临时脚本。脚本路径已写盘，
 /// 字符串拼接只发生在 AppleScript 字面量内，并用 `quoted form of POSIX path of`
 /// 走 AppleScript 自身的转义机制，不依赖手工 shell escape。
+///
+/// **fix (issue follow-up: force TCC re-prompt every time)**：复用
+/// `build_osascript_command` 注入 nonce,让 macOS TCC 5min 缓存不命中,
+/// disable / recovery 路径也每次重新弹授权框（与 `spawn_osascript` 一致）。
 fn invoke_osascript(path: &std::path::Path) -> Result<std::process::Output, String> {
     let path_str = path.to_string_lossy();
-    let apple_script = format!(
-        "do shell script \"sh \" & quoted form of POSIX path of \"{}\" with administrator privileges",
-        // 双重 escape 是因为我们要塞进 AppleScript 字符串字面量
-        path_str.replace('\\', "\\\\").replace('"', "\\\"")
+    let nonce = generate_nonce();
+    let apple_script = build_osascript_command(&path_str, &nonce);
+    tracing::debug!(
+        "invoke_osascript: nonce={}, script_path={}",
+        nonce,
+        path_str
     );
     Command::new("osascript")
         .args(["-e", &apple_script])
@@ -195,6 +201,176 @@ fn invoke_osascript(path: &std::path::Path) -> Result<std::process::Output, Stri
         .map_err(|e| format!("osascript failed: {}", e))
 }
 
+/// **fix (issue #142 follow-up)**：Result of an osascript invocation that
+/// exposes the child PID so the caller can kill it on timeout — the
+/// previous `Command::output()` wrapper hid the PID. macOS-only because
+/// the osascript call site itself is macOS-only.
+///
+/// **TODO (#149/#155 follow-up)**：当前 `commands/dns.rs` 还在用
+/// `tokio::time::timeout + spawn_blocking`（fix #142 的 60s timeout 路径），
+/// 会 leak osascript 子进程（timeout fire 时 blocking thread 不取消）。
+/// 后续 Group 4/#149 PR 会改用 `run_with_privileges_timeout` 同步调用，
+/// 届时这些 helper 会被实际使用 → 移除这个 `allow(dead_code)`。
+#[cfg(target_os = "macos")]
+#[allow(dead_code)] // see TODO above — used by future PR, not by current call site
+pub(crate) struct OsascriptRun {
+    pub child: std::process::Child,
+    pub pid: i32,
+}
+
+/// Build the AppleScript that `osascript -e` will execute. Pure function
+/// (no I/O, no spawning) so it's directly unit-testable.
+///
+/// **fix (issue follow-up: force TCC re-prompt every time)**：每次调用
+/// 都注入一个唯一 nonce 到 elevated shell 命令里（作为 shell 注释
+/// `#nonce<value>`）。macOS TCC 的 authorization cache key 基于实际
+/// 被提权的命令字符串 —— nonce 不同 → cache key 不同 → TCC 必须重新弹
+/// 授权框而不是静默放行（5min 缓存窗口失效）。
+///
+/// 注释形式 `#nonce<value>` 保证 nonce 不影响脚本执行（shell 注释），但
+/// 仍能让 macOS TCC 看到不同的命令字符串。
+///
+/// Path escaping：AppleScript 字符串里 `\` 和 `"` 需要分别转义为 `\\`
+/// 和 `\"`（AppleScript 的 escape 规则）。
+#[cfg(target_os = "macos")]
+pub(crate) fn build_osascript_command(script_path: &str, nonce: &str) -> String {
+    let escaped_path = script_path.replace('\\', "\\\\").replace('"', "\\\"");
+    format!(
+        "do shell script \"sh \" & quoted form of POSIX path of \"{}\" \
+         & \" #nonce{}\" with administrator privileges",
+        escaped_path, nonce
+    )
+}
+
+/// Generate a unique nonce for one osascript invocation. Uses nanosecond
+/// timestamp + PID + monotonic counter so even rapid-fire calls (same
+/// nanosecond, same process) yield distinct values.
+///
+/// Format: `<nanos_hex>-<pid>-<counter>` —— 紧凑、易读、跨进程+进程内唯一。
+#[cfg(target_os = "macos")]
+fn generate_nonce() -> String {
+    use std::sync::atomic::Ordering;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{:x}-{}-{}", nanos, pid, counter)
+}
+
+/// Spawn osascript and return the running `Child` so the caller can kill
+/// it on timeout. Replaces the previous fire-and-forget `.output()` call.
+///
+/// Stdio pipes are set explicitly (`Stdio::piped()`) so the Rust side
+/// owns valid pipes; without them `wait_with_output` would fail.
+///
+/// **fix (issue follow-up: force TCC re-prompt every time)**：每次 spawn
+/// 都通过 `generate_nonce()` 注入一个唯一 nonce 到 AppleScript 命令，
+/// 让 macOS TCC 不会用 5min 缓存静默放行。详见 `build_osascript_command`。
+///
+/// **TODO (#149/#155 follow-up)**：当前 callsite 还没切过来，保留供未来 PR。
+#[cfg(target_os = "macos")]
+#[allow(dead_code)] // see TODO above — used by future PR, not by current call site
+pub(crate) fn spawn_osascript(path: &std::path::Path) -> Result<OsascriptRun, String> {
+    let nonce = generate_nonce();
+    let path_str = path.to_string_lossy();
+    let apple_script = build_osascript_command(&path_str, &nonce);
+    tracing::debug!("spawn_osascript: nonce={}, script_path={}", nonce, path_str);
+    let child = Command::new("osascript")
+        .args(["-e", &apple_script])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("osascript spawn failed: {}", e))?;
+    let pid = child.id() as i32;
+    Ok(OsascriptRun { child, pid })
+}
+
+/// Best-effort SIGKILL the osascript child. The goal is to unblock the
+/// Rust-side wait so the UI can recover; the kill itself is fire-and-forget.
+///
+/// **TODO (#149/#155 follow-up)**：当前 callsite 还没切过来，保留供未来 PR。
+#[cfg(target_os = "macos")]
+#[allow(dead_code)] // see TODO above — used by future PR, not by current call site
+pub(crate) fn kill_osascript(pid: i32) {
+    // SAFETY: `kill(2)` with a valid PID is safe; the PID comes from the
+    // Child we just spawned and we hold the Child handle.
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+    }
+}
+
+/// Run osascript with a hard wall-clock timeout. On timeout, SIGKILL the
+/// child and return `Err` so the caller surfaces a clear error to the UI.
+///
+/// Synchronous (not `tokio::time::timeout` + `spawn_blocking`) on purpose:
+/// the v0.3.3 attempt used that pattern and was removed because dropping
+/// the `JoinHandle` after timeout doesn't interrupt the blocking thread,
+/// which leaks osascript and leaves `dns_enabled=false` in-memory while
+/// the proxy is already running + system DNS is already flipped
+/// (state desync). Here we hold the `Child` directly and SIGKILL on
+/// expiry, so the child is reaped on every exit path.
+///
+/// **TODO (#149/#155 follow-up)**：当前 `commands/dns.rs` 还在用
+/// `tokio::time::timeout + spawn_blocking`（leaky 60s timeout 路径）。
+/// 后续 Group 4 / #149 PR 会把这个 helper 接到 `enable_dns_mode` 的
+/// osascript 调用点，取代 leaky timeout wrapper → 移除 `allow(dead_code)`。
+#[cfg(target_os = "macos")]
+#[allow(dead_code)] // see TODO above — used by future PR, not by current call site
+pub(crate) fn run_with_privileges_timeout(
+    script_body: &str,
+    timeout: std::time::Duration,
+) -> Result<std::process::Output, String> {
+    let path = write_temp_script(script_body).map_err(|e| format!("temp script failed: {}", e))?;
+    let mut run = match spawn_osascript(&path) {
+        Ok(r) => r,
+        Err(e) => {
+            // spawn failed; safe to remove (osascript never started).
+            let _ = std::fs::remove_file(&path);
+            return Err(e);
+        }
+    };
+
+    let start = std::time::Instant::now();
+    // **Critical (issue found 2026-08-07)**: do NOT remove the temp script
+    // file until AFTER osascript has exited. osascript spawns `sh <path>`
+    // lazily from the AppleScript engine — if we delete the file before
+    // that exec, sh gets ENOENT (exit 127) and osascript returns exit 256
+    // with no error dialog visible to the user. This was the cause of
+    // the "no prompt, no error, UI stuck" hang.
+    let outcome: Result<std::process::Output, String> = loop {
+        match run.child.try_wait() {
+            Ok(Some(_status)) => {
+                break run
+                    .child
+                    .wait_with_output()
+                    .map_err(|e| format!("osascript wait_with_output failed: {}", e));
+            }
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    kill_osascript(run.pid);
+                    // Reap the zombie, don't block forever.
+                    let _ = run.child.wait();
+                    break Err(format!(
+                        "osascript timed out after {:?} (killed pid={}); \
+                         the TCC prompt may be stuck — try again or \
+                         force-quit System Events",
+                        timeout, run.pid
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => break Err(format!("osascript try_wait failed: {}", e)),
+        }
+    };
+
+    // SAFE TO REMOVE NOW: osascript has exited and won't exec sh again.
+    let _ = std::fs::remove_file(&path);
+    outcome
+}
 /// **fix（disabling-after-network-switch）**：capture the user's original DNS
 /// configuration **type**, separating "user managed" from "DHCP/empty".
 ///
@@ -382,7 +558,18 @@ fn networksetup_get_dns(port: &str) -> Result<Vec<String>, PlatformError> {
             stderr
         )));
     }
-    parse_dns_servers(&String::from_utf8_lossy(&output.stdout))
+    let raw = parse_dns_servers(&String::from_utf8_lossy(&output.stdout))?;
+    // **fix (issue #152, root cause 2)**: `127.0.0.1` / `::1` are
+    // mHost's own proxy address injected by `enable_dns_mode`. If they
+    // are read back via `capture_dns_state` (e.g., enable → partial-fail
+    // disable → re-enable before marker recovery), they get persisted
+    // to `mhost-dns-original.txt` and `manifest.original_dns` as the
+    // "user's original DNS", which silently corrupts future restores.
+    //
+    // `is_local_resolver` is already used by `get_upstream_resolvers`
+    // (issue #103 fix) for the same reason. Reuse here.
+    let filtered: Vec<String> = raw.into_iter().filter(|s| !is_local_resolver(s)).collect();
+    Ok(filtered)
 }
 
 /// `ipconfig getoption <device> domain_name_server` —— DHCP 推的 DNS。
@@ -453,11 +640,26 @@ pub fn enable_dns_mode(dns_port: u16, original: &OriginalDns) -> Result<(), Plat
         .map_err(|e| PlatformError::SetDns(format!("create runtime dir: {}", e)))?;
 
     // 2. 写 original DNS 文件 + signal 文件（同 issue #155 老逻辑）
+    //
+    // **fix (issue #152 hardening)**：写盘前最后再过滤一次 loopback。
+    // 上游 `capture_dns_state` 已经过滤；这里多一道是 belt-and-suspenders，
+    // 防止未来新增的 capture 路径忘了过滤把 127.0.0.1 写进 original.txt。
     let original_path = original_dns_file();
     if let OriginalDns::Manual(servers) = original {
-        let original_content = servers.join("\n");
-        write_atomic_0600(&original_path, original_content.as_bytes())
-            .map_err(|e| PlatformError::SetDns(format!("write original dns file: {}", e)))?;
+        let filtered: Vec<String> = servers
+            .iter()
+            .filter(|s| !is_local_resolver(s))
+            .cloned()
+            .collect();
+        if filtered.is_empty() {
+            // 过滤后变空（极端情况：用户原本的 Manual 只有 loopback）→
+            // 视为 DhcpEmpty，不写文件。
+            let _ = std::fs::remove_file(&original_path);
+        } else {
+            let original_content = filtered.join("\n");
+            write_atomic_0600(&original_path, original_content.as_bytes())
+                .map_err(|e| PlatformError::SetDns(format!("write original dns file: {}", e)))?;
+        }
     } else {
         let _ = std::fs::remove_file(&original_path);
     }
@@ -618,6 +820,43 @@ cleanup() {{
     exit "$rc"
 }}
 trap cleanup EXIT
+
+# ---- fix A: inline sudo-level orphan cleanup (already-elevated shell) ----
+# **fix (issue #152 hardening, Step 2)**：避免盲扫 `pgrep -x mhost-dns-proxy`。
+# 上一轮的 expected proxy 正在 self-restore（disable 中途发起的
+# restore_dns_and_exit 调用 networksetup 还没返回）时，如果 disable→re-enable
+# 在 ~1s 内发生，broad pgrep 会 TERM 掉还在跑 networksetup 的 proxy →
+# 系统 DNS 卡在 127.0.0.1。所以这里改成 PID-targeted kill：只对 pid_file
+# 里记录的 expected PID 做 TERM，且先用 `ps -o comm=` 精确匹配 basename
+# 防 PID 重用误杀（与 Rust 端 `cleanup_stale_proxy` 同样的语义）。
+# 只有 pid_file 缺失或陈旧（>30s）才退回 broad pgrep 兜底（针对真正的孤儿，
+# 不是 expected proxy）。
+if [ -f "{pid_file}" ]; then
+    pid=$(awk '{{print $1}}' "{pid_file}")
+    expected=$(awk '{{print $2}}' "{pid_file}")
+    expected_bn=$(basename "$expected" 2>/dev/null || echo "$expected")
+    if [ -n "$pid" ] && [ -n "$expected_bn" ]; then
+        current=$(ps -p "$pid" -o comm= 2>/dev/null | xargs -I{{}} basename {{}} 2>/dev/null || echo "")
+        if [ "$current" = "$expected_bn" ]; then
+            kill -TERM "$pid" 2>/dev/null || true
+        fi
+    fi
+fi
+sleep 1
+# Broad sweep 只在 pid_file 缺失或陈旧（>30s）时才跑 —— 保护 expected proxy
+# 不被「快速 re-enable」误杀，但真正的孤儿（pid_file 已经被自己的 cleanup
+# 清掉、或者 30s 前就死掉的）会被清理。
+pid_file_age=999
+if [ -f "{pid_file}" ]; then
+    pid_file_mtime=$(stat -f %m "{pid_file}" 2>/dev/null || echo "0")
+    now=$(date +%s)
+    pid_file_age=$((now - pid_file_mtime))
+fi
+if [ "$pid_file_age" -gt 30 ]; then
+    for pid in $(pgrep -x mhost-dns-proxy); do
+        kill -KILL "$pid" 2>/dev/null || true
+    done
+fi
 
 # Layer 1：显式可执行校验（提权后是另一 uid 上下文，再防一层）
 if [ ! -x "$PROXY" ]; then
@@ -917,13 +1156,76 @@ pub fn disable_dns_mode(original: &OriginalDns, interactive: bool) -> Result<(),
             while std::time::Instant::now() < deadline {
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 if unsafe { libc::kill(proxy_pid as libc::pid_t, 0) != 0 } {
-                    // proxy 已退出 → restore_dns_and_exit 已恢复系统 DNS。
-                    // 全部临时文件 + marker 都可以清掉。
-                    let _ = std::fs::remove_file(proxy_pid_file());
-                    let _ = std::fs::remove_file(original_dns_file());
-                    // signal 文件由 proxy 自己清理（restore_dns_and_exit）
-                    let _ = std::fs::remove_file(disable_recovery_marker_file());
-                    return Ok(());
+                    // proxy 已退出。**fix (issue #152 hardening, Step 3)**：
+                    // 不要无条件认为成功 —— proxy 退出前 networksetup 失败
+                    // 也算「正常退出」。post-restore 验证一次：当前 DNS 还有
+                    // loopback 就按 5s 超时的兜底路径升级（interactive 弹 sudo，
+                    // !interactive / 兜底失败 → 保留 marker）。
+                    match verify_dns_restored_against_loopback() {
+                        Ok(true) => {
+                            // 真的恢复了。清文件 + marker。
+                            let _ = std::fs::remove_file(proxy_pid_file());
+                            let _ = std::fs::remove_file(original_dns_file());
+                            // signal 文件由 proxy 自己清理（restore_dns_and_exit）
+                            let _ = std::fs::remove_file(disable_recovery_marker_file());
+                            return Ok(());
+                        }
+                        Ok(false) => {
+                            // proxy 死了但 DNS 还卡在 loopback
+                            eprintln!(
+                                "[mHost] dns mode disable: proxy exited but system DNS \
+                                 still points at loopback; escalating to sudo fallback"
+                            );
+                            let _ = std::fs::remove_file(proxy_pid_file());
+                            let _ = std::fs::remove_file(original_dns_file());
+                            let _ = std::fs::remove_file(shutdown_signal_file());
+                            // marker 必须保留给下次启动 try_recover_dns
+                            if interactive
+                                && osascript_restore(
+                                    original,
+                                    proxy_pid_at_start,
+                                    expected_basename_at_start.as_deref(),
+                                )
+                                .is_ok()
+                            {
+                                let _ = std::fs::remove_file(disable_recovery_marker_file());
+                                return Ok(());
+                            }
+                            return Err(PlatformError::RestoreDns(format!(
+                                "proxy exited but system DNS still points at loopback; \
+                                 recovery marker left at {}",
+                                disable_recovery_marker_file().display()
+                            )));
+                        }
+                        Err(e) => {
+                            // 验证本身失败（networksetup 也卡了），按失败处理
+                            eprintln!(
+                                "[mHost] dns mode disable: post-restore verify failed ({}); \
+                                 preserving recovery marker",
+                                e
+                            );
+                            let _ = std::fs::remove_file(proxy_pid_file());
+                            let _ = std::fs::remove_file(original_dns_file());
+                            let _ = std::fs::remove_file(shutdown_signal_file());
+                            // marker 必须保留给下次启动 try_recover_dns
+                            if interactive
+                                && osascript_restore(
+                                    original,
+                                    proxy_pid_at_start,
+                                    expected_basename_at_start.as_deref(),
+                                )
+                                .is_ok()
+                            {
+                                let _ = std::fs::remove_file(disable_recovery_marker_file());
+                                return Ok(());
+                            }
+                            return Err(PlatformError::RestoreDns(format!(
+                                "post-restore verify failed: {}; recovery marker left at {}",
+                                e,
+                                disable_recovery_marker_file().display()
+                            )));
+                        }
+                    }
                 }
             }
             // 5s 超时：proxy 还活着但没自管恢复
@@ -1066,6 +1368,39 @@ pub fn force_dns_restore_if_needed() -> Result<(), PlatformError> {
 
     let _ = std::fs::remove_file(disable_recovery_marker_file());
     Ok(())
+}
+
+/// **fix (issue #152 hardening, Step 3)**：post-restore 验证的纯逻辑部分。
+///
+/// 把「servers 里是否有 loopback」抽成纯函数，便于单测覆盖各种
+/// 输入组合（`networksetup_get_dns` 本身要走 `Command::new`，纯单测
+/// 不能跑到）。
+///
+/// 返回 `true` 表示「仍有 loopback」 → caller 应当升级到兜底路径。
+pub(crate) fn any_local_resolver(servers: &[String]) -> bool {
+    servers.iter().any(|s| is_local_resolver(s))
+}
+
+/// **fix (issue #152 hardening, Step 3)**：post-restore 验证。
+///
+/// proxy self-restore 走 `networksetup -setdnsservers` 时可能因为
+/// configd 抖动 / Wi-Fi handoff / TCC 缓存等原因静默失败；proxy 进程
+/// 仍然正常退出（`restore_dns_and_exit` 把 `networksetup` 错误当 warning
+/// 处理），mhost 端的 `kill(pid,0)!=0` 也跟着认为 disable 成功。
+///
+/// 验证：proxy 退出后从 networksetup 读回 DNS，如果还有任何
+/// loopback（`127.0.0.1` / `::1` / unspecified），说明 proxy 自管
+/// 失败 → 不要清 marker，按 5s 超时的兜底路径升级。
+///
+/// 返回语义：
+/// - `Ok(true)`：当前 DNS 没有 loopback（安全，可清 marker）
+/// - `Ok(false)`：当前 DNS 仍有 loopback（proxy 自管失败）
+/// - `Err(_)`：networksetup 自己失败（按失败处理，最保守）
+fn verify_dns_restored_against_loopback() -> Result<bool, PlatformError> {
+    let interface = get_active_network_interface()?;
+    validate_interface_name(&interface)?;
+    let servers = networksetup_get_dns(&interface)?;
+    Ok(!any_local_resolver(&servers))
 }
 
 /// 从 PID 文件读出 proxy 的 PID（如果可读 + 可解析）。
@@ -2309,6 +2644,116 @@ Ethernet Address: aa:bb:cc:dd:ee:ff
         }
     }
 
+    /// **fix (issue #152, root cause 2)**: `networksetup_get_dns` must strip
+    /// **fix (issue #152 hardening, Step 3)**：post-restore 验证纯逻辑。
+    /// `any_local_resolver(&Vec<String>)` 是 `verify_dns_restored_against_loopback`
+    /// 内部的纯函数，单元测试可覆盖。`networksetup_get_dns` 本身要走
+    /// `Command::new`，纯单测跑不到，但 filter 逻辑就是
+    /// `into_iter().filter(|s| !is_local_resolver(s))`，已由
+    /// `test_is_local_resolver_*` + `test_parse_dns_servers_then_filter_loopback`
+    /// 覆盖。
+    #[test]
+    fn test_post_restore_verify_helper_detects_loopback() {
+        // 无 loopback → 安全（Ok(true) at 调用方）
+        assert!(!any_local_resolver(&[]));
+        assert!(!any_local_resolver(&["8.8.8.8".to_string()]));
+        assert!(!any_local_resolver(&[
+            "8.8.8.8".to_string(),
+            "1.1.1.1".to_string()
+        ]));
+
+        // 任何 loopback 出现 → 升级兜底
+        assert!(any_local_resolver(&["127.0.0.1".to_string()]));
+        assert!(any_local_resolver(&["::1".to_string()]));
+        assert!(any_local_resolver(&["0.0.0.0".to_string()]));
+        // 混合：只要有一个 loopback 就算失败
+        assert!(any_local_resolver(&[
+            "127.0.0.1".to_string(),
+            "8.8.8.8".to_string()
+        ]));
+        // host:port 形式也算
+        assert!(any_local_resolver(&[
+            "127.0.0.1:53".to_string(),
+            "8.8.8.8".to_string()
+        ]));
+    }
+
+    /// **fix (issue #152, root cause 2)**：`networksetup_get_dns` 的内部
+    /// 行为 —— `parse_dns_servers` 输出后必须 filter 掉 loopback。
+    /// 这是行为测试（不是 source-grep）：直接构造 parse + filter 流水线，
+    /// 覆盖 wrapper 的语义。
+    #[test]
+    fn test_networksetup_get_dns_filter_pipeline() {
+        // 模拟「DNS mode 启用后 networksetup -getdnsservers」输出
+        let raw = parse_dns_servers("127.0.0.1\n1.1.1.1\n").unwrap();
+        let filtered: Vec<String> = raw.into_iter().filter(|s| !is_local_resolver(s)).collect();
+        assert_eq!(filtered, vec!["1.1.1.1".to_string()]);
+
+        // 全部 loopback → filter 后空 → 调用方应退回 DhcpEmpty
+        let raw = parse_dns_servers("127.0.0.1\n::1\n0.0.0.0\n").unwrap();
+        let filtered: Vec<String> = raw.into_iter().filter(|s| !is_local_resolver(s)).collect();
+        assert!(filtered.is_empty());
+
+        // 没 loopback → 原样保留
+        let raw = parse_dns_servers("8.8.8.8\n1.1.1.1\n").unwrap();
+        let filtered: Vec<String> = raw.into_iter().filter(|s| !is_local_resolver(s)).collect();
+        assert_eq!(filtered, vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()]);
+    }
+
+    /// **fix (issue #152, root cause 1)**: `try_recover_dns` must read the
+    /// recovery marker via `disable_recovery_marker_file()`, NOT from a
+    /// hard-coded `/tmp/...` path. The disable path writes to the former;
+    /// the recovery path used to read from the latter. The two sides have
+    /// always disagreed on the path, making the recovery branch dead code.
+    ///
+    /// `state/mod.rs` and `platform.rs` live in different crates, so we
+    /// use the source-grep technique to verify the reader path.
+    #[test]
+    fn test_try_recover_dns_reads_canonical_marker_path() {
+        let state_src = include_str!("../../../src/state/mod.rs");
+        assert!(
+            !state_src.contains("/tmp/mhost-dns-disable-recovery.marker"),
+            "state/mod.rs try_recover_dns must not hard-code /tmp/... for the recovery \
+             marker (issue #152). Use mhost_dns::platform::disable_recovery_marker_file() \
+             instead."
+        );
+        assert!(
+            state_src.contains("disable_recovery_marker_file()"),
+            "state/mod.rs try_recover_dns must call \
+             mhost_dns::platform::disable_recovery_marker_file() to locate the recovery \
+             marker (issue #152)"
+        );
+    }
+
+    /// **fix (issue #152 hardening)**：disable 路径写 marker 的位置和
+    /// try_recover_dns 读 marker 的位置必须在同一路径（同一个 helper），
+    /// 否则再次出现「写一处、读另一处 → recovery branch 是死代码」。
+    /// 行为测试（不是 source-grep）：验证 helper 自洽。
+    #[test]
+    fn test_disable_recovery_marker_file_path_is_canonical() {
+        let path = disable_recovery_marker_file();
+        // 必须不是 `/tmp/...`
+        assert!(
+            !path.starts_with("/tmp/"),
+            "recovery marker path must not live in /tmp; got {}",
+            path.display()
+        );
+        // 必须在 runtime_dir() 下
+        let runtime = runtime_dir();
+        assert!(
+            path.starts_with(&runtime),
+            "recovery marker must live under runtime_dir ({}); got {}",
+            runtime.display(),
+            path.display()
+        );
+        // 文件名必须是固定的 marker 名
+        assert!(
+            path.file_name().and_then(|n| n.to_str()) == Some("mhost-dns-disable-recovery.marker"),
+            "recovery marker filename must be mhost-dns-disable-recovery.marker; got {:?}",
+            path.file_name()
+        );
+    }
+
     /// 回归测试（fix: code review B1）：disable_dns_mode 脚本必须有 `set -e`，
     /// 否则最后一行 `rm -f` 永远成功，掩盖 networksetup 失败的退出码。
     ///
@@ -2617,6 +3062,97 @@ rm -f /tmp/mhost-dns-nonexistent.pid
                 None => std::env::remove_var("MHOST_TEST_PS_MAP_FILE"),
             }
         }
+    }
+    // -----------------------------------------------------------------------
+    // Force TCC re-prompt every time (defeat TCC cache)
+    // -----------------------------------------------------------------------
+    //
+    // **fix (issue follow-up)**:`spawn_osascript` 的 AppleScript 命令必须
+    // 每次带不同 nonce,否则 macOS TCC 在 5min 缓存窗口内会静默放行,
+    // 用户看到「没弹授权框」但实际上 enable 已经完成,造成 UI 状态混乱
+    // (用户以为卡住,其实 mhost 在 OS 层面已经 enabled)。
+
+    /// 纯函数:每次生成的 AppleScript 命令必须包含传入的 nonce。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_build_osascript_command_includes_nonce() {
+        let cmd = super::build_osascript_command("/tmp/mhost-script.sh", "abc123def");
+        assert!(
+            cmd.contains("abc123def"),
+            "command must include nonce, got: {}",
+            cmd
+        );
+        assert!(
+            cmd.contains("/tmp/mhost-script.sh"),
+            "command must include script path"
+        );
+        assert!(
+            cmd.contains("with administrator privileges"),
+            "must still request TCC elevation"
+        );
+    }
+
+    /// 纯函数:不同 nonce 必须生成不同命令(否则 nonce 就没意义了)。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_build_osascript_command_unique_per_nonce() {
+        let cmd1 = super::build_osascript_command("/tmp/x.sh", "nonce-aaa");
+        let cmd2 = super::build_osascript_command("/tmp/x.sh", "nonce-bbb");
+        assert_ne!(
+            cmd1, cmd2,
+            "different nonces must yield different commands (otherwise \
+             TCC cache bypass is not defeated)"
+        );
+    }
+
+    /// 路径含双引号时必须正确转义(防御性 —— 正常 temp path 不会含,但
+    /// $TMPDIR 自定义 / ~/ 路径含特殊字符理论上可能)。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_build_osascript_command_escapes_quotes_in_path() {
+        let cmd = super::build_osascript_command("/tmp/has\"quote.sh", "abc");
+        // 双引号在 AppleScript 字符串里需要 \"(注意:AppleScript parser
+        // 把 \" 视为字面 ",不是 delimiter)
+        assert!(
+            cmd.contains("has\\\"quote.sh"),
+            "double quote must be escaped to \\\", got: {}",
+            cmd
+        );
+        // 路径里 literal " 字符必须仍然存在(只是被 \ 转义,不能消失)
+        let original_quote_count = "/tmp/has\"quote.sh".matches('"').count();
+        let escaped_quote_count = cmd.matches("\\\"").count();
+        assert_eq!(
+            original_quote_count, escaped_quote_count,
+            "every input quote must produce exactly one escaped quote in output"
+        );
+    }
+
+    /// 路径含反斜杠时也正确转义。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_build_osascript_command_escapes_backslash_in_path() {
+        let cmd = super::build_osascript_command("/tmp/has\\back.sh", "abc");
+        // 反斜杠在 AppleScript 字符串里需要 \\
+        assert!(
+            cmd.contains("has\\\\back.sh"),
+            "backslash must be escaped: {}",
+            cmd
+        );
+    }
+
+    /// nonce 的纯随机源必须足够唯一 —— 连续两次调用 spawn_osascript
+    /// 拿到的 nonce 必须不同(否则 mhost 在 1 秒内连点两次 Enable 会
+    /// 拿到同一 nonce → TCC 还是缓存命中 → 还是看不到 prompt)。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_generate_nonce_is_unique_across_calls() {
+        let n1 = super::generate_nonce();
+        let n2 = super::generate_nonce();
+        let n3 = super::generate_nonce();
+        assert!(!n1.is_empty(), "nonce must be non-empty");
+        assert_ne!(n1, n2, "nonce must differ across calls");
+        assert_ne!(n2, n3, "nonce must differ across calls");
+        assert_ne!(n1, n3, "nonce must differ across calls");
     }
 
     /// Fake-binary 测试基础设施（fix #158）：写 fake `mhost-dns-proxy` +
