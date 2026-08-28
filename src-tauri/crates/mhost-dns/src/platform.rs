@@ -205,7 +205,14 @@ fn invoke_osascript(path: &std::path::Path) -> Result<std::process::Output, Stri
 /// exposes the child PID so the caller can kill it on timeout — the
 /// previous `Command::output()` wrapper hid the PID. macOS-only because
 /// the osascript call site itself is macOS-only.
+///
+/// **TODO (#149/#155 follow-up)**：当前 `commands/dns.rs` 还在用
+/// `tokio::time::timeout + spawn_blocking`（fix #142 的 60s timeout 路径），
+/// 会 leak osascript 子进程（timeout fire 时 blocking thread 不取消）。
+/// 后续 Group 4/#149 PR 会改用 `run_with_privileges_timeout` 同步调用，
+/// 届时这些 helper 会被实际使用 → 移除这个 `allow(dead_code)`。
 #[cfg(target_os = "macos")]
+#[allow(dead_code)] // see TODO above — used by future PR, not by current call site
 pub(crate) struct OsascriptRun {
     pub child: std::process::Child,
     pub pid: i32,
@@ -263,7 +270,10 @@ fn generate_nonce() -> String {
 /// **fix (issue follow-up: force TCC re-prompt every time)**：每次 spawn
 /// 都通过 `generate_nonce()` 注入一个唯一 nonce 到 AppleScript 命令，
 /// 让 macOS TCC 不会用 5min 缓存静默放行。详见 `build_osascript_command`。
+///
+/// **TODO (#149/#155 follow-up)**：当前 callsite 还没切过来，保留供未来 PR。
 #[cfg(target_os = "macos")]
+#[allow(dead_code)] // see TODO above — used by future PR, not by current call site
 pub(crate) fn spawn_osascript(path: &std::path::Path) -> Result<OsascriptRun, String> {
     let nonce = generate_nonce();
     let path_str = path.to_string_lossy();
@@ -281,7 +291,10 @@ pub(crate) fn spawn_osascript(path: &std::path::Path) -> Result<OsascriptRun, St
 
 /// Best-effort SIGKILL the osascript child. The goal is to unblock the
 /// Rust-side wait so the UI can recover; the kill itself is fire-and-forget.
+///
+/// **TODO (#149/#155 follow-up)**：当前 callsite 还没切过来，保留供未来 PR。
 #[cfg(target_os = "macos")]
+#[allow(dead_code)] // see TODO above — used by future PR, not by current call site
 pub(crate) fn kill_osascript(pid: i32) {
     // SAFETY: `kill(2)` with a valid PID is safe; the PID comes from the
     // Child we just spawned and we hold the Child handle.
@@ -300,7 +313,13 @@ pub(crate) fn kill_osascript(pid: i32) {
 /// the proxy is already running + system DNS is already flipped
 /// (state desync). Here we hold the `Child` directly and SIGKILL on
 /// expiry, so the child is reaped on every exit path.
+///
+/// **TODO (#149/#155 follow-up)**：当前 `commands/dns.rs` 还在用
+/// `tokio::time::timeout + spawn_blocking`（leaky 60s timeout 路径）。
+/// 后续 Group 4 / #149 PR 会把这个 helper 接到 `enable_dns_mode` 的
+/// osascript 调用点，取代 leaky timeout wrapper → 移除 `allow(dead_code)`。
 #[cfg(target_os = "macos")]
+#[allow(dead_code)] // see TODO above — used by future PR, not by current call site
 pub(crate) fn run_with_privileges_timeout(
     script_body: &str,
     timeout: std::time::Duration,
@@ -1161,7 +1180,14 @@ pub fn disable_dns_mode(original: &OriginalDns, interactive: bool) -> Result<(),
                             let _ = std::fs::remove_file(original_dns_file());
                             let _ = std::fs::remove_file(shutdown_signal_file());
                             // marker 必须保留给下次启动 try_recover_dns
-                            if interactive && osascript_restore(original, proxy_pid_at_start, expected_basename_at_start.as_deref()).is_ok() {
+                            if interactive
+                                && osascript_restore(
+                                    original,
+                                    proxy_pid_at_start,
+                                    expected_basename_at_start.as_deref(),
+                                )
+                                .is_ok()
+                            {
                                 let _ = std::fs::remove_file(disable_recovery_marker_file());
                                 return Ok(());
                             }
@@ -1182,7 +1208,14 @@ pub fn disable_dns_mode(original: &OriginalDns, interactive: bool) -> Result<(),
                             let _ = std::fs::remove_file(original_dns_file());
                             let _ = std::fs::remove_file(shutdown_signal_file());
                             // marker 必须保留给下次启动 try_recover_dns
-                            if interactive && osascript_restore(original, proxy_pid_at_start, expected_basename_at_start.as_deref()).is_ok() {
+                            if interactive
+                                && osascript_restore(
+                                    original,
+                                    proxy_pid_at_start,
+                                    expected_basename_at_start.as_deref(),
+                                )
+                                .is_ok()
+                            {
                                 let _ = std::fs::remove_file(disable_recovery_marker_file());
                                 return Ok(());
                             }
@@ -3000,6 +3033,12 @@ rm -f /tmp/mhost-dns-nonexistent.pid
         saved_ps_map_file: Option<String>,
     }
 
+    impl EnvRestore {
+        fn snapshot() -> Self {
+            Self {
+                saved_runtime_dir: std::env::var("MHOST_RUNTIME_DIR").ok(),
+                saved_path: std::env::var("PATH").ok(),
+                saved_ps_map_file: std::env::var("MHOST_TEST_PS_MAP_FILE").ok(),
             }
         }
     }
@@ -3115,7 +3154,6 @@ rm -f /tmp/mhost-dns-nonexistent.pid
         assert_ne!(n2, n3, "nonce must differ across calls");
         assert_ne!(n1, n3, "nonce must differ across calls");
     }
-
 
     /// Fake-binary 测试基础设施（fix #158）：写 fake `mhost-dns-proxy` +
     /// fake `networksetup` 到 tempdir，把 tempdir 加到 PATH 前面。
