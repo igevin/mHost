@@ -33,15 +33,32 @@ export function useWebKitPointerDown() {
     firedRef.current = false;
   }, []);
 
+  // **issue #149 follow-up (c4eb339)**: when both `onPointerDown` AND `onClick`
+  // route through one handler (Settings.tsx DNS toggle after Cancel-button
+  // mount), the trailing synthetic `click` fires ~10ms after pointerdown.
+  // Calling `release()` synchronously would let the click handler pass the
+  // `fire()` guard a second time → double toggle → AbortController slot
+  // overwritten, Cancel button ineffective on the first click.
+  //
+  // `releaseSoon()` defers the reset by `RESET_DELAY_MS` so the trailing
+  // click is absorbed by the same `fire()` guard. Use this in handlers that
+  // bind both `onPointerDown` and `onClick`; use plain `release()` for
+  // pointerdown-only handlers where the click fallback is not bound.
+  const releaseSoon = useCallback(() => {
+    setTimeout(release, RESET_DELAY_MS);
+  }, [release]);
+
   const onPointerDown = useCallback(
     (handler: () => void) => (e: React.PointerEvent) => {
       if (e.button !== 0) return;
       if (!fire()) return;
       handler();
-      setTimeout(release, RESET_DELAY_MS);
+      // Pointerdown-only handler — onClick is NOT bound, so we don't need
+      // the trailing-click protection `releaseSoon` provides.
+      releaseSoon();
     },
-    [fire, release],
+    [fire, releaseSoon],
   );
 
-  return { fire, release, onPointerDown };
+  return { fire, release, releaseSoon, onPointerDown };
 }
