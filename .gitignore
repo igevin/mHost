@@ -68,6 +68,11 @@ target/
 # Tauri auto-generated
 src-tauri/gen/
 
+# bundle.externalBin sidecar inputs (target-triple suffixed binaries
+# produced by scripts/build-proxy-sidecar.sh; rebuilt by every release
+# workflow run, never edited by hand).
+src-tauri/bin/
+
 # Frontend build output
 dist/
 
