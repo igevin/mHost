@@ -690,25 +690,45 @@ pub(crate) struct DisableScriptInputs<'a> {
 /// 三重保险：ESRCH / EPERM / comm 不匹配都不会让脚本非零退出，
 /// `networksetup` 仍能跑。
 pub(crate) fn build_disable_script(inputs: &DisableScriptInputs<'_>) -> String {
+    // **fix (PR #164 review concern #3)**：`expected` 已经过
+    // `read_proxy_expected_basename` 的 basename charset 校验；这里再用
+    // `shell_single_quote` 包一层是防御深度 —— 即使上游绕过校验，shell
+    // 也不会执行注入。`target` 来自 `OriginalDns::restore_argv()`（"Empty"
+    // 或空格分隔的 IP 列表），来自用户原始 DNS 配置，统一加单引号保证
+    // 不会被 word splitting 截断。`interface` 已经过 `validate_interface_name`
+    // 校验，再加单引号是防御深度（macOS 接口名可含空格如
+    // "USB 10/100/1000 LAN"）。
+    let expected_q = inputs
+        .expected_basename
+        .as_deref()
+        .map(shell_single_quote)
+        .unwrap_or_default();
+    let target_q = shell_single_quote(&inputs.target);
+    let iface_q = shell_single_quote(inputs.interface);
     let kill_block = match (inputs.proxy_pid, inputs.expected_basename.as_deref()) {
-        (Some(pid), Some(expected)) => format!(
-            "EXPECTED={expected}\n\
-             ACTUAL=$(ps -p {pid} -o comm= 2>/dev/null | xargs -I{{}} basename {{}} 2>/dev/null)\n\
+        (Some(pid), Some(_expected)) => format!(
+            "EXPECTED={expected_q}\n\
+             ACTUAL=$(ps -p {pid_q} -o comm= 2>/dev/null | xargs -I{{}} basename {{}} 2>/dev/null)\n\
              if [ \"$ACTUAL\" = \"$EXPECTED\" ]; then kill -9 {pid} 2>/dev/null; fi\n\
-             true\n"
+             true\n",
+            pid_q = shell_single_quote(&pid.to_string()),
         ),
         (Some(pid), None) => format!(
-            // 老格式 PID 文件（只 PID，没 binary 路径）→ 跳过 comm 校验；
-            // `; true` 兜底让 ESRCH 不影响 networksetup。
-            "kill -9 {pid} 2>/dev/null; true\n"
+            // **fix (PR #164 review concern #4)**：老格式 PID 文件
+            // （只 PID，没 binary 路径）→ 跳过 comm 校验。保留 kill 路径
+            // 以兼容从老版本升级的用户，但往 stderr 打 WARNING 让 sudo
+            // 操作可见可审计（替代之前完全静默的 SIGKILL）。
+            "echo \"WARNING: skipping #81 comm check for legacy PID file {pid}\" >&2\n\
+             kill -9 {pid} 2>/dev/null\n\
+             true\n"
         ),
         (None, _) => String::new(),
     };
     format!(
-        "{kill_block}networksetup -setdnsservers {iface} {target}",
+        "{kill_block}networksetup -setdnsservers {iface_q} {target_q}",
         kill_block = kill_block,
-        iface = inputs.interface,
-        target = inputs.target,
+        iface_q = iface_q,
+        target_q = target_q,
     )
 }
 
@@ -804,6 +824,16 @@ pub(crate) fn write_signal_file(path: &Path, content: &str) -> std::io::Result<(
 /// - kill 失败（PID reuse, `#81` comm 不匹配）只 log warning，不影响 DNS
 ///   恢复路径；marker 兜底逻辑保持不变。修复后所有四条退出路径（UI Disable
 ///   / Tray Quit / Cmd-Q / SIGINT/SIGTERM）都不再泄漏 53 端口。
+///
+/// **kill-then-restore failure chain**（**fix (PR #164 review nit #10)**）：
+/// 如果 sudo 脚本里的 `kill -9 <pid>` 成功但
+/// `networksetup -setdnsservers <iface> <target>` 失败（典型场景：mid-call
+/// 时接口消失 / 用户在 System Settings 抢锁），`osascript_restore` 返回 Err，
+/// **recovery marker 保留**（上面"marker 兜底逻辑保持不变"），下一次
+/// 启动 mhost 时 `force_dns_restore_if_needed` 看到标记会写 `Empty`
+/// （DHCP）。这是**故意的** —— kill-then-restore 这一对是 best-effort，
+/// DHCP 是安全 fallback。专门文档化是为 traceability：后续 reviewer 看
+/// 到"marker 保留 + 上次 Disable 返回 Err"不会以为是 race / bug。
 ///
 /// 注：参数 `servers` 保留 API 兼容：proxy 用自己的 original.txt 恢复，
 /// 但 interactive 分支用 `servers` 决定要恢复成什么 IP（proxy 不在的
@@ -1044,21 +1074,41 @@ fn read_proxy_pid() -> Option<u32> {
     content.split_whitespace().next()?.parse().ok()
 }
 
+/// 严格 basename 字符集：ASCII 字母、数字、`._-`，与合法 binary 名一致。
+///
+/// **fix (PR #164 review concern #3)**：`read_proxy_expected_basename` 在把
+/// 字符串注入 `build_disable_script` 的 sudo 脚本（`EXPECTED='...'`）
+/// 之前先用这个字符集做白名单校验。即便 `shell_single_quote` 已经
+/// 防住注入，把非 basename 内容推进 disable 脚本本身也是个 bad smell
+/// —— 表示 PID 文件被外部进程改坏了，应该走"无预期 basename"路径
+/// （= legacy arm = stderr WARNING）而不是相信文件内容。
+fn is_valid_basename_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-'
+}
+
 /// 从 PID 文件读出记录的 binary path 的 basename（#81 安全格式）。
 ///
 /// **fix（issue #163 re-fix）**：传给 `build_disable_script` 在 sudo 提权
 /// 上下文里做 comm 校验，防止 PID 重用时被误杀。返回 `None` 表示：
 /// - PID 文件不存在 / 不可读
 /// - PID 文件只有 PID 没有 binary path（老格式）
+/// - **fix (PR #164 review concern #3)**：recorded binary path 不是合法
+///   basename（含 shell metacharacter / 路径分隔符等）—— PID 文件可能
+///   被外部破坏，宁可走"无预期 basename"路径也不冒险
 fn read_proxy_expected_basename() -> Option<String> {
     let content = std::fs::read_to_string(proxy_pid_file()).ok()?;
     let recorded_binary = content.split_whitespace().nth(1)?;
     if recorded_binary.is_empty() {
         return None;
     }
-    std::path::Path::new(recorded_binary)
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
+    let file_name = std::path::Path::new(recorded_binary)
+        .file_name()?
+        .to_str()?;
+    // 基线：必须是严格 basename 字符集（ASCII alphanumeric / . _ -）
+    if !file_name.chars().all(is_valid_basename_char) {
+        return None;
+    }
+    Some(file_name.to_string())
 }
 
 /// 清理残留的 dns-proxy 进程（应用启动时调用）。
@@ -1133,6 +1183,13 @@ pub fn cleanup_stale_proxy() {
 /// helper 自身契约（SIGTERM → SIGKILL、`#81` comm 校验、不删 PID 文件）
 /// 不变。disable 路径的主杀是 `osascript_restore` 里的 sudo 脚本，
 /// 不是这个 helper。
+///
+/// **fix (PR #164 review concern #5)**：SIGKILL 后会 best-effort 调
+/// `waitpid(pid, &mut status, WNOHANG)` 尝试 reap zombie。仅在当前进程
+/// 是目标进程的父进程时生效（生产里 proxy 通常由 osascript-spawned sh
+/// 启动，父进程不是 mhost → waitpid 返回 ECHILD，silently ignored）；
+/// 本地测试 cargo test 是父进程 → reap 成功。这是 cleanup 而不是
+/// 正确性契约：reap 不成功不影响 `KillOutcome::Killed` 的语义。
 fn kill_proxy_via_pid_file(pid_file: &Path) -> KillOutcome {
     // 1. 读 PID 文件 + parse "{pid} {binary_path}"
     let content = match std::fs::read_to_string(pid_file) {
@@ -1193,6 +1250,20 @@ fn kill_proxy_via_pid_file(pid_file: &Path) -> KillOutcome {
             libc::kill(pid as libc::pid_t, libc::SIGKILL);
         }
     }
+
+    // **fix (PR #164 review concern #5)**：SIGKILL 后 best-effort reap
+    // zombie。如果当前进程是目标的父进程，`waitpid(pid, ..., WNOHANG)`
+    // 会立即 reap 已死子进程，避免它以 zombie 形态继续占用 PID 表项；
+    // 后续 caller 的 `kill(pid, 0)` 才能看到 ESRCH（PID 真释放）而不是
+    // 0（zombie 仍可见）。生产里 proxy 的父进程通常是 `osascript` 起的
+    // sh，不一定是当前 mhost 进程 —— 此时 waitpid 返回 0 (ECHILD)，
+    // 我们 ignore 这条路径：那是 osascript-spawned sh 的 reap 责任，
+    // 这里只 best-effort。能 reap 更好，不能也无害。
+    let _ = unsafe {
+        let mut status: libc::c_int = 0;
+        libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG)
+    };
+
     KillOutcome::Killed
 }
 
@@ -2179,7 +2250,7 @@ Ethernet Address: aa:bb:cc:dd:ee:ff
         // 不能裸出现
         let unquoted_path_str = proxy_with_space.to_string_lossy();
         // 找到第一个空格之后的子串（"mhost enable..."）—— 必须整个在 '…' 之内
-        if let Some(space_idx) = unquoted_path_str.find(' ') {
+        if let Some(_space_idx) = unquoted_path_str.find(' ') {
             // 这个子串不应该在脚本里裸出现（在某两个 ' 之间）
             // 我们接受它在 quoted form 里，但不允许 "*...$ unquoted form..."
             // 简化断言：全路径必须以 single-quote 边界包围
@@ -2388,6 +2459,101 @@ rm -f /tmp/mhost-dns-nonexistent.pid
     }
 
     // -----------------------------------------------------------------------
+    // read_proxy_expected_basename 单元测试（fix PR #164 review nit #8）
+    //
+    // 之前只有 `test_disable_dns_mode_passes_pid_to_osascript_restore`
+    // 间接验证这个函数；本组测试覆盖 5 种典型 / 边界场景，让回归有
+    // 直接 contract guard。所有测试走 `serial_runtime_dir_test` 锁 +
+    // `EnvRestore::snapshot` 模式，与同模块其他 pid-file 测试一致。
+    // -----------------------------------------------------------------------
+
+    /// 新格式：`"12345 /usr/local/bin/mhost-dns-proxy\n"` →
+    /// 返回 `Some("mhost-dns-proxy")`。
+    #[test]
+    fn test_read_proxy_expected_basename_new_format() {
+        let _guard = serial_runtime_dir_test();
+        let _env = EnvRestore::snapshot();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("MHOST_RUNTIME_DIR", dir.path());
+
+        std::fs::write(proxy_pid_file(), "12345 /usr/local/bin/mhost-dns-proxy\n").unwrap();
+
+        assert_eq!(
+            read_proxy_expected_basename(),
+            Some("mhost-dns-proxy".to_string()),
+        );
+    }
+
+    /// 老格式：`"12345\n"`（仅 PID，无 binary 路径）→ 返回 `None`。
+    #[test]
+    fn test_read_proxy_expected_basename_legacy_format() {
+        let _guard = serial_runtime_dir_test();
+        let _env = EnvRestore::snapshot();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("MHOST_RUNTIME_DIR", dir.path());
+
+        std::fs::write(proxy_pid_file(), "12345\n").unwrap();
+
+        assert_eq!(read_proxy_expected_basename(), None);
+    }
+
+    /// 第二字段是空白字符串：`"12345 \n"` → split_whitespace 后第二个
+    /// token 不存在 → 返回 `None`（与 legacy_format 等价路径）。
+    #[test]
+    fn test_read_proxy_expected_basename_empty_second_field() {
+        let _guard = serial_runtime_dir_test();
+        let _env = EnvRestore::snapshot();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("MHOST_RUNTIME_DIR", dir.path());
+
+        std::fs::write(proxy_pid_file(), "12345 \n").unwrap();
+
+        assert_eq!(read_proxy_expected_basename(), None);
+    }
+
+    /// PID 文件不存在 → 返回 `None`（runtime_dir 指向空 tempdir）。
+    #[test]
+    fn test_read_proxy_expected_basename_no_pid_file() {
+        let _guard = serial_runtime_dir_test();
+        let _env = EnvRestore::snapshot();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("MHOST_RUNTIME_DIR", dir.path());
+
+        // dir 是空的，proxy_pid_file() 在其下不存在
+        assert!(!proxy_pid_file().exists());
+
+        assert_eq!(read_proxy_expected_basename(), None);
+    }
+
+    /// **fix (PR #164 review concern #3)**：recorded binary path 含
+    /// shell metacharacter → basename charset 校验拒绝 → 返回 `None`。
+    /// 这是防御深度：basename 应该只是合法 binary 名（字母/数字/._-），
+    /// 出现 `;` / ` ` / `'` / `/` 等都是 PID 文件被破坏的信号，宁可走
+    /// "无预期 basename" 路径（= legacy arm = stderr WARNING）也不冒险。
+    #[test]
+    fn test_read_proxy_expected_basename_rejects_non_basename_chars() {
+        let _guard = serial_runtime_dir_test();
+        let _env = EnvRestore::snapshot();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("MHOST_RUNTIME_DIR", dir.path());
+
+        // 反向 case：注入字符
+        std::fs::write(proxy_pid_file(), "12345 evil;rm -rf /\n").unwrap();
+        assert_eq!(
+            read_proxy_expected_basename(),
+            None,
+            "PID file with shell metacharacters must be rejected"
+        );
+
+        // 正向 case：合法 basename（连字符、下划线、点都允许）
+        std::fs::write(proxy_pid_file(), "12345 /path/with-dashes_and.dots\n").unwrap();
+        assert_eq!(
+            read_proxy_expected_basename(),
+            Some("with-dashes_and.dots".to_string()),
+            "PID file with valid basename charset must return basename"
+        );
+    }
+    // -----------------------------------------------------------------------
     // 端到端执行测试基础设施 + 测试（issue #158）
     //
     // F1/F2 fix（PR #156 review）已经把 build_enable_script 抽出成
@@ -2412,9 +2578,14 @@ rm -f /tmp/mhost-dns-nonexistent.pid
     /// RAII env-var restore（fix #158）：任何修改 MHOST_RUNTIME_DIR / PATH
     /// 的测试都应持一个 `EnvRestore::snapshot()`，避免中途 panic 时污染
     /// 全局 env，导致后续测试 race / 失败。
+    ///
+    /// PR #164 review (blocker #2)：fake `ps` 基础设施额外设了
+    /// `MHOST_TEST_PS_MAP_FILE`（指向 per-test PID→comm map 文件），
+    /// 也纳入 restore 范围。
     struct EnvRestore {
         saved_runtime_dir: Option<String>,
         saved_path: Option<String>,
+        saved_ps_map_file: Option<String>,
     }
 
     impl EnvRestore {
@@ -2422,6 +2593,7 @@ rm -f /tmp/mhost-dns-nonexistent.pid
             Self {
                 saved_runtime_dir: std::env::var("MHOST_RUNTIME_DIR").ok(),
                 saved_path: std::env::var("PATH").ok(),
+                saved_ps_map_file: std::env::var("MHOST_TEST_PS_MAP_FILE").ok(),
             }
         }
     }
@@ -2435,6 +2607,14 @@ rm -f /tmp/mhost-dns-nonexistent.pid
             match self.saved_path.take() {
                 Some(v) => std::env::set_var("PATH", v),
                 None => std::env::remove_var("PATH"),
+            }
+            // PR #164 review (blocker #2): fake `ps` infra installs this env
+            // var pointing at the per-test PID→comm map file. Tests that
+            // touched it must restore / clear it on drop, otherwise parallel
+            // tests pick up a stale map and fail with phantom comm matches.
+            match self.saved_ps_map_file.take() {
+                Some(v) => std::env::set_var("MHOST_TEST_PS_MAP_FILE", v),
+                None => std::env::remove_var("MHOST_TEST_PS_MAP_FILE"),
             }
         }
     }
@@ -2485,6 +2665,123 @@ rm -f /tmp/mhost-dns-nonexistent.pid
         std::env::set_var("PATH", &new_path);
 
         (dir, bin)
+    }
+
+    /// Fake `ps` 基础设施（PR #164 review blocker #2）：sandboxed runners
+    ///（Codex `sandbox-exec`、rootless containers 等）拒绝 `/bin/ps`，
+    /// 让 `kill_proxy_via_pid_file` 内部 `Command::new("ps")` 返回 Err，
+    /// helper 的 `_ => false` arm 把这折叠成 `PidReusedOrMismatch`，
+    /// `#81` comm 校验测试集体 flake。
+    ///
+    /// 本 wrapper 在 `setup_fake_bin_env` 之上额外写一个 fake `ps` 到
+    /// tempdir bin + 一个 `PID COMM` map 文件，把 map 文件路径 export 到
+    /// `MHOST_TEST_PS_MAP_FILE`。fake `ps` sh 脚本按 `awk '$1 == p'`
+    /// 在 map 里查找匹配 PID 的 comm 行，剥掉首字段后 print —— 模拟
+    /// macOS 真实 `ps -p <pid> -o comm=` 的输出（带路径的 comm 字符串）。
+    ///
+    /// 调用方在 spawn 出子进程拿到 PID 后调 `append_ps_comm_map(pid, comm)`
+    /// 把 PID→comm 写到 map（wrapper 不知道 spawn 时机）。对于不需要
+    /// 关注 PID 的纯 legacy 测试，map 可为空 → fake `ps` 对任意 `-p`
+    /// 都返回空 → 走 helper 的 `_ => false` 兜底（与"找不到 /bin/ps"
+    /// 行为一致，仍是 conservative fail）。
+    ///
+    /// **契约**：
+    ///   - 不破坏 `setup_fake_bin_env` 的对外签名 → 现有 4 个调用点不动
+    ///   - 返回值与 `setup_fake_bin_env` 形状一致：`(TempDir, PathBuf)`
+    ///   - 必须持 `serial_runtime_dir_test()` 锁（同 `setup_fake_bin_env`）
+    ///   - 持 `EnvRestore::snapshot()` 让 `MHOST_TEST_PS_MAP_FILE` 跟着
+    ///     PATH / MHOST_RUNTIME_DIR 一起 restore
+    ///
+    /// **fake ps sh 脚本接受的两类调用**（与 helper 兼容）：
+    ///   - `ps -p <pid> -o comm=` → 查 map 找匹配行 print
+    ///   - 无 `-p` 的 legacy form → 静默 no-op（不影响 helper；helper 只
+    ///     调 `-p` form）
+    #[cfg(target_os = "macos")]
+    fn setup_fake_bin_env_with_ps(
+        proxy_contents: &str,
+        networksetup_contents: &str,
+        pid_comm_overrides: &[(u32, &str)],
+    ) -> (tempfile::TempDir, PathBuf) {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        // 复用既有 fake-bin 基础设施（proxy + networksetup + PATH 前置）
+        let (dir, bin) = setup_fake_bin_env(proxy_contents, networksetup_contents);
+
+        // 写 fake `ps` 到 bin → 同一 PATH 前置会让 `Command::new("ps")`
+        // resolve 到它。脚本 chmod 0o755 才能直接执行（helper 走
+        // Command::new 不带 shebang path，所以可执行位必须设）。
+        let ps_path = bin.join("ps");
+        let ps_script = r#"#!/bin/sh
+# Fake ps for sandboxed test runners (PR #164 review blocker #2).
+# Reads MHOST_TEST_PS_MAP_FILE (lines: "<pid> <comm>") and prints
+# comm for matching PID. Real macOS `ps -p <pid> -o comm=` returns
+# the full path of the executable (e.g. /bin/sh for shell scripts),
+# so we just print whatever comm the test registered.
+case "$1" in
+  -p)
+    target_pid="$2"
+    if [ -n "$MHOST_TEST_PS_MAP_FILE" ] && [ -f "$MHOST_TEST_PS_MAP_FILE" ]; then
+      awk -v p="$target_pid" '$1 == p { $1=""; sub(/^ /, ""); print; found=1; exit } END { if (!found) exit 1 }' "$MHOST_TEST_PS_MAP_FILE"
+    fi
+    ;;
+esac
+exit 0
+"#;
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o755)
+                .open(&ps_path)
+                .unwrap();
+            f.write_all(ps_script.as_bytes()).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        // 写 PID→comm map 文件 + 暴露路径给 fake `ps` sh 脚本
+        let map_path = dir.path().join("ps_comm_map.txt");
+        {
+            let mut map_content = String::new();
+            for (pid, comm) in pid_comm_overrides {
+                map_content.push_str(&format!(
+                    "{pid} {comm}
+"
+                ));
+            }
+            std::fs::write(&map_path, map_content).unwrap();
+        }
+        std::env::set_var("MHOST_TEST_PS_MAP_FILE", &map_path);
+
+        (dir, bin)
+    }
+
+    /// 把新 PID→comm 映射追加到 `MHOST_TEST_PS_MAP_FILE`（append 模式，
+    /// 不破坏已有 entries）。
+    ///
+    /// 用法：`spawn_*_fake_proxy` 拿到 PID 后调用，让 fake `ps` 在该 PID
+    /// 上能返回正确的 comm。多次 spawn（多 fake proxy 并存）也可。
+    ///
+    /// **必须**先调 `setup_fake_bin_env_with_ps`（它会 set
+    /// `MHOST_TEST_PS_MAP_FILE` env var）；没设过就 panic（兜底防误用）。
+    #[cfg(target_os = "macos")]
+    fn append_ps_comm_map(pid: u32, comm: &str) {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let map_file = std::env::var("MHOST_TEST_PS_MAP_FILE").unwrap_or_else(|_| {
+            panic!(
+                "append_ps_comm_map called but MHOST_TEST_PS_MAP_FILE is unset;                  did you forget to call setup_fake_bin_env_with_ps first?"
+            )
+        });
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .mode(0o600)
+            .open(&map_file)
+            .expect("open ps_comm_map for append");
+        writeln!(f, "{pid} {comm}").expect("append to ps_comm_map");
+        f.sync_all().expect("sync ps_comm_map");
     }
 
     /// 把 shell 脚本写到 0o700 temp 文件 + /bin/sh 执行，返回 `Output`。
@@ -3083,7 +3380,7 @@ networksetup -setdnsservers "$IFACE" 127.0.0.1
     /// basename 也是 "sh"，才能通过 #81 精确匹配。生产环境 proxy 是编译后
     /// 的 Mach-O 二进制，`ps` 直接返回 binary 路径，不需要这层对齐。
     #[cfg(target_os = "macos")]
-    fn spawn_stuck_fake_proxy(_bin_dir: &Path, marker_file: &Path) -> std::process::Child {
+    fn spawn_stuck_fake_proxy(marker_file: &Path) -> std::process::Child {
         let contents = format!(
             "trap '' TERM\n\
              echo $$ > '{marker}'\n\
@@ -3115,7 +3412,7 @@ networksetup -setdnsservers "$IFACE" 127.0.0.1
     /// 验证 SIGTERM 单独就够的场景。同样以 /bin/sh 启动，PID 文件的
     /// `recorded_binary` 用 `/bin/sh` 才能通过 #81 comm 匹配。
     #[cfg(target_os = "macos")]
-    fn spawn_cooperative_fake_proxy(_bin_dir: &Path, marker_file: &Path) -> std::process::Child {
+    fn spawn_cooperative_fake_proxy(marker_file: &Path) -> std::process::Child {
         let contents = format!(
             "echo $$ > '{marker}'\n\
              sleep 30 &\n\
@@ -3140,12 +3437,17 @@ networksetup -setdnsservers "$IFACE" 127.0.0.1
             .unwrap();
         std::env::set_var("MHOST_RUNTIME_DIR", dir.path());
 
-        let bin_dir = dir.path().join("bin");
-        std::fs::create_dir(&bin_dir).unwrap();
+        // PR #164 review (blocker #2): sandboxed runners deny `/bin/ps`.
+        // Install fake `ps` so helper's comm check returns the right comm
+        // for the spawned `/bin/sh` interpreter. Recorded in PID file as
+        // `/bin/sh` → fake `ps` returns `/bin/sh` → basename = `sh` matches.
+        let (_fake_bin_dir, _fake_bin_path) =
+            setup_fake_bin_env_with_ps("#!/bin/sh\nexit 0\n", "#!/bin/sh\nexit 0\n", &[]);
         let pid_marker = dir.path().join("fake_proxy.pid");
 
-        let mut child = spawn_stuck_fake_proxy(&bin_dir, &pid_marker);
+        let mut child = spawn_stuck_fake_proxy(&pid_marker);
         let stuck_pid = wait_for_proxy_pid(&pid_marker);
+        append_ps_comm_map(stuck_pid, "/bin/sh");
 
         // 写 PID 文件成 #81 格式：recorded_binary 必须是 `/bin/sh`（spawn 时
         // 的实际解释器），因为 shell 脚本经 shebang 启动后 `ps -o comm=` 返回
@@ -3229,12 +3531,20 @@ networksetup -setdnsservers "$IFACE" 127.0.0.1
             .unwrap();
         std::env::set_var("MHOST_RUNTIME_DIR", dir.path());
 
+        // PR #164 review (blocker #2): install fake `ps` for sandboxed runners.
+        let (_fake_bin_dir, _fake_bin_path) =
+            setup_fake_bin_env_with_ps("#!/bin/sh\nexit 0\n", "#!/bin/sh\nexit 0\n", &[]);
+
         // 起一个不是 mhost-dns-proxy 的进程
         let mut other_child = std::process::Command::new("/bin/sh")
             .args(["-c", "exec sleep 30"])
             .spawn()
             .expect("spawn sleep");
         let other_pid = other_child.id();
+        // spawn 走 `exec sleep 30` 后真实进程是 `/bin/sleep`（macOS
+        // ps 对 sleep 返回 `/bin/sleep`）；fake `ps` 必须返回这个才能
+        // 让 helper 的 comm 校验路径正常走到 basename 对比。
+        append_ps_comm_map(other_pid, "/bin/sleep");
 
         // PID 文件写 other_pid，但 recorded_binary 是 mhost-dns-proxy
         // → expected_comm = "mhost-dns-proxy"
@@ -3283,12 +3593,14 @@ networksetup -setdnsservers "$IFACE" 127.0.0.1
             .unwrap();
         std::env::set_var("MHOST_RUNTIME_DIR", dir.path());
 
-        let bin_dir = dir.path().join("bin");
-        std::fs::create_dir(&bin_dir).unwrap();
+        // PR #164 review (blocker #2): install fake `ps` for sandboxed runners.
+        let (_fake_bin_dir, _fake_bin_path) =
+            setup_fake_bin_env_with_ps("#!/bin/sh\nexit 0\n", "#!/bin/sh\nexit 0\n", &[]);
         let pid_marker = dir.path().join("fake_proxy.pid");
 
-        let mut child = spawn_cooperative_fake_proxy(&bin_dir, &pid_marker);
+        let mut child = spawn_cooperative_fake_proxy(&pid_marker);
         let pid = wait_for_proxy_pid(&pid_marker);
+        append_ps_comm_map(pid, "/bin/sh");
 
         // recorded_binary 用 `/bin/sh`（spawn 的实际解释器，ps 返回这个）
         let pid_file = proxy_pid_file();
@@ -3321,12 +3633,14 @@ networksetup -setdnsservers "$IFACE" 127.0.0.1
             .unwrap();
         std::env::set_var("MHOST_RUNTIME_DIR", dir.path());
 
-        let bin_dir = dir.path().join("bin");
-        std::fs::create_dir(&bin_dir).unwrap();
+        // PR #164 review (blocker #2): install fake `ps` for sandboxed runners.
+        let (_fake_bin_dir, _fake_bin_path) =
+            setup_fake_bin_env_with_ps("#!/bin/sh\nexit 0\n", "#!/bin/sh\nexit 0\n", &[]);
         let pid_marker = dir.path().join("fake_proxy.pid");
 
-        let _child = spawn_cooperative_fake_proxy(&bin_dir, &pid_marker);
+        let mut child = spawn_cooperative_fake_proxy(&pid_marker);
         let pid = wait_for_proxy_pid(&pid_marker);
+        append_ps_comm_map(pid, "/bin/sh");
 
         // recorded_binary 用 `/bin/sh`（spawn 的实际解释器，ps 返回这个）
         let pid_file = proxy_pid_file();
@@ -3334,6 +3648,11 @@ networksetup -setdnsservers "$IFACE" 127.0.0.1
 
         let outcome = kill_proxy_via_pid_file(&pid_file);
         assert_eq!(outcome, KillOutcome::Killed);
+        // reap zombie 才能让 PID 真正释放（kill_proxy_via_pid_file 内部
+        // 已用 waitpid(WNOHANG) 兜底，但这里再 wait() 一次保险；与
+        // test_kill_proxy_via_pid_file_stuck_proxy_sigkill_escalates /
+        // test_kill_proxy_via_pid_file_idempotent 的收尾模式一致）
+        let _ = child.wait();
 
         // 关键：PID 文件必须还在（disable 路径 caller 统一清一组 temp 文件）
         assert!(
@@ -3432,7 +3751,12 @@ networksetup -setdnsservers "$IFACE" 127.0.0.1
             !script.contains("kill -9"),
             "None pid must NOT produce kill line; got: {script}"
         );
-        assert!(script.contains("networksetup -setdnsservers Wi-Fi Empty"));
+        // **fix (PR #164 review concern #3)**：target / interface 现在用
+        // `shell_single_quote` 包裹。
+        assert!(
+            script.contains("networksetup -setdnsservers 'Wi-Fi' 'Empty'"),
+            "None pid script must single-quote interface + target; got: {script}"
+        );
         assert!(
             script.starts_with("networksetup"),
             "script must start with networksetup when no pid; got: {script}"
@@ -3448,13 +3772,15 @@ networksetup -setdnsservers "$IFACE" 127.0.0.1
             proxy_pid: Some(12345),
             expected_basename: Some("mhost-dns-proxy".to_string()),
         });
+        // **fix (PR #164 review concern #3)**：EXPECTED 现在用 single-quote
+        // 包裹（防御深度，即使 basename charset 校验已经过滤过）。
         assert!(
-            script.contains("EXPECTED=mhost-dns-proxy"),
-            "must set EXPECTED env var for comm check; got: {script}"
+            script.contains("EXPECTED='mhost-dns-proxy'"),
+            "must set EXPECTED env var single-quoted for comm check; got: {script}"
         );
         assert!(
-            script.contains("ps -p 12345 -o comm="),
-            "must use ps -p <pid> -o comm= for verification; got: {script}"
+            script.contains("ps -p '12345' -o comm="),
+            "must use ps -p '<pid>' -o comm= (single-quoted per PR #164 review concern #3) for verification; got: {script}"
         );
         assert!(
             script
@@ -3474,7 +3800,12 @@ networksetup -setdnsservers "$IFACE" 127.0.0.1
             "kill block must precede networksetup; \
              kill_pos={kill_pos} ns_pos={ns_pos} script={script}"
         );
-        assert!(script.contains("networksetup -setdnsservers Wi-Fi 8.8.8.8 1.1.1.1"));
+        // target 来自 OriginalDns::restore_argv()，会被 single-quote 整体
+        // 包裹（含内嵌空格的 IP 列表不会触发 word splitting）。
+        assert!(
+            script.contains("networksetup -setdnsservers 'Wi-Fi' '8.8.8.8 1.1.1.1'"),
+            "networksetup line must single-quote interface + target; got: {script}"
+        );
     }
 
     /// Some(pid) + None(basename) → 跳过 comm 校验（老格式 PID 文件）
@@ -3490,13 +3821,32 @@ networksetup -setdnsservers "$IFACE" 127.0.0.1
             !script.contains("EXPECTED="),
             "legacy PID file must NOT produce EXPECTED env var; got: {script}"
         );
+        // **fix (PR #164 review concern #4)**：legacy arm 现在在 stderr 打
+        // 一条 WARNING 让 sudo 操作可见可审计（替代之前完全静默的 SIGKILL），
+        // 然后才接 plain kill -9 兜底。
         assert!(
-            script.starts_with("kill -9 12345 2>/dev/null; true\n"),
-            "legacy PID file must produce plain 'kill -9 ... ; true' line; \
-             got first line: {:?}",
-            script.lines().next()
+            script.contains(
+                "echo \"WARNING: skipping #81 comm check for legacy PID file 12345\" >&2"
+            ),
+            "legacy arm must emit stderr WARNING before kill; got: {script}"
         );
-        assert!(script.contains("networksetup -setdnsservers Wi-Fi Empty"));
+        assert!(
+            script.contains("kill -9 12345 2>/dev/null"),
+            "legacy arm must still emit kill -9 for upgrade compatibility; got: {script}"
+        );
+        // WARNING 必须在 kill 之前（让操作员先看到警告再 kill）
+        let warn_pos = script.find("WARNING:").expect("WARNING line missing");
+        let kill_pos = script.find("kill -9 12345").expect("kill line");
+        assert!(
+            warn_pos < kill_pos,
+            "WARNING must precede kill; warn_pos={warn_pos} kill_pos={kill_pos} \
+             script={script}"
+        );
+        // networksetup 仍然在尾部，interface + target 都 single-quoted
+        assert!(
+            script.contains("networksetup -setdnsservers 'Wi-Fi' 'Empty'"),
+            "legacy script must end with single-quoted networksetup; got: {script}"
+        );
     }
 
     /// PID 必须 decimal 格式化（无 padding / 无 hex）
@@ -3509,9 +3859,12 @@ networksetup -setdnsservers "$IFACE" 127.0.0.1
                 proxy_pid: Some(pid),
                 expected_basename: Some("mhost-dns-proxy".to_string()),
             });
+            // **fix (PR #164 review concern #3)**：ps arg 现在用
+            // `shell_single_quote` 包裹（PID 是 decimal，注入面理论为零；
+            // 加 single-quote 是和 EXPECTED/target/iface 一致的防御深度）。
             assert!(
-                script.contains(&format!("ps -p {pid} -o comm=")),
-                "pid {pid} must format as decimal in ps arg; got: {script}"
+                script.contains(&format!("ps -p '{pid}' -o comm=")),
+                "pid {pid} must format as decimal in single-quoted ps arg; got: {script}"
             );
             assert!(
                 script.contains(&format!("kill -9 {pid} 2>/dev/null")),
