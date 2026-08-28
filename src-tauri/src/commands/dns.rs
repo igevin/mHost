@@ -260,12 +260,6 @@ async fn set_dns_mode_enable(
             )));
         }
     }
-            let _ = server.stop().await;
-            return Err(MhostError::InvalidInput(format!(
-                "Failed to enable DNS mode (blocking task join failed): {}",
-                join_err
-            )));
-        }
 
     // 7. **PERSIST MANIFEST FIRST** —— 持久层是 commit point。
     //    只有 manifest 写入成功后才允许修改 in-memory state。
@@ -579,6 +573,7 @@ mod tests {
             dns_enabled: AtomicBool::new(false),
             original_dns: Mutex::new(OriginalDns::DhcpEmpty),
             dns_lock: ApplyLock::new(),
+            dns_cancel: Mutex::new(None),
             ad_block_state: Arc::new(tokio::sync::RwLock::new(mhost_core::AdBlockState::default())),
             ad_block_refresh_task: Mutex::new(None),
             ad_block_refresh_cancel: Mutex::new(tokio_util::sync::CancellationToken::new()),
@@ -620,6 +615,7 @@ mod tests {
             dns_enabled: AtomicBool::new(true), // 假装启用 → cleanup 会走 disable 路径
             original_dns: Mutex::new(OriginalDns::DhcpEmpty), // DhcpEmpty → 写 Empty
             dns_lock: ApplyLock::new(),
+            dns_cancel: Mutex::new(None),
             ad_block_state: Arc::new(tokio::sync::RwLock::new(mhost_core::AdBlockState::default())),
             ad_block_refresh_task: Mutex::new(None),
             ad_block_refresh_cancel: Mutex::new(tokio_util::sync::CancellationToken::new()),
@@ -674,6 +670,7 @@ mod tests {
             dns_enabled: AtomicBool::new(true),
             original_dns: Mutex::new(OriginalDns::DhcpEmpty),
             dns_lock: ApplyLock::new(),
+            dns_cancel: Mutex::new(None),
             ad_block_state: Arc::new(tokio::sync::RwLock::new(mhost_core::AdBlockState::default())),
             ad_block_refresh_task: Mutex::new(None),
             ad_block_refresh_cancel: Mutex::new(tokio_util::sync::CancellationToken::new()),

@@ -25,14 +25,14 @@ function Settings() {
   // already calls `fire()`, and re-clicking calls the handler again before
   // `firedRef` resets). Sidebar/DrawerProfileCard hit the same bug in
   // commit 88641c6 and were fixed by routing both events through one
-  // handler that owns `fire()` + `releaseSoon()`. We do the same here —
+  // handler that owns `fire()` + `release()`. We do the same here —
   // without it, the second invocation overwrites the active
   // AbortController slot, and the synchronous re-render (Enable →
   // Cancel) causes the trailing click event to fire `handleCancelDns`,
   // which cancels the in-flight Rust `set_dns_mode` future before the
   // TCC prompt can appear. Symptom: Enable click hangs forever with
   // "Enable DNS mode" UI state and no macOS authorization dialog.
-  const { fire, releaseSoon } = useWebKitPointerDown();
+  const { fire, release } = useWebKitPointerDown();
 
   // Update check state
   const [updateStatus, setUpdateStatus] = useState<"idle" | "checking" | "available" | "up-to-date" | "error">("idle");
@@ -73,10 +73,10 @@ function Settings() {
       // click then lands on the newly-mounted Cancel button and cancels
       // the in-flight Rust enable — no TCC prompt ever appears.
       if (!fire()) return;
-      releaseSoon();
+      release();
       toggleDnsMode(enabled);
     },
-    [fire, releaseSoon, toggleDnsMode],
+    [fire, release, toggleDnsMode],
   );
 
   // issue #149: Settings cancel button. Aborts the in-flight `set_dns_mode`

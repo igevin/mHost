@@ -206,13 +206,17 @@ fn invoke_osascript(path: &std::path::Path) -> Result<std::process::Output, Stri
 /// previous `Command::output()` wrapper hid the PID. macOS-only because
 /// the osascript call site itself is macOS-only.
 ///
-/// **TODO (#149/#155 follow-up)**：当前 `commands/dns.rs` 还在用
-/// `tokio::time::timeout + spawn_blocking`（fix #142 的 60s timeout 路径），
-/// 会 leak osascript 子进程（timeout fire 时 blocking thread 不取消）。
-/// 后续 Group 4/#149 PR 会改用 `run_with_privileges_timeout` 同步调用，
-/// 届时这些 helper 会被实际使用 → 移除这个 `allow(dead_code)`。
+/// **NOTE (#149 decision, 2026-08)**: Group 4 dropped the
+/// `tokio::time::timeout + spawn_blocking` wrapper entirely
+/// (replaced with plain `spawn_blocking` plus a Settings Cancel
+/// button + IPC `CancellationToken`). The frontend `withTimeout(30s)`
+/// (src/lib/tauri.ts) is the only timeout layer now. So
+/// `run_with_privileges_timeout` is currently unused — kept around as
+/// scaffolding for future osascript-timeout features. If you find no
+/// use case within a release cycle, feel free to delete these helpers
+/// + remove `allow(dead_code)`.
 #[cfg(target_os = "macos")]
-#[allow(dead_code)] // see TODO above — used by future PR, not by current call site
+#[allow(dead_code)] // see NOTE above — unused after Group 4; kept as scaffolding
 pub(crate) struct OsascriptRun {
     pub child: std::process::Child,
     pub pid: i32,
@@ -271,9 +275,9 @@ fn generate_nonce() -> String {
 /// 都通过 `generate_nonce()` 注入一个唯一 nonce 到 AppleScript 命令，
 /// 让 macOS TCC 不会用 5min 缓存静默放行。详见 `build_osascript_command`。
 ///
-/// **TODO (#149/#155 follow-up)**：当前 callsite 还没切过来，保留供未来 PR。
+/// **NOTE (#149)**: unused after Group 4 dropped the leaky timeout wrapper. Kept as scaffolding.
 #[cfg(target_os = "macos")]
-#[allow(dead_code)] // see TODO above — used by future PR, not by current call site
+#[allow(dead_code)] // see NOTE above — unused after Group 4; kept as scaffolding
 pub(crate) fn spawn_osascript(path: &std::path::Path) -> Result<OsascriptRun, String> {
     let nonce = generate_nonce();
     let path_str = path.to_string_lossy();
@@ -292,9 +296,9 @@ pub(crate) fn spawn_osascript(path: &std::path::Path) -> Result<OsascriptRun, St
 /// Best-effort SIGKILL the osascript child. The goal is to unblock the
 /// Rust-side wait so the UI can recover; the kill itself is fire-and-forget.
 ///
-/// **TODO (#149/#155 follow-up)**：当前 callsite 还没切过来，保留供未来 PR。
+/// **NOTE (#149)**: unused after Group 4 dropped the leaky timeout wrapper. Kept as scaffolding.
 #[cfg(target_os = "macos")]
-#[allow(dead_code)] // see TODO above — used by future PR, not by current call site
+#[allow(dead_code)] // see NOTE above — unused after Group 4; kept as scaffolding
 pub(crate) fn kill_osascript(pid: i32) {
     // SAFETY: `kill(2)` with a valid PID is safe; the PID comes from the
     // Child we just spawned and we hold the Child handle.
@@ -314,12 +318,13 @@ pub(crate) fn kill_osascript(pid: i32) {
 /// (state desync). Here we hold the `Child` directly and SIGKILL on
 /// expiry, so the child is reaped on every exit path.
 ///
-/// **TODO (#149/#155 follow-up)**：当前 `commands/dns.rs` 还在用
-/// `tokio::time::timeout + spawn_blocking`（leaky 60s timeout 路径）。
-/// 后续 Group 4 / #149 PR 会把这个 helper 接到 `enable_dns_mode` 的
-/// osascript 调用点，取代 leaky timeout wrapper → 移除 `allow(dead_code)`。
+/// **NOTE (#149 decision)**: Group 4 dropped the `tokio::time::timeout +
+/// spawn_blocking` wrapper entirely (plain `spawn_blocking` now), so this
+/// helper is currently unused. Kept as scaffolding for future osascript
+/// timeout features. If no use case emerges within a release cycle, delete
+/// it + remove the `allow(dead_code)`.
 #[cfg(target_os = "macos")]
-#[allow(dead_code)] // see TODO above — used by future PR, not by current call site
+#[allow(dead_code)] // see NOTE above — unused after Group 4; kept as scaffolding
 pub(crate) fn run_with_privileges_timeout(
     script_body: &str,
     timeout: std::time::Duration,
@@ -4437,6 +4442,7 @@ networksetup -setdnsservers "$IFACE" 127.0.0.1
                 "pid {pid} must appear verbatim in kill line; got: {script}"
             );
         }
+    }
     // Issue #149 — disable_dns_mode cancel-token contract
     //
     // When `Some(cancel)` is passed, the 5s proxy-exit wait loop must bail
