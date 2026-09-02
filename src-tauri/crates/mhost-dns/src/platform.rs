@@ -197,6 +197,40 @@ fn run_with_privileges(script_body: &str) -> Result<std::process::Output, String
 /// `build_osascript_command` 注入 nonce,让 macOS TCC 5min 缓存不命中,
 /// disable / recovery 路径也每次重新弹授权框（与 `spawn_osascript` 一致）。
 fn invoke_osascript(path: &std::path::Path) -> Result<std::process::Output, String> {
+    // -----------------------------------------------------------------
+    // Test-only escape hatch (fix: CI hang on `disable_dns_mode`
+    // 5s-timeout → osascript sudo prompt).
+    //
+    // `osascript -e 'do shell script "..." with administrator privileges'`
+    // pops a system-modal sudo password prompt that **blocks forever**
+    // in headless CI runners (no GUI session to type the password).
+    //
+    // `test_disable_dns_mode_cancellable_none_does_not_bail` deliberately
+    // exercises the 5s-timeout fallback branch (to prove `cancel=None`
+    // is not consulted during the wait loop). That branch calls
+    // `run_with_privileges` → `invoke_osascript`. Without this gate the
+    // test hangs the entire `cargo test --workspace` invocation on macOS
+    // CI runners, which has been burning ~2h of CI minutes per master
+    // push since PR #168 landed (the PR was merged before this was
+    // observed; the two previous CI runs both timed out at the OS level
+    // after 6h).
+    //
+    // Production code never sets this var, so the gate is a no-op in
+    // release builds. `#[cfg(test)]` strips it from non-test builds
+    // entirely, so even accidentally setting the env var in production
+    // has no effect on a release-mode binary.
+    // -----------------------------------------------------------------
+    #[cfg(test)]
+    {
+        if std::env::var_os("MHOST_TEST_NO_OSASCRIPT").is_some() {
+            use std::os::unix::process::ExitStatusExt;
+            return Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            });
+        }
+    }
     let path_str = path.to_string_lossy();
     let nonce = generate_nonce();
     let apple_script = build_osascript_command(&path_str, &nonce);
@@ -4720,11 +4754,25 @@ networksetup -setdnsservers "$IFACE" 127.0.0.1
     /// Ok (if osascript + networksetup succeed in this runner) or Err
     /// (if sudo isn't available). The point is: cancel=None behaves
     /// exactly as before this PR — the cancel token must be ignored.
+    ///
+    /// **CI hang fix**: `osascript ... with administrator privileges`
+    /// blocks forever waiting for a sudo password on a headless runner
+    /// (no GUI session to type into). Setting `MHOST_TEST_NO_OSASCRIPT=1`
+    /// makes `invoke_osascript` short-circuit to a fake Output so the
+    /// 5s-timeout branch returns immediately instead of hanging the
+    /// whole `cargo test` invocation. The env var is unset in the
+    /// cleanup block; production code never reads it (the check is
+    /// `#[cfg(test)]`-only).
     #[test]
     fn test_disable_dns_mode_cancellable_none_does_not_bail() {
         let _guard = serial_runtime_dir_test();
         let _tmp = tempfile::tempdir().unwrap();
         std::env::set_var("MHOST_RUNTIME_DIR", _tmp.path());
+        // Test-only escape hatch: see invoke_osascript for the matching
+        // `#[cfg(test)]` gate and the full rationale. Removed in cleanup
+        // below alongside MHOST_RUNTIME_DIR (same pattern as the other
+        // tests in this module).
+        std::env::set_var("MHOST_TEST_NO_OSASCRIPT", "1");
 
         std::fs::create_dir_all(runtime_dir()).unwrap();
         std::fs::write(
@@ -4748,8 +4796,9 @@ networksetup -setdnsservers "$IFACE" 127.0.0.1
         // The defining assertion: cancel=None must wait the full 5s timeout,
         // proving the cancel token was NOT consulted. The result type
         // depends on whether osascript + networksetup succeed in this
-        // runner (Ok on dev machines with sudo, Err in CI without), so we
-        // don't assert on it.
+        // runner (Ok on dev machines with sudo, Err in CI without, but
+        // never HANG on CI now that the env-var gate is in place), so
+        // we don't assert on it.
         assert!(
             elapsed >= std::time::Duration::from_secs(4),
             "cancel=None must wait full timeout; took {:?}",
@@ -4760,5 +4809,6 @@ networksetup -setdnsservers "$IFACE" 127.0.0.1
         let _ = std::fs::remove_file(proxy_pid_file());
         let _ = std::fs::remove_file(disable_recovery_marker_file());
         std::env::remove_var("MHOST_RUNTIME_DIR");
+        std::env::remove_var("MHOST_TEST_NO_OSASCRIPT");
     }
 }
