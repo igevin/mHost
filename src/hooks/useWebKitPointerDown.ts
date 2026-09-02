@@ -75,7 +75,7 @@ export function useWebKitPointerDown() {
       (e: React.PointerEvent) => {
       if (e.button !== 0) return;
       if (!fire()) return;
-      handler();
+      handler(e);
       // Pointerdown-only handler — onClick is NOT bound, so we don't need
       // the trailing-click protection `releaseSoon` provides.
       releaseSoon();
