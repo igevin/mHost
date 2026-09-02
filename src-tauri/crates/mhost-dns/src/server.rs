@@ -9,6 +9,7 @@ use hickory_proto::rr::rdata::A;
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
 use hickory_resolver::config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts};
+use hickory_resolver::error::ResolveErrorKind;
 use hickory_resolver::TokioAsyncResolver;
 use lru::LruCache;
 use parking_lot::{Mutex as PlMutex, RwLock as PlRwLock};
@@ -754,10 +755,16 @@ async fn resolve_upstream_typed(
     qtype: RecordType,
     resolver: &Arc<TokioAsyncResolver>,
 ) -> Result<(Record, u32), QueryError> {
-    let lookup = resolver
-        .lookup(domain, qtype)
-        .await
-        .map_err(|e| QueryError::ServFail(e.to_string()))?;
+    let lookup = resolver.lookup(domain, qtype).await.map_err(|e| {
+        // 区分「上游没有这个 qtype 的记录」（如 AAAA 查询只回了 A 记录，
+        // happy-eyeballs 双栈场景的正常路径，见 issue #157）vs 上游真的
+        // 出错（SERVFAIL / 超时 / IO）。前者属正常流程，不应 warn；
+        // 仅后者才视为 ServFail 并打 warn / 客户端回 SERVFAIL。
+        match e.kind() {
+            ResolveErrorKind::NoRecordsFound { .. } => QueryError::NoMatch,
+            _ => QueryError::ServFail(e.to_string()),
+        }
+    })?;
     let record = lookup
         .record_iter()
         .next()
@@ -2010,5 +2017,32 @@ mod tests {
 
         server.stop().await.unwrap();
         let _ = h.await;
+    }
+
+    /// Regression test for issue #157: when the upstream returns
+    /// NoError + 0 answers (typical AAAA-only-miss scenario, normal
+    /// happy-eyeballs dual-stack path), `resolve_upstream_typed` must
+    /// classify hickory's `NoRecordsFound` as `NoMatch`
+    /// (-> `QueryResult::NoError` for clients, no warn log), not as
+    /// the pre-fix `ServFail` (-> client SERVFAIL + warn spam).
+    ///
+    /// The mock upstream (`spawn_mock_upstream` behaviour) only answers
+    /// A queries and emits NoError + 0 answers for everything else,
+    /// which exactly reproduces the noisy AAAA scenario in #157.
+    #[tokio::test]
+    async fn test_resolve_upstream_typed_no_records_found_is_no_match() {
+        let upstream = spawn_mock_upstream(std::net::Ipv4Addr::new(1, 2, 3, 4)).await;
+        // Pass the full SocketAddr (incl. ephemeral port). `build_resolver`
+        // defaults single-IP entries to port 53 when given a bare IP string,
+        // which would target the system resolver instead of our mock.
+        let resolver =
+            Arc::new(build_resolver(&[upstream.to_string()], 1000).expect("build_resolver"));
+        // Send AAAA: mock replies NoError + 0 answers, so hickory raises
+        // NoRecordsFound. Pre-fix classified it as ServFail; post-fix
+        // classifies it as NoMatch.
+        let result =
+            resolve_upstream_typed("aaaa-only-target.example.com", RecordType::AAAA, &resolver)
+                .await;
+        assert!(matches!(result, Err(QueryError::NoMatch)));
     }
 }
