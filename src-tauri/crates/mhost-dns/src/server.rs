@@ -1873,4 +1873,142 @@ mod tests {
         server.stop().await.unwrap();
         let _ = h.await;
     }
+
+    // -----------------------------------------------------------------------
+    // 端到端集成测试（fix issue #140 测试覆盖 gap）：
+    //   DnsServer + reload_rules（profile 规则）+ reload_ad_block_rules（adblock）
+    //   + 上游 forwarding 三个引擎同时在线，发四种查询分别验证每个路径。
+    //
+    // 之前 issue #140 复发是因为没有任何测试同时跑这三个引擎：
+    //   - adblock.rs 单测只验 AdBlockEngine.check()，不发 UDP 包
+    //   - server.rs 单测只验 reload_rules 或 reload_ad_block_rules 之一
+    //   - 没有跨引擎的端到端查询序列测试
+    //
+    // 这个测试用一个 mock upstream + 一组 profile rules + 一组 adblock rules
+    // 同时装载，串行发四个查询：
+    //   1. profile 域名 → 应走本地规则
+    //   2. adblock ZeroAddress 域名 → 应返回 0.0.0.0
+    //   3. adblock NxDomain 域名 → 应返回 NXDOMAIN
+    //   4. 未知域名 → 应走 mock upstream 拿到 10.0.0.99
+    // 任何一条回归（adblock 误拦截、规则丢、上游死）都会被本测试立刻抓住。
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_dns_server_full_stack_profile_adblock_upstream() {
+        use std::collections::{HashMap, HashSet};
+
+        let upstream_ip = std::net::Ipv4Addr::new(10, 0, 0, 99);
+        let mock_upstream = spawn_mock_upstream(upstream_ip).await;
+
+        let server_port: u16 = 1074;
+        let server_addr = SocketAddr::from(([127, 0, 0, 1], server_port));
+
+        let config = DnsConfig {
+            port: server_port,
+            upstream: vec![mock_upstream.to_string()],
+            refresh_upstream: false,
+            timeout_ms: 1000,
+            ..Default::default()
+        };
+        let server = Arc::new(DnsServer::new(config).unwrap());
+
+        // 1. 装载 profile 规则（issue #140 用户的场景：本地 DNS 规则）
+        let profile = make_profile(
+            "issue140-profile",
+            ProfileMode::Dns,
+            true,
+            vec![make_rule(
+                Some("127.0.0.1"),
+                vec!["local.example.com"],
+                true,
+            )],
+        );
+        server.reload_rules(&[profile]);
+
+        // 2. 装载 adblock 规则（混合 ZeroAddress + NxDomain + whitelist）
+        let mut zero_addr = HashMap::new();
+        zero_addr.insert(
+            "ads.example.com".to_string(),
+            std::net::IpAddr::from([0u8, 0, 0, 0]),
+        );
+        let mut nxdomain = HashSet::new();
+        nxdomain.insert("blocked.example.com".to_string());
+        let mut whitelist = HashSet::new();
+        whitelist.insert("safe.example.com".to_string());
+        server.reload_ad_block_rules(zero_addr, nxdomain, whitelist);
+
+        // 3. 启动 server 并查询四种场景
+        let s = Arc::clone(&server);
+        let h = tokio::spawn(async move { s.start().await });
+        wait_for_server_running(&server, 1000).await;
+
+        // 场景 1：profile 域名 → 本地规则（127.0.0.1）
+        let resp_profile = send_a_query(server_addr, "local.example.com.").await;
+        let msg_profile = Message::from_bytes(&resp_profile).unwrap();
+        assert_eq!(
+            msg_profile.response_code(),
+            ResponseCode::NoError,
+            "profile 域名应返回 NoError"
+        );
+        assert_eq!(
+            msg_profile.answer_count(),
+            1,
+            "profile 域名应有 1 条 Answer"
+        );
+        match msg_profile.answers().first().and_then(|r| r.data()) {
+            Some(RData::A(a)) => assert_eq!(
+                a.0,
+                std::net::Ipv4Addr::new(127, 0, 0, 1),
+                "profile 域名应解析到本地规则 IP"
+            ),
+            other => panic!("profile 域名应返回 A 记录，实际 {:?}", other),
+        }
+
+        // 场景 2：adblock ZeroAddress 域名 → 0.0.0.0
+        let resp_za = send_a_query(server_addr, "ads.example.com.").await;
+        let msg_za = Message::from_bytes(&resp_za).unwrap();
+        assert_eq!(
+            msg_za.response_code(),
+            ResponseCode::NoError,
+            "ZeroAddress 应返回 NoError"
+        );
+        assert_eq!(msg_za.answer_count(), 1, "ZeroAddress 应有 1 条 Answer");
+        match msg_za.answers().first().and_then(|r| r.data()) {
+            Some(RData::A(a)) => assert_eq!(
+                a.0,
+                std::net::Ipv4Addr::new(0, 0, 0, 0),
+                "ZeroAddress 应返回 0.0.0.0"
+            ),
+            other => panic!("ZeroAddress 应返回 A 记录，实际 {:?}", other),
+        }
+
+        // 场景 3：adblock NxDomain 域名 → NXDOMAIN
+        let resp_nx = send_a_query(server_addr, "blocked.example.com.").await;
+        let msg_nx = Message::from_bytes(&resp_nx).unwrap();
+        assert_eq!(
+            msg_nx.response_code(),
+            ResponseCode::NXDomain,
+            "NxDomain 规则应返回 NXDOMAIN"
+        );
+
+        // 场景 4：未知域名 → 走 mock upstream 拿到 10.0.0.99
+        let resp_upstream = send_a_query(server_addr, "first.example.com.").await;
+        let msg_upstream = Message::from_bytes(&resp_upstream).unwrap();
+        assert_eq!(
+            msg_upstream.response_code(),
+            ResponseCode::NoError,
+            "上游查询应返回 NoError"
+        );
+        assert_eq!(msg_upstream.answer_count(), 1, "上游查询应有 1 条 Answer");
+        match msg_upstream.answers().first().and_then(|r| r.data()) {
+            Some(RData::A(a)) => assert_eq!(
+                a.0, upstream_ip,
+                "未知域名应通过 mock upstream 解析到 10.0.0.99 \
+                 （issue #140：regression 在这里 —— 上游死或被 adblock 误拦都会 fail）"
+            ),
+            other => panic!("上游查询应返回 A 记录，实际 {:?}", other),
+        }
+
+        server.stop().await.unwrap();
+        let _ = h.await;
+    }
 }

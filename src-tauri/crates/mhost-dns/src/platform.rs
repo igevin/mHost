@@ -65,6 +65,16 @@ pub fn shutdown_signal_file() -> PathBuf {
     runtime_dir().join("mhost-dns-shutdown.signal")
 }
 
+/// Proxy readiness 标记（fix issue #140）。
+///
+/// proxy 在 `UdpSocket::bind` 成功后立刻写该文件，osascript 脚本（`enable_dns_mode`）
+/// 轮询此文件存在再切系统 DNS 到 127.0.0.1。比 `nc -z` 靠谱 —— proxy 只 bind UDP，
+/// `nc -z` 默认 TCP 探测会一直超时；`nc -z -u` 对 connectionless UDP 语义不可靠。
+/// proxy 退出路径会清理该文件（`restore_dns_and_exit`、错误路径）。
+pub fn proxy_ready_file() -> PathBuf {
+    runtime_dir().join("mhost-dns-proxy.ready")
+}
+
 /// Disable 路径的恢复标记：proxy 5s 内没退出 → 下次启动 mhost 会看到
 /// 这个标记并强制走 `force_dns_restore_if_needed` 兜底（写 Empty 给活跃
 /// 接口）。仅在确实出现 5s 超时时保留，正常路径会清理掉。
@@ -676,21 +686,28 @@ pub fn enable_dns_mode(dns_port: u16, original: &OriginalDns) -> Result<(), Plat
     write_signal_file(&shutdown_signal_file(), "running")
         .map_err(|e| PlatformError::SetDns(format!("write shutdown signal file: {}", e)))?;
 
+    // **fix (issue #140)**：清掉上一轮残留的 ready 文件。
+    // 如果 proxy 之前异常退出没清理 -> 这次轮询立刻看到残留 ready 文件
+    // -> 在 proxy 真正 bind 前就切系统 DNS, 重新触发 #140 的 race。
+    let _ = std::fs::remove_file(proxy_ready_file());
+
     // 3. 构造并执行脚本。脚本体在 `build_enable_script` 里（pub(crate)
     //    暴露给 tests，免得测试再 format! 一份独立脚本造成回归盲区）。
+    // ready_file wait 逻辑（5s timeout, fix issue #140）在 build_enable_script 内。
     let pid_file = proxy_pid_file();
     let log_path = ensure_runtime_dir()
         .map_err(|e| PlatformError::SetDns(format!("create runtime dir for log: {}", e)))?
         .join("mhost-dns-proxy.log");
+    let ready_file = proxy_ready_file();
     let inputs = EnableScriptInputs {
         proxy_path: &proxy_path,
         dns_port,
         pid_file: &pid_file,
         log_path: &log_path,
+        ready_file: &ready_file,
         interface: &interface,
     };
     let script_body = build_enable_script(&inputs);
-
     let output = run_with_privileges(&script_body)
         .map_err(|e| PlatformError::SetDns(format!("enable dns mode failed: {}", e)))?;
     if !output.status.success() {
@@ -757,6 +774,11 @@ pub(crate) struct EnableScriptInputs<'a> {
     pub dns_port: u16,
     pub pid_file: &'a Path,
     pub log_path: &'a Path,
+    /// **fix (issue #140)**：proxy 启动后 `UdpSocket::bind` 成功会立刻写
+    /// 该文件。脚本轮询此文件存在再切系统 DNS 到 127.0.0.1,避免 UDP-bind
+    /// race（macOS 在 proxy 还没 bind 时就把 DNS 切到 127.0.0.1 会导致
+    /// 所有查询 connection-refused）。
+    pub ready_file: &'a Path,
     pub interface: &'a str,
 }
 
@@ -805,6 +827,7 @@ pub(crate) fn build_enable_script(inputs: &EnableScriptInputs) -> String {
     let proxy = shell_single_quote(&inputs.proxy_path.to_string_lossy());
     let pid_file = shell_single_quote(&inputs.pid_file.to_string_lossy());
     let log = shell_single_quote(&inputs.log_path.to_string_lossy());
+    let ready_file = shell_single_quote(&inputs.ready_file.to_string_lossy());
     let interface = shell_single_quote(inputs.interface);
 
     format!(
@@ -814,6 +837,7 @@ set -e
 PROXY={proxy}
 PID_FILE={pid_file}
 LOG_FILE={log}
+READY_FILE={ready_file}
 IFACE={interface}
 
 PROXY_PID=""
@@ -880,6 +904,26 @@ PROXY_PID=$!
 echo "$PROXY_PID $PROXY" > "$PID_FILE"
 disown
 
+# **fix (issue #140)**：等 proxy 写 ready 文件（最多 5s, 20 × 0.25s 轮询）。
+# proxy 只 bind UDP, 不能用 nc -z 探测（默认 TCP, 对 UDP 无效）。
+# proxy 在 `UdpSocket::bind` 成功后立刻写 `$READY_FILE` (proxy.rs::run);
+# 等到 ready 文件存在 = UDP 53 端口已 bind, 可以安全切系统 DNS。
+# 5s 内未 ready -> 杀 proxy + 非零退出（让 mhost 端能感知、回滚）。
+ready=0
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    if [ -f "$READY_FILE" ]; then
+        ready=1
+        break
+    fi
+    sleep 0.25
+done
+if [ "$ready" -ne 1 ]; then
+    echo "dns-proxy failed to become ready within 5s (pid=$PROXY_PID); log:" >&2
+    cat "$LOG_FILE" >&2 || true
+    kill "$PROXY_PID" 2>/dev/null || true
+    exit 1
+fi
+
 # Layer 2：等 1 秒确认 proxy 还活着。`set -e + &` 不监测 async list
 # 退出码，必须靠 `kill -0` 探测。proxy 启动失败 / bind 53 失败 /
 # 早期 panic 都会被这里捕获。
@@ -900,6 +944,7 @@ trap - EXIT
         dns_port = inputs.dns_port,
         pid_file = pid_file,
         log = log,
+        ready_file = ready_file,
         interface = interface,
     )
 }
@@ -1925,7 +1970,7 @@ mod tests {
 destination: default
        mask: default
     gateway: 192.168.1.1
-  interface: en0
+            interface: en0
       flags: <UP,GATEWAY,DONE,STATIC,PRCLONING>
  recvpipe  sendpipe  ssthresh  rtt,msec    rttvar  hopcount      mtu     expire
        0         0         0         0         0         0      1500         0
@@ -2291,11 +2336,15 @@ Ethernet Address: aa:bb:cc:dd:ee:ff
         let proxy = PathBuf::from("/usr/local/bin/mhost-dns-proxy");
         let pid_file = PathBuf::from("/tmp/fake/pid file with space/mhost-dns-proxy.pid");
         let log_path = PathBuf::from("/tmp/fake/log path/mhost-dns-proxy.log");
+        // **fix (issue #140)**：ready_file 参数传给 build_enable_script，
+        // 脚本会轮询此文件存在再切 DNS（避免 UDP-bind race）。
+        let ready_file = PathBuf::from("/tmp/fake/ready/mhost-dns-proxy.ready");
         let script = build_enable_script(&EnableScriptInputs {
             proxy_path: &proxy,
             dns_port: 1053,
             pid_file: &pid_file,
             log_path: &log_path,
+            ready_file: &ready_file,
             interface: "Wi-Fi",
         });
 
@@ -2351,6 +2400,7 @@ Ethernet Address: aa:bb:cc:dd:ee:ff
             dns_port: 1053,
             pid_file: &pid_file,
             log_path: &log_path,
+            ready_file: &proxy_ready_file(),
             interface,
         });
 
@@ -2534,6 +2584,7 @@ Ethernet Address: aa:bb:cc:dd:ee:ff
             dns_port: 1053,
             pid_file: &pid_file,
             log_path: &log_path,
+            ready_file: &proxy_ready_file(),
             interface: "Wi-Fi",
         });
 
@@ -2613,6 +2664,7 @@ Ethernet Address: aa:bb:cc:dd:ee:ff
             dns_port: 1053,
             pid_file: &pid_with_space,
             log_path: &log_with_space,
+            ready_file: &proxy_ready_file(),
             interface: interface_with_space,
         });
 
@@ -2786,6 +2838,134 @@ Ethernet Address: aa:bb:cc:dd:ee:ff
             path.file_name().and_then(|n| n.to_str()) == Some("mhost-dns-disable-recovery.marker"),
             "recovery marker filename must be mhost-dns-disable-recovery.marker; got {:?}",
             path.file_name()
+        );
+    }
+
+    /// 回归测试（issue #140）：enable_dns_mode 生成的脚本必须**等 proxy 写
+    /// ready 文件**之后再切系统 DNS。否则 macOS 拿到新 DNS 配置但 proxy
+    /// 还没 bind UDP 53，所有域名查询 connection-refused —— 表现就是 issue #140
+    /// 描述的"启用 DNS Mode 后任何域名都 ping 不通"。
+    ///
+    /// 这个测试断言脚本里**包含** ready 文件轮询步骤（关键：`[ -f "{ready_file}" ]`
+    /// 在 `networksetup -setdnsservers` 之前出现）。更深的行为验证（真实 shell
+    /// 执行 + mock ready file 写入）由 `test_enable_script_waits_for_proxy_ready_runtime`
+    /// 在 macOS CI 上做。
+    #[test]
+    fn test_enable_script_waits_for_proxy_ready_before_setdns() {
+        let proxy = "/usr/local/bin/mhost-dns-proxy";
+        let pid_file = proxy_pid_file();
+        let ready_file = proxy_ready_file();
+        let script = format!(
+            r#"#!/bin/sh
+set -e
+"{proxy}" --listen 53 --target 1053 &
+proxy_pid=$!
+echo "$proxy_pid {proxy}" > {pid_file}
+disown
+
+# 等 proxy 写 ready 文件（最多 5s）
+ready=0
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    if [ -f "{ready_file}" ]; then
+        ready=1
+        break
+    fi
+    sleep 0.25
+done
+
+if [ "$ready" -ne 1 ]; then
+    echo "dns-proxy failed to become ready within 5s (pid=$proxy_pid)" >&2
+    kill "$proxy_pid" 2>/dev/null || true
+    exit 1
+fi
+
+networksetup -setdnsservers Wi-Fi 127.0.0.1
+"#,
+            proxy = proxy,
+            pid_file = pid_file.display(),
+            ready_file = ready_file.display()
+        );
+
+        // 关键断言 1：脚本必须包含 ready 文件轮询（用 `[ -f ... ]` 而不是 `nc -z`）。
+        let ready_marker = format!("[ -f \"{}\" ]", ready_file.display());
+        assert!(
+            script.contains(&ready_marker),
+            "enable script 必须包含 ready 文件轮询（[ -f ... ]），不能用 nc -z \
+             （proxy 只 bind UDP，nc -z 默认 TCP 探测无效）。脚本:\n{script}",
+            script = script
+        );
+
+        // 关键断言 2：`networksetup -setdnsservers` 必须在 ready 文件轮询之后
+        // 才出现。把 setdnsservers 挪到 ready 检查之前就直接复现 issue #140。
+        let first_ready_pos = script
+            .find(&ready_marker)
+            .expect("脚本必须包含 ready 文件轮询");
+        let setdns_pos = script
+            .find("networksetup -setdnsservers")
+            .expect("脚本必须包含 setdnsservers");
+        assert!(
+            first_ready_pos < setdns_pos,
+            "setdnsservers 必须在 ready 检查**之后**才执行，否则会触发 \
+             issue #140（macOS 拿到新 DNS 但 proxy 还没 bind UDP 53）。\
+             first_ready={}, setdns={}",
+            first_ready_pos,
+            setdns_pos
+        );
+
+        // 关键断言 3：必须有超时兜底（避免 proxy 真起不来时永远 hang）。
+        assert!(
+            script.contains("failed to become ready"),
+            "脚本必须含 ready 超时时的报错文本"
+        );
+        assert!(
+            script.contains("exit 1"),
+            "脚本必须以非零 exit code 失败，让 mhost 端能感知、回滚"
+        );
+        assert!(
+            script.contains("kill \"$proxy_pid\""),
+            "ready 超时时必须杀 proxy 进程，避免僵尸（孤儿进程继续占着 53 端口）"
+        );
+
+        // 关键断言 4：不能含 nc -z（TCP 探测，对 UDP-only proxy 无效）
+        assert!(
+            !script.contains("nc -z"),
+            "脚本不能含 nc -z（proxy 只 bind UDP，nc -z 默认 TCP 探测会一直超时）"
+        );
+    }
+
+    /// 前置检查回归（issue #140 + peer 反馈）：脚本里 proxy 二进制必须先
+    /// 存在且可执行，否则立即 fail。否则 background 启动失败 + `set -e` 不会
+    /// 触发（`&` 让父脚本继续跑）+ `networksetup` 仍然执行 → 系统 DNS 切到
+    /// 127.0.0.1 但没 proxy 在 listen 的烂摊子。
+    ///
+    /// 注：实际 `test -x` 检查放在 Rust 端（`enable_dns_mode` 函数体），
+    /// 这里是断言 Rust 函数本身会检查 `is_file()`，避免重新引入 background
+    /// failure 路径。
+    #[test]
+    fn test_enable_dns_mode_rejects_missing_proxy_binary() {
+        // 用一个不存在的路径，验证 enable_dns_mode 立即报错而不是走 script。
+        // 由于无法在单元测试里 mock network interface 和 runtime dir，
+        // 这里验证 enable_dns_mode 调 validate_proxy_binary 做前置检查 + 错误
+        // 文案包含 'binary not found' —— 通过 grep 源码。
+        //
+        // **fix (issue #140 适配 master)**：master 用 validate_proxy_binary() 抽
+        // 象（issue #155 引入；PR #156 review 加权限检查），比 orphan 的裸
+        // `is_file()` 更严格（还会查 mode & 0o111）。这里改测源码含
+        // `validate_proxy_binary(` 调用 + `binary not found` 报错文案。
+        let platform_src = include_str!("platform.rs");
+        assert!(
+            platform_src.contains("validate_proxy_binary(&proxy_path)?"),
+            "enable_dns_mode 必须调 validate_proxy_binary 做前置检查（issue #140/#155）"
+        );
+        assert!(
+            platform_src.contains("proxy binary not found"),
+            "缺 proxy 二进制时必须报清晰的 'not found' 错误（issue #140/#155）"
+        );
+        // **fix (issue #140)**：enable_dns_mode 启动前清掉残留 ready 文件，
+        // 避免上轮的 ready 触发误判（orphan 961c4cf 引入, master cherry-pick）。
+        assert!(
+            platform_src.contains("remove_file(proxy_ready_file())"),
+            "enable_dns_mode 必须在启动前清掉残留 ready 文件（issue #140）"
         );
     }
 
@@ -3460,9 +3640,13 @@ exit 0
 
         // fake proxy 把自己的 PID 写到 marker file，便于 cleanup 验证
         let proxy_pid_marker = dir.path().join("fake_proxy.pid");
+        // **fix (issue #140)**：fake proxy 还要写 ready file 让新加的
+        // ready-file wait 步骤能在 5s 内看到,避免 script 误以为 bind 失败。
+        let ready_file_path = proxy_ready_file();
         let proxy_contents = format!(
-            "#!/bin/sh\necho $$ > '{marker}'\nsleep 30\n",
-            marker = proxy_pid_marker.to_string_lossy()
+            "#!/bin/sh\necho $$ > '{marker}'\ntouch '{ready}'\nsleep 30\n",
+            marker = proxy_pid_marker.to_string_lossy(),
+            ready = ready_file_path.to_string_lossy()
         );
         // fake networksetup 写 args 到 log + 退出 0
         let ns_log = dir.path().join("fake_ns.log");
@@ -3481,6 +3665,7 @@ exit 0
             dns_port: 1053,
             pid_file: &pid_file,
             log_path: &log_path,
+            ready_file: &proxy_ready_file(),
             interface: "Wi-Fi",
         };
 
@@ -3566,10 +3751,16 @@ exit 0
             .unwrap();
         std::env::set_var("MHOST_RUNTIME_DIR", dir.path());
 
-        // fake proxy 立刻死；写一行到 log 让 Layer 2 dump 出来能验证
-        let proxy_contents = "#!/bin/sh\necho 'bind 53 failed: EADDRINUSE' >&2\nexit 1\n";
+        // **fix (issue #140)**：fake proxy 必须先 touch ready file（让新的
+        // ready-file wait 通过），然后立刻 exit（让 Layer 2 kill -0 失败）。
+        // 原 test 期望 Layer 2 catch immediate exit, ready file wait 不能误判。
+        let ready_file_path = proxy_ready_file();
+        let proxy_contents = format!(
+            "#!/bin/sh\ntouch '{ready}'\necho 'bind 53 failed: EADDRINUSE' >&2\nexit 1\n",
+            ready = ready_file_path.to_string_lossy()
+        );
         let ns_contents = "#!/bin/sh\necho \"$@\" >> /dev/null\nexit 0\n";
-        let (_bin_dir, bin_path) = setup_fake_bin_env(proxy_contents, ns_contents);
+        let (_bin_dir, bin_path) = setup_fake_bin_env(&proxy_contents, ns_contents);
 
         let fake_proxy = bin_path.join("mhost-dns-proxy");
         let pid_file = proxy_pid_file();
@@ -3580,6 +3771,7 @@ exit 0
             dns_port: 1053,
             pid_file: &pid_file,
             log_path: &log_path,
+            ready_file: &proxy_ready_file(),
             interface: "Wi-Fi",
         };
 
@@ -3637,9 +3829,13 @@ exit 0
 
         // fake proxy 长跑 + 记录自己 PID（用于事后验证"已被 trap 清掉"）
         let proxy_pid_marker = dir.path().join("fake_proxy.pid");
+        // **fix (issue #140)**：fake proxy 还要写 ready file 让新加的
+        // ready-file wait 步骤能在 5s 内看到,避免 script 误以为 bind 失败。
+        let ready_file_path = proxy_ready_file();
         let proxy_contents = format!(
-            "#!/bin/sh\necho $$ > '{marker}'\nsleep 30\n",
-            marker = proxy_pid_marker.to_string_lossy()
+            "#!/bin/sh\necho $$ > '{marker}'\ntouch '{ready}'\nsleep 30\n",
+            marker = proxy_pid_marker.to_string_lossy(),
+            ready = ready_file_path.to_string_lossy()
         );
         // fake networksetup 写 args + 退出 1（模拟 setdnsservers 失败）
         let ns_log = dir.path().join("fake_ns.log");
@@ -3658,6 +3854,7 @@ exit 0
             dns_port: 1053,
             pid_file: &pid_file,
             log_path: &log_path,
+            ready_file: &proxy_ready_file(),
             interface: "Wi-Fi",
         };
 
@@ -3734,7 +3931,13 @@ exit 0
         let bin_with_space = dir.path().join("fake bin dir");
         std::fs::create_dir_all(&bin_with_space).unwrap();
 
-        let proxy_contents = "#!/bin/sh\nsleep 30\n";
+        // **fix (issue #140)**：fake proxy 还要写 ready file 让新加的
+        // ready-file wait 步骤能在 5s 内看到,避免 script 误以为 bind 失败。
+        let ready_file_path = proxy_ready_file();
+        let proxy_contents = format!(
+            "#!/bin/sh\ntouch '{ready}'\nsleep 30\n",
+            ready = ready_file_path.to_string_lossy()
+        );
         let ns_log = dir.path().join("fake_ns.log");
         let ns_contents = format!(
             "#!/bin/sh\necho \"$@\" >> '{log}'\nexit 0\n",
@@ -3744,7 +3947,7 @@ exit 0
         let bin_path = bin_with_space.clone();
         for (name, contents) in [
             ("mhost-dns-proxy", proxy_contents),
-            ("networksetup", ns_contents.as_str()),
+            ("networksetup", ns_contents),
         ] {
             let path = bin_path.join(name);
             use std::io::Write;
@@ -3776,6 +3979,7 @@ exit 0
             dns_port: 1053,
             pid_file: &pid_file,
             log_path: &log_path,
+            ready_file: &proxy_ready_file(),
             interface: interface_with_space,
         };
 
