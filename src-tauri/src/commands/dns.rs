@@ -1,13 +1,11 @@
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
-use crate::state::lock_or_recover;
+use crate::state::{lock_or_recover, AppState};
 use mhost_core::{MhostError, OriginalDns, ProfileMode};
 use tauri::State;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-
-use crate::state::{lock_or_recover, AppState};
 
 /// 启动/停止 DNS 模式。
 ///

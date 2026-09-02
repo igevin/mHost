@@ -12,15 +12,6 @@ use tokio_util::sync::CancellationToken;
 ///
 /// `tokio::sync::Mutex` (used by [`ApplyLock`]) does not have poison — a
 /// panicked holder releases the lock automatically — so this helper is
-/// only needed for plain `std::sync::Mutex` slots (e.g. the ad block
-/// refresh task slot and cancel slot).
-pub(crate) fn lock_or_recover<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    match mutex.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    }
-}
-
 /// Async mutex to serialize apply operations and prevent concurrent writes to /etc/hosts.
 /// Security fix (#16): Prevents race conditions when user rapidly toggles profiles.
 /// Perf fix (#26): Changed to `tokio::sync::Mutex` to allow holding across await points.
