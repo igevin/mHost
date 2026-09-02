@@ -1,0 +1,19 @@
+/* Hosts syntax highlight tokens (issue #126). Shared by RuleEditor and
+   SystemHosts. `highlightHostsLine()` in src/lib/highlightHosts.ts emits
+   spans with these class names. Colors come from the design tokens in
+   src/styles/global.css (Terminal Native palette). */
+
+.hosts-token-ip {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.hosts-token-domain {
+  color: var(--success);
+  font-weight: 500;
+}
+
+.hosts-token-comment {
+  color: var(--ink-muted);
+  font-style: italic;
+}

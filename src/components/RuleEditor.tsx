@@ -4,7 +4,7 @@ import { validateHostsText } from "../lib/tauri";
 import { extractErrorMessage } from "../lib/error";
 import { findMatches } from "../lib/search";
 import type { MatchInfo } from "../lib/search";
-import { escapeHtml } from "../lib/escape";
+import { highlightHostsLine } from "../lib/highlightHosts";
 import SearchBar from "./SearchBar";
 import styles from "./RuleEditor.module.css";
 
@@ -33,71 +33,9 @@ function rulesToText(rules: HostRule[]): string {
     .join("\n");
 }
 
-/** Single-line syntax highlighting (no search marks) */
-function highlightLine(line: string): string {
-  const trimmed = line.trim();
-
-  if (trimmed === "") {
-    return "";
-  }
-
-  // Full line comment
-  if (trimmed.startsWith("#")) {
-    return `<span class="${styles.tokenComment}">${escapeHtml(line)}</span>`;
-  }
-
-  let remaining = line;
-  let html = "";
-
-  // Disabled prefix
-  if (remaining.startsWith("# ")) {
-    html += `<span class="${styles.tokenComment}">${escapeHtml("# ")}</span>`;
-    remaining = remaining.slice(2);
-  }
-
-  // IP address (IPv4 or IPv6)
-  const ipv4Match = remaining.match(/^(\d+\.\d+\.\d+\.\d+)/);
-  const ipv6Match = remaining.match(/^([0-9a-fA-F:]+)/);
-  if (ipv4Match) {
-    html += `<span class="${styles.tokenIp}">${escapeHtml(ipv4Match[1])}</span>`;
-    remaining = remaining.slice(ipv4Match[1].length);
-  } else if (ipv6Match && ipv6Match[1].includes(":")) {
-    html += `<span class="${styles.tokenIp}">${escapeHtml(ipv6Match[1])}</span>`;
-    remaining = remaining.slice(ipv6Match[1].length);
-  }
-
-  // Remaining: spaces, domains, inline comment
-  const commentIdx = remaining.indexOf(" #");
-  if (commentIdx >= 0) {
-    const beforeComment = remaining.slice(0, commentIdx);
-    const comment = remaining.slice(commentIdx);
-
-    // Tokenize before comment
-    const parts = beforeComment.split(/(\s+)/);
-    for (const part of parts) {
-      if (part === "") continue;
-      if (/^\s+$/.test(part)) {
-        html += escapeHtml(part); // spaces as-is
-      } else {
-        html += `<span class="${styles.tokenDomain}">${escapeHtml(part)}</span>`;
-      }
-    }
-
-    html += `<span class="${styles.tokenComment}">${escapeHtml(comment)}</span>`;
-  } else {
-    const parts = remaining.split(/(\s+)/);
-    for (const part of parts) {
-      if (part === "") continue;
-      if (/^\s+$/.test(part)) {
-        html += escapeHtml(part);
-      } else {
-        html += `<span class="${styles.tokenDomain}">${escapeHtml(part)}</span>`;
-      }
-    }
-  }
-
-  return html;
-}
+// issue #126: per-line highlighting is delegated to the shared helper so
+// RuleEditor and SystemHosts render identical token colors.
+const highlightLine = highlightHostsLine;
 
 /** Parse text into HTML with syntax highlighting and search marks */
 function highlightText(
@@ -319,6 +257,44 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEd
     }
   }, []);
 
+  // Track the line the caret is on — used to highlight the active row in the gutter.
+  // Derives from textarea.selectionStart so it works for both keyboard nav and clicks.
+  //
+  // Perf (issue #125 review): the previous implementation did
+  //   value.slice(0, selectionStart).split("\n").length - 1
+  // on every keystroke, re-scanning the prefix from char 0 every time. For a
+  // 5k-line file with the caret at line 3000, that's 3000 char-codes per
+  // keystroke. We now keep a (lastSel, lastLine) cache and walk only the
+  // *delta* between selections — O(diff), typically 1 char. The fast path
+  // (sel unchanged) returns immediately, and the equality guard on the
+  // setState prevents re-renders when the line index didn't change.
+  const [activeLineNumber, setActiveLineNumber] = useState(0);
+  const lastSelRef = useRef(0);
+  const lastLineRef = useRef(0);
+
+  const handleActiveLineUpdate = useCallback(() => {
+    const ta = textareaRef.current;
+    if (!ta) return;
+    const sel = ta.selectionStart;
+    if (sel === lastSelRef.current) return; // fast path
+
+    const lastSel = lastSelRef.current;
+    const lastLine = lastLineRef.current;
+    const lo = Math.min(sel, lastSel);
+    const hi = Math.max(sel, lastSel);
+    let delta = 0;
+    // \n = charCode 10. Walking the delta (not the full prefix) makes this
+    // O(diff): 1 for a keystroke, N for a paste of N chars.
+    for (let i = lo; i < hi; i++) {
+      if (ta.value.charCodeAt(i) === 10) delta++;
+    }
+    const lineIdx = sel > lastSel ? lastLine + delta : lastLine - delta;
+
+    lastSelRef.current = sel;
+    lastLineRef.current = lineIdx;
+    setActiveLineNumber((prev) => (prev === lineIdx ? prev : lineIdx));
+  }, []);
+
   // Scroll to a specific line in the textarea
   const scrollToMatch = useCallback((lineIndex: number) => {
     if (textareaRef.current) {
@@ -438,9 +414,18 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEd
       <div className={`${styles.editorWrapper} ${editorHasBlockingIssues ? styles.editorWrapperHasErrors : ""}`}>
         {/* Line Numbers */}
         <div ref={lineNumbersRef} className={styles.lineNumbers}>
-          {lineNumbers.map((num) => (
-            <div key={num} className={styles.lineNumber}>{num}</div>
-          ))}
+          {lineNumbers.map((num) => {
+            const lineIdx = num - 1;
+            const isActive = !readOnly && lineIdx === activeLineNumber;
+            return (
+              <div
+                key={num}
+                className={`${styles.lineNumber} ${isActive ? styles.lineNumberActive : ""}`}
+              >
+                {num}
+              </div>
+            );
+          })}
         </div>
 
         {/* Highlight Layer */}
@@ -458,6 +443,10 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEd
           value={text}
           onChange={handleChange}
           onScroll={handleScroll}
+          // onSelect alone covers clicks, arrow keys, Home/End, and Shift+arrow
+          // extends (the browser fires `select` whenever the selection changes).
+          // Adding onClick/onKeyUp on top only causes redundant re-renders.
+          onSelect={handleActiveLineUpdate}
           readOnly={readOnly}
           spellCheck={false}
           placeholder="Enter hosts rules, one per line:&#10;127.0.0.1 localhost # local dev&#10;192.168.1.100 api.dev.local # API server"
