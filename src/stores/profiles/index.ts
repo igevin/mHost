@@ -27,6 +27,9 @@ export {
   adBlockErrorAtom,
   adBlockRuleCountAtom,
   adBlockHasErrorsAtom,
+  quickApplyOnToggleAtom,
+  quickApplyOutcomeAtom,
+  isQuickApplyToastOpenAtom,
 } from "./state";
 
 // ---- Async action atoms ----
@@ -66,4 +69,5 @@ export {
   removeAdBlockWhitelistAtom,
   fetchAdBlockSourcesAtom,
   fetchAdBlockWhitelistAtom,
+  quickApplyToggleAtom,
 } from "./actions";

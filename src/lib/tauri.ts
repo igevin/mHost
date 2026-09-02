@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   Profile,
   ApplyPlan,
+  ApplyOutcome,
   ValidateResult,
   ExportFormat,
   SnapshotMeta,
@@ -56,8 +57,18 @@ export async function setProfileEnabled(
 export async function enableAndApply(
   id: string,
   enabled: boolean,
-): Promise<void> {
-  return invoke("enable_and_apply", { id, enabled });
+  requireSafe = false,
+): Promise<ApplyOutcome> {
+  return invoke<ApplyOutcome>("enable_and_apply", { id, enabled, requireSafe });
+}
+
+/// Read-only IPC: compute what an `enableAndApply(id, enabled)` call would
+/// produce, without writing anything. Refs #127.
+export async function previewApplyOutcome(
+  id: string,
+  enabled: boolean,
+): Promise<ApplyOutcome> {
+  return invoke<ApplyOutcome>("preview_apply_outcome", { id, enabled });
 }
 
 // ---- Apply commands ----
