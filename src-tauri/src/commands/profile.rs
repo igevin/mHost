@@ -182,14 +182,16 @@ pub async fn set_profile_enabled(
     // Hosts 模式保持互斥；DNS 模式允许多激活
     if profile.mode == ProfileMode::Hosts && enabled {
         disable_other_profiles(state.storage.as_ref(), &profile_id)?;
-        // P-R12 (issue #181): disable_other_profiles may have mutated N profiles;
-        // invalidate cache so subsequent reads see fresh state.
-        state.invalidate_profile_cache();
     }
 
     profile.enabled = enabled;
     profile.updated_at = chrono::Utc::now();
     state.storage.save_profile(&profile)?;
+    // P-R12 (issue #181): 单一 invalidate 覆盖所有 mutation:
+    // - Hosts + enabled: disable_other_profiles 写了 N 条 + 当前 save_profile
+    // - Hosts + !enabled: 仅当前 save_profile
+    // - DNS 任意: 仅当前 save_profile
+    state.invalidate_profile_cache();
 
     // 如果是 DNS 模式 Profile 且 dns_enabled == true，热重载规则。
     // **fix issue #67 round 3 (Bug B)**: 不再要求 `enabled == true` —— 禁用

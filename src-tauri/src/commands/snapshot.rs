@@ -292,6 +292,9 @@ pub async fn load_snapshot(
     })
     .await
     .map_err(|e| MhostError::InvalidInput(e.to_string()))??;
+    // P-R12 (issue #181): load_snapshot_logic 写入 N 条 profile (snapshot.profiles)
+    // + 删除不在 snapshot 的当前 profiles, cache 必须 invalidate.
+    state.invalidate_profile_cache();
 
     // 快照恢复后，若 DNS 模式处于启用状态，同步重载 DNS 规则表
     if state.dns_enabled.load(std::sync::atomic::Ordering::Relaxed) {
