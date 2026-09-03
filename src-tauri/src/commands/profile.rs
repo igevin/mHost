@@ -101,6 +101,7 @@ pub fn create_profile(
     // Security fix (#18): Validate profile before saving
     validate_profile(&profile)?;
     state.storage.save_profile(&profile)?;
+    state.invalidate_profile_cache();
     #[cfg(target_os = "macos")]
     crate::tray::update_tray_menu(&app_handle);
     Ok(profile)
@@ -186,6 +187,11 @@ pub async fn set_profile_enabled(
     profile.enabled = enabled;
     profile.updated_at = chrono::Utc::now();
     state.storage.save_profile(&profile)?;
+    // P-R12 (issue #181): 单一 invalidate 覆盖所有 mutation:
+    // - Hosts + enabled: disable_other_profiles 写了 N 条 + 当前 save_profile
+    // - Hosts + !enabled: 仅当前 save_profile
+    // - DNS 任意: 仅当前 save_profile
+    state.invalidate_profile_cache();
 
     // 如果是 DNS 模式 Profile 且 dns_enabled == true，热重载规则。
     // **fix issue #67 round 3 (Bug B)**: 不再要求 `enabled == true` —— 禁用
@@ -242,6 +248,8 @@ pub async fn update_profile(
     // N4: Validate profile data before applying changes to system hosts.
     validate_profile(&profile)?;
     state.storage.save_profile(&profile)?;
+    // P-R12 (issue #181): invalidate profile cache so subsequent reads see updated data.
+    state.invalidate_profile_cache();
 
     // Hosts 模式：若 profile 已 enabled，把新规则自动写入 /etc/hosts（fix issue #121）。
     // 之前只 save_profile 不写 hosts，用户得 disable→enable 才能让改动生效，体验割裂。
@@ -307,6 +315,8 @@ pub fn delete_profile(
 ) -> Result<(), MhostError> {
     let profile_id = ProfileId::from_str(&id)?;
     state.storage.delete_profile(&profile_id)?;
+    // P-R12 (issue #181): invalidate profile cache so subsequent reads don't return deleted profile.
+    state.invalidate_profile_cache();
     #[cfg(target_os = "macos")]
     crate::tray::update_tray_menu(&app_handle);
     Ok(())

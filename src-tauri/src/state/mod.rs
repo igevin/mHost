@@ -1,9 +1,9 @@
 use mhost_apply::writer::HostsWriter;
-use mhost_core::{AdBlockState, MhostError, OriginalDns, ProfileMode};
+use mhost_core::{AdBlockState, MhostError, OriginalDns, Profile, ProfileMode};
 use mhost_storage::migration::migrate_v1_to_v2;
 use mhost_storage::storage::{FileStorage, Storage};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -63,6 +63,26 @@ pub(crate) fn lock_or_recover<T>(mutex: &std::sync::Mutex<T>) -> std::sync::Mute
     }
 }
 
+/// `std::sync::RwLock` 的 poison recovery（issue #181 P-R12 + P-R15 配套）。
+/// 用法同 [`lock_or_recover`]，区分 read / write guard 类型。
+pub(crate) fn lock_or_recover_rwlock<T>(
+    rwlock: &std::sync::RwLock<T>,
+) -> std::sync::RwLockReadGuard<'_, T> {
+    match rwlock.read() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+pub(crate) fn lock_or_recover_rwlock_write<T>(
+    rwlock: &std::sync::RwLock<T>,
+) -> std::sync::RwLockWriteGuard<'_, T> {
+    match rwlock.write() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 pub struct AppState {
     pub storage: Arc<dyn Storage + Send + Sync>,
     pub writer: Arc<HostsWriter>,
@@ -71,6 +91,18 @@ pub struct AppState {
     pub snapshot_lock: ApplyLock,
     /// Perf fix (#29): Track last rendered profile IDs to avoid unnecessary menu rebuilds.
     pub last_profile_ids: Mutex<Vec<String>>,
+    /// Perf fix (P-R12 + P-R15, issue #181): Cached profile list to avoid
+    /// re-reading every profile JSON on every tray build / apply / IPC read.
+    ///
+    /// `None` = not loaded; first [`cached_profiles`] call populates.
+    /// All profile mutation IPC handlers (create / update / delete / set_enabled /
+    /// duplicate / import) **must** call [`invalidate_profile_cache`] after
+    /// their storage write so the next read sees fresh data.
+    ///
+    /// Uses `std::sync::RwLock` (not tokio) because tray callbacks are
+    /// sync and don't need to hold across await; lock acquisition is
+    /// non-blocking as long as no panics while holding write guard.
+    pub cached_profiles: RwLock<Option<Vec<Profile>>>,
     // DNS 相关
     pub dns_server: Arc<Mutex<Option<mhost_dns::DnsServer>>>,
     pub dns_enabled: AtomicBool,
@@ -202,6 +234,7 @@ impl AppState {
             apply_lock: ApplyLock(tokio::sync::Mutex::new(())),
             snapshot_lock: ApplyLock(tokio::sync::Mutex::new(())),
             last_profile_ids: Mutex::new(Vec::new()),
+            cached_profiles: RwLock::new(None), // lazy load on first cached_profiles() call
             dns_server,
             dns_enabled: AtomicBool::new(dns_enabled),
             original_dns: tokio::sync::RwLock::new(original_dns),
@@ -403,6 +436,36 @@ impl AppState {
 
         Ok((server, original))
     }
+
+    // -------------------------------------------------------------------
+    // Profile list cache (issue #181 P-R12 + P-R15)
+    // -------------------------------------------------------------------
+
+    /// 读缓存；miss 时从 storage 加载并写入缓存。
+    ///
+    /// **双重检查锁**：read 命中直接 clone 返回（锁立即 drop）；
+    /// miss 才走 write 路径 load + store。Tray 每次 build 都读，
+    /// 二次读零 I/O 是主要收益。
+    pub fn cached_profiles(&self) -> Result<Vec<Profile>, mhost_core::StorageError> {
+        // Fast path: cache hit.
+        {
+            let guard = lock_or_recover_rwlock(&self.cached_profiles);
+            if let Some(c) = guard.as_ref() {
+                return Ok(c.clone());
+            }
+        }
+        // Slow path: load from storage, store to cache, return clone.
+        let profiles = self.storage.list_profiles()?;
+        *lock_or_recover_rwlock_write(&self.cached_profiles) = Some(profiles.clone());
+        Ok(profiles)
+    }
+
+    /// 失效缓存：mutation 后调用，下一次 [`cached_profiles`] 会重新从 storage 拉。
+    /// 比 write-through（更新单条 Vec 项）简单，且在 `disable_other_profiles` 这种
+    /// 循环写 N 条场景下也只需在末尾调一次。
+    pub fn invalidate_profile_cache(&self) {
+        *lock_or_recover_rwlock_write(&self.cached_profiles) = None;
+    }
 }
 
 #[cfg(test)]
@@ -457,5 +520,146 @@ mod tests {
         // After recovery, the helper should hand out a writable guard.
         *lock_or_recover(&m) = 999;
         assert_eq!(*lock_or_recover(&m), 999);
+    }
+
+    // -----------------------------------------------------------------------
+    // lock_or_recover_rwlock (issue #181 P-R12 + P-R15)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn lock_or_recover_rwlock_returns_read_guard_on_normal_lock() {
+        let r: std::sync::RwLock<u32> = std::sync::RwLock::new(42);
+        let guard = lock_or_recover_rwlock(&r);
+        assert_eq!(*guard, 42);
+    }
+
+    #[test]
+    fn lock_or_recover_rwlock_write_allows_mutation() {
+        let r: std::sync::RwLock<u32> = std::sync::RwLock::new(0);
+        *lock_or_recover_rwlock_write(&r) = 100;
+        assert_eq!(*lock_or_recover_rwlock(&r), 100);
+    }
+
+    #[test]
+    fn lock_or_recover_rwlock_recovers_from_poison() {
+        let r = std::sync::Arc::new(std::sync::RwLock::new("data".to_string()));
+        let r2 = r.clone();
+
+        let join = std::thread::spawn(move || {
+            let _g = r2.write().unwrap();
+            panic!("simulated panic in write guard");
+        });
+        let _ = join.join();
+
+        // The RwLock is now poisoned, but our helper must recover transparently.
+        let guard = lock_or_recover_rwlock(&r);
+        assert_eq!(guard.as_str(), "data");
+    }
+
+    #[test]
+    fn lock_or_recover_rwlock_write_recovers_from_poison() {
+        let r = std::sync::Arc::new(std::sync::RwLock::new(0u32));
+        let r2 = r.clone();
+
+        let join = std::thread::spawn(move || {
+            let _g = r2.write().unwrap();
+            panic!("simulated panic");
+        });
+        let _ = join.join();
+
+        // Should be able to write after recovery.
+        *lock_or_recover_rwlock_write(&r) = 999;
+        assert_eq!(*lock_or_recover_rwlock(&r), 999);
+    }
+
+    // -----------------------------------------------------------------------
+    // AppState::cached_profiles (issue #181 P-R12 + P-R15)
+    // -----------------------------------------------------------------------
+    //
+    // 这些 test 需要一个真实构造的 AppState。我们构造最小的状态（只关心
+    // storage + cached_profiles 字段），避开 DNS / manifest 等无关字段。
+
+    use mhost_storage::storage::{FileStorage, Storage};
+    use tempfile::TempDir;
+
+    /// 构造一个最小可用的 AppState：只填 storage 和 cached_profields，
+    /// 其他字段填默认值，足够验证 cache 行为。
+    fn make_test_state() -> (TempDir, std::sync::Arc<AppState>) {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = std::sync::Arc::new(FileStorage::new(temp_dir.path()))
+            as std::sync::Arc<dyn Storage + Send + Sync>;
+        let state = AppState {
+            storage,
+            writer: std::sync::Arc::new(mhost_apply::writer::HostsWriter::new()),
+            apply_lock: ApplyLock::new(),
+            snapshot_lock: ApplyLock::new(),
+            last_profile_ids: std::sync::Mutex::new(Vec::new()),
+            cached_profiles: std::sync::RwLock::new(None),
+            dns_server: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            dns_enabled: std::sync::atomic::AtomicBool::new(false),
+            original_dns: tokio::sync::RwLock::new(OriginalDns::DhcpEmpty),
+            dns_lock: ApplyLock::new(),
+            dns_cancel: std::sync::Mutex::new(None),
+            ad_block_state: std::sync::Arc::new(tokio::sync::RwLock::new(
+                mhost_core::AdBlockState::default(),
+            )),
+            ad_block_refresh_task: std::sync::Mutex::new(None),
+            ad_block_refresh_cancel: std::sync::Mutex::new(
+                tokio_util::sync::CancellationToken::new(),
+            ),
+        };
+        (temp_dir, std::sync::Arc::new(state))
+    }
+
+    #[test]
+    fn cached_profiles_lazy_loads_on_first_call() {
+        let (_temp, state) = make_test_state();
+        // First call should populate the cache by reading from storage.
+        let profiles = state.cached_profiles().unwrap();
+        assert!(profiles.is_empty());
+    }
+
+    #[test]
+    fn cached_profiles_returns_clones_without_mutating_cache() {
+        let (_temp, state) = make_test_state();
+
+        // Populate cache
+        let first = state.cached_profiles().unwrap();
+        assert!(first.is_empty());
+
+        // Modify external storage (cache should NOT auto-refresh)
+        let mut profile = mhost_core::Profile::new("late-add");
+        profile.id = mhost_core::ProfileId(uuid::Uuid::new_v4());
+        state.storage.save_profile(&profile).unwrap();
+
+        // cached_profiles() still returns old (cached) value
+        let second = state.cached_profiles().unwrap();
+        assert!(
+            second.is_empty(),
+            "cache must not auto-refresh on external write"
+        );
+        assert_eq!(first.len(), second.len());
+
+        // invalidate_profile_cache forces refresh
+        state.invalidate_profile_cache();
+        let third = state.cached_profiles().unwrap();
+        assert_eq!(third.len(), 1);
+        assert_eq!(third[0].name, "late-add");
+    }
+
+    #[test]
+    fn cached_profiles_returns_independent_clones() {
+        // Multiple readers should not interfere with each other.
+        let (_temp, state) = make_test_state();
+        let mut p = mhost_core::Profile::new("shared");
+        p.id = mhost_core::ProfileId(uuid::Uuid::new_v4());
+        state.storage.save_profile(&p).unwrap();
+
+        let a = state.cached_profiles().unwrap();
+        let b = state.cached_profiles().unwrap();
+        assert_eq!(a.len(), 1);
+        assert_eq!(b.len(), 1);
+        // distinct Vec instances
+        assert!(!std::ptr::eq(a.as_ptr(), b.as_ptr()));
     }
 }

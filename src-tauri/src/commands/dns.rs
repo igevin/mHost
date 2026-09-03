@@ -543,6 +543,7 @@ mod tests {
             apply_lock: ApplyLock::new(),
             snapshot_lock: ApplyLock::new(),
             last_profile_ids: Mutex::new(Vec::new()),
+            cached_profiles: std::sync::RwLock::new(None), // lazy load on first cached_profiles() call
             dns_server: Arc::new(Mutex::new(None)),
             dns_enabled: AtomicBool::new(false),
             original_dns: tokio::sync::RwLock::new(OriginalDns::DhcpEmpty),
@@ -583,6 +584,7 @@ mod tests {
             apply_lock: ApplyLock::new(),
             snapshot_lock: ApplyLock::new(),
             last_profile_ids: Mutex::new(Vec::new()),
+            cached_profiles: std::sync::RwLock::new(None), // lazy load on first cached_profiles() call
             dns_server: Arc::new(Mutex::new(None)),
             dns_enabled: AtomicBool::new(false),
             original_dns: tokio::sync::RwLock::new(OriginalDns::DhcpEmpty),
@@ -617,6 +619,7 @@ mod tests {
             apply_lock: ApplyLock::new(),
             snapshot_lock: ApplyLock::new(),
             last_profile_ids: Mutex::new(Vec::new()),
+            cached_profiles: std::sync::RwLock::new(None), // lazy load on first cached_profiles() call
             dns_server: Arc::new(Mutex::new(None)),
             dns_enabled: AtomicBool::new(false),
             original_dns: tokio::sync::RwLock::new(OriginalDns::DhcpEmpty),
@@ -667,6 +670,7 @@ mod tests {
             apply_lock: ApplyLock::new(),
             snapshot_lock: ApplyLock::new(),
             last_profile_ids: Mutex::new(Vec::new()),
+            cached_profiles: std::sync::RwLock::new(None), // lazy load on first cached_profiles() call
             dns_server: Arc::new(Mutex::new(None)),
             dns_enabled: AtomicBool::new(false),
             original_dns: tokio::sync::RwLock::new(OriginalDns::DhcpEmpty),
@@ -709,6 +713,7 @@ mod tests {
             apply_lock: ApplyLock::new(),
             snapshot_lock: ApplyLock::new(),
             last_profile_ids: Mutex::new(Vec::new()),
+            cached_profiles: std::sync::RwLock::new(None), // lazy load on first cached_profiles() call
             dns_server: Arc::new(Mutex::new(None)),
             dns_enabled: AtomicBool::new(true), // 假装启用 → cleanup 会走 disable 路径
             original_dns: tokio::sync::RwLock::new(OriginalDns::DhcpEmpty), // DhcpEmpty → 写 Empty
@@ -764,6 +769,7 @@ mod tests {
             apply_lock: ApplyLock::new(),
             snapshot_lock: ApplyLock::new(),
             last_profile_ids: Mutex::new(Vec::new()),
+            cached_profiles: std::sync::RwLock::new(None), // lazy load on first cached_profiles() call
             dns_server: Arc::new(Mutex::new(None)),
             dns_enabled: AtomicBool::new(true),
             original_dns: tokio::sync::RwLock::new(OriginalDns::DhcpEmpty),

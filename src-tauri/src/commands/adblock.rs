@@ -1268,6 +1268,7 @@ mod tests {
             apply_lock: crate::state::ApplyLock::new(),
             snapshot_lock: crate::state::ApplyLock::new(),
             last_profile_ids: std::sync::Mutex::new(Vec::new()),
+            cached_profiles: std::sync::RwLock::new(None), // lazy load on first cached_profiles() call
             dns_server: Arc::new(std::sync::Mutex::new(None)),
             dns_enabled: std::sync::atomic::AtomicBool::new(false),
             original_dns: tokio::sync::RwLock::new(mhost_core::OriginalDns::DhcpEmpty),
