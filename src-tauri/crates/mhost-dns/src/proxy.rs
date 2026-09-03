@@ -148,7 +148,7 @@ impl DnsProxy {
 
     /// 取出关闭信号 notifier（克隆）。Signal handler / file-poll task
     /// 拿到 clone 即可调 `notify_waiters()` 唤醒主循环。
-    pub fn take_shutdown_notifier(&mut self) -> Arc<tokio::sync::Notify> {
+    pub fn take_shutdown_notifier(&self) -> Arc<tokio::sync::Notify> {
         Arc::clone(&self.shutdown)
     }
 
@@ -315,10 +315,10 @@ impl DnsProxy {
         let mut buf = [0u8; 4096];
 
         // **P-R19 (issue #181)**：把 file-poll 1Hz interval 迁出主循环。
-        // 之前主循环里 \`tokio::time::interval\` 每秒强制 wake 一次（即使无流量），
-        // 既浪费 CPU 也让 \`recv_from\` 不能常驻内核 buffer。
+        // 之前主循环里 `tokio::time::interval` 每秒强制 wake 一次（即使无流量），
+        // 既浪费 CPU 也让 `recv_from` 不能常驻内核 buffer。
         // 现在：spawn 一个独立 task 轮询文件，检测到 "shutdown" 后通过
-        // \`Notify\` 唤醒主循环；主循环只在 (1) UDP 包到达 (2) Notify 触发
+        // `Notify` 唤醒主循环；主循环只在 (1) UDP 包到达 (2) Notify 触发
         // 时 wake，DNS 热路径零额外开销。
         {
             let shutdown = Arc::clone(&self.shutdown);
