@@ -1270,7 +1270,7 @@ mod tests {
             last_profile_ids: std::sync::Mutex::new(Vec::new()),
             dns_server: Arc::new(std::sync::Mutex::new(None)),
             dns_enabled: std::sync::atomic::AtomicBool::new(false),
-            original_dns: std::sync::Mutex::new(mhost_core::OriginalDns::DhcpEmpty),
+            original_dns: tokio::sync::RwLock::new(mhost_core::OriginalDns::DhcpEmpty),
             dns_lock: crate::state::ApplyLock::new(),
             dns_cancel: std::sync::Mutex::new(None),
             ad_block_state: Arc::new(tokio::sync::RwLock::new(AdBlockState::default())),

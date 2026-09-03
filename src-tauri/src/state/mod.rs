@@ -79,7 +79,7 @@ pub struct AppState {
     /// 「manual vs DHCP」的区分，导致 disable 时把 DHCP 推的 IP 错误
     /// 回写到系统 DNS。现在用 `OriginalDns` 区分，DhcpEmpty 写 Empty
     /// （= DHCP default）。
-    pub original_dns: Mutex<OriginalDns>,
+    pub original_dns: tokio::sync::RwLock<OriginalDns>,
     /// 串行化 DNS 模式切换操作。
     pub dns_lock: ApplyLock,
 
@@ -204,7 +204,7 @@ impl AppState {
             last_profile_ids: Mutex::new(Vec::new()),
             dns_server,
             dns_enabled: AtomicBool::new(dns_enabled),
-            original_dns: Mutex::new(original_dns),
+            original_dns: tokio::sync::RwLock::new(original_dns),
             dns_lock: ApplyLock(tokio::sync::Mutex::new(())),
             dns_cancel: Mutex::new(None),
             // Ad block（issue #130）：从 adblock.json 恢复，损坏时自动备份。
