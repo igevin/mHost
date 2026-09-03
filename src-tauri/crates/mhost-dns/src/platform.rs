@@ -711,7 +711,7 @@ pub fn enable_dns_mode(dns_port: u16, original: &OriginalDns) -> Result<(), Plat
             let _ = std::fs::remove_file(&original_path);
         } else {
             let original_content = filtered.join("\n");
-            write_atomic_0600(&original_path, original_content.as_bytes())
+            mhost_storage::storage::write_atomic_0600(&original_path, original_content.as_bytes())
                 .map_err(|e| PlatformError::SetDns(format!("write original dns file: {}", e)))?;
         }
     } else {
@@ -1060,31 +1060,6 @@ pub(crate) fn build_disable_script(inputs: &DisableScriptInputs<'_>) -> String {
     )
 }
 
-/// 原子写入文件，mode 0o600（owner only）。
-///
-/// 流程：写 `<path>.tmp`（mode 0o600）→ sync → rename 到目标。
-/// POSIX rename 是原子的，读者要么看到旧 inode（旧内容），要么看到新
-/// inode（新内容），永远看不到中间空态。
-pub(crate) fn write_atomic_0600(path: &Path, content: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    // tmp 文件放在同一目录下，确保 rename 在同一 filesystem 是原子的
-    let file_name = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid path"))?;
-    let tmp_path = parent.join(format!("{}.tmp", file_name));
-    {
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true).mode(0o600);
-        let mut f = opts.open(&tmp_path)?;
-        f.write_all(content)?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp_path, path)
-}
-
 /// 把 signal 文件写入指定内容，原子 + sync，mode 0o600。
 ///
 /// **fix（B2 review）**：用「写 tmp + atomic rename」避免 truncate → write_all
@@ -1092,8 +1067,12 @@ pub(crate) fn write_atomic_0600(path: &Path, content: &[u8]) -> std::io::Result<
 /// 那一瞬文件就被清空；如果 proxy 恰好在 open 和 write_all 之间读
 /// `check_shutdown_signal`，会读到空字符串误触发 shutdown（之前 receiver
 /// 端把「非 running」都当 shutdown）。
+///
+/// **fix（issue #181 P-R17）**：底层 helper 统一到
+/// `mhost_storage::storage::write_atomic_0600`，与 profile / snapshot
+/// 等敏感文件共用同一原子写实现，避免分叉。
 pub(crate) fn write_signal_file(path: &Path, content: &str) -> std::io::Result<()> {
-    write_atomic_0600(path, content.as_bytes())
+    mhost_storage::storage::write_atomic_0600(path, content.as_bytes())
 }
 
 /// 在 macOS 上禁用 DNS 模式：
@@ -1454,7 +1433,7 @@ pub fn disable_dns_mode(
 /// 看到标记，调 `force_dns_restore_if_needed` 兜底。
 fn write_recovery_marker() -> std::io::Result<()> {
     let marker = disable_recovery_marker_file();
-    write_atomic_0600(&marker, b"pending")
+    mhost_storage::storage::write_atomic_0600(&marker, b"pending")
 }
 
 /// 上次退出没成功恢复时，下一次启动的兜底：以 admin 身份调用
@@ -1945,14 +1924,15 @@ mod tests {
         std::env::remove_var("MHOST_RUNTIME_DIR");
     }
 
-    /// 回归测试（H1）：`write_atomic_0600` 是 pub(crate) helper，被多个
-    /// signal/state 文件复用，统一保证 0o600 + atomic rename + sync。
+    /// 回归测试（H1）：`mhost_storage::storage::write_atomic_0600` 被 signal/state
+    /// 文件复用，统一保证 0o600 + atomic rename + sync。本测试留在 mhost-dns
+    /// 是因为原始 H1 fix 在 mhost-dns，回归保护范围需要覆盖原调用方。
     #[test]
     fn test_write_atomic_0600_helper() {
         let _guard = serial_runtime_dir_test();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test-state.bin");
-        write_atomic_0600(&path, b"hello atomic").expect("write 失败");
+        mhost_storage::storage::write_atomic_0600(&path, b"hello atomic").expect("write 失败");
 
         let meta = std::fs::metadata(&path).unwrap();
         assert_eq!(meta.permissions().mode() & 0o777, 0o600);

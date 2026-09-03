@@ -344,6 +344,46 @@ pub(crate) fn atomic_write(path: &Path, content: &[u8]) -> io::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Secure atomic write (mode 0o600 + sync)
+// ---------------------------------------------------------------------------
+
+/// 原子写入文件，mode 0o600（owner only）+ sync 落盘。
+///
+/// 流程：写 `<path>.tmp`（mode 0o600）→ `sync_all()` → `rename` 到目标。
+/// POSIX rename 是原子的，读者要么看到旧 inode（旧内容），要么看到新
+/// inode（新内容），永远看不到中间空态。`sync_all` 保证写入在 rename 前
+/// 已落盘，避免 power-cut 后出现"rename 成功但内容未刷盘"的窗口。
+///
+/// 与 [`atomic_write`]（NamedTempFile）的区别：
+/// - `atomic_write` 走 `tempfile::NamedTempFile`，文件 mode 由 umask 决定
+///   （macOS 0o600 是巧合；宽松 umask 系统可能更宽）
+/// - `write_atomic_0600` 显式 0o600 + sync_all，保证 owner-only 且 crash-safe
+///
+/// 用途：含敏感信息的信号文件、状态文件、snapshot 文件（profile 规则可能
+/// 暴露内部主机名 / staging 域名），不应被同机其他用户读取。
+///
+/// **fix (issue #90 / #181 P-R17)**：原 `mhost-dns::platform::write_atomic_0600`
+/// 是 inline 实现，profile / snapshot 走 `fs::write + rename` 时既无 0o600
+/// 也无 sync。本函数统一这两个语义，避免再分叉。
+pub fn write_atomic_0600(path: &Path, content: &[u8]) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid path"))?;
+    let tmp_path = parent.join(format!("{}.tmp", file_name));
+    {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true).mode(0o600);
+        let mut f = opts.open(&tmp_path)?;
+        f.write_all(content)?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp_path, path)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -548,6 +588,48 @@ mod tests {
 
         // 验证目标路径仍然是目录，未被破坏为文件
         assert!(target_as_dir.is_dir(), "目标路径应保持为目录，不应被破坏");
+    }
+
+    // -----------------------------------------------------------------------
+    // write_atomic_0600 (issue #181 P-R17)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_write_atomic_0600_creates_file_with_owner_only_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        // mode 0o600 + 写入内容 + 无残留 .tmp（与 #90 H1 fix 同语义）
+        let temp_dir = TempDir::new().unwrap();
+        let target = temp_dir.path().join("sensitive.bin");
+        write_atomic_0600(&target, b"snapshot data").unwrap();
+
+        let meta = fs::metadata(&target).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        assert_eq!(fs::read(&target).unwrap(), b"snapshot data");
+        assert!(
+            !target.with_extension("tmp").exists(),
+            "rename 后不应留 .tmp 孤儿"
+        );
+    }
+
+    #[test]
+    fn test_write_atomic_0600_atomic_replace() {
+        // 第二次 write 必须原子替换，读者看不到中间空态
+        let temp_dir = TempDir::new().unwrap();
+        let target = temp_dir.path().join("state.json");
+        write_atomic_0600(&target, b"v1").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"v1");
+
+        write_atomic_0600(&target, b"v2").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"v2");
+    }
+
+    #[test]
+    fn test_write_atomic_0600_rejects_invalid_path() {
+        // 路径无 file_name 应当返回 InvalidInput
+        let temp_dir = TempDir::new().unwrap();
+        let bad_path = temp_dir.path(); // 这是目录，无 file_name
+        let result = write_atomic_0600(bad_path, b"data");
+        assert!(result.is_err());
     }
 
     // -----------------------------------------------------------------------

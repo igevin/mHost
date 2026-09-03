@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use mhost_apply::writer::HostsWriter;
 use mhost_core::{MhostError, ProfileMode, Snapshot, SnapshotMeta};
-use mhost_storage::storage::Storage;
+use mhost_storage::storage::{write_atomic_0600, Storage};
 use serde::Deserialize;
 use tauri::{AppHandle, State};
 
@@ -67,10 +67,11 @@ pub fn save_snapshot_logic(
     let json = serde_json::to_string_pretty(&snapshot)
         .map_err(|e| MhostError::InvalidInput(format!("serialize snapshot failed: {}", e)))?;
 
-    // N1: Atomic write via temp file + rename
-    let temp_path = snapshot_path.with_extension("tmp");
-    std::fs::write(&temp_path, json)?;
-    std::fs::rename(&temp_path, &snapshot_path)?;
+    // P-R18 (issue #181): 复用 mhost-storage 的 atomic_write_0600 替代手写
+    // fs::write + rename。统一 0o600 + sync + atomic rename，避免分叉。
+    // snapshot 内容包含完整 profile 规则，可能暴露内部主机名，
+    // 必须 owner-only 不能用默认 umask。
+    write_atomic_0600(&snapshot_path, json.as_bytes())?;
 
     let meta = SnapshotMeta {
         id: id.clone(),
@@ -412,6 +413,34 @@ mod tests {
             .join("snapshots")
             .join(format!("{}.json", meta.id));
         assert!(snapshot_path.exists());
+    }
+
+    /// 回归测试 P-R18（issue #181）：snapshot 文件必须 owner-only (0o600)，
+    /// 不能依赖 umask 默认值。snapshot 内容是完整 profile 规则，
+    /// 可能暴露内部主机名 / staging 域名，必须保护。
+    #[test]
+    fn test_save_snapshot_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_temp, storage, _writer) = create_test_storage_and_writer();
+        create_profile_with_rules(&storage, "dev", vec![("127.0.0.1", "example.com")]);
+
+        let meta = save_snapshot_logic(storage.as_ref(), "test-snap".to_string(), None).unwrap();
+        let snapshot_path = storage
+            .root()
+            .join("snapshots")
+            .join(format!("{}.json", meta.id));
+
+        let mode = std::fs::metadata(&snapshot_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "snapshot 文件 mode 必须 0o600, 实际 {:#o}",
+            mode
+        );
     }
 
     #[test]
