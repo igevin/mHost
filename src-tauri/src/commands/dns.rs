@@ -304,9 +304,9 @@ async fn set_dns_mode_enable(
     }
 
     // 8. manifest 已成功落盘，现在才允许修改 in-memory state。
-    // lock_or_recover: std::sync::Mutex poisoning is recovered transparently
-    // (see state::lock_or_recover docs).
-    *lock_or_recover(&state.original_dns) = original;
+    // (dns_server 仍用 std::sync::Mutex + lock_or_recover 处理 poison；original_dns
+    // 改用 tokio::sync::RwLock 允许多读。)
+    *state.original_dns.write().await = original;
     *lock_or_recover(&state.dns_server) = Some(server);
     state.dns_enabled.store(true, Ordering::Relaxed);
 
@@ -357,7 +357,7 @@ async fn set_dns_mode_disable(
     cancel: Option<&CancellationToken>,
 ) -> Result<(), MhostError> {
     // 1. 读取 in-memory original_dns（由 enable 路径写入）
-    let original = lock_or_recover(&state.original_dns).clone();
+    let original = state.original_dns.read().await.clone();
 
     // fix (bug 1, disable-mode refuses on empty snapshot):
     //   之前在 `state.original_dns` 为空 且 当前系统 DNS 含 127.0.0.1 时拒绝
@@ -545,7 +545,7 @@ mod tests {
             last_profile_ids: Mutex::new(Vec::new()),
             dns_server: Arc::new(Mutex::new(None)),
             dns_enabled: AtomicBool::new(false),
-            original_dns: Mutex::new(OriginalDns::DhcpEmpty),
+            original_dns: tokio::sync::RwLock::new(OriginalDns::DhcpEmpty),
             dns_lock: ApplyLock::new(),
             dns_cancel: Mutex::new(Some(token.clone())),
             ad_block_state: Arc::new(tokio::sync::RwLock::new(mhost_core::AdBlockState::default())),
@@ -585,7 +585,7 @@ mod tests {
             last_profile_ids: Mutex::new(Vec::new()),
             dns_server: Arc::new(Mutex::new(None)),
             dns_enabled: AtomicBool::new(false),
-            original_dns: Mutex::new(OriginalDns::DhcpEmpty),
+            original_dns: tokio::sync::RwLock::new(OriginalDns::DhcpEmpty),
             dns_lock: ApplyLock::new(),
             dns_cancel: Mutex::new(None),
             ad_block_state: Arc::new(tokio::sync::RwLock::new(mhost_core::AdBlockState::default())),
@@ -619,7 +619,7 @@ mod tests {
             last_profile_ids: Mutex::new(Vec::new()),
             dns_server: Arc::new(Mutex::new(None)),
             dns_enabled: AtomicBool::new(false),
-            original_dns: Mutex::new(OriginalDns::DhcpEmpty),
+            original_dns: tokio::sync::RwLock::new(OriginalDns::DhcpEmpty),
             dns_lock: ApplyLock::new(),
             // Pre-populate slot with a CANCELLED token.
             dns_cancel: Mutex::new({
@@ -669,7 +669,7 @@ mod tests {
             last_profile_ids: Mutex::new(Vec::new()),
             dns_server: Arc::new(Mutex::new(None)),
             dns_enabled: AtomicBool::new(false),
-            original_dns: Mutex::new(OriginalDns::DhcpEmpty),
+            original_dns: tokio::sync::RwLock::new(OriginalDns::DhcpEmpty),
             dns_lock: ApplyLock::new(),
             dns_cancel: Mutex::new(None),
             ad_block_state: Arc::new(tokio::sync::RwLock::new(mhost_core::AdBlockState::default())),
@@ -711,7 +711,7 @@ mod tests {
             last_profile_ids: Mutex::new(Vec::new()),
             dns_server: Arc::new(Mutex::new(None)),
             dns_enabled: AtomicBool::new(true), // 假装启用 → cleanup 会走 disable 路径
-            original_dns: Mutex::new(OriginalDns::DhcpEmpty), // DhcpEmpty → 写 Empty
+            original_dns: tokio::sync::RwLock::new(OriginalDns::DhcpEmpty), // DhcpEmpty → 写 Empty
             dns_lock: ApplyLock::new(),
             dns_cancel: Mutex::new(None),
             ad_block_state: Arc::new(tokio::sync::RwLock::new(mhost_core::AdBlockState::default())),
@@ -766,7 +766,7 @@ mod tests {
             last_profile_ids: Mutex::new(Vec::new()),
             dns_server: Arc::new(Mutex::new(None)),
             dns_enabled: AtomicBool::new(true),
-            original_dns: Mutex::new(OriginalDns::DhcpEmpty),
+            original_dns: tokio::sync::RwLock::new(OriginalDns::DhcpEmpty),
             dns_lock: ApplyLock::new(),
             dns_cancel: Mutex::new(None),
             ad_block_state: Arc::new(tokio::sync::RwLock::new(mhost_core::AdBlockState::default())),
@@ -811,7 +811,7 @@ mod tests {
 pub async fn get_dns_status(
     state: State<'_, AppState>,
 ) -> Result<mhost_core::DnsStatus, MhostError> {
-    let original_dns = lock_or_recover(&state.original_dns).clone();
+    let original_dns = state.original_dns.read().await.clone();
     fn build(
         server: Option<&mhost_dns::DnsServer>,
         original_dns: OriginalDns,
