@@ -175,7 +175,10 @@ pub fn import_profile(
     hosts_text: String,
     state: State<'_, AppState>,
 ) -> Result<Profile, MhostError> {
-    import_profile_logic(name, &hosts_text, state.storage.as_ref())
+    let profile = import_profile_logic(name, &hosts_text, state.storage.as_ref())?;
+    // P-R12 (issue #181): invalidate profile cache after import.
+    state.invalidate_profile_cache();
+    Ok(profile)
 }
 
 #[tauri::command]
@@ -193,7 +196,10 @@ pub fn duplicate_profile(
     new_name: String,
     state: State<'_, AppState>,
 ) -> Result<Profile, MhostError> {
-    duplicate_profile_logic(&id, new_name, state.storage.as_ref())
+    let profile = duplicate_profile_logic(&id, new_name, state.storage.as_ref())?;
+    // P-R12 (issue #181): invalidate profile cache after duplicate.
+    state.invalidate_profile_cache();
+    Ok(profile)
 }
 
 /// Export a profile to a file.
@@ -256,6 +262,10 @@ pub async fn import_profile_from_file(
     })
     .await
     .map_err(|e| MhostError::InvalidInput(e.to_string()))?
+    .inspect(|_profile| {
+        // P-R12 (issue #181): invalidate profile cache after import.
+        state.invalidate_profile_cache();
+    })
 }
 
 /// Import a profile from JSON content.

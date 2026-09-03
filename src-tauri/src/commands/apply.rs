@@ -517,6 +517,10 @@ pub async fn enable_and_apply(
         ApplyOutcome::empty()
     };
 
+    // P-R12 (issue #181): enable_and_apply mutates profiles via enable_and_apply_logic
+    // (hosts) or save_profile (dns). Invalidate cache so tray / IPC reads see fresh.
+    state.invalidate_profile_cache();
+
     #[cfg(target_os = "macos")]
     crate::tray::update_tray_menu(&app_handle);
     Ok(outcome)

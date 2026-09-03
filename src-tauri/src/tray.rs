@@ -65,7 +65,11 @@ pub fn build_tray<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn std::err
 /// Build the tray menu from current profiles.
 fn build_menu<R: Runtime>(app: &AppHandle<R>) -> Result<Menu<R>, Box<dyn std::error::Error>> {
     let state = app.state::<AppState>();
-    let profiles = state.storage.list_profiles()?;
+    // P-R15 (issue #181): read from in-memory cache instead of disk.
+    // First call populates cache; subsequent tray rebuilds are zero-disk.
+    let profiles = state
+        .cached_profiles()
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
 
     // Perf fix (#29): Track last rendered profile IDs.
     // lock_or_recover: std::sync::Mutex poisoning is recovered transparently.
@@ -122,7 +126,8 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>) -> Result<Menu<R>, Box<dyn std::er
 /// Build tooltip text from current enabled profile.
 fn build_tooltip<R: Runtime>(app: &AppHandle<R>) -> String {
     let state = app.state::<AppState>();
-    let profiles = match state.storage.list_profiles() {
+    // P-R15 (issue #181): use cached profile list to avoid disk read on every tooltip refresh.
+    let profiles = match state.cached_profiles() {
         Ok(p) => p,
         Err(_) => return tray_logic::build_tooltip_text(None),
     };
@@ -269,7 +274,8 @@ pub fn update_tray_menu<R: Runtime>(app: &AppHandle<R>) {
     // Read new profile IDs from AppState
     let new_profile_ids = {
         let state = app.state::<AppState>();
-        match state.storage.list_profiles() {
+        // P-R15 (issue #181): use cached profile list.
+        match state.cached_profiles() {
             Ok(profiles) => profiles
                 .into_iter()
                 .map(|p| p.id.to_string())
