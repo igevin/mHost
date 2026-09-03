@@ -32,11 +32,22 @@ pub const MAX_CONCURRENT_CLIENT_QUERIES: usize = 1024;
 /// proxy 轮询 shutdown signal 的间隔。
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
-/// 永远不会发送的 dummy Sender，用于在被 take 后占位。
-/// `oneshot::Sender::send` 返回 `Err`（receiver 已 drop），不会有副作用。
-fn dummy_shutdown_sender() -> tokio::sync::oneshot::Sender<()> {
-    let (tx, _rx) = tokio::sync::oneshot::channel();
-    tx
+/// 检查 shutdown signal 文件是否含 "shutdown"。用于 file-poll task
+/// （P-R19 issue #181，主循环不直接调用）。
+///
+/// **fix（B2 review）**：严格匹配 "shutdown"，而不是「非 running 就触发」。
+/// 之前用 `content.trim() != "running"` 在 mhost 写入时（truncate → write_all
+/// 之间）读到空字符串会误触发 shutdown。原子写入修了这问题；这里再加固
+/// 一层：「空文件 = mhost 还没写完，不当作 shutdown 信号」。
+fn shutdown_signal_file_contains_shutdown() -> bool {
+    let Ok(content) = std::fs::read_to_string(crate::platform::shutdown_signal_file()) else {
+        // 文件不在 = mhost 没在管（手动启 proxy 的情况）
+        return false;
+    };
+    if content.trim().is_empty() {
+        return false;
+    }
+    content.trim() == "shutdown"
 }
 
 /// 从文件读出原始 DNS（每行一个）。失败或文件不存在返回空 vec。
@@ -86,23 +97,28 @@ pub enum ProxyError {
 /// UDP 转发代理。
 /// 监听 `listen_addr`（特权端口），转发到 `target_addr`（非特权端口）。
 ///
-/// # 关闭信号（fix: systematic DNS logic review）
+/// # 关闭信号（P-R19, issue #181）
 ///
-/// 之前用 `tokio::sync::Notify`：每次 select 迭代重新创建 `notified()` future，
-/// `notify_waiters()` 只唤醒「当前已注册」的 waiter —— 如果 SIGTERM 落在
-/// `notify_waiters()` 已发但 select 还没注册 waiter 的窗口，信号会丢失，
-/// 进程永远不退出。
+/// 用 `tokio::sync::Notify` + 跨 select 迭代复用的 `Notified` future：
 ///
-/// 改用 `tokio::sync::oneshot`：发送端 `tx` 被信号 handler 持有，
-/// 接收端 `rx` 在主循环里**只 poll 一次**（`let mut shutdown = rx;`），
-/// 没有「重新注册 waiter」的概念。信号不会丢。
+/// 之前用 `oneshot`：单一 shot，take 后 sender 变 dummy；与 file-poll 1Hz
+/// interval 共存时，**主循环每 1 秒被 interval 强制唤醒一次**（即使无流量），
+/// 既浪费 CPU 也让 `recv_from` 不能常驻内核 buffer。
+///
+/// 现在 file-poll 迁出主循环（spawn 一个独立 task），主循环只 wake 在：
+///   1. UDP 包到达（`recv_from`），
+///   2. Notify 触发（signal handler 或 file-poll task 检测到 shutdown）。
+///
+/// `Notified` future 关键 trick：跨 select 迭代**复用同一个 future**
+///（`let mut shutdown = self.shutdown.notified();` 然后 `select! { _ = &mut shutdown, ... }`）。
+/// 这样 `notify_waiters()` 即使落在 select 边界也保证不丢信号（Notify
+/// 会记住"有通知到达"直到 `Notified` future 被 poll 完）。
 pub struct DnsProxy {
     listen_addr: SocketAddr,
     target_addr: SocketAddr,
-    /// 关闭信号发送端。外部 signal handler 调用 `send(())` 即可触发关闭。
-    shutdown_tx: tokio::sync::oneshot::Sender<()>,
-    /// 关闭信号接收端。`run()` 持有它，poll 一次后再 select。
-    shutdown_rx: Option<tokio::sync::oneshot::Receiver<()>>,
+    /// 关闭信号 notifier。Signal handler / file-poll task 调
+    /// `notify_waiters()` 唤醒主循环的 `Notified` future。
+    shutdown: Arc<tokio::sync::Notify>,
     /// 并发任务上限（DoS 防御）
     concurrency: Arc<Semaphore>,
     /// 启用 DNS 前的原始 DNS（启动时从文件读，用于退出时自管恢复）。
@@ -113,7 +129,6 @@ pub struct DnsProxy {
 
 impl DnsProxy {
     pub fn new(listen_port: u16, target_port: u16) -> Self {
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let original_dns = read_original_dns_from_file();
         if !original_dns.is_empty() {
             eprintln!(
@@ -125,18 +140,16 @@ impl DnsProxy {
         Self {
             listen_addr: ([127, 0, 0, 1], listen_port).into(),
             target_addr: ([127, 0, 0, 1], target_port).into(),
-            shutdown_tx,
-            shutdown_rx: Some(shutdown_rx),
+            shutdown: Arc::new(tokio::sync::Notify::new()),
             concurrency: Arc::new(Semaphore::new(MAX_CONCURRENT_CLIENT_QUERIES)),
             original_dns,
         }
     }
 
-    /// 取出关闭信号发送端（一次性）。信号 handler 在 setup 阶段拿走。
-    pub fn take_shutdown_sender(&mut self) -> tokio::sync::oneshot::Sender<()> {
-        // 把当前的 shutdown_tx 取出来，换上一个 dummy sender（永不 send）。
-        // 因为 oneshot::Sender 只能 send 一次，必须 take。
-        std::mem::replace(&mut self.shutdown_tx, dummy_shutdown_sender())
+    /// 取出关闭信号 notifier（克隆）。Signal handler / file-poll task
+    /// 拿到 clone 即可调 `notify_waiters()` 唤醒主循环。
+    pub fn take_shutdown_notifier(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.shutdown)
     }
 
     /// 当前可用的 concurrency permit 数（用于测试 + 监控）。
@@ -162,18 +175,6 @@ impl DnsProxy {
     /// 之前用 `content.trim() != "running"` 在 mhost 写入时（truncate → write_all
     /// 之间）读到空字符串会误触发 shutdown。原子写入修了这问题；这里再加固
     /// 一层：「空文件 = mhost 还没写完，不当作 shutdown 信号」。
-    fn check_shutdown_signal(&self) -> bool {
-        let Ok(content) = std::fs::read_to_string(crate::platform::shutdown_signal_file()) else {
-            // 文件不在 = mhost 没在管（手动启 proxy 的情况）
-            return false;
-        };
-        if content.trim().is_empty() {
-            // 空文件 = mhost 刚 truncate 还没 write_all，不当 shutdown
-            return false;
-        }
-        content.trim() == "shutdown"
-    }
-
     /// 以 root 身份恢复系统 DNS 到 original_dns，然后清理 signal 文件退出。
     ///
     /// **fix（proxy self-cleanup）**：proxy 已经在以 root 跑（绑 53 端口必须），
@@ -307,43 +308,57 @@ impl DnsProxy {
             self.listen_addr, self.target_addr
         );
 
-        // oneshot 保留在 struct 里以兼容外部 API，
-        // 但主循环不再使用（统一走文件 signal）
-        drop(self.shutdown_rx.take());
-
         // 主循环：接收客户端查询 → spawn task 处理
         // 缓冲区 4096 字节支持 EDNS(0) 协商后的最大响应
-        let mut buf = vec![0u8; 4096];
-        // 定期轮询 shutdown signal 文件（fix: proxy self-cleanup）。
-        // 这是 mhost 退出时通知 proxy 恢复 DNS 的主路径：
-        // mhost 用户态写 "shutdown" 到文件，proxy 1 秒后检测到，**自己
-        // 以 root 身份**调 networksetup 恢复系统 DNS 后退出。
-        //
-        // **不再用 oneshot**：之前的 oneshot 路径要求 sender 持有
-        // 独立的所有权，take_shutdown_sender() 后 sender 变 dummy
-        // 会让 receiver 立刻 resolve 为 Err，与 select! 的 biased
-        // 语义冲突。统一走文件 signal 更简洁。
-        let mut shutdown_poll = tokio::time::interval(SHUTDOWN_POLL_INTERVAL);
-        // **fix（MINOR review）**：`tokio::time::interval` 默认首 tick 在
-        // SHUTDOWN_POLL_INTERVAL 之后。显式 await 一次让首 tick 立即触发，
-        // proxy 启动后能立刻检查一次 signal，而不是等满 1 秒。
-        // `MissedTickBehavior::Delay` 是 tokio 默认值，显式设置无意义，删掉。
-        shutdown_poll.tick().await;
+        // **P-R5 (issue #181)**：栈分配 [u8; 4096] (4 KiB) 替代 heap vec!
+        // 每轮循环复用同一块栈内存，零 alloc。
+        let mut buf = [0u8; 4096];
+
+        // **P-R19 (issue #181)**：把 file-poll 1Hz interval 迁出主循环。
+        // 之前主循环里 `tokio::time::interval` 每秒强制 wake 一次（即使无流量），
+        // 既浪费 CPU 也让 `recv_from` 不能常驻内核 buffer。
+        // 现在：spawn 一个独立 task 轮询文件，检测到 "shutdown" 后通过
+        // `Notify` 唤醒主循环；主循环只在 (1) UDP 包到达 (2) Notify 触发
+        // 时 wake，DNS 热路径零额外开销。
+        {
+            let shutdown = Arc::clone(&self.shutdown);
+            tokio::spawn(async move {
+                let mut poll = tokio::time::interval(SHUTDOWN_POLL_INTERVAL);
+                poll.tick().await; // immediate first check
+                loop {
+                    poll.tick().await;
+                    if shutdown_signal_file_contains_shutdown() {
+                        shutdown.notify_waiters();
+                        break;
+                    }
+                }
+            });
+        }
+
+        // Notified future 必须**跨 select 迭代复用**（let mut, not let _）
+        // —— 这样 notify_waiters() 即使落在 select 边界（select 还没注册
+        // 新 waiter 的窗口）也能保证不丢信号。
+        // Notified 是 !Unpin（PhantomPinned），需要 tokio::pin! 才能在
+        // select! 里以 &mut 引用。
+        let shutdown_wait = self.shutdown.notified();
+        tokio::pin!(shutdown_wait);
         loop {
             tokio::select! {
                 biased;
-                // 定期检查文件 signal（mhost 用户态 / proxy 自身 signal handler）
-                _ = shutdown_poll.tick() => {
-                    if self.check_shutdown_signal() {
-                        eprintln!("[mhost-dns-proxy] shutdown signal received");
-                        self.restore_dns_and_exit().await;
-                        break;
-                    }
+                // 关闭信号：file-poll task / signal handler 调 notify_waiters() 唤醒
+                _ = &mut shutdown_wait => {
+                    eprintln!("[mhost-dns-proxy] shutdown signal received");
+                    self.restore_dns_and_exit().await;
+                    break;
                 }
                 result = listen_socket.recv_from(&mut buf) => {
                     match result {
                         Ok((len, src)) => {
-                            let query = buf[..len].to_vec();
+                            // **P-R4 (issue #181)**：用 bytes::Bytes 替代 Vec<u8>。
+                            // Bytes 是 Arc-backed slice，spawn task 持有 clone 零成本。
+                            // 初始 copy_from_slice 仍有一次 memcpy（不可避免），
+                            // 但消除了原 to_vec 后 spawn 又 clone 的二次分配。
+                            let query = bytes::Bytes::copy_from_slice(&buf[..len]);
                             let listen = Arc::clone(&listen_socket);
                             let target = self.target_addr;
                             let sem = Arc::clone(&self.concurrency);
@@ -390,7 +405,7 @@ impl DnsProxy {
 /// 处理单个客户端查询：用临时 socket 做 upstream 往返，再回包给客户端。
 async fn handle_client_query(
     listen: &UdpSocket,
-    query: Vec<u8>,
+    query: bytes::Bytes,
     client: SocketAddr,
     target: SocketAddr,
 ) -> Result<(), ProxyError> {
@@ -402,7 +417,8 @@ async fn handle_client_query(
     upstream.send(&query).await?;
 
     // 3. 等响应（5s 超时）
-    let mut resp_buf = vec![0u8; 4096];
+    // **P-R5 (issue #181)**：栈分配 [u8; 4096] (4 KiB) 替代 heap vec!.
+    let mut resp_buf = [0u8; 4096];
     let resp_len = tokio::time::timeout(Duration::from_secs(5), upstream.recv(&mut resp_buf))
         .await
         .map_err(|_| ProxyError::UpstreamTimeout(Duration::from_secs(5)))??;
@@ -453,11 +469,9 @@ pub async fn run_proxy() {
 
     let mut proxy = DnsProxy::new(listen_port, target_port);
 
-    // **fix（proxy self-cleanup）**：直接写 signal 文件，proxy 主循环
-    // 轮询检测。这样不需要 oneshot，shutdown 路径与 mhost 退出路径
-    // 走同一份代码。
-    // （旧的 take_shutdown_sender() oneshot 机制保留用于测试代码
-    // 兼容性，但生产路径不再依赖。）
+    // **P-R19 (issue #181)**：signal handler 用 Notify 唤醒主循环，
+    // 同时仍然写 signal 文件（供 file-poll task 和外部 mhost 用户态观察）。
+    let shutdown_notifier = proxy.take_shutdown_notifier();
     tokio::spawn(async move {
         let ctrl_c = async {
             tokio::signal::ctrl_c().await.ok();
@@ -480,12 +494,14 @@ pub async fn run_proxy() {
             _ = ctrl_c => eprintln!("[mhost-dns-proxy] received SIGINT"),
             _ = sigterm => eprintln!("[mhost-dns-proxy] received SIGTERM"),
         }
-        // 写 shutdown signal 文件，主循环轮询检测后自管清理并退出。
-        // **fix（H1, issue #90）**：路径由 platform::shutdown_signal_file() 提供。
+        // 写 shutdown signal 文件 + 直接 notify 主循环。
+        // file 信号主要用于跨进程（外部 mhost 用户态写）；同进程 signal handler
+        // 走 in-process Notify 路径（不依赖 file-poll 1Hz 检测）。
         let _ = crate::platform::write_signal_file(
             &crate::platform::shutdown_signal_file(),
             "shutdown",
         );
+        shutdown_notifier.notify_waiters();
     });
 
     if let Err(e) = proxy.run().await {
@@ -589,7 +605,7 @@ pub(crate) mod tests {
         drop(listen_socket);
         let mut proxy = DnsProxy::new(listen_port, upstream_addr.port());
         // fix（proxy self-cleanup）：oneshot 路径已被 file signal 取代
-        let _ = proxy.take_shutdown_sender();
+        let _ = proxy.take_shutdown_notifier();
         let proxy_handle = tokio::spawn(async move { proxy.run().await });
 
         // 两个 client 并发查询
@@ -667,7 +683,7 @@ pub(crate) mod tests {
         let listen_port = listen_socket.local_addr().unwrap().port();
         drop(listen_socket);
         let mut proxy = DnsProxy::new(listen_port, 1053);
-        let _ = proxy.take_shutdown_sender();
+        let _ = proxy.take_shutdown_notifier();
         let proxy_handle = tokio::spawn(async move { proxy.run().await });
         // 等 1.5s（覆盖至少 1 个 poll tick）。proxy 不应该退出。
         tokio::time::sleep(Duration::from_millis(1500)).await;
@@ -707,7 +723,7 @@ pub(crate) mod tests {
         let listen_port = listen_socket.local_addr().unwrap().port();
         drop(listen_socket);
         let mut proxy = DnsProxy::new(listen_port, upstream_port);
-        let _shutdown_tx = proxy.take_shutdown_sender();
+        let _shutdown_tx = proxy.take_shutdown_notifier();
         let proxy_handle = tokio::spawn(async move { proxy.run().await });
 
         // 给 proxy 100ms 启动
@@ -768,7 +784,7 @@ pub(crate) mod tests {
         let listen_port = listen_socket.local_addr().unwrap().port();
         drop(listen_socket);
         let mut proxy = DnsProxy::new(listen_port, upstream_port);
-        let _shutdown_tx = proxy.take_shutdown_sender();
+        let _shutdown_tx = proxy.take_shutdown_notifier();
         let sem_handle = proxy.concurrency_handle();
         let available_before = sem_handle.available_permits();
         assert_eq!(available_before, MAX_CONCURRENT_CLIENT_QUERIES);
@@ -829,26 +845,22 @@ pub(crate) mod tests {
         // 先确保初始状态
         let _ = std::fs::remove_file(&signal_path);
 
-        let listen_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let port = listen_socket.local_addr().unwrap().port();
-        drop(listen_socket);
-        let proxy = DnsProxy::new(port, 1053);
+        let _ = std::fs::remove_file(&signal_path);
 
         // 1. 文件不存在 → false（mhost 没在管）
-        let _ = std::fs::remove_file(&signal_path);
-        assert!(!proxy.check_shutdown_signal());
+        assert!(!shutdown_signal_file_contains_shutdown());
 
         // 2. 文件内容 = "running" → false
         std::fs::write(&signal_path, "running").unwrap();
-        assert!(!proxy.check_shutdown_signal());
+        assert!(!shutdown_signal_file_contains_shutdown());
 
         // 3. 文件内容 = "shutdown" → true
         std::fs::write(&signal_path, "shutdown").unwrap();
-        assert!(proxy.check_shutdown_signal());
+        assert!(shutdown_signal_file_contains_shutdown());
 
-        // 4. 文件内容 = 其他（truncated / 加换行）→ trim 后 != "running" → true
+        // 4. 文件内容 = 其他（truncated / 加换行）→ trim 后 = "shutdown" → true
         std::fs::write(&signal_path, "  shutdown  \n").unwrap();
-        assert!(proxy.check_shutdown_signal());
+        assert!(shutdown_signal_file_contains_shutdown());
 
         // 清理
         let _ = std::fs::remove_file(&signal_path);

@@ -2351,6 +2351,7 @@ dependencies = [
 name = "mhost-dns"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "chrono",
  "dirs 5.0.1",
  "hickory-proto",
