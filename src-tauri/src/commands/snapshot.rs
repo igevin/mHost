@@ -415,6 +415,34 @@ mod tests {
         assert!(snapshot_path.exists());
     }
 
+    /// 回归测试 P-R18（issue #181）：snapshot 文件必须 owner-only (0o600)，
+    /// 不能依赖 umask 默认值。snapshot 内容是完整 profile 规则，
+    /// 可能暴露内部主机名 / staging 域名，必须保护。
+    #[test]
+    fn test_save_snapshot_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_temp, storage, _writer) = create_test_storage_and_writer();
+        create_profile_with_rules(&storage, "dev", vec![("127.0.0.1", "example.com")]);
+
+        let meta = save_snapshot_logic(storage.as_ref(), "test-snap".to_string(), None).unwrap();
+        let snapshot_path = storage
+            .root()
+            .join("snapshots")
+            .join(format!("{}.json", meta.id));
+
+        let mode = std::fs::metadata(&snapshot_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "snapshot 文件 mode 必须 0o600, 实际 {:#o}",
+            mode
+        );
+    }
+
     #[test]
     fn test_save_snapshot_prunes_old() {
         let (_temp, storage, _writer) = create_test_storage_and_writer();
