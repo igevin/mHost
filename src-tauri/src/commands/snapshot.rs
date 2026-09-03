@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use mhost_apply::writer::HostsWriter;
 use mhost_core::{MhostError, ProfileMode, Snapshot, SnapshotMeta};
-use mhost_storage::storage::Storage;
+use mhost_storage::storage::{write_atomic_0600, Storage};
 use serde::Deserialize;
 use tauri::{AppHandle, State};
 
@@ -67,10 +67,11 @@ pub fn save_snapshot_logic(
     let json = serde_json::to_string_pretty(&snapshot)
         .map_err(|e| MhostError::InvalidInput(format!("serialize snapshot failed: {}", e)))?;
 
-    // N1: Atomic write via temp file + rename
-    let temp_path = snapshot_path.with_extension("tmp");
-    std::fs::write(&temp_path, json)?;
-    std::fs::rename(&temp_path, &snapshot_path)?;
+    // P-R18 (issue #181): 复用 mhost-storage 的 atomic_write_0600 替代手写
+    // fs::write + rename。统一 0o600 + sync + atomic rename，避免分叉。
+    // snapshot 内容包含完整 profile 规则，可能暴露内部主机名，
+    // 必须 owner-only 不能用默认 umask。
+    write_atomic_0600(&snapshot_path, json.as_bytes())?;
 
     let meta = SnapshotMeta {
         id: id.clone(),

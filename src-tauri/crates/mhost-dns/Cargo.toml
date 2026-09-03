@@ -9,6 +9,7 @@ path = "src/bin/dns_proxy.rs"
 
 [dependencies]
 mhost-core = { path = "../mhost-core" }
+mhost-storage = { path = "../mhost-storage" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
