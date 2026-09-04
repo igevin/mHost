@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use mhost_core::MhostError;
 use serde::{Deserialize, Serialize};
 
@@ -36,32 +38,55 @@ pub async fn check_update(current_version: String) -> Result<Option<LatestReleas
 }
 
 /// Fetches the latest GitHub release.
+///
+/// Runs the blocking `ureq` call inside `spawn_blocking` so the tokio
+/// worker pool isn't tied up waiting on the network. `ureq` is sync
+/// (issue #180 — replacing `reqwest` shrank the dependency graph by
+/// removing h2 / aws-lc-sys / hyper transitively).
 async fn fetch_latest(current_version: String) -> Result<Option<LatestRelease>, MhostError> {
-    let client = reqwest::Client::builder()
+    tokio::task::spawn_blocking(move || fetch_latest_blocking(&current_version))
+        .await
+        .map_err(|e| MhostError::Network(format!("spawn_blocking join: {}", e)))?
+}
+
+fn fetch_latest_blocking(current_version: &str) -> Result<Option<LatestRelease>, MhostError> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
         .user_agent("mHost-Desktop/1.0")
+        .timeout_global(Some(Duration::from_secs(30)))
         .build()
-        .map_err(|e| MhostError::Network(format!("reqwest build error: {}", e)))?;
+        .into();
 
     let url = "https://api.github.com/repos/igevin/mHost/releases/latest";
-    let resp = client
+    let resp = agent
         .get(url)
         .header("Accept", "application/vnd.github+json")
         .header("X-GitHub-Api-Version", "2022-11-28")
-        .send()
-        .await
-        .map_err(|e| MhostError::Network(format!("network error: {}", e)))?;
+        .call();
 
-    if !resp.status().is_success() {
-        return Err(MhostError::ExternalApi(format!(
-            "GitHub API error: {}",
-            resp.status()
-        )));
-    }
+    let resp = match resp {
+        Ok(r) => r,
+        Err(ureq::Error::StatusCode(code)) => {
+            return Err(MhostError::ExternalApi(format!(
+                "GitHub API error: {}",
+                code
+            )));
+        }
+        Err(e) => {
+            return Err(MhostError::Network(format!("network error: {}", e)));
+        }
+    };
 
+    // Drain the body into a String so any JSON parse error stays close to the
+    // raw bytes. Use ureq's built-in `read_json` with a 8 MB cap on the
+    // response body (the GitHub release endpoint returns <100 KB in practice
+    // — release notes + body — but we cap generously for safety).
+    let mut resp = resp;
     let gh: GithubReleaseResponse = resp
-        .json()
-        .await
-        .map_err(|e| MhostError::ExternalApi(format!("failed to parse GitHub response: {}", e)))?;
+        .body_mut()
+        .with_config()
+        .limit(8 * 1024 * 1024)
+        .read_json()
+        .map_err(|e| MhostError::ExternalApi(format!("read GitHub response JSON: {}", e)))?;
 
     let latest = LatestRelease {
         tag: gh.tag_name,
@@ -72,7 +97,7 @@ async fn fetch_latest(current_version: String) -> Result<Option<LatestRelease>, 
 
     // Strip leading "v" prefix for comparison.
     let latest_version = latest.tag.trim_start_matches('v');
-    if is_newer(&current_version, latest_version) {
+    if is_newer(current_version, latest_version) {
         Ok(Some(latest))
     } else {
         Ok(None)
