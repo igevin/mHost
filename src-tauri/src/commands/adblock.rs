@@ -58,61 +58,60 @@ pub(crate) const REFRESH_CONCURRENCY: usize = 4;
 const USER_AGENT: &str = "mHost-Desktop/1.0";
 
 // ---------------------------------------------------------------------------
-// Shared HTTP client (PR #131 review findings 1.8 + 1.9)
+// Shared HTTP agent (PR #131 review findings 1.8 + 1.9; issue #180)
 // ---------------------------------------------------------------------------
+//
+// `ureq` is a synchronous HTTP client. `Agent` construction is cheap-ish
+// (builds TLS config + connection pool) but not free, so we still cache one
+// in a `OnceLock` for process-wide reuse. `ureq` deliberately ships a much
+// smaller dependency footprint than `reqwest` — no `h2`, no `hyper`,
+// no `aws-lc-sys` — which trimmed the dependency graph on the order of
+// several MBs of indirect rlib code (issue #180).
+static HTTP_AGENT: OnceLock<ureq::Agent> = OnceLock::new();
 
-/// Process-wide shared `reqwest::Client`. Building a client is non-trivial
-/// (TLS keylog, DNS resolver, connection pool) and we were doing it on every
-/// fetch + every background refresh tick. Reusing one client also means
-/// HTTP keep-alive across fetches and a bounded connection pool.
-///
-/// `OnceLock::get_or_init` runs the closure synchronously on the first
-/// call; all subsequent calls return the same `&'static` handle. Safe
-/// because `reqwest::Client::build()` is sync.
-static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-
-fn http_client() -> &'static reqwest::Client {
-    HTTP_CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
+fn http_agent() -> &'static ureq::Agent {
+    HTTP_AGENT.get_or_init(|| {
+        ureq::Agent::config_builder()
             .user_agent(USER_AGENT)
-            .timeout(Duration::from_secs(FETCH_TIMEOUT_SECS))
-            // reqwest 0.13 lacks `body_limit`; we enforce MAX_RESPONSE_BYTES
-            // explicitly via `fetch_source_content` (early reject via the
-            // Content-Length header + post-read size check).
+            .timeout_global(Some(Duration::from_secs(FETCH_TIMEOUT_SECS)))
             .build()
-            .expect("reqwest client build must succeed with static config")
+            .into()
     })
 }
 
-/// Fetch `url` via the shared client. Returns the raw body bytes plus the
-/// `ETag` header (if any), and rejects anything larger than
-/// `MAX_RESPONSE_BYTES`. Two-stage guard:
+/// Fetch `url` synchronously via the shared agent. Returns the raw body bytes
+/// plus the `ETag` header (if any), and rejects anything larger than
+/// `MAX_RESPONSE_BYTES`.
 ///
-///   1. Server-advertised `Content-Length` → reject without downloading.
-///   2. Post-read size check → catches servers that lie about length.
-///
-/// PR #131 review finding 1.8 — a malicious or misconfigured source can
-/// otherwise stream arbitrary bytes for `FETCH_TIMEOUT_SECS` before our
-/// parser sees them.
-async fn fetch_source(url: &str) -> Result<(Vec<u8>, Option<String>), MhostError> {
-    let resp = http_client()
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| MhostError::Network(format!("network error: {}", e)))?;
-    if !resp.status().is_success() {
-        return Err(MhostError::ExternalApi(format!(
-            "fetch {} failed: HTTP {}",
-            url,
-            resp.status()
-        )));
-    }
+/// Sync because `ureq` is sync; callers wrap in
+/// `tokio::task::spawn_blocking` (issue #180 — `ureq` replaced `reqwest`
+/// to shrink the dependency graph). Size enforcement uses `ureq`'s
+/// built-in `Body::with_config().limit(...)` reader so a malicious or
+/// misconfigured source cannot blow past `MAX_RESPONSE_BYTES` even when
+/// the server lies about `Content-Length` (PR #131 review finding 1.8).
+fn fetch_source_sync(url: &str) -> Result<(Vec<u8>, Option<String>), MhostError> {
+    let mut resp = match http_agent().get(url).call() {
+        Ok(r) => r,
+        Err(ureq::Error::StatusCode(code)) => {
+            return Err(MhostError::ExternalApi(format!(
+                "fetch {} failed: HTTP {}",
+                url, code
+            )));
+        }
+        Err(e) => {
+            return Err(MhostError::Network(format!("network error: {}", e)));
+        }
+    };
+
     let etag = resp
         .headers()
-        .get(reqwest::header::ETAG)
+        .get("ETag")
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-    if let Some(len) = resp.content_length() {
+        .map(String::from);
+
+    // Cheap pre-check: if the server honestly reports a Content-Length
+    // over our limit, reject without reading any bytes.
+    if let Some(len) = resp.body().content_length() {
         if len > MAX_RESPONSE_BYTES as u64 {
             return Err(MhostError::InvalidInput(format!(
                 "source body length {} exceeds limit {}",
@@ -120,18 +119,17 @@ async fn fetch_source(url: &str) -> Result<(Vec<u8>, Option<String>), MhostError
             )));
         }
     }
-    let body = resp
-        .bytes()
-        .await
+
+    // Hard cap on read bytes via ureq's LimitReader. Errors out if the
+    // server streams beyond `MAX_RESPONSE_BYTES` (Content-Length lies or
+    // chunked transfer with no advertised length).
+    let body: Vec<u8> = resp
+        .body_mut()
+        .with_config()
+        .limit(MAX_RESPONSE_BYTES as u64)
+        .read_to_vec()
         .map_err(|e| MhostError::Network(format!("read body error: {}", e)))?;
-    if body.len() > MAX_RESPONSE_BYTES {
-        return Err(MhostError::InvalidInput(format!(
-            "source body received {} bytes, exceeds limit {}",
-            body.len(),
-            MAX_RESPONSE_BYTES
-        )));
-    }
-    Ok((body.to_vec(), etag))
+    Ok((body, etag))
 }
 
 // ---------------------------------------------------------------------------
@@ -367,57 +365,48 @@ pub(crate) async fn fetch_and_cache_source(
         }
     };
 
-    // 2. Fetch raw bytes via the shared reqwest client (PR #131 review
-    // finding 1.9). The static client is built once; size enforcement
-    // happens inside `fetch_source` (PR #131 review finding 1.8).
+    // 2. Fetch raw bytes via the shared ureq agent (issue #180), then
+    // parse + enforce rule cap and write the canonical cache. Both
+    // stages run inside a single `spawn_blocking` because ureq is sync
+    // and the parser is sync; the prior split-fetch-then-parse would
+    // needlessly bounce between the tokio worker pool and the blocking
+    // pool (issue #180 — `ureq` replaced `reqwest`).
     //
     // PR #131 re-review P1-2: record a fetch failure on the source's
     // `last_error` before propagating — the parse-failure branch below
     // already did this, but a network/size failure returned via `?` with no
     // record, so the UI badge and the persisted state both stayed stale.
     let url = source_clone.url.clone();
-    let body_and_etag = fetch_source(&url).await;
-    let (body, etag) = match body_and_etag {
-        Ok(v) => v,
-        Err(e) => {
-            let msg = e.to_string();
-            let _ = record_fetch_error(state, source_id, &msg).await;
-            return Err(e);
-        }
-    };
-    let content_str = std::str::from_utf8(&body)
-        .map_err(|e| MhostError::InvalidInput(format!("response is not valid UTF-8: {}", e)))?;
-
-    // 3. Parse + enforce hard limit. Use spawn_blocking because the parser
-    // is sync and the input can be large.
-    let content_owned = content_str.to_string();
     let root = state.storage.root().to_path_buf();
     let id_owned = source_id.clone();
-    let parse_result: Result<(usize, Vec<u8>), MhostError> =
-        tokio::task::spawn_blocking(move || {
-            let domains = parse_blocklist_domains(&content_owned);
-            if domains.len() > MAX_RULES_PER_SOURCE {
-                return Err(MhostError::InvalidInput(format!(
-                    "source produced {} rules (limit: {})",
-                    domains.len(),
-                    MAX_RULES_PER_SOURCE
-                )));
-            }
-            // Re-serialize as canonical hosts text so the cache is always
-            // valid hosts format (drops comments the original may have).
-            let canon = domains
-                .iter()
-                .map(|d| format!("0.0.0.0 {}", d))
-                .collect::<Vec<_>>()
-                .join("\n");
-            adblock_store::write_cache(&root, &id_owned, canon.as_bytes())?;
-            Ok((domains.len(), Vec::new()))
-        })
-        .await
-        .map_err(|e| MhostError::InvalidInput(format!("parse task failed: {}", e)))?;
+    type FetchParseResult = Result<(usize, Option<String>), MhostError>;
+    let fetch_parse: FetchParseResult = tokio::task::spawn_blocking(move || {
+        let (body, etag) = fetch_source_sync(&url)?;
+        let content_str = std::str::from_utf8(&body)
+            .map_err(|e| MhostError::InvalidInput(format!("response is not valid UTF-8: {}", e)))?;
+        let domains = parse_blocklist_domains(content_str);
+        if domains.len() > MAX_RULES_PER_SOURCE {
+            return Err(MhostError::InvalidInput(format!(
+                "source produced {} rules (limit: {})",
+                domains.len(),
+                MAX_RULES_PER_SOURCE
+            )));
+        }
+        // Re-serialize as canonical hosts text so the cache is always
+        // valid hosts format (drops comments the original may have).
+        let canon = domains
+            .iter()
+            .map(|d| format!("0.0.0.0 {}", d))
+            .collect::<Vec<_>>()
+            .join("\n");
+        adblock_store::write_cache(&root, &id_owned, canon.as_bytes())?;
+        Ok((domains.len(), etag))
+    })
+    .await
+    .map_err(|e| MhostError::Network(format!("fetch task failed: {}", e)))?;
 
-    let rule_count = match parse_result {
-        Ok((count, _)) => count,
+    let (rule_count, etag) = match fetch_parse {
+        Ok(v) => v,
         Err(e) => {
             // Persist the failure on the source so the UI can show it,
             // but keep the previous cache intact for DNS to keep working.
@@ -485,16 +474,18 @@ pub(crate) async fn fetch_and_cache_source_internal(
         }
     };
 
+    // Fused fetch + parse inside one `spawn_blocking` task (issue #180):
+    // `ureq` and the parser are both sync, and the prior split-fetch-then-parse
+    // would roundtrip through the tokio worker pool for no reason.
     let url = source_clone.url.clone();
-    let (body, etag) = fetch_source(&url).await?;
-    let content_str = std::str::from_utf8(&body)
-        .map_err(|e| MhostError::InvalidInput(format!("response is not valid UTF-8: {}", e)))?;
-
-    let content_owned = content_str.to_string();
     let root = storage.root().to_path_buf();
     let id_owned = source_id.clone();
-    let parse_result: Result<usize, MhostError> = tokio::task::spawn_blocking(move || {
-        let domains = parse_blocklist_domains(&content_owned);
+    type FetchParseResult = Result<(usize, Option<String>), MhostError>;
+    let fetch_parse: FetchParseResult = tokio::task::spawn_blocking(move || {
+        let (body, etag) = fetch_source_sync(&url)?;
+        let content_str = std::str::from_utf8(&body)
+            .map_err(|e| MhostError::InvalidInput(format!("response is not valid UTF-8: {}", e)))?;
+        let domains = parse_blocklist_domains(content_str);
         if domains.len() > MAX_RULES_PER_SOURCE {
             return Err(MhostError::InvalidInput(format!(
                 "source produced {} rules (limit: {})",
@@ -508,13 +499,13 @@ pub(crate) async fn fetch_and_cache_source_internal(
             .collect::<Vec<_>>()
             .join("\n");
         adblock_store::write_cache(&root, &id_owned, canon.as_bytes())?;
-        Ok(domains.len())
+        Ok((domains.len(), etag))
     })
     .await
-    .map_err(|e| MhostError::InvalidInput(format!("parse task failed: {}", e)))?;
+    .map_err(|e| MhostError::Network(format!("fetch task failed: {}", e)))?;
 
-    let rule_count = match parse_result {
-        Ok(n) => n,
+    let (rule_count, etag) = match fetch_parse {
+        Ok(v) => v,
         Err(e) => {
             record_fetch_error_internal(ad_block_state, source_id, &e.to_string()).await?;
             return Err(e);
