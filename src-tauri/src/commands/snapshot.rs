@@ -121,14 +121,13 @@ pub fn save_snapshot_logic(
                 cleanup_ok = false;
             }
         }
-        if cleanup_ok {
-            all.truncate(MAX_SNAPSHOTS);
-        } else {
-            eprintln!(
-                "[mHost] Snapshot transaction {} kept pending because cleanup was incomplete",
-                id
-            );
+        if !cleanup_ok {
+            return Err(MhostError::Io {
+                kind: "Other".to_string(),
+                message: format!("snapshot prune failed for transaction {}", id),
+            });
         }
+        all.truncate(MAX_SNAPSHOTS);
     }
     write_snapshot_index(&snapshots_dir, &all)?;
 
@@ -232,7 +231,16 @@ fn write_snapshot_index(
 }
 
 fn read_snapshot_meta(path: &Path) -> Option<SnapshotMeta> {
-    let content = std::fs::read_to_string(path).ok()?;
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) => {
+            eprintln!(
+                "[mHost] Skipping unreadable snapshot file {:?}: {}",
+                path, error
+            );
+            return None;
+        }
+    };
     let meta: SnapshotFileMeta = serde_json::from_str(&content)
         .map_err(|error| {
             eprintln!(
@@ -310,6 +318,10 @@ pub fn reconcile_snapshot_index(
                 rebuild_snapshot_index(&snapshots_dir)?
             }
         }
+    } else if snapshots_dir.exists() {
+        // A missing index still needs pending markers to be resolved.  This
+        // is also the legacy migration path used on first startup.
+        rebuild_snapshot_index(&snapshots_dir)?
     } else {
         Vec::new()
     };
@@ -467,15 +479,8 @@ fn ensure_snapshot_index(
     reconcile_snapshot_index(storage, false)?;
     let snapshots_dir = storage.root().join("snapshots");
     let index_path = snapshot_index_path(&snapshots_dir);
-    if !index_path.exists() {
-        if !snapshots_dir.exists() {
-            return Ok(Vec::new());
-        }
-        let _ = rebuild_snapshot_index(&snapshots_dir)?;
-        // The rebuild above intentionally ignores the nested pending/ marker
-        // files.  Resolve any marker left by an interrupted first save so a
-        // subsequent list is already a clean, idempotent state.
-        reconcile_snapshot_index(storage, false)?;
+    if !snapshots_dir.exists() {
+        return Ok(Vec::new());
     }
 
     let content = std::fs::read_to_string(&index_path)?;
@@ -511,6 +516,12 @@ pub fn load_snapshot_logic(
     id: &str,
 ) -> Result<(), MhostError> {
     validate_snapshot_id(id)?;
+
+    // Load participates in the same pending-transaction recovery protocol.
+    // Without this, a crash marker could be loaded before its index entry was
+    // committed.  Reconcile is also idempotent and does not scan full files
+    // when the index is healthy.
+    reconcile_snapshot_index(storage, false)?;
 
     let snapshot_path = storage
         .root()
@@ -613,7 +624,10 @@ pub async fn load_snapshot(
     state: State<'_, AppState>,
     app_handle: AppHandle,
 ) -> Result<(), MhostError> {
-    let _guard = state.apply_lock.lock().await;
+    // Keep load on the same snapshot lock as save/delete.  load_snapshot_logic
+    // also reconciles pending markers, so it must not race a save or delete.
+    let _apply_guard = state.apply_lock.lock().await;
+    let _snapshot_guard = state.snapshot_lock.lock().await;
     let storage = state.storage.clone();
     let writer = state.writer.clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -964,7 +978,9 @@ mod tests {
         .unwrap();
 
         // A marker with its full file is committed without scanning the
-        // complete snapshot directory.
+        // complete snapshot directory.  Running reconciliation repeatedly
+        // must leave the same final state.
+        reconcile_snapshot_index(storage.as_ref(), false).unwrap();
         reconcile_snapshot_index(storage.as_ref(), false).unwrap();
 
         let metas = list_snapshots_logic(storage.as_ref()).unwrap();
@@ -1126,6 +1142,56 @@ mod tests {
         assert_eq!(restored.len(), 2);
         assert!(restored.iter().any(|p| p.name == "dev"));
         assert!(restored.iter().any(|p| p.name == "test"));
+    }
+
+    #[test]
+    fn test_load_snapshot_reconciles_pending_transaction_first() {
+        let (_temp, storage, writer) = create_test_storage_and_writer();
+        let profile = create_profile_with_rules(
+            &storage,
+            "pending-load",
+            vec![("127.0.0.1", "pending.local")],
+        );
+        let meta = SnapshotMeta {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "pending-load".to_string(),
+            description: None,
+            profile_count: 1,
+            created_at: Utc::now(),
+        };
+        let snapshot = Snapshot {
+            id: meta.id.clone(),
+            name: meta.name.clone(),
+            description: None,
+            profiles: vec![profile],
+            created_at: meta.created_at,
+        };
+        let snapshots_dir = storage.root().join("snapshots");
+        let transaction_dir = snapshots_dir.join(SNAPSHOT_TRANSACTION_DIR);
+        std::fs::create_dir_all(&transaction_dir).unwrap();
+        std::fs::write(
+            snapshots_dir.join(format!("{}.json", meta.id)),
+            serde_json::to_vec(&snapshot).unwrap(),
+        )
+        .unwrap();
+        let transaction = SnapshotTransaction {
+            version: SNAPSHOT_TRANSACTION_VERSION,
+            meta: meta.clone(),
+        };
+        write_atomic_0600(
+            &snapshot_transaction_path(&snapshots_dir, &meta.id),
+            &serde_json::to_vec(&transaction).unwrap(),
+        )
+        .unwrap();
+
+        load_snapshot_logic(storage.as_ref(), &writer, &meta.id).unwrap();
+
+        assert!(storage
+            .list_profiles()
+            .unwrap()
+            .iter()
+            .any(|profile| profile.name == "pending-load"));
+        assert!(!snapshot_transaction_path(&snapshots_dir, &meta.id).exists());
     }
 
     #[test]
