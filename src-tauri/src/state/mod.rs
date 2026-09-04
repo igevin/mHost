@@ -182,6 +182,14 @@ impl AppState {
         }
 
         let storage = Arc::new(file_storage);
+        // Run the one-time snapshot transaction reconciliation at cold start.
+        // Normal list calls below only read the index; this pass repairs data
+        // left by interrupted saves or upgrades from the pre-index layout.
+        if let Err(error) =
+            crate::commands::snapshot::reconcile_snapshot_index(storage.as_ref(), true)
+        {
+            eprintln!("[mHost] Snapshot index reconciliation failed: {}", error);
+        }
         let storage_root = storage.root().to_path_buf();
         let writer = Arc::new(HostsWriter::new());
 
