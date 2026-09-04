@@ -209,6 +209,7 @@ pub async fn apply_hosts(state: State<'_, AppState>) -> Result<(), MhostError> {
     let _guard = state.apply_lock.lock().await;
     let writer = state.writer.clone();
     let storage = state.storage.clone();
+    let snapshot_lock = state.snapshot_lock.clone();
     tauri::async_runtime::spawn_blocking(move || {
         eprintln!("[mHost] Waiting for user authorization (if needed)...");
         let profiles = storage.list_profiles_by_mode(ProfileMode::Hosts)?;
@@ -234,7 +235,9 @@ pub async fn apply_hosts(state: State<'_, AppState>) -> Result<(), MhostError> {
         write_last_applied(storage.root())?;
 
         // Auto-snapshot after successful apply
-        if let Err(e) = crate::commands::snapshot::auto_snapshot_logic(storage.as_ref()) {
+        if let Err(e) =
+            crate::commands::snapshot::auto_snapshot_logic(storage.as_ref(), &snapshot_lock)
+        {
             eprintln!("[mHost] Auto-snapshot failed: {}", e);
         }
 
@@ -454,6 +457,7 @@ pub async fn enable_and_apply(
         let _guard = state.apply_lock.lock().await;
         let writer = state.writer.clone();
         let storage = state.storage.clone();
+        let snapshot_lock = state.snapshot_lock.clone();
         tauri::async_runtime::spawn_blocking(move || {
             // Refs #127: `profile.mode` was read before the lock, and mode is
             // mutable via `update_profile`. Re-assert under the lock that the
@@ -484,10 +488,11 @@ pub async fn enable_and_apply(
                 enable_and_apply_logic(&profile_id, enabled, storage.as_ref(), &writer)?;
 
             // Auto-snapshot: capture id so the toast can mention it.
-            let snapshot_id = crate::commands::snapshot::auto_snapshot_logic(storage.as_ref())
-                .ok()
-                .flatten()
-                .map(|m| m.id);
+            let snapshot_id =
+                crate::commands::snapshot::auto_snapshot_logic(storage.as_ref(), &snapshot_lock)
+                    .ok()
+                    .flatten()
+                    .map(|m| m.id);
 
             Ok::<ApplyOutcome, MhostError>(ApplyOutcome::from_parts(
                 plan,

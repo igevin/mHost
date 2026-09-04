@@ -2,14 +2,17 @@ use chrono::{DateTime, Utc};
 use mhost_apply::writer::HostsWriter;
 use mhost_core::{MhostError, ProfileMode, Snapshot, SnapshotMeta};
 use mhost_storage::storage::{write_atomic_0600, Storage};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use tauri::{AppHandle, State};
 
-use crate::state::{lock_or_recover, AppState};
+use crate::state::{lock_or_recover, AppState, ApplyLock};
 
 const MAX_SNAPSHOTS: usize = 20;
 const MAX_SNAPSHOT_NAME_LENGTH: usize = 100;
 const MAX_SNAPSHOT_DESC_LENGTH: usize = 500;
+const SNAPSHOT_INDEX_VERSION: u32 = 1;
+const SNAPSHOT_INDEX_FILE: &str = "index.json";
 
 // ---------------------------------------------------------------------------
 // ID validation
@@ -81,27 +84,36 @@ pub fn save_snapshot_logic(
         created_at,
     };
 
-    // Prune old snapshots if exceeding MAX_SNAPSHOTS
-    let mut all = list_snapshots_logic(storage)?;
+    // Prune old snapshots if exceeding MAX_SNAPSHOTS.  The index is the
+    // metadata source of truth; after this first write, list_snapshots never
+    // needs to read the full snapshot files again.
+    let mut all = ensure_snapshot_index(storage)?;
+    all.retain(|old| old.id != id);
+    all.push(meta.clone());
+    all.sort_by_key(|entry| std::cmp::Reverse(entry.created_at));
     if all.len() > MAX_SNAPSHOTS {
-        all.sort_by_key(|a| a.created_at); // oldest first
-        let excess = all.len() - MAX_SNAPSHOTS;
-        for old in all.iter().take(excess) {
-            // Do not prune the snapshot we just created
-            if old.id == id {
-                continue;
-            }
+        for old in all.iter().skip(MAX_SNAPSHOTS) {
             let path = snapshots_dir.join(format!("{}.json", old.id));
             let _ = std::fs::remove_file(&path);
         }
+        all.truncate(MAX_SNAPSHOTS);
     }
+    write_snapshot_index(&snapshots_dir, &all)?;
 
     Ok(meta)
 }
 
-/// Lightweight metadata-only structure for reading snapshot files without
-/// loading the full `profiles` array into memory.
-/// Fix (B3): Avoids deserializing the entire Snapshot when only meta is needed.
+/// On-disk metadata index.  Keeping the version field makes it possible to
+/// migrate the index when SnapshotMeta evolves without re-reading every full
+/// snapshot file.
+#[derive(Debug, Serialize, Deserialize)]
+struct SnapshotIndex {
+    version: u32,
+    snapshots: Vec<SnapshotMeta>,
+}
+
+/// Lightweight metadata-only structure for the one-time migration of legacy
+/// snapshot directories (those created before `index.json` was introduced).
 #[derive(Deserialize)]
 struct SnapshotFileMeta {
     id: String,
@@ -141,38 +153,59 @@ where
     deserializer.deserialize_seq(ProfileCountVisitor)
 }
 
-pub fn list_snapshots_logic(
-    storage: &(dyn Storage + Send + Sync),
-) -> Result<Vec<SnapshotMeta>, MhostError> {
-    let snapshots_dir = storage.root().join("snapshots");
-    if !snapshots_dir.exists() {
-        return Ok(Vec::new());
-    }
+fn snapshot_index_path(snapshots_dir: &std::path::Path) -> PathBuf {
+    snapshots_dir.join(SNAPSHOT_INDEX_FILE)
+}
 
+fn write_snapshot_index(
+    snapshots_dir: &std::path::Path,
+    snapshots: &[SnapshotMeta],
+) -> Result<(), MhostError> {
+    let index = SnapshotIndex {
+        version: SNAPSHOT_INDEX_VERSION,
+        snapshots: snapshots.to_vec(),
+    };
+    let json = serde_json::to_vec(&index)
+        .map_err(|e| MhostError::InvalidInput(format!("serialize snapshot index failed: {}", e)))?;
+    Ok(write_atomic_0600(
+        &snapshot_index_path(snapshots_dir),
+        &json,
+    )?)
+}
+
+/// Rebuild the index from legacy snapshot files.  This is deliberately only
+/// used when the index is missing or incompatible; normal list operations do
+/// not inspect the full files.
+fn rebuild_snapshot_index(
+    snapshots_dir: &std::path::Path,
+) -> Result<Vec<SnapshotMeta>, MhostError> {
     let mut metas = Vec::new();
-    for entry in std::fs::read_dir(&snapshots_dir)? {
+    for entry in std::fs::read_dir(snapshots_dir)? {
         let entry = match entry {
-            Ok(e) => e,
+            Ok(entry) => entry,
             Err(_) => continue,
         };
         let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+        if path.file_name().and_then(|name| name.to_str()) == Some(SNAPSHOT_INDEX_FILE)
+            || path.extension().and_then(|extension| extension.to_str()) != Some("json")
+        {
             continue;
         }
 
         let content = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
+            Ok(content) => content,
             Err(_) => continue,
         };
-
         let meta: SnapshotFileMeta = match serde_json::from_str(&content) {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("[mHost] Skipping corrupted snapshot file {:?}: {}", path, e);
+            Ok(meta) => meta,
+            Err(error) => {
+                eprintln!(
+                    "[mHost] Skipping corrupted snapshot file {:?}: {}",
+                    path, error
+                );
                 continue;
             }
         };
-
         metas.push(SnapshotMeta {
             id: meta.id,
             name: meta.name,
@@ -182,8 +215,50 @@ pub fn list_snapshots_logic(
         });
     }
 
-    metas.sort_by_key(|b| std::cmp::Reverse(b.created_at));
+    metas.sort_by_key(|entry| std::cmp::Reverse(entry.created_at));
+    write_snapshot_index(snapshots_dir, &metas)?;
     Ok(metas)
+}
+
+/// Load or lazily rebuild the metadata index.  Once present, this reads only
+/// one small file and never touches `<id>.json` files.
+fn ensure_snapshot_index(
+    storage: &(dyn Storage + Send + Sync),
+) -> Result<Vec<SnapshotMeta>, MhostError> {
+    let snapshots_dir = storage.root().join("snapshots");
+    let index_path = snapshot_index_path(&snapshots_dir);
+    if !index_path.exists() {
+        if !snapshots_dir.exists() {
+            return Ok(Vec::new());
+        }
+        return rebuild_snapshot_index(&snapshots_dir);
+    }
+
+    let content = std::fs::read_to_string(&index_path)?;
+    match serde_json::from_str::<SnapshotIndex>(&content) {
+        Ok(index) if index.version == SNAPSHOT_INDEX_VERSION => {
+            let mut snapshots = index.snapshots;
+            snapshots.sort_by_key(|entry| std::cmp::Reverse(entry.created_at));
+            Ok(snapshots)
+        }
+        Ok(index) => {
+            eprintln!(
+                "[mHost] Rebuilding snapshot index for unsupported version {}",
+                index.version
+            );
+            rebuild_snapshot_index(&snapshots_dir)
+        }
+        Err(error) => {
+            eprintln!("[mHost] Rebuilding corrupted snapshot index: {}", error);
+            rebuild_snapshot_index(&snapshots_dir)
+        }
+    }
+}
+
+pub fn list_snapshots_logic(
+    storage: &(dyn Storage + Send + Sync),
+) -> Result<Vec<SnapshotMeta>, MhostError> {
+    ensure_snapshot_index(storage)
 }
 
 pub fn load_snapshot_logic(
@@ -240,12 +315,21 @@ pub fn delete_snapshot_logic(
 ) -> Result<(), MhostError> {
     validate_snapshot_id(id)?;
 
-    let snapshot_path = storage
-        .root()
-        .join("snapshots")
-        .join(format!("{}.json", id));
+    let snapshots_dir = storage.root().join("snapshots");
+    let snapshot_path = snapshots_dir.join(format!("{}.json", id));
+    let mut all = if snapshot_path.exists() || snapshot_index_path(&snapshots_dir).exists() {
+        ensure_snapshot_index(storage)?
+    } else {
+        Vec::new()
+    };
+
     if snapshot_path.exists() {
         std::fs::remove_file(&snapshot_path)?;
+    }
+    let previous_len = all.len();
+    all.retain(|entry| entry.id != id);
+    if all.len() != previous_len {
+        write_snapshot_index(&snapshots_dir, &all)?;
     }
     Ok(())
 }
@@ -272,6 +356,7 @@ pub async fn save_snapshot(
 
 #[tauri::command]
 pub async fn list_snapshots(state: State<'_, AppState>) -> Result<Vec<SnapshotMeta>, MhostError> {
+    let _guard = state.snapshot_lock.lock().await;
     let storage = state.storage.clone();
     tauri::async_runtime::spawn_blocking(move || list_snapshots_logic(storage.as_ref()))
         .await
@@ -337,7 +422,11 @@ const AUTO_SNAPSHOT_INTERVAL_DAYS: i64 = 3;
 /// - Otherwise, do nothing.
 pub fn auto_snapshot_logic(
     storage: &(dyn Storage + Send + Sync),
+    snapshot_lock: &ApplyLock,
 ) -> Result<Option<SnapshotMeta>, MhostError> {
+    let _snapshot_guard = snapshot_lock.blocking_lock();
+    // Blocking lock is required because this pure helper runs inside
+    // spawn_blocking after the caller has acquired apply_lock.
     let snapshots = list_snapshots_logic(storage)?;
 
     let should_create = if snapshots.is_empty() {
@@ -447,6 +536,46 @@ mod tests {
     }
 
     #[test]
+    fn test_snapshot_index_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_temp, storage, _writer) = create_test_storage_and_writer();
+        save_snapshot_logic(storage.as_ref(), "index-permissions".to_string(), None).unwrap();
+
+        let index_path = storage.root().join("snapshots").join("index.json");
+        let mode = std::fs::metadata(index_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn test_list_rebuilds_unsupported_snapshot_index_version() {
+        let (_temp, storage, _writer) = create_test_storage_and_writer();
+        let meta = save_snapshot_logic(storage.as_ref(), "versioned".to_string(), None).unwrap();
+        let index_path = storage.root().join("snapshots").join("index.json");
+        std::fs::write(&index_path, br#"{"version":999,"snapshots":[]}"#).unwrap();
+
+        let metas = list_snapshots_logic(storage.as_ref()).unwrap();
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].id, meta.id);
+        let rebuilt: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(index_path).unwrap()).unwrap();
+        assert_eq!(rebuilt["version"], 1);
+    }
+
+    #[test]
+    fn test_list_rebuilds_corrupted_snapshot_index() {
+        let (_temp, storage, _writer) = create_test_storage_and_writer();
+        let meta =
+            save_snapshot_logic(storage.as_ref(), "corrupted-index".to_string(), None).unwrap();
+        let index_path = storage.root().join("snapshots").join("index.json");
+        std::fs::write(index_path, b"not valid index json").unwrap();
+
+        let metas = list_snapshots_logic(storage.as_ref()).unwrap();
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].id, meta.id);
+    }
+
+    #[test]
     fn test_save_snapshot_prunes_old() {
         let (_temp, storage, _writer) = create_test_storage_and_writer();
 
@@ -473,6 +602,72 @@ mod tests {
         assert_eq!(metas[0].id, meta.id);
         assert_eq!(metas[0].name, "test-snap");
         assert_eq!(metas[0].profile_count, 1);
+    }
+
+    #[test]
+    fn test_save_snapshot_creates_metadata_index() {
+        let (_temp, storage, _writer) = create_test_storage_and_writer();
+        let meta = save_snapshot_logic(storage.as_ref(), "indexed".to_string(), None).unwrap();
+
+        let index_path = storage.root().join("snapshots").join("index.json");
+        let index_json = std::fs::read_to_string(index_path).unwrap();
+        let index: serde_json::Value = serde_json::from_str(&index_json).unwrap();
+        assert_eq!(index["version"], 1);
+        assert_eq!(index["snapshots"].as_array().unwrap().len(), 1);
+        assert_eq!(index["snapshots"][0]["id"], meta.id);
+    }
+
+    #[test]
+    fn test_delete_snapshot_updates_metadata_index() {
+        let (_temp, storage, _writer) = create_test_storage_and_writer();
+        let meta = save_snapshot_logic(storage.as_ref(), "delete-me".to_string(), None).unwrap();
+
+        delete_snapshot_logic(storage.as_ref(), &meta.id).unwrap();
+
+        let index_path = storage.root().join("snapshots").join("index.json");
+        let index_json = std::fs::read_to_string(index_path).unwrap();
+        let index: serde_json::Value = serde_json::from_str(&index_json).unwrap();
+        assert!(index["snapshots"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_list_snapshots_migrates_legacy_data_once() {
+        let (_temp, storage, _writer) = create_test_storage_and_writer();
+        let snapshot = Snapshot {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "legacy".to_string(),
+            description: None,
+            profiles: Vec::new(),
+            created_at: Utc::now(),
+        };
+        let snapshots_dir = storage.root().join("snapshots");
+        std::fs::create_dir_all(&snapshots_dir).unwrap();
+        std::fs::write(
+            snapshots_dir.join(format!("{}.json", snapshot.id)),
+            serde_json::to_vec(&snapshot).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            snapshots_dir.join("corrupt.json"),
+            b"not valid snapshot json",
+        )
+        .unwrap();
+
+        // The first call performs the one-time migration and creates index.json.
+        // The corrupt legacy file is skipped while the valid snapshot is indexed.
+        assert_eq!(list_snapshots_logic(storage.as_ref()).unwrap().len(), 1);
+        assert!(snapshots_dir.join("index.json").exists());
+
+        // A later call only reads the index, so a legacy full snapshot file may
+        // be corrupted without affecting the metadata list.
+        std::fs::write(
+            snapshots_dir.join(format!("{}.json", snapshot.id)),
+            b"not valid snapshot json",
+        )
+        .unwrap();
+        let metas = list_snapshots_logic(storage.as_ref()).unwrap();
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].name, "legacy");
     }
 
     #[test]
@@ -630,7 +825,7 @@ mod tests {
         let (_temp, storage, _writer) = create_test_storage_and_writer();
         create_profile_with_rules(&storage, "dev", vec![("127.0.0.1", "example.com")]);
 
-        let result = auto_snapshot_logic(storage.as_ref()).unwrap();
+        let result = auto_snapshot_logic(storage.as_ref(), &ApplyLock::new()).unwrap();
         assert!(
             result.is_some(),
             "should create snapshot when list is empty"
@@ -649,7 +844,7 @@ mod tests {
         // Create a snapshot with current time
         save_snapshot_logic(storage.as_ref(), "recent".to_string(), None).unwrap();
 
-        let result = auto_snapshot_logic(storage.as_ref()).unwrap();
+        let result = auto_snapshot_logic(storage.as_ref(), &ApplyLock::new()).unwrap();
         assert!(
             result.is_none(),
             "should NOT create snapshot when recent one exists"
@@ -679,7 +874,7 @@ mod tests {
         let json = serde_json::to_string_pretty(&old_snapshot).unwrap();
         std::fs::write(&path, json).unwrap();
 
-        let result = auto_snapshot_logic(storage.as_ref()).unwrap();
+        let result = auto_snapshot_logic(storage.as_ref(), &ApplyLock::new()).unwrap();
         assert!(
             result.is_some(),
             "should create snapshot when latest is older than 3 days"

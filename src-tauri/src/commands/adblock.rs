@@ -1266,7 +1266,7 @@ mod tests {
             storage: storage.clone(),
             writer: Arc::new(HostsWriter::new()),
             apply_lock: crate::state::ApplyLock::new(),
-            snapshot_lock: crate::state::ApplyLock::new(),
+            snapshot_lock: Arc::new(crate::state::ApplyLock::new()),
             last_profile_ids: std::sync::Mutex::new(Vec::new()),
             cached_profiles: std::sync::RwLock::new(None), // lazy load on first cached_profiles() call
             dns_server: Arc::new(std::sync::Mutex::new(None)),

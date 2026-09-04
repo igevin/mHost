@@ -541,7 +541,7 @@ mod tests {
             storage,
             writer: Arc::new(HostsWriter::new()),
             apply_lock: ApplyLock::new(),
-            snapshot_lock: ApplyLock::new(),
+            snapshot_lock: Arc::new(ApplyLock::new()),
             last_profile_ids: Mutex::new(Vec::new()),
             cached_profiles: std::sync::RwLock::new(None), // lazy load on first cached_profiles() call
             dns_server: Arc::new(Mutex::new(None)),
@@ -582,7 +582,7 @@ mod tests {
             storage,
             writer: Arc::new(HostsWriter::new()),
             apply_lock: ApplyLock::new(),
-            snapshot_lock: ApplyLock::new(),
+            snapshot_lock: Arc::new(ApplyLock::new()),
             last_profile_ids: Mutex::new(Vec::new()),
             cached_profiles: std::sync::RwLock::new(None), // lazy load on first cached_profiles() call
             dns_server: Arc::new(Mutex::new(None)),
@@ -617,7 +617,7 @@ mod tests {
             storage,
             writer: Arc::new(HostsWriter::new()),
             apply_lock: ApplyLock::new(),
-            snapshot_lock: ApplyLock::new(),
+            snapshot_lock: Arc::new(ApplyLock::new()),
             last_profile_ids: Mutex::new(Vec::new()),
             cached_profiles: std::sync::RwLock::new(None), // lazy load on first cached_profiles() call
             dns_server: Arc::new(Mutex::new(None)),
@@ -668,7 +668,7 @@ mod tests {
             storage,
             writer: Arc::new(HostsWriter::new()),
             apply_lock: ApplyLock::new(),
-            snapshot_lock: ApplyLock::new(),
+            snapshot_lock: Arc::new(ApplyLock::new()),
             last_profile_ids: Mutex::new(Vec::new()),
             cached_profiles: std::sync::RwLock::new(None), // lazy load on first cached_profiles() call
             dns_server: Arc::new(Mutex::new(None)),
@@ -711,7 +711,7 @@ mod tests {
             storage,
             writer: Arc::new(HostsWriter::new()),
             apply_lock: ApplyLock::new(),
-            snapshot_lock: ApplyLock::new(),
+            snapshot_lock: Arc::new(ApplyLock::new()),
             last_profile_ids: Mutex::new(Vec::new()),
             cached_profiles: std::sync::RwLock::new(None), // lazy load on first cached_profiles() call
             dns_server: Arc::new(Mutex::new(None)),
@@ -767,7 +767,7 @@ mod tests {
             storage,
             writer: Arc::new(HostsWriter::new()),
             apply_lock: ApplyLock::new(),
-            snapshot_lock: ApplyLock::new(),
+            snapshot_lock: Arc::new(ApplyLock::new()),
             last_profile_ids: Mutex::new(Vec::new()),
             cached_profiles: std::sync::RwLock::new(None), // lazy load on first cached_profiles() call
             dns_server: Arc::new(Mutex::new(None)),

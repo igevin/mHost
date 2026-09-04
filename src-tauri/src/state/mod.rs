@@ -88,7 +88,7 @@ pub struct AppState {
     pub writer: Arc<HostsWriter>,
     pub apply_lock: ApplyLock,
     /// N2: Serialize snapshot save/delete operations to prevent races.
-    pub snapshot_lock: ApplyLock,
+    pub snapshot_lock: Arc<ApplyLock>,
     /// Perf fix (#29): Track last rendered profile IDs to avoid unnecessary menu rebuilds.
     pub last_profile_ids: Mutex<Vec<String>>,
     /// Perf fix (P-R12 + P-R15, issue #181): Cached profile list to avoid
@@ -232,7 +232,7 @@ impl AppState {
             storage,
             writer,
             apply_lock: ApplyLock(tokio::sync::Mutex::new(())),
-            snapshot_lock: ApplyLock(tokio::sync::Mutex::new(())),
+            snapshot_lock: Arc::new(ApplyLock(tokio::sync::Mutex::new(()))),
             last_profile_ids: Mutex::new(Vec::new()),
             cached_profiles: RwLock::new(None), // lazy load on first cached_profiles() call
             dns_server,
@@ -592,7 +592,7 @@ mod tests {
             storage,
             writer: std::sync::Arc::new(mhost_apply::writer::HostsWriter::new()),
             apply_lock: ApplyLock::new(),
-            snapshot_lock: ApplyLock::new(),
+            snapshot_lock: Arc::new(ApplyLock::new()),
             last_profile_ids: std::sync::Mutex::new(Vec::new()),
             cached_profiles: std::sync::RwLock::new(None),
             dns_server: std::sync::Arc::new(std::sync::Mutex::new(None)),

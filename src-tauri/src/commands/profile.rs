@@ -265,10 +265,13 @@ pub async fn update_profile(
         let _guard = state.apply_lock.lock().await;
         let writer = state.writer.clone();
         let storage = state.storage.clone();
+        let snapshot_lock = state.snapshot_lock.clone();
         let apply_result = tauri::async_runtime::spawn_blocking(move || {
             apply_current_plan_logic(storage.as_ref(), &writer)?;
             // Auto-snapshot：与 apply_hosts / enable_and_apply 保持一致
-            if let Err(e) = crate::commands::snapshot::auto_snapshot_logic(storage.as_ref()) {
+            if let Err(e) =
+                crate::commands::snapshot::auto_snapshot_logic(storage.as_ref(), &snapshot_lock)
+            {
                 eprintln!("[mHost] Auto-snapshot failed: {}", e);
             }
             Ok::<(), MhostError>(())
