@@ -314,10 +314,11 @@ async fn set_dns_mode_enable(
     //    hot-reload 到新 server，并启动定时刷新 task。task 在 disable
     //    时被 abort。
     //
-    //    9a. 即时 reload：spawn_ad_block_refresh_task 在
-    //    auto_refresh_enabled=false 或 interval=0 时不会 spawn，但用户
-    //    仍期望持久化的 ad-block 规则立即生效。所以这里显式做一次
-    //    classify + reload，与 AppState::new 冷启动路径一致。
+    //    9a. 即时 reload：spawn_ad_block_refresh_task 现在总会 spawn
+    //    （auto_refresh_enabled=false 或 interval=0 时 task park 在 wake
+    //    上，issue #195），但用户仍期望持久化的 ad-block 规则立即生效。
+    //    所以这里显式做一次 classify + reload，与 AppState::new 冷启动
+    //    路径一致。
     //
     //    9b. 这里复用了 commands::adblock 的 `classify_rules` + 重载路径
     //    的等价逻辑（避免循环依赖和 IPC 边界），不经过 IPC handler。
@@ -332,6 +333,7 @@ async fn set_dns_mode_enable(
         &state.dns_server,
         &state.storage,
         &state.ad_block_refresh_cancel,
+        &state.ad_block_refresh_wake,
     );
 
     Ok(())
@@ -552,6 +554,7 @@ mod tests {
             ad_block_state: Arc::new(tokio::sync::RwLock::new(mhost_core::AdBlockState::default())),
             ad_block_refresh_task: Mutex::new(None),
             ad_block_refresh_cancel: Mutex::new(CancellationToken::new()),
+            ad_block_refresh_wake: Arc::new(tokio::sync::Notify::new()),
         };
 
         assert!(!token.is_cancelled(), "pre-condition: token uncancelled");
@@ -593,6 +596,7 @@ mod tests {
             ad_block_state: Arc::new(tokio::sync::RwLock::new(mhost_core::AdBlockState::default())),
             ad_block_refresh_task: Mutex::new(None),
             ad_block_refresh_cancel: Mutex::new(CancellationToken::new()),
+            ad_block_refresh_wake: Arc::new(tokio::sync::Notify::new()),
         };
 
         let slot = lock_or_recover(&state.dns_cancel);
@@ -633,6 +637,7 @@ mod tests {
             ad_block_state: Arc::new(tokio::sync::RwLock::new(mhost_core::AdBlockState::default())),
             ad_block_refresh_task: Mutex::new(None),
             ad_block_refresh_cancel: Mutex::new(CancellationToken::new()),
+            ad_block_refresh_wake: Arc::new(tokio::sync::Notify::new()),
         };
 
         // Simulate the swap pattern at the top of `set_dns_mode`:
@@ -679,6 +684,7 @@ mod tests {
             ad_block_state: Arc::new(tokio::sync::RwLock::new(mhost_core::AdBlockState::default())),
             ad_block_refresh_task: Mutex::new(None),
             ad_block_refresh_cancel: Mutex::new(tokio_util::sync::CancellationToken::new()),
+            ad_block_refresh_wake: Arc::new(tokio::sync::Notify::new()),
         };
         // dns_enabled = false → cleanup 应直接返回 Ok
         let result = cleanup_dns_on_exit(&state, false).await;
@@ -722,6 +728,7 @@ mod tests {
             ad_block_state: Arc::new(tokio::sync::RwLock::new(mhost_core::AdBlockState::default())),
             ad_block_refresh_task: Mutex::new(None),
             ad_block_refresh_cancel: Mutex::new(tokio_util::sync::CancellationToken::new()),
+            ad_block_refresh_wake: Arc::new(tokio::sync::Notify::new()),
         };
         // cleanup_dns_on_exit → set_dns_mode_disable(interactive=false)
         //   - original 是 DhcpEmpty → 只打印 warning（不返回 Err，bug 1 修复）
@@ -778,6 +785,7 @@ mod tests {
             ad_block_state: Arc::new(tokio::sync::RwLock::new(mhost_core::AdBlockState::default())),
             ad_block_refresh_task: Mutex::new(None),
             ad_block_refresh_cancel: Mutex::new(tokio_util::sync::CancellationToken::new()),
+            ad_block_refresh_wake: Arc::new(tokio::sync::Notify::new()),
         };
 
         // 第一次 cleanup：跑 disable 路径。注意必须用 interactive=false
@@ -809,6 +817,188 @@ mod tests {
         // 第三次（同样）
         let r3 = cleanup_dns_on_exit(&state, false).await;
         assert!(r3.is_ok(), "third cleanup must also be a no-op");
+    }
+
+    // -------------------------------------------------------------------
+    // Refresh-task wake / park contract (issues #192 + #195).
+    //
+    // The tests run on tokio's paused clock. Between steps we deliberately
+    // avoid `.await`ing anything that could let the runtime idle-park:
+    // with a paused clock, an idle park auto-advances time to the next
+    // timer, which would defeat the "must not tick yet" assertions. All
+    // config mutations therefore go through `try_write()` (sync) + a sync
+    // `notify_one()`, mirroring the IPC command bodies.
+    //
+    // Observable tick side effect: the fixture's single enabled source
+    // points at a connection-refused URL (same trick as
+    // `add_ad_block_source_persists_on_fetch_failure` in adblock.rs), so
+    // a tick records `last_error` on the source — visible via
+    // `try_read()` with no network dependency beyond a fast loopback
+    // refusal.
+    // -------------------------------------------------------------------
+
+    /// Fixture for the refresh-task tests. `dns_server` stays `None`, so
+    /// the post-fetch reload step is skipped and a tick's only effect is
+    /// the recorded fetch error.
+    struct RefreshTaskEnv {
+        _temp: TempDir,
+        storage: Arc<dyn mhost_storage::storage::Storage + Send + Sync>,
+        ad_block_state: Arc<tokio::sync::RwLock<mhost_core::AdBlockState>>,
+        dns_server: Arc<std::sync::Mutex<Option<mhost_dns::DnsServer>>>,
+        task_slot: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+        cancel_slot: Mutex<CancellationToken>,
+        wake: Arc<tokio::sync::Notify>,
+    }
+
+    fn refresh_task_env(auto: bool, interval_hours: u32) -> RefreshTaskEnv {
+        let temp = TempDir::new().unwrap();
+        let storage = Arc::new(FileStorage::new(temp.path()))
+            as Arc<dyn mhost_storage::storage::Storage + Send + Sync>;
+        let source = mhost_core::AdBlockSource {
+            source_id: mhost_core::SourceId(uuid::Uuid::new_v4()),
+            name: "failing".into(),
+            url: "http://127.0.0.1:1/blocklist".into(),
+            enabled: true,
+            response: mhost_core::AdBlockResponse::ZeroAddress,
+            last_fetched_at: None,
+            last_error: None,
+            rule_count: 0,
+            etag: None,
+        };
+        let st = mhost_core::AdBlockState {
+            enabled: true, // master switch on — the tick's only observable is the fetch error
+            sources: vec![source],
+            auto_refresh_enabled: auto,
+            refresh_interval_hours: interval_hours,
+            ..Default::default()
+        };
+        RefreshTaskEnv {
+            _temp: temp,
+            storage,
+            ad_block_state: Arc::new(tokio::sync::RwLock::new(st)),
+            dns_server: Arc::new(Mutex::new(None)),
+            task_slot: Mutex::new(None),
+            cancel_slot: Mutex::new(CancellationToken::new()),
+            wake: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    impl RefreshTaskEnv {
+        fn spawn_task(&self) {
+            super::spawn_ad_block_refresh_task(
+                &self.task_slot,
+                &self.ad_block_state,
+                &self.dns_server,
+                &self.storage,
+                &self.cancel_slot,
+                &self.wake,
+            );
+        }
+
+        fn task_spawned(&self) -> bool {
+            lock_or_recover(&self.task_slot).is_some()
+        }
+
+        /// Sync observation of the tick side effect (no `.await` → no
+        /// paused-clock auto-advance in the caller between steps).
+        fn has_error(&self) -> bool {
+            self.ad_block_state
+                .try_read()
+                .map(|g| g.sources.iter().any(|s| s.last_error.is_some()))
+                .unwrap_or(false)
+        }
+    }
+
+    /// Wait until the task records a fetch error, stepping the paused
+    /// clock in small increments so any pending timer can fire.
+    async fn wait_for_tick(env: &RefreshTaskEnv) -> bool {
+        for _ in 0..10_000 {
+            if env.has_error() {
+                return true;
+            }
+            tokio::task::yield_now().await;
+            tokio::time::advance(std::time::Duration::from_millis(10)).await;
+        }
+        env.has_error()
+    }
+
+    /// Issue #192 + #195: with auto-refresh off, the task is still
+    /// spawned (parked, no timer) and toggling it back on via the IPC
+    /// semantics (mutate + `notify_one`) makes it tick one full interval
+    /// later — no respawn needed.
+    #[tokio::test(start_paused = true)]
+    async fn test_refresh_task_parks_when_disabled_and_wakes_on_toggle() {
+        let env = refresh_task_env(false, 6);
+        env.spawn_task();
+        assert!(
+            env.task_spawned(),
+            "#192: task must spawn (park) even when auto-refresh is off"
+        );
+
+        // Parked task has no timer: a long simulated wait must not tick.
+        tokio::time::advance(std::time::Duration::from_secs(100 * 3600)).await;
+        assert!(
+            !env.has_error(),
+            "parked task must not tick while auto-refresh is off"
+        );
+
+        // Mirror the set_ad_block_auto_refresh_enabled IPC body (sync, so
+        // paused time cannot auto-advance between mutate and notify).
+        env.ad_block_state
+            .try_write()
+            .expect("no other writers")
+            .auto_refresh_enabled = true;
+        env.wake.notify_one();
+        // Let the task consume the wake and rebuild its timer at the
+        // current simulated instant — `advance` does not poll other tasks,
+        // so without this yield the new 6h timer would start after the
+        // advance below and never fire.
+        tokio::task::yield_now().await;
+
+        // Toggle takes effect now: the tick lands one interval (6h) after
+        // the change, not "never" (pre-#192 the task didn't exist).
+        tokio::time::advance(std::time::Duration::from_secs(6 * 3600)).await;
+        assert!(
+            wait_for_tick(&env).await,
+            "#192: toggle-on must wake the parked task and drive a tick"
+        );
+    }
+
+    /// Issue #195: changing `refresh_interval_hours` mid-sleep must
+    /// interrupt the in-flight sleep; the tick must land on the new
+    /// interval, far before the spawn-time 168h sleep elapses.
+    #[tokio::test(start_paused = true)]
+    async fn test_interval_change_interrupts_refresh_sleep() {
+        let env = refresh_task_env(true, 168);
+        env.spawn_task();
+        let t0 = tokio::time::Instant::now();
+
+        // 1h into the 168h sleep: no tick yet.
+        tokio::time::advance(std::time::Duration::from_secs(3600)).await;
+        assert!(!env.has_error(), "task must still be in the first sleep");
+
+        // Mirror the set_ad_block_refresh_interval IPC body.
+        env.ad_block_state
+            .try_write()
+            .expect("no other writers")
+            .refresh_interval_hours = 6;
+        env.wake.notify_one();
+        // Let the task consume the wake and rebuild its timer at the
+        // current simulated instant (see the sibling test for why).
+        tokio::task::yield_now().await;
+
+        // The new interval drives the next tick: 6h after the change
+        // (≈7h after spawn), not 168h after spawn.
+        tokio::time::advance(std::time::Duration::from_secs(6 * 3600)).await;
+        assert!(
+            wait_for_tick(&env).await,
+            "#195: interval change must interrupt the in-flight sleep"
+        );
+        let elapsed = tokio::time::Instant::now() - t0;
+        assert!(
+            elapsed < std::time::Duration::from_secs(168 * 3600),
+            "tick must follow the NEW interval, not the spawn-time 168h one; elapsed={elapsed:?}"
+        );
     }
 }
 
@@ -920,13 +1110,21 @@ fn cancel_ad_block_refresh_task(slot: &Mutex<CancellationToken>) {
 /// immediately. See `test_re_enable_after_disable_respawns_with_fresh_token`.
 ///
 /// The task:
-/// 1. Reads `refresh_interval_hours` from `ad_block_state`.
-/// 2. Sleeps for the interval (or until the cancel token fires).
+/// 1. Reads `auto_refresh_enabled` + `refresh_interval_hours` from
+///    `ad_block_state` at the top of every iteration.
+/// 2. Sleeps for the interval — or until the cancel token fires (disable)
+///    or the wake signal fires (config changed, issue #195).
 /// 3. Refreshes all enabled sources + hot-reloads the engine.
 /// 4. Exits cleanly when the current `ad_block_refresh_cancel` is cancelled.
 ///
-/// `refresh_interval_hours == 0` or `auto_refresh_enabled == false` short-
-/// circuits — task is not spawned at all (callers don't need to abort it).
+/// **Issue #195:** the task is now spawned unconditionally while DNS mode
+/// is on — `auto_refresh_enabled == false` or `refresh_interval_hours ==
+/// 0` no longer short-circuits the spawn. Instead the loop parks on
+/// `wake` (no timer) when auto-refresh is off, so the `#192` toggle and
+/// interval changes take effect immediately via `Notify` instead of
+/// needing a cancel + respawn (which would couple with the #138
+/// cancellation protocol). Callers still don't need to abort the task on
+/// config changes — only the disable path cancels it.
 ///
 /// **Issue #138:** The disable path now signals a `CancellationToken` (see
 /// `cancel_ad_block_refresh_task`) *before* aborting. The select! below
@@ -948,15 +1146,8 @@ pub(crate) fn spawn_ad_block_refresh_task(
     dns_server: &Arc<std::sync::Mutex<Option<mhost_dns::DnsServer>>>,
     storage: &Arc<dyn mhost_storage::storage::Storage + Send + Sync>,
     cancel_slot: &Mutex<CancellationToken>,
+    wake: &Arc<tokio::sync::Notify>,
 ) {
-    let cfg = match ad_block_state.try_read() {
-        Ok(g) => (g.auto_refresh_enabled, g.refresh_interval_hours),
-        Err(_) => return,
-    };
-    if !cfg.0 || cfg.1 == 0 {
-        return;
-    }
-
     // Issue #138 follow-up (re-enable): swap the cancel slot for a fresh
     // token so this task is unaffected by a previous disable's `cancel()`.
     // `CancellationToken::cancel()` is sticky — if we just cloned the
@@ -973,30 +1164,67 @@ pub(crate) fn spawn_ad_block_refresh_task(
     let storage = storage.clone();
     let ad_block_state = ad_block_state.clone();
     let dns_server = dns_server.clone();
+    let wake = wake.clone();
 
-    let interval_secs = (cfg.1 as u64).saturating_mul(3600).max(3600); // floor 1h
     let handle = tokio::spawn(async move {
         loop {
-            // Sleep OR cancellation. The select! is the **first** thing
-            // the loop checks so disable can interrupt even a long
-            // inter-tick sleep.
-            tokio::select! {
-                _ = tokio::time::sleep(std::time::Duration::from_secs(interval_secs)) => {}
-                _ = cancel.cancelled() => {
-                    // Disable path fired the token. Exit the loop cleanly.
-                    break;
+            // Re-read config at the top of every iteration (issue #195):
+            // the sleep duration must follow the CURRENT
+            // `refresh_interval_hours`, not the value captured at spawn
+            // time. On lock contention (an IPC `set_*` holds the write
+            // guard) back off briefly instead of spinning — the select!
+            // keeps the cancel path responsive.
+            let (auto, interval_h) = match ad_block_state.try_read() {
+                Ok(g) => (g.auto_refresh_enabled, g.refresh_interval_hours),
+                Err(_) => {
+                    // Review N2: 1s is an arbitrary throttle, orders of
+                    // magnitude below the smallest meaningful interval
+                    // (1h floor) — its only job is to keep this retry
+                    // from busy-spinning while a writer holds the guard.
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => continue,
+                        _ = cancel.cancelled() => break,
+                    }
+                }
+            };
+
+            if auto && interval_h > 0 {
+                // Floor 1h: below that hurts upstreams. The duration is
+                // recomputed every iteration so an interval change made
+                // mid-sleep applies to the NEXT wait (a change wakes us
+                // via `wake` first — see the third select arm).
+                let interval_secs = (interval_h as u64).saturating_mul(3600).max(3600);
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(interval_secs)) => {}
+                    _ = cancel.cancelled() => {
+                        // Disable path fired the token. Exit the loop cleanly.
+                        break;
+                    }
+                    // Issue #195: interval / auto-refresh toggle changed.
+                    // Restart the wait immediately with the fresh config.
+                    _ = wake.notified() => continue,
+                }
+            } else {
+                // Auto-refresh off (toggle, or "Manual only" interval=0).
+                // Park with NO timer: only a config change (`wake`) or
+                // DNS-mode disable (`cancel`) can end the park. This is
+                // what makes the #192 toggle effective without a respawn.
+                tokio::select! {
+                    _ = wake.notified() => continue,
+                    _ = cancel.cancelled() => break,
                 }
             }
 
-            // Re-read config — user may have changed interval or disabled
-            // auto-refresh since the last tick.
-            let (auto, interval_h, enabled) = {
+            // Master switch check (auto / interval were validated at the
+            // top of this iteration; mutator IPCs wake us on change, so a
+            // mid-sleep config change re-enters the loop from the top).
+            let enabled = {
                 let Ok(g) = ad_block_state.try_read() else {
                     continue;
                 };
-                (g.auto_refresh_enabled, g.refresh_interval_hours, g.enabled)
+                g.enabled
             };
-            if !auto || interval_h == 0 || !enabled {
+            if !enabled {
                 continue;
             }
 
@@ -1023,6 +1251,16 @@ pub(crate) fn spawn_ad_block_refresh_task(
             // completion after disable; the spawn_blocking step below is
             // the critical one (it mutates the server), and that's where
             // the self-check lives.
+            //
+            // Notify vs this whole fetch+reload section (review N1): the
+            // task is not parked on `wake.notified()` while it runs, so a
+            // `notify_one()` landing here cannot wake it mid-flight —
+            // `Notify` buffers it as a single permit instead. When the
+            // task loops back to the select at the top, the parked arm
+            // consumes the permit immediately and the loop re-reads the
+            // (already updated) config. At most one change is buffered,
+            // which is all we need: every iteration reads the LATEST
+            // state, so intermediate changes collapse into one re-read.
             crate::commands::adblock::fetch_sources_concurrent(
                 &storage,
                 &ad_block_state,

@@ -165,6 +165,7 @@ pub fn run() {
             get_ad_block_state,
             set_ad_block_enabled,
             set_ad_block_refresh_interval,
+            set_ad_block_auto_refresh_enabled,
             list_ad_block_sources,
             add_ad_block_source,
             remove_ad_block_source,

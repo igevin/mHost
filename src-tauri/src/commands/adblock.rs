@@ -545,11 +545,20 @@ pub async fn set_ad_block_enabled(
         let mut guard = state.ad_block_state.write().await;
         guard.enabled = enabled;
     }
+    // Issue #195 (review P1): the refresh task reads `enabled` after each
+    // tick — wake it so master-switch changes don't wait out the
+    // in-flight sleep, consistent with the other mutator IPCs.
+    state.ad_block_refresh_wake.notify_one();
     persist_and_reload(&state).await
 }
 
-/// Change the auto-refresh interval in hours. `0` disables background
-/// refresh (frontend shows a hint to refresh manually).
+/// Change the auto-refresh interval in hours. The new value applies to
+/// the *next* refresh wait (issue #195: an in-flight sleep is woken via
+/// `Notify` so it does not run to completion).
+///
+/// `0` parks the refresh task as a backend fallback (legacy "Manual
+/// only" state). Prefer `set_ad_block_auto_refresh_enabled` to toggle
+/// auto-refresh from the UI.
 #[tauri::command]
 pub async fn set_ad_block_refresh_interval(
     hours: u32,
@@ -561,6 +570,33 @@ pub async fn set_ad_block_refresh_interval(
         let mut guard = state.ad_block_state.write().await;
         guard.refresh_interval_hours = clamped;
     }
+    // Issue #195: the refresh task may be mid-sleep with the old value —
+    // wake it so the new interval applies to the next wait immediately
+    // instead of after the in-flight sleep (worst case 168h) elapses.
+    state.ad_block_refresh_wake.notify_one();
+    persist_and_reload(&state).await
+}
+
+/// Toggle background auto-refresh on/off (issue #192). Before this
+/// command existed, `auto_refresh_enabled` was persisted but nothing
+/// could change it — users could only emulate "off" via
+/// `refresh_interval_hours = 0` ("Manual only").
+///
+/// The refresh task observes this field on every loop iteration; the
+/// `notify_one` below (issue #195) makes the change effective
+/// immediately instead of after the in-flight sleep. When re-enabled,
+/// the next tick is a full interval away, matching the semantics of
+/// editing the interval.
+#[tauri::command]
+pub async fn set_ad_block_auto_refresh_enabled(
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> Result<(), MhostError> {
+    {
+        let mut guard = state.ad_block_state.write().await;
+        guard.auto_refresh_enabled = enabled;
+    }
+    state.ad_block_refresh_wake.notify_one();
     persist_and_reload(&state).await
 }
 
@@ -1270,6 +1306,7 @@ mod tests {
             ad_block_refresh_cancel: std::sync::Mutex::new(
                 tokio_util::sync::CancellationToken::new(),
             ),
+            ad_block_refresh_wake: std::sync::Arc::new(tokio::sync::Notify::new()),
         };
 
         // Port 1 on loopback refuses connections → fetch_source errors fast.

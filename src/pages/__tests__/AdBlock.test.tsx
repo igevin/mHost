@@ -21,6 +21,7 @@ const mockRefreshAllAdBlockSources = vi.fn().mockResolvedValue([]);
 const mockAddAdBlockWhitelist = vi.fn().mockResolvedValue([]);
 const mockRemoveAdBlockWhitelist = vi.fn().mockResolvedValue([]);
 const mockSetAdBlockRefreshInterval = vi.fn().mockResolvedValue(undefined);
+const mockSetAdBlockAutoRefreshEnabled = vi.fn().mockResolvedValue(undefined);
 
 vi.mock("../../lib/tauri", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../lib/tauri")>();
@@ -37,6 +38,8 @@ vi.mock("../../lib/tauri", async (importOriginal) => {
     addAdBlockWhitelist: (...args: unknown[]) => mockAddAdBlockWhitelist(...args),
     removeAdBlockWhitelist: (...args: unknown[]) => mockRemoveAdBlockWhitelist(...args),
     setAdBlockRefreshInterval: (...args: unknown[]) => mockSetAdBlockRefreshInterval(...args),
+    setAdBlockAutoRefreshEnabled: (...args: unknown[]) =>
+      mockSetAdBlockAutoRefreshEnabled(...args),
   };
 });
 
@@ -297,5 +300,46 @@ describe("AdBlock", () => {
     renderWithProviders(<AdBlock />);
     expect(await screen.findByRole("heading", { name: "Sources" })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Whitelist" })).toBeInTheDocument();
+  });
+
+  // ---- issue #192: auto-refresh toggle ----
+  it("toggling auto-refresh off calls setAdBlockAutoRefreshEnabled(false)", async () => {
+    const state = makeState(); // auto_refresh_enabled: true, no sources
+    setStore((s) => s.set(adBlockStateAtom, state));
+    mockGetAdBlockState.mockResolvedValue(state);
+    renderWithProviders(<AdBlock />);
+    await screen.findByText("Auto-refresh");
+    const autoRefreshToggle = screen.getByRole("checkbox", {
+      name: "Auto-refresh",
+    });
+    expect(autoRefreshToggle).toBeChecked();
+    await act(async () => {
+      fireEvent.click(autoRefreshToggle);
+    });
+    expect(mockSetAdBlockAutoRefreshEnabled).toHaveBeenCalledWith(false);
+  });
+
+  it("hides the interval select when auto-refresh is off and shows it when on", async () => {
+    const state = makeState({ auto_refresh_enabled: false });
+    setStore((s) => s.set(adBlockStateAtom, state));
+    mockGetAdBlockState.mockResolvedValue(state);
+    renderWithProviders(<AdBlock />);
+    await screen.findByText("Auto-refresh");
+    expect(
+      screen.queryByRole("combobox", { name: "Refresh interval" }),
+    ).not.toBeInTheDocument();
+
+    // Re-enable via the toggle: the action re-fetches state; return an
+    // enabled one so the select renders.
+    mockGetAdBlockState.mockResolvedValue(makeState({ auto_refresh_enabled: true }));
+    const autoRefreshToggle = screen.getByRole("checkbox", {
+      name: "Auto-refresh",
+    });
+    await act(async () => {
+      fireEvent.click(autoRefreshToggle);
+    });
+    expect(
+      await screen.findByRole("combobox", { name: "Refresh interval" }),
+    ).toBeInTheDocument();
   });
 });

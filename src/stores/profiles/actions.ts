@@ -23,6 +23,7 @@ import {
   getAdBlockState,
   setAdBlockEnabled,
   setAdBlockRefreshInterval,
+  setAdBlockAutoRefreshEnabled,
   listAdBlockSources,
   addAdBlockSource,
   removeAdBlockSource,
@@ -608,6 +609,21 @@ export const setAdBlockIntervalAtom = atom(
     set(adBlockErrorAtom, null);
     try {
       await setAdBlockRefreshInterval(hours);
+      const state = await getAdBlockState();
+      set(adBlockStateAtom, state);
+    } catch (err) {
+      set(adBlockErrorAtom, extractErrorMessage(err));
+      throw err;
+    }
+  },
+);
+
+export const setAdBlockAutoRefreshEnabledAtom = atom(
+  null,
+  async (_get, set, enabled: boolean) => {
+    set(adBlockErrorAtom, null);
+    try {
+      await setAdBlockAutoRefreshEnabled(enabled);
       const state = await getAdBlockState();
       set(adBlockStateAtom, state);
     } catch (err) {

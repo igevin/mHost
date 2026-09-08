@@ -55,6 +55,8 @@ objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSRunningApplic
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# tokio::time::advance / start_paused for the refresh-task wake tests (issue #195)
+tokio = { workspace = true, features = ["test-util"] }
 uuid = { workspace = true }
 filetime = "0.2"
 hickory-proto = "0.24"
