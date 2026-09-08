@@ -309,8 +309,9 @@ describe("AdBlock", () => {
     mockGetAdBlockState.mockResolvedValue(state);
     renderWithProviders(<AdBlock />);
     await screen.findByText("Auto-refresh");
-    // Checkboxes in DOM order with no sources: [master, auto-refresh].
-    const autoRefreshToggle = screen.getAllByRole("checkbox")[1];
+    const autoRefreshToggle = screen.getByRole("checkbox", {
+      name: "Auto-refresh",
+    });
     expect(autoRefreshToggle).toBeChecked();
     await act(async () => {
       fireEvent.click(autoRefreshToggle);
@@ -331,7 +332,9 @@ describe("AdBlock", () => {
     // Re-enable via the toggle: the action re-fetches state; return an
     // enabled one so the select renders.
     mockGetAdBlockState.mockResolvedValue(makeState({ auto_refresh_enabled: true }));
-    const autoRefreshToggle = screen.getAllByRole("checkbox")[1];
+    const autoRefreshToggle = screen.getByRole("checkbox", {
+      name: "Auto-refresh",
+    });
     await act(async () => {
       fireEvent.click(autoRefreshToggle);
     });

@@ -545,11 +545,20 @@ pub async fn set_ad_block_enabled(
         let mut guard = state.ad_block_state.write().await;
         guard.enabled = enabled;
     }
+    // Issue #195 (review P1): the refresh task reads `enabled` after each
+    // tick — wake it so master-switch changes don't wait out the
+    // in-flight sleep, consistent with the other mutator IPCs.
+    state.ad_block_refresh_wake.notify_one();
     persist_and_reload(&state).await
 }
 
-/// Change the auto-refresh interval in hours. `0` disables background
-/// refresh (frontend shows a hint to refresh manually).
+/// Change the auto-refresh interval in hours. The new value applies to
+/// the *next* refresh wait (issue #195: an in-flight sleep is woken via
+/// `Notify` so it does not run to completion).
+///
+/// `0` parks the refresh task as a backend fallback (legacy "Manual
+/// only" state). Prefer `set_ad_block_auto_refresh_enabled` to toggle
+/// auto-refresh from the UI.
 #[tauri::command]
 pub async fn set_ad_block_refresh_interval(
     hours: u32,

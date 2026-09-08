@@ -426,6 +426,7 @@ function AdBlock() {
             <label className="toggle">
               <input
                 type="checkbox"
+                aria-label="Auto-refresh"
                 checked={state.auto_refresh_enabled}
                 onChange={(e) => handleAutoRefreshToggle(e.target.checked)}
                 disabled={isLoading}
@@ -452,7 +453,9 @@ function AdBlock() {
                     placeholder the select would misdisplay as "1 hour"
                     while nothing ever refreshes. */}
                 {state.refresh_interval_hours === 0 && (
-                  <option value="0">Choose interval…</option>
+                  <option value="0" disabled>
+                    Choose interval…
+                  </option>
                 )}
                 <option value="1">1 hour</option>
                 <option value="6">6 hours</option>
