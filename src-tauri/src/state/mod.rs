@@ -148,6 +148,19 @@ pub struct AppState {
     /// 生效；`spawn_ad_block_refresh_task` 在 spawn 前 swap 一个新 token
     /// 避免上次 token 的 stickiness 干扰下次启用（issue #138）。
     pub ad_block_refresh_cancel: Mutex<tokio_util::sync::CancellationToken>,
+    /// ad block 定时刷新 task 的"配置变更"唤醒信号（issue #195）。
+    ///
+    /// 改变刷新行为的 IPC（`set_ad_block_refresh_interval` /
+    /// `set_ad_block_auto_refresh_enabled`）在写完状态后 `notify_one()`，
+    /// 让正在 sleep / park 的刷新 task 立即醒来重读配置，而不是等当前
+    /// tick 的 sleep（最坏 168h）跑完才生效。
+    ///
+    /// `Notify` 而不是 cancel + respawn：#138 的 cancellation 协议依赖
+    /// "disable 时 token 被 cancel、enable 时 swap 新 token" 的时序，
+    /// respawn 路径与它耦合且有 swap 竞态风险；`Notify::notify_one()`
+    /// 在无等待者时保留一个 permit，IPC 与 task 循环之间的任意交错都
+    /// 不会丢唤醒。
+    pub ad_block_refresh_wake: Arc<tokio::sync::Notify>,
 }
 
 impl AppState {
@@ -254,6 +267,7 @@ impl AppState {
             )),
             ad_block_refresh_task: Mutex::new(None),
             ad_block_refresh_cancel: Mutex::new(tokio_util::sync::CancellationToken::new()),
+            ad_block_refresh_wake: Arc::new(tokio::sync::Notify::new()),
         };
 
         // 冷启动自动恢复（PR #131 review P1-1）：如果上次退出时
@@ -292,6 +306,7 @@ impl AppState {
                 &state.dns_server,
                 &state.storage,
                 &state.ad_block_refresh_cancel,
+                &state.ad_block_refresh_wake,
             );
         }
 
@@ -615,6 +630,7 @@ mod tests {
             ad_block_refresh_cancel: std::sync::Mutex::new(
                 tokio_util::sync::CancellationToken::new(),
             ),
+            ad_block_refresh_wake: std::sync::Arc::new(tokio::sync::Notify::new()),
         };
         (temp_dir, std::sync::Arc::new(state))
     }

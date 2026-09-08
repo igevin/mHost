@@ -59,6 +59,7 @@ export {
   fetchAdBlockStateAtom,
   toggleAdBlockEnabledAtom,
   setAdBlockIntervalAtom,
+  setAdBlockAutoRefreshEnabledAtom,
   addAdBlockSourceAtom,
   removeAdBlockSourceAtom,
   setAdBlockSourceEnabledAtom,

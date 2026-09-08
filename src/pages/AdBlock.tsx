@@ -11,6 +11,7 @@ import {
   fetchAdBlockStateAtom,
   toggleAdBlockEnabledAtom,
   setAdBlockIntervalAtom,
+  setAdBlockAutoRefreshEnabledAtom,
   addAdBlockSourceAtom,
   removeAdBlockSourceAtom,
   setAdBlockSourceEnabledAtom,
@@ -36,6 +37,7 @@ function AdBlock() {
   const fetchState = useSetAtom(fetchAdBlockStateAtom);
   const toggleEnabled = useSetAtom(toggleAdBlockEnabledAtom);
   const setInterval = useSetAtom(setAdBlockIntervalAtom);
+  const setAutoRefresh = useSetAtom(setAdBlockAutoRefreshEnabledAtom);
   const addSource = useSetAtom(addAdBlockSourceAtom);
   const removeSource = useSetAtom(removeAdBlockSourceAtom);
   const setSourceEnabled = useSetAtom(setAdBlockSourceEnabledAtom);
@@ -88,6 +90,13 @@ function AdBlock() {
       setInterval(hours).catch(() => {});
     },
     [setInterval],
+  );
+
+  const handleAutoRefreshToggle = useCallback(
+    (enabled: boolean) => {
+      setAutoRefresh(enabled).catch(() => {});
+    },
+    [setAutoRefresh],
   );
 
   if (!state) {
@@ -401,34 +410,59 @@ function AdBlock() {
           )}
         </div>
 
-        {/* Refresh interval */}
+        {/* Auto-refresh toggle + interval */}
         <div className="card">
-          <h2 className="card-title">Auto-refresh</h2>
-          <p className={styles.muted}>
-            Background refresh keeps sources up to date without manual
-            intervention. Set to 0 to disable (refresh manually instead).
-          </p>
-          <div className={`${styles.inlineForm} ${styles.sectionGap}`}>
-            <label className={`form-label ${styles.labelReset}`}>
-              Every
+          <div className={styles.bannerText}>
+            <div>
+              <div className={styles.bannerTitle}>Auto-refresh</div>
+              <div className={styles.muted}>
+                Background refresh keeps sources up to date without manual
+                intervention. Turn it off to refresh manually only.
+              </div>
+            </div>
+            {/* #192: before this toggle, `auto_refresh_enabled` was a dead
+                field — nothing could set it, and "Manual only" (interval=0)
+                was the only way to disable auto-refresh. */}
+            <label className="toggle">
+              <input
+                type="checkbox"
+                checked={state.auto_refresh_enabled}
+                onChange={(e) => handleAutoRefreshToggle(e.target.checked)}
+                disabled={isLoading}
+              />
+              <span className="toggle-slider" />
             </label>
-            <select
-              className={`input ${styles.width120}`}
-              value={state.refresh_interval_hours}
-              onChange={(e) =>
-                handleIntervalChange(parseInt(e.target.value, 10))
-              }
-              disabled={isLoading}
-            >
-              <option value="0">Manual only</option>
-              <option value="1">1 hour</option>
-              <option value="6">6 hours</option>
-              <option value="12">12 hours</option>
-              <option value="24">24 hours</option>
-              <option value="48">2 days</option>
-              <option value="168">1 week</option>
-            </select>
           </div>
+          {state.auto_refresh_enabled && (
+            <div className={`${styles.inlineForm} ${styles.sectionGap}`}>
+              <label className={`form-label ${styles.labelReset}`}>
+                Every
+              </label>
+              <select
+                className={`input ${styles.width120}`}
+                aria-label="Refresh interval"
+                value={state.refresh_interval_hours}
+                onChange={(e) =>
+                  handleIntervalChange(parseInt(e.target.value, 10))
+                }
+                disabled={isLoading}
+              >
+                {/* Legacy state from the pre-toggle UI ("Manual only" set
+                    interval=0 while auto stayed true): without this
+                    placeholder the select would misdisplay as "1 hour"
+                    while nothing ever refreshes. */}
+                {state.refresh_interval_hours === 0 && (
+                  <option value="0">Choose interval…</option>
+                )}
+                <option value="1">1 hour</option>
+                <option value="6">6 hours</option>
+                <option value="12">12 hours</option>
+                <option value="24">24 hours</option>
+                <option value="48">2 days</option>
+                <option value="168">1 week</option>
+              </select>
+            </div>
+          )}
         </div>
       </div>
     </div>

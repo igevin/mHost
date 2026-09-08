@@ -266,6 +266,10 @@ export async function setAdBlockRefreshInterval(hours: number): Promise<void> {
   return invoke<void>("set_ad_block_refresh_interval", { hours });
 }
 
+export async function setAdBlockAutoRefreshEnabled(enabled: boolean): Promise<void> {
+  return invoke<void>("set_ad_block_auto_refresh_enabled", { enabled });
+}
+
 export async function listAdBlockSources(): Promise<AdBlockSource[]> {
   return invoke<AdBlockSource[]>("list_ad_block_sources");
 }
