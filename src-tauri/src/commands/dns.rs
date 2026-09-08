@@ -1177,6 +1177,10 @@ pub(crate) fn spawn_ad_block_refresh_task(
             let (auto, interval_h) = match ad_block_state.try_read() {
                 Ok(g) => (g.auto_refresh_enabled, g.refresh_interval_hours),
                 Err(_) => {
+                    // Review N2: 1s is an arbitrary throttle, orders of
+                    // magnitude below the smallest meaningful interval
+                    // (1h floor) — its only job is to keep this retry
+                    // from busy-spinning while a writer holds the guard.
                     tokio::select! {
                         _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => continue,
                         _ = cancel.cancelled() => break,
@@ -1247,6 +1251,16 @@ pub(crate) fn spawn_ad_block_refresh_task(
             // completion after disable; the spawn_blocking step below is
             // the critical one (it mutates the server), and that's where
             // the self-check lives.
+            //
+            // Notify vs this whole fetch+reload section (review N1): the
+            // task is not parked on `wake.notified()` while it runs, so a
+            // `notify_one()` landing here cannot wake it mid-flight —
+            // `Notify` buffers it as a single permit instead. When the
+            // task loops back to the select at the top, the parked arm
+            // consumes the permit immediately and the loop re-reads the
+            // (already updated) config. At most one change is buffered,
+            // which is all we need: every iteration reads the LATEST
+            // state, so intermediate changes collapse into one re-read.
             crate::commands::adblock::fetch_sources_concurrent(
                 &storage,
                 &ad_block_state,
