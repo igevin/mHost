@@ -122,3 +122,33 @@ These are project invariants — do not weaken them:
 ## Release flow
 
 `.github/workflows/release.yml` triggers on `v*` tags. The matrix builds both `aarch64-apple-darwin` and `x86_64-apple-darwin`. `tauri-action@v0.6` produces a draft release (`prerelease: false`). To ship a release: tag, push, then publish the draft from the GitHub UI.
+
+## PR workflow — preserve the commit history
+
+**Never `git push --force` / `git commit --amend` on a PR branch that has had
+review activity.** Reviewers read individual commits (or the PR's commit
+list); rewriting history erases that trail and forces them to re-review the
+whole diff.
+
+When a follow-up change is needed on a branch that has reviews or comments:
+
+- Make the follow-up a **new commit** on top of the existing one (regular
+  `git push`), not an `amend`. Each commit should be self-contained and
+  `cargo fmt` / `clippy` / `tests` clean on its own.
+- For local-only cleanups before pushing the first version of a branch
+  (no review yet), amend freely. Once a review lands (even a "LGTM with
+  nits"), stop amending.
+- If a true history rewrite is unavoidable (e.g. a leaked secret), use
+  `--force-with-lease` and explicitly call out in the PR description
+  which commits were rewritten and why. Coordinate with the reviewer
+  before pushing.
+- The merge commit itself can be `--squash` — that's the maintainer's call
+  on landing, separate from the branch history during review.
+
+Rationale: PR #201 was rewritten three times via `--amend + push -f`
+(refactor → CI clippy fix → review test addition) and each rewrite
+zeroed the previous commit's SHA. Reviewers who clicked "view commit"
+on an earlier round saw a 404 once the force-push landed. The merged
+`aae8e00` on `master` is a squash anyway, so the lost history only
+matters for the in-flight review trail — but that trail is the whole
+point of having commits instead of one monolithic diff.
