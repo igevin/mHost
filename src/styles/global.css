@@ -253,6 +253,10 @@ body {
   min-height: 0;
   display: flex;
   flex-direction: column;
+  /* Issue #208: .mhostLayout/.mhostMain are overflow:hidden, so each page
+   * root is the only candidate scroll container. Without this, tall pages
+   * (e.g. AdBlock with several sources) get clipped with no scrollbar. */
+  overflow-y: auto;
 }
 
 .mhost-page-header {
