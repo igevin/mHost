@@ -6,6 +6,10 @@
   flex: 1;
   min-height: 0;
   max-width: none;
+  /* Issue #208: same as .mhost-page — with overflow:hidden ancestors this
+   * page root must scroll itself when fixed-height sections (info bar,
+   * header) plus the rules area exceed the viewport. */
+  overflow-y: auto;
 }
 
 /* ---- Info Bar (collapsible basic info) ---- */
