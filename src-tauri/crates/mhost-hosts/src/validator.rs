@@ -7,7 +7,12 @@ use std::collections::BTreeMap;
 /// - must not be empty
 /// - only letters, digits, hyphens, and dots are allowed
 /// - each label must not start or end with '-'
-/// - each label must not be all digits (to avoid accepting IP-like tokens as domains)
+/// - must not be an IP-lookalike token: composed entirely of digits and
+///   dots (covers `1.2.3.4`, partial forms like `1.2`, and bare `12345`).
+///   RFC 1123 permits all-numeric labels (e.g. `analytics.163.com`), so
+///   rejecting any all-numeric *label* was too strict — it silently
+///   dropped thousands of real rules when ingesting blocklists (issue
+///   #203).
 pub fn is_valid_domain(domain: &str) -> bool {
     if domain.is_empty() {
         return false;
@@ -21,14 +26,14 @@ pub fn is_valid_domain(domain: &str) -> bool {
     {
         return false;
     }
+    if domain.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        return false;
+    }
     for label in domain.split('.') {
         if label.is_empty() {
             return false;
         }
         if label.starts_with('-') || label.ends_with('-') {
-            return false;
-        }
-        if label.chars().all(|c| c.is_ascii_digit()) {
             return false;
         }
     }
@@ -140,9 +145,26 @@ mod tests {
             ("invalid_char", "bad@com", false),
             ("underscore", "bad_com", false),
             ("ends_with_dot", "example.com.", false),
-            ("all_digits_label", "123.456", false),
-            ("all_digits", "12345", false),
-            ("mixed_label", "123.example.com", false),
+            // IP-lookalike tokens (digits + dots only) are rejected...
+            ("ipv4_lookalike", "1.2.3.4", false),
+            ("partial_ip_two_labels", "1.2", false),
+            ("partial_ip_three_labels", "1.2.3", false),
+            ("bare_digits", "12345", false),
+            ("bare_numeric_label_zero", "0", false),
+            ("digits_dots_only", "0.0.0.0", false),
+            // ...but RFC 1123 all-numeric *labels* inside a real domain
+            // are valid — issue #203 (these were silently dropped from
+            // real-world blocklists before the fix).
+            ("numeric_tld_label", "analytics.163.com", true),
+            ("numeric_root_domain", "163.com", true),
+            ("zero_label_domain", "0.ackzany.com", true),
+            (
+                "numeric_prefix_and_suffix",
+                "0.0.0.0.creative.hpyrdr.com",
+                true,
+            ),
+            ("mixed_label", "123.example.com", true),
+            ("mixed_short", "3.cn", true),
         ];
 
         for (name, domain, expected) in cases {
