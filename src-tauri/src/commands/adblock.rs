@@ -71,17 +71,43 @@ static HTTP_AGENT: OnceLock<ureq::Agent> = OnceLock::new();
 
 fn http_agent() -> &'static ureq::Agent {
     HTTP_AGENT.get_or_init(|| {
+        // `http_status_as_error = false`: we want to inspect `304 Not Modified`
+        // ourselves (RFC 7232 conditional GET — issue #193) instead of having
+        // ureq collapse it into `Err(StatusCode(304))`. The trade-off is that
+        // 4xx/5xx must be handled explicitly below; that's the cost of one
+        // `if` for a working conditional-GET contract.
         ureq::Agent::config_builder()
             .user_agent(USER_AGENT)
             .timeout_global(Some(Duration::from_secs(FETCH_TIMEOUT_SECS)))
+            .http_status_as_error(false)
             .build()
             .into()
     })
 }
 
-/// Fetch `url` synchronously via the shared agent. Returns the raw body bytes
-/// plus the `ETag` header (if any), and rejects anything larger than
-/// `MAX_RESPONSE_BYTES`.
+/// Outcome of an ad-block source HTTP GET (issue #193).
+///
+/// `Fresh` means the upstream returned a 200 with a body we should cache;
+/// `NotModified` means a 304 to a conditional GET — the caller should keep
+/// the existing cache and only refresh the bookkeeping
+/// (`last_fetched_at` / clear `last_error`).
+#[derive(Debug)]
+pub(crate) enum FetchOutcome {
+    Fresh { body: Vec<u8>, etag: Option<String> },
+    NotModified,
+}
+
+/// Fetch `url` synchronously via the shared agent, optionally as a
+/// conditional GET (RFC 7232 — issue #193):
+///
+/// - `if_none_match` → emitted as `If-None-Match: <value>` when `Some`.
+/// - `if_modified_since` → emitted as `If-Modified-Since: <rfc7231 date>`
+///   when `Some`. Honored independently of `If-None-Match` (a server that
+///   supports only one will pick the relevant header).
+///
+/// Returns [`FetchOutcome::NotModified`] on `304 Not Modified` — no body is
+/// read in that branch. Returns the body + ETag on `200 OK`. Rejects anything
+/// larger than `MAX_RESPONSE_BYTES` and any 4xx/5xx as `MhostError`.
 ///
 /// Sync because `ureq` is sync; callers wrap in
 /// `tokio::task::spawn_blocking` (issue #180 — `ureq` replaced `reqwest`
@@ -89,10 +115,25 @@ fn http_agent() -> &'static ureq::Agent {
 /// built-in `Body::with_config().limit(...)` reader so a malicious or
 /// misconfigured source cannot blow past `MAX_RESPONSE_BYTES` even when
 /// the server lies about `Content-Length` (PR #131 review finding 1.8).
-fn fetch_source_sync(url: &str) -> Result<(Vec<u8>, Option<String>), MhostError> {
-    let mut resp = match http_agent().get(url).call() {
+fn fetch_source_sync(
+    url: &str,
+    if_none_match: Option<&str>,
+    if_modified_since: Option<&str>,
+) -> Result<FetchOutcome, MhostError> {
+    let mut req = http_agent().get(url);
+    if let Some(etag) = if_none_match {
+        req = req.header("If-None-Match", etag);
+    }
+    if let Some(date) = if_modified_since {
+        req = req.header("If-Modified-Since", date);
+    }
+
+    let mut resp = match req.call() {
         Ok(r) => r,
         Err(ureq::Error::StatusCode(code)) => {
+            // With `http_status_as_error = false` ureq shouldn't return this,
+            // but keep the arm so a future config flip doesn't silently lose
+            // the mapping.
             return Err(MhostError::ExternalApi(format!(
                 "fetch {} failed: HTTP {}",
                 url, code
@@ -102,6 +143,27 @@ fn fetch_source_sync(url: &str) -> Result<(Vec<u8>, Option<String>), MhostError>
             return Err(MhostError::Network(format!("network error: {}", e)));
         }
     };
+
+    let status = resp.status();
+    if status == 304 {
+        // RFC 7232 §4.1: 304 has no body. We don't trust `Content-Length` or
+        // try to read past it — `read_to_vec` on an empty body is a no-op.
+        // If the server sends `ETag` / `Last-Modified` headers on the 304 we
+        // ignore them: they're guaranteed to match what we already have.
+        return Ok(FetchOutcome::NotModified);
+    }
+
+    // `resp.status()` returns a `ureq::http::StatusCode` newtype (ureq 3
+    // re-exports the `http` crate). It only implements ordering against
+    // other `StatusCode`s, so compare via `as_u16()` — the 304 short-circuit
+    // above already handled the only status that warrants a bespoke path.
+    let status_u16 = status.as_u16();
+    if !(200..300).contains(&status_u16) {
+        return Err(MhostError::ExternalApi(format!(
+            "fetch {} failed: HTTP {}",
+            url, status_u16
+        )));
+    }
 
     let etag = resp
         .headers()
@@ -129,7 +191,7 @@ fn fetch_source_sync(url: &str) -> Result<(Vec<u8>, Option<String>), MhostError>
         .limit(MAX_RESPONSE_BYTES as u64)
         .read_to_vec()
         .map_err(|e| MhostError::Network(format!("read body error: {}", e)))?;
-    Ok((body, etag))
+    Ok(FetchOutcome::Fresh { body, etag })
 }
 
 // ---------------------------------------------------------------------------
@@ -345,17 +407,38 @@ fn parse_blocklist_domains(content: &str) -> Vec<String> {
 }
 
 /// Fetch a remote blocklist over HTTP(S), validate, and persist the raw
-/// content + parsed-domain count back into `state.sources[i]`. The hot-reload
-/// is the caller's responsibility (use `persist_and_reload` after).
+/// content + parsed-domain count back into the source record. The
+/// hot-reload is the caller's responsibility (use `persist_and_reload`
+/// after).
+///
+/// **Issue #194:** this used to be two near-identical copies of the same
+/// function (`fetch_and_cache_source` and `fetch_and_cache_source_internal`),
+/// differing only in whether they reached the storage root through
+/// `state.storage` or a passed-in `Arc<dyn Storage>`. They collapsed into
+/// a single function taking `Arc<dyn Storage + Send + Sync>` so future
+/// bug fixes (e.g. PR #131 P1-2) only have to land once.
+///
+/// **Issue #193:** the HTTP layer now supports RFC 7232 conditional GET.
+/// On `304 Not Modified` the on-disk cache is left untouched and only
+/// `last_fetched_at` is bumped (and `last_error` cleared) — saves the
+/// 5–15 MB re-download on every periodic refresh of an unchanged
+/// blocklist.
 pub(crate) async fn fetch_and_cache_source(
-    state: &AppState,
+    storage: &Arc<dyn mhost_storage::storage::Storage + Send + Sync>,
+    ad_block_state: &Arc<tokio::sync::RwLock<AdBlockState>>,
     source_id: &SourceId,
 ) -> Result<(), MhostError> {
-    // 1. Read the source record under the read lock.
-    let source_clone = {
-        let guard = state.ad_block_state.read().await;
+    // 1. Read the source record under the read lock. We capture both
+    //    the URL (for the fetch) and the previous ETag / last_fetched_at
+    //    (for the conditional GET — issue #193).
+    let (url, if_none_match, if_modified_since) = {
+        let guard = ad_block_state.read().await;
         match adblock_store::find_source(&guard, source_id) {
-            Some(s) => s.clone(),
+            Some(s) => (
+                s.url.clone(),
+                s.etag.clone(),
+                s.last_fetched_at.map(rfc7231_date),
+            ),
             None => {
                 return Err(MhostError::InvalidInput(format!(
                     "ad block source not found: {}",
@@ -365,83 +448,105 @@ pub(crate) async fn fetch_and_cache_source(
         }
     };
 
-    // 2. Fetch raw bytes via the shared ureq agent (issue #180), then
-    // parse + enforce rule cap and write the canonical cache. Both
-    // stages run inside a single `spawn_blocking` because ureq is sync
-    // and the parser is sync; the prior split-fetch-then-parse would
-    // needlessly bounce between the tokio worker pool and the blocking
-    // pool (issue #180 — `ureq` replaced `reqwest`).
+    // 2. Fused fetch + parse inside one `spawn_blocking` task (issue #180):
+    //    `ureq` and the parser are both sync, and the prior split-fetch-then-
+    //    parse would roundtrip through the tokio worker pool for no reason.
     //
-    // PR #131 re-review P1-2: record a fetch failure on the source's
-    // `last_error` before propagating — the parse-failure branch below
-    // already did this, but a network/size failure returned via `?` with no
-    // record, so the UI badge and the persisted state both stayed stale.
-    let url = source_clone.url.clone();
-    let root = state.storage.root().to_path_buf();
+    //    PR #131 re-review P1-2: a fetch failure used to bubble past
+    //    `record_fetch_error`, so the UI badge and the persisted state
+    //    both stayed stale. The `Err` branch below always records the
+    //    failure on `last_error` before propagating.
+    let root = storage.root().to_path_buf();
     let id_owned = source_id.clone();
-    type FetchParseResult = Result<(usize, Option<String>), MhostError>;
+    enum Parsed {
+        Fresh {
+            rule_count: usize,
+            etag: Option<String>,
+        },
+        NotModified,
+    }
+    type FetchParseResult = Result<Parsed, MhostError>;
     let fetch_parse: FetchParseResult = tokio::task::spawn_blocking(move || {
-        let (body, etag) = fetch_source_sync(&url)?;
-        let content_str = std::str::from_utf8(&body)
-            .map_err(|e| MhostError::InvalidInput(format!("response is not valid UTF-8: {}", e)))?;
-        let domains = parse_blocklist_domains(content_str);
-        if domains.len() > MAX_RULES_PER_SOURCE {
-            return Err(MhostError::InvalidInput(format!(
-                "source produced {} rules (limit: {})",
-                domains.len(),
-                MAX_RULES_PER_SOURCE
-            )));
+        let outcome =
+            fetch_source_sync(&url, if_none_match.as_deref(), if_modified_since.as_deref())?;
+        match outcome {
+            FetchOutcome::NotModified => Ok(Parsed::NotModified),
+            FetchOutcome::Fresh { body, etag } => {
+                let content_str = std::str::from_utf8(&body).map_err(|e| {
+                    MhostError::InvalidInput(format!("response is not valid UTF-8: {}", e))
+                })?;
+                let domains = parse_blocklist_domains(content_str);
+                if domains.len() > MAX_RULES_PER_SOURCE {
+                    return Err(MhostError::InvalidInput(format!(
+                        "source produced {} rules (limit: {})",
+                        domains.len(),
+                        MAX_RULES_PER_SOURCE
+                    )));
+                }
+                // Re-serialize as canonical hosts text so the cache is
+                // always valid hosts format (drops comments the original
+                // may have). Skipped entirely on 304 — see issue #193.
+                let canon = domains
+                    .iter()
+                    .map(|d| format!("0.0.0.0 {}", d))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                adblock_store::write_cache(&root, &id_owned, canon.as_bytes())?;
+                Ok(Parsed::Fresh {
+                    rule_count: domains.len(),
+                    etag,
+                })
+            }
         }
-        // Re-serialize as canonical hosts text so the cache is always
-        // valid hosts format (drops comments the original may have).
-        let canon = domains
-            .iter()
-            .map(|d| format!("0.0.0.0 {}", d))
-            .collect::<Vec<_>>()
-            .join("\n");
-        adblock_store::write_cache(&root, &id_owned, canon.as_bytes())?;
-        Ok((domains.len(), etag))
     })
     .await
     .map_err(|e| MhostError::Network(format!("fetch task failed: {}", e)))?;
 
-    let (rule_count, etag) = match fetch_parse {
-        Ok(v) => v,
-        Err(e) => {
-            // Persist the failure on the source so the UI can show it,
-            // but keep the previous cache intact for DNS to keep working.
-            record_fetch_error(state, source_id, &e.to_string()).await?;
-            return Err(e);
+    match fetch_parse {
+        Ok(Parsed::Fresh { rule_count, etag }) => {
+            // 200 OK path — full update: clear error, set fetched_at,
+            // rule_count, and the new ETag.
+            let mut guard = ad_block_state.write().await;
+            if let Some(s) = adblock_store::find_source_mut(&mut guard, source_id) {
+                s.last_error = None;
+                s.last_fetched_at = Some(Utc::now());
+                s.rule_count = rule_count;
+                s.etag = etag;
+            }
+            Ok(())
         }
-    };
-
-    // 4. Update source record: clear error, set fetched_at, rule_count, etag.
-    {
-        let mut guard = state.ad_block_state.write().await;
-        if let Some(s) = adblock_store::find_source_mut(&mut guard, source_id) {
-            s.last_error = None;
-            s.last_fetched_at = Some(Utc::now());
-            s.rule_count = rule_count;
-            s.etag = etag;
+        Ok(Parsed::NotModified) => {
+            // 304 path (issue #193): the cache is unchanged on disk, but
+            // we still want a fresh `last_fetched_at` so the UI doesn't
+            // look stale, and we want to clear any prior `last_error`
+            // since we just successfully round-tripped the upstream.
+            // `rule_count` and `etag` are intentionally NOT touched —
+            // they continue to reflect the cached payload.
+            let mut guard = ad_block_state.write().await;
+            if let Some(s) = adblock_store::find_source_mut(&mut guard, source_id) {
+                s.last_error = None;
+                s.last_fetched_at = Some(Utc::now());
+            }
+            Ok(())
+        }
+        Err(e) => {
+            // Network / size / parse failure: record on `last_error`,
+            // keep the previous cache intact for DNS to keep serving.
+            record_fetch_error(ad_block_state, source_id, &e.to_string()).await?;
+            Err(e)
         }
     }
-    Ok(())
 }
 
 /// Persist an error string onto a source's `last_error` field. Does NOT
 /// touch `last_fetched_at` or `rule_count` — those reflect the last
 /// successful fetch and should be preserved on failure.
+///
+/// **Issue #194:** used to be two near-identical functions, one
+/// AppState-shaped and one Arc-shaped, with the AppState variant just
+/// unwrapping the Arc. Collapsed into a single Arc-shaped entry point
+/// (callers pass `&state.ad_block_state`).
 pub(crate) async fn record_fetch_error(
-    state: &AppState,
-    source_id: &SourceId,
-    err: &str,
-) -> Result<(), MhostError> {
-    record_fetch_error_internal(&state.ad_block_state, source_id, err).await
-}
-
-/// `AppState`-free variant for the background refresh task (which clones
-/// just the Arcs it needs at spawn time).
-pub(crate) async fn record_fetch_error_internal(
     ad_block_state: &Arc<tokio::sync::RwLock<AdBlockState>>,
     source_id: &SourceId,
     err: &str,
@@ -453,75 +558,16 @@ pub(crate) async fn record_fetch_error_internal(
     Ok(())
 }
 
-/// `AppState`-free variant of `fetch_and_cache_source` for the background
-/// refresh task. Skips the proxy detection of "is DNS still on" — that's
-/// checked at the call site in `dns.rs` before invoking this.
-pub(crate) async fn fetch_and_cache_source_internal(
-    storage: &Arc<dyn mhost_storage::storage::Storage + Send + Sync>,
-    ad_block_state: &Arc<tokio::sync::RwLock<AdBlockState>>,
-    source_id: &SourceId,
-) -> Result<(), MhostError> {
-    let source_clone = {
-        let guard = ad_block_state.read().await;
-        match adblock_store::find_source(&guard, source_id) {
-            Some(s) => s.clone(),
-            None => {
-                return Err(MhostError::InvalidInput(format!(
-                    "ad block source not found: {}",
-                    source_id
-                )))
-            }
-        }
-    };
-
-    // Fused fetch + parse inside one `spawn_blocking` task (issue #180):
-    // `ureq` and the parser are both sync, and the prior split-fetch-then-parse
-    // would roundtrip through the tokio worker pool for no reason.
-    let url = source_clone.url.clone();
-    let root = storage.root().to_path_buf();
-    let id_owned = source_id.clone();
-    type FetchParseResult = Result<(usize, Option<String>), MhostError>;
-    let fetch_parse: FetchParseResult = tokio::task::spawn_blocking(move || {
-        let (body, etag) = fetch_source_sync(&url)?;
-        let content_str = std::str::from_utf8(&body)
-            .map_err(|e| MhostError::InvalidInput(format!("response is not valid UTF-8: {}", e)))?;
-        let domains = parse_blocklist_domains(content_str);
-        if domains.len() > MAX_RULES_PER_SOURCE {
-            return Err(MhostError::InvalidInput(format!(
-                "source produced {} rules (limit: {})",
-                domains.len(),
-                MAX_RULES_PER_SOURCE
-            )));
-        }
-        let canon = domains
-            .iter()
-            .map(|d| format!("0.0.0.0 {}", d))
-            .collect::<Vec<_>>()
-            .join("\n");
-        adblock_store::write_cache(&root, &id_owned, canon.as_bytes())?;
-        Ok((domains.len(), etag))
-    })
-    .await
-    .map_err(|e| MhostError::Network(format!("fetch task failed: {}", e)))?;
-
-    let (rule_count, etag) = match fetch_parse {
-        Ok(v) => v,
-        Err(e) => {
-            record_fetch_error_internal(ad_block_state, source_id, &e.to_string()).await?;
-            return Err(e);
-        }
-    };
-
-    {
-        let mut guard = ad_block_state.write().await;
-        if let Some(s) = adblock_store::find_source_mut(&mut guard, source_id) {
-            s.last_error = None;
-            s.last_fetched_at = Some(Utc::now());
-            s.rule_count = rule_count;
-            s.etag = etag;
-        }
-    }
-    Ok(())
+/// Format `dt` as an RFC 7231 IMF-fixdate string for use in the
+/// `If-Modified-Since` request header (issue #193). Example output:
+/// `Sun, 06 Nov 1994 08:49:37 GMT`.
+///
+/// `chrono::DateTime::to_rfc2822()` produces a similar shape but uses
+/// `+0000` for UTC instead of `GMT`, which some servers reject. The
+/// IMF-fixdate format is the only one the RFC mandates servers MUST
+/// accept.
+fn rfc7231_date(dt: chrono::DateTime<chrono::Utc>) -> String {
+    dt.format("%a, %d %b %Y %H:%M:%S GMT").to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -677,7 +723,7 @@ pub(crate) async fn add_ad_block_source_impl(
     // fetch failure, so the source existed only in memory and was lost
     // on restart. Persist unconditionally first (capturing `last_error`
     // too), then surface the fetch error to the toast.
-    let fetch_result = fetch_and_cache_source(state, &new_id).await;
+    let fetch_result = fetch_and_cache_source(&state.storage, &state.ad_block_state, &new_id).await;
     persist_and_reload(state).await?;
     fetch_result?;
 
@@ -746,7 +792,7 @@ pub async fn set_ad_block_source_response(
 // Refresh (concurrent)
 // ---------------------------------------------------------------------------
 
-/// Fan out `fetch_and_cache_source_internal` over `source_ids` with bounded
+/// Fan out `fetch_and_cache_source` over `source_ids` with bounded
 /// concurrency. Per-source errors are recorded on `last_error` (preserving
 /// the existing semantics) so the caller doesn't have to propagate.
 ///
@@ -777,8 +823,8 @@ pub(crate) async fn fetch_sources_concurrent(
             // Permit drops at end of task → slot released regardless of
             // success/failure.
             let _permit = permit;
-            if let Err(e) = fetch_and_cache_source_internal(&storage, &ad_block_state, &id).await {
-                let _ = record_fetch_error_internal(&ad_block_state, &id, &e.to_string()).await;
+            if let Err(e) = fetch_and_cache_source(&storage, &ad_block_state, &id).await {
+                let _ = record_fetch_error(&ad_block_state, &id, &e.to_string()).await;
                 eprintln!("[adblock] concurrent refresh source {} failed: {}", id, e);
             }
         }));
@@ -804,7 +850,8 @@ pub async fn refresh_ad_block_source(
     // unconditionally so `last_error` is captured on disk, then surface the
     // fetch error. The source already exists on disk here, so this is about
     // not losing the error state rather than not losing the source.
-    let fetch_result = fetch_and_cache_source(&state, &source_id).await;
+    let fetch_result =
+        fetch_and_cache_source(&state.storage, &state.ad_block_state, &source_id).await;
     persist_and_reload(&state).await?;
     fetch_result?;
     let snap = state.ad_block_state.read().await;
@@ -1334,5 +1381,670 @@ mod tests {
             persisted.sources[0].last_error.is_some(),
             "last_error must be recorded on the persisted source"
         );
+    }
+
+    /// Pick a free TCP port by binding to port 0.
+    fn pick_free_tcp_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind free TCP port");
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        port
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #193: RFC 7232 conditional GET on ad-block sources.
+    //
+    // These tests use a minimal in-process TCP mock HTTP server so they
+    // don't depend on any external crate (no `wiremock` / `httpmock` — those
+    // would inflate the dev-dependency footprint for what's effectively a
+    // ~80-line helper). The mock is single-threaded, FIFO over a
+    // `Mutex<VecDeque<Response>>`, and never sends back a real HTTP/1.1
+    // `Content-Length`-aware body — it's just enough to exercise ureq's
+    // 304 contract.
+    // -----------------------------------------------------------------
+
+    /// One canned response from the mock server.
+    #[derive(Clone)]
+    struct MockResponse {
+        status: u16,
+        /// Headers to emit before the body (already pre-formatted lines,
+        /// e.g. `"ETag: \"v1\""` — joined onto the response as-is).
+        headers: Vec<String>,
+        body: Vec<u8>,
+    }
+
+    impl MockResponse {
+        fn ok_200(etag: &str, body: &[u8]) -> Self {
+            Self {
+                status: 200,
+                headers: vec![
+                    // `format!`-vs-`.to_string()`: with no interpolation
+                    // the lint `clippy::useless_format` (Rust 1.98+) flags
+                    // `format!("literal")` as redundant.
+                    "Content-Type: text/plain".to_string(),
+                    format!("Content-Length: {}", body.len()),
+                    format!("ETag: {}", etag),
+                ],
+                body: body.to_vec(),
+            }
+        }
+
+        fn not_modified_304() -> Self {
+            Self {
+                status: 304,
+                headers: vec![],
+                body: Vec::new(),
+            }
+        }
+    }
+
+    /// Records a single request the mock received.
+    #[derive(Clone, Debug, Default)]
+    struct RecordedRequest {
+        method: String,
+        path: String,
+        if_none_match: Option<String>,
+        if_modified_since: Option<String>,
+    }
+
+    /// Spawn a mock HTTP/1.1 server on `127.0.0.1:<port>`. Each accepted
+    /// connection pulls the next response off `responses` (FIFO). Returns
+    /// the join handle plus a shared `Vec<RecordedRequest>` for assertions.
+    ///
+    /// The handler thread loops until `stop_flag` is set; tests drop the
+    /// `Arc<AtomicBool>` to stop it before exiting.
+    fn spawn_mock_http(
+        port: u16,
+        responses: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<MockResponse>>>,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> (
+        std::thread::JoinHandle<()>,
+        std::sync::Arc<std::sync::Mutex<Vec<RecordedRequest>>>,
+    ) {
+        let recorded: std::sync::Arc<std::sync::Mutex<Vec<RecordedRequest>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded_clone = recorded.clone();
+        let listener =
+            std::net::TcpListener::bind(("127.0.0.1", port)).expect("bind mock listener");
+        listener
+            .set_nonblocking(false)
+            .expect("set blocking listener");
+        let handle = std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                // Read until we see CRLFCRLF (end of headers). Cap at 8 KB
+                // to avoid unbounded reads from a misbehaving client — ureq
+                // sends a tiny request.
+                let mut buf = [0u8; 8192];
+                let mut received = Vec::new();
+                loop {
+                    use std::io::Read;
+                    match stream.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            received.extend_from_slice(&buf[..n]);
+                            if received.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                            if received.len() >= buf.len() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let req_text = String::from_utf8_lossy(&received);
+                let mut rec = RecordedRequest::default();
+                for (i, line) in req_text.lines().enumerate() {
+                    if i == 0 {
+                        // "GET /path HTTP/1.1"
+                        let mut parts = line.split_whitespace();
+                        rec.method = parts.next().unwrap_or("").to_string();
+                        rec.path = parts.next().unwrap_or("").to_string();
+                    } else if line.is_empty() {
+                        break;
+                    } else {
+                        // HTTP header names are case-insensitive — ureq
+                        // emits lowercase, but a real upstream might emit
+                        // `If-None-Match`. Match by lowercased prefix.
+                        let lower = line.to_ascii_lowercase();
+                        if let Some(v) = lower.strip_prefix("if-none-match:") {
+                            // Re-slice the *original* line to keep the value
+                            // case intact (etag values are case-sensitive).
+                            let v = &line[line.len() - v.len()..];
+                            rec.if_none_match = Some(v.trim().to_string());
+                        } else if let Some(v) = lower.strip_prefix("if-modified-since:") {
+                            let v = &line[line.len() - v.len()..];
+                            rec.if_modified_since = Some(v.trim().to_string());
+                        }
+                    }
+                }
+                recorded_clone.lock().unwrap().push(rec);
+
+                let resp = responses
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("test ran out of canned responses");
+                let reason = match resp.status {
+                    200 => "OK",
+                    304 => "Not Modified",
+                    _ => "Status",
+                };
+                let mut head = format!(
+                    "HTTP/1.1 {} {}\r\nConnection: close\r\n",
+                    resp.status, reason
+                );
+                for h in &resp.headers {
+                    head.push_str(&format!("{}\r\n", h));
+                }
+                head.push_str("\r\n");
+                use std::io::Write;
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(&resp.body);
+                let _ = stream.flush();
+                // `drop(stream)` closes the connection so ureq's response
+                // reader sees EOF and finishes.
+            }
+        });
+        (handle, recorded)
+    }
+
+    /// Helper: write a tiny valid hosts blocklist into the adblock cache
+    /// for `source_id` (so the 304 path has something to *not* overwrite).
+    fn write_canonical_cache_for(
+        root: &std::path::Path,
+        source_id: &SourceId,
+        body: &str,
+    ) -> std::time::SystemTime {
+        use mhost_storage::adblock as adblock_store;
+        adblock_store::write_cache(root, source_id, body.as_bytes()).unwrap();
+        // Stash an mtime the test can later compare against. The cache
+        // path mirrors `adblock_store::cache_path`; we can't call the
+        // private helper from a test in another crate, but the layout is
+        // pinned by the storage module — see `adblock.rs`.
+        let p = root
+            .join("adblock-cache")
+            .join(format!("{}.txt", source_id.0));
+        let mtime = filetime::FileTime::now();
+        filetime::set_file_mtime(&p, mtime).unwrap();
+        mtime.into()
+    }
+
+    // -- The tests ----------------------------------------------------------
+
+    /// Issue #193: the first fetch returns `Fresh` (200 + ETag + body) and
+    /// persists the ETag on the source record.
+    #[tokio::test]
+    async fn fetch_source_sync_returns_fresh_on_200() {
+        let port = pick_free_tcp_port();
+        let body = b"0.0.0.0 example.com";
+        let responses = std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::VecDeque::from(vec![MockResponse::ok_200("\"v1\"", body)]),
+        ));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_h, recorded) = spawn_mock_http(port, responses, stop.clone());
+
+        let url = format!("http://127.0.0.1:{}/list", port);
+        let outcome = tokio::task::spawn_blocking(move || fetch_source_sync(&url, None, None))
+            .await
+            .unwrap()
+            .expect("fetch should succeed");
+
+        match outcome {
+            FetchOutcome::Fresh { body: got, etag } => {
+                assert_eq!(got, body);
+                assert_eq!(etag.as_deref(), Some("\"v1\""));
+            }
+            FetchOutcome::NotModified => panic!("first fetch must be Fresh"),
+        }
+
+        // No conditional headers on a first fetch.
+        let recs = recorded.lock().unwrap();
+        assert_eq!(recs.len(), 1);
+        assert!(recs[0].if_none_match.is_none());
+        assert!(recs[0].if_modified_since.is_none());
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Issue #193: with an ETag already on the source record, the next
+    /// fetch sends `If-None-Match: <etag>`. When the upstream replies 304,
+    /// the function returns `NotModified` and does NOT consume any body.
+    #[tokio::test]
+    async fn fetch_source_sync_returns_not_modified_on_304() {
+        let port = pick_free_tcp_port();
+        let responses = std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::VecDeque::from(vec![MockResponse::not_modified_304()]),
+        ));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_h, recorded) = spawn_mock_http(port, responses, stop.clone());
+
+        let url = format!("http://127.0.0.1:{}/list", port);
+        let outcome = tokio::task::spawn_blocking(move || {
+            fetch_source_sync(&url, Some("\"v1\""), Some("Sun, 06 Nov 1994 08:49:37 GMT"))
+        })
+        .await
+        .unwrap()
+        .expect("304 should not be an error");
+
+        assert!(
+            matches!(outcome, FetchOutcome::NotModified),
+            "expected NotModified, got {:?}",
+            outcome
+        );
+
+        // Both conditional headers should have been forwarded.
+        let recs = recorded.lock().unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].if_none_match.as_deref(), Some("\"v1\""));
+        assert_eq!(
+            recs[0].if_modified_since.as_deref(),
+            Some("Sun, 06 Nov 1994 08:49:37 GMT")
+        );
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Issue #193: end-to-end — first call writes the cache and stores
+    /// the ETag; second call hits a 304 from the upstream, and the on-disk
+    /// cache file is NOT touched (mtime unchanged).
+    #[tokio::test]
+    async fn fetch_and_cache_source_304_leaves_cache_untouched() {
+        use mhost_storage::adblock as adblock_store;
+        use mhost_storage::storage::FileStorage;
+
+        let port = pick_free_tcp_port();
+        // First call: 200 + body + ETag. Second call: 304.
+        let initial_body = b"0.0.0.0 ads.example.com";
+        let responses = std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::VecDeque::from(vec![
+                MockResponse::ok_200("\"v1\"", initial_body),
+                MockResponse::not_modified_304(),
+            ]),
+        ));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_h, recorded) = spawn_mock_http(port, responses, stop.clone());
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = std::sync::Arc::new(FileStorage::new(temp.path()))
+            as std::sync::Arc<dyn mhost_storage::storage::Storage + Send + Sync>;
+        let ad_block_state = std::sync::Arc::new(tokio::sync::RwLock::new(AdBlockState::default()));
+
+        // Seed one source pointing at the mock URL, no prior cache.
+        let source_id = SourceId(uuid::Uuid::new_v4());
+        {
+            let mut g = ad_block_state.write().await;
+            g.sources.push(AdBlockSource {
+                source_id: source_id.clone(),
+                name: "test".into(),
+                url: format!("http://127.0.0.1:{}/list", port),
+                enabled: true,
+                response: AdBlockResponse::ZeroAddress,
+                last_fetched_at: None,
+                last_error: None,
+                rule_count: 0,
+                etag: None,
+            });
+        }
+
+        // First call: should write cache + persist the etag.
+        fetch_and_cache_source(&storage, &ad_block_state, &source_id)
+            .await
+            .expect("first fetch should succeed");
+
+        let snap_after_first = {
+            let g = ad_block_state.read().await;
+            adblock_store::find_source(&g, &source_id).cloned().unwrap()
+        };
+        assert_eq!(snap_after_first.etag.as_deref(), Some("\"v1\""));
+        assert_eq!(snap_after_first.rule_count, 1);
+        assert!(snap_after_first.last_error.is_none());
+        let first_fetched_at = snap_after_first.last_fetched_at.expect("set on 200");
+
+        // Stash the cache file mtime and contents.
+        let cache_path = temp
+            .path()
+            .join("adblock-cache")
+            .join(format!("{}.txt", source_id.0));
+        assert!(cache_path.exists(), "first fetch should write cache");
+        let mtime_before = std::fs::metadata(&cache_path).unwrap().modified().unwrap();
+        let body_before = std::fs::read(&cache_path).unwrap();
+        assert_eq!(body_before, initial_body);
+
+        // Sleep enough that any rewrite would bump the mtime. `filetime`
+        // has 1-second resolution on some filesystems, so use 1.5 s.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+        // Second call: 304 from upstream. Cache must NOT be rewritten,
+        // and `last_fetched_at` should advance.
+        fetch_and_cache_source(&storage, &ad_block_state, &source_id)
+            .await
+            .expect("304 should be a success");
+
+        // Cache file unchanged.
+        let mtime_after = std::fs::metadata(&cache_path).unwrap().modified().unwrap();
+        let body_after = std::fs::read(&cache_path).unwrap();
+        assert_eq!(
+            mtime_after, mtime_before,
+            "cache file mtime must NOT change on a 304 (issue #193)"
+        );
+        assert_eq!(body_after, initial_body);
+
+        // Source record: etag + rule_count preserved, last_fetched_at bumped,
+        // last_error still None.
+        let snap_after_second = {
+            let g = ad_block_state.read().await;
+            adblock_store::find_source(&g, &source_id).cloned().unwrap()
+        };
+        assert_eq!(
+            snap_after_second.etag, snap_after_first.etag,
+            "etag must NOT change on a 304"
+        );
+        assert_eq!(
+            snap_after_second.rule_count, snap_after_first.rule_count,
+            "rule_count must NOT change on a 304"
+        );
+        assert!(
+            snap_after_second.last_error.is_none(),
+            "304 must clear any prior last_error"
+        );
+        assert!(
+            snap_after_second.last_fetched_at.unwrap() > first_fetched_at,
+            "last_fetched_at must advance on a 304"
+        );
+
+        // The mock should have seen BOTH requests with If-None-Match set
+        // on the second one.
+        let recs = recorded.lock().unwrap();
+        assert_eq!(recs.len(), 2);
+        assert!(
+            recs[0].if_none_match.is_none(),
+            "first request should not carry conditional headers"
+        );
+        assert_eq!(
+            recs[1].if_none_match.as_deref(),
+            Some("\"v1\""),
+            "second request must echo the cached ETag"
+        );
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Issue #193: when the upstream returns 200 again (etag mismatch /
+    /// upstream rolled forward), the cache is rewritten with the new body
+    /// and the new ETag is persisted. This is the "etag stale" path —
+    /// distinct from the 304 path and worth pinning down so future refactors
+    /// don't accidentally take it.
+    #[tokio::test]
+    async fn fetch_and_cache_source_overwrites_on_etag_mismatch() {
+        use mhost_storage::adblock as adblock_store;
+        use mhost_storage::storage::FileStorage;
+
+        let port = pick_free_tcp_port();
+        let new_body = b"0.0.0.0 new-ads.example.com";
+        let responses = std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::VecDeque::from(vec![MockResponse::ok_200("\"v2\"", new_body)]),
+        ));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_h, _recorded) = spawn_mock_http(port, responses, stop.clone());
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = std::sync::Arc::new(FileStorage::new(temp.path()))
+            as std::sync::Arc<dyn mhost_storage::storage::Storage + Send + Sync>;
+        let ad_block_state = std::sync::Arc::new(tokio::sync::RwLock::new(AdBlockState::default()));
+        let source_id = SourceId(uuid::Uuid::new_v4());
+
+        // Pre-seed: source with a stale `etag` + a stale cache file.
+        {
+            let mut g = ad_block_state.write().await;
+            g.sources.push(AdBlockSource {
+                source_id: source_id.clone(),
+                name: "stale".into(),
+                url: format!("http://127.0.0.1:{}/list", port),
+                enabled: true,
+                response: AdBlockResponse::ZeroAddress,
+                last_fetched_at: None,
+                last_error: None,
+                rule_count: 0,
+                etag: Some("\"v0-stale\"".to_string()),
+            });
+        }
+        // Plant a stale cache file so we can assert it gets overwritten.
+        let stale_body = b"0.0.0.0 old-ads.example.com";
+        write_canonical_cache_for(
+            temp.path(),
+            &source_id,
+            std::str::from_utf8(stale_body).unwrap(),
+        );
+        let cache_path = temp
+            .path()
+            .join("adblock-cache")
+            .join(format!("{}.txt", source_id.0));
+        let mtime_before = std::fs::metadata(&cache_path).unwrap().modified().unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+        fetch_and_cache_source(&storage, &ad_block_state, &source_id)
+            .await
+            .expect("200 should succeed");
+
+        let snap = {
+            let g = ad_block_state.read().await;
+            adblock_store::find_source(&g, &source_id).cloned().unwrap()
+        };
+        assert_eq!(snap.etag.as_deref(), Some("\"v2\""));
+        assert_eq!(snap.rule_count, 1);
+        let body = std::fs::read(&cache_path).unwrap();
+        assert_eq!(body, new_body, "cache must be overwritten on fresh 200");
+        let mtime_after = std::fs::metadata(&cache_path).unwrap().modified().unwrap();
+        assert!(
+            mtime_after > mtime_before,
+            "cache file mtime should advance when content is rewritten"
+        );
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Issue #193 — `If-Modified-Since` only (no prior ETag) is also a
+    /// valid conditional GET. The first fetch produces no conditional
+    /// headers; the second fetch sends `If-Modified-Since` derived from
+    /// the source's `last_fetched_at`. A 304 response clears `last_error`
+    /// and bumps `last_fetched_at` (round-trip time recorded as
+    /// "successful handshake with upstream"), without touching the cache.
+    #[tokio::test]
+    async fn fetch_and_cache_source_uses_if_modified_sans_when_no_etag() {
+        use mhost_storage::adblock as adblock_store;
+        use mhost_storage::storage::FileStorage;
+
+        let port = pick_free_tcp_port();
+        let responses = std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::VecDeque::from(vec![MockResponse::not_modified_304()]),
+        ));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_h, recorded) = spawn_mock_http(port, responses, stop.clone());
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = std::sync::Arc::new(FileStorage::new(temp.path()))
+            as std::sync::Arc<dyn mhost_storage::storage::Storage + Send + Sync>;
+        let ad_block_state = std::sync::Arc::new(tokio::sync::RwLock::new(AdBlockState::default()));
+        let source_id = SourceId(uuid::Uuid::new_v4());
+        let prior_fetch = chrono::Utc::now() - chrono::Duration::hours(1);
+        {
+            let mut g = ad_block_state.write().await;
+            g.sources.push(AdBlockSource {
+                source_id: source_id.clone(),
+                name: "test".into(),
+                url: format!("http://127.0.0.1:{}/list", port),
+                enabled: true,
+                response: AdBlockResponse::ZeroAddress,
+                last_fetched_at: Some(prior_fetch),
+                last_error: Some("prior boom".into()),
+                rule_count: 7,
+                etag: None, // no etag → If-None-Match will be omitted
+            });
+        }
+
+        fetch_and_cache_source(&storage, &ad_block_state, &source_id)
+            .await
+            .expect("304 should succeed");
+
+        let snap = {
+            let g = ad_block_state.read().await;
+            adblock_store::find_source(&g, &source_id).cloned().unwrap()
+        };
+        // last_error cleared on the successful 304 round-trip.
+        assert!(snap.last_error.is_none(), "304 must clear last_error");
+        // rule_count preserved — we did NOT parse a new body.
+        assert_eq!(snap.rule_count, 7);
+        // last_fetched_at advanced past the seeded prior_fetch.
+        assert!(snap.last_fetched_at.unwrap() > prior_fetch);
+
+        // Recorded request: no If-None-Match (etag was None), but
+        // If-Modified-Since should be present.
+        let recs = recorded.lock().unwrap();
+        assert_eq!(recs.len(), 1);
+        assert!(recs[0].if_none_match.is_none());
+        assert!(
+            recs[0].if_modified_since.is_some(),
+            "If-Modified-Since should be sent when source has a prior fetch time"
+        );
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    // -----------------------------------------------------------------
+    // Review of #201: when the agent flipped `http_status_as_error`
+    // from default-true to false, the 4xx/5xx → `MhostError::ExternalApi`
+    // mapping stopped being a built-in ureq default and became a
+    // hand-rolled `!(200..300)` check on the response status. This
+    // test pins that contract down — the failure message must mention
+    // the status code, and the error must surface to the caller (the
+    // fetch path then records it on `last_error` via `record_fetch_error`).
+    //
+    // Catches regressions where:
+    //   - the range check is inverted,
+    //   - 304 starts being treated as an error again,
+    //   - someone re-enables `http_status_as_error(true)` on the shared
+    //     agent and the call site is no longer reached for non-2xx.
+    // -----------------------------------------------------------------
+    #[tokio::test]
+    async fn fetch_source_sync_maps_4xx_5xx_to_external_api() {
+        // 404 — client error. Pick a status that, under ureq defaults,
+        // would have come back as `Err(StatusCode(404))`. With the
+        // agent configured `http_status_as_error(false)` it now arrives
+        // as `Ok(response)` with `status() == 404`, which is exactly
+        // what exercises the hand-rolled range check.
+        for &status in &[403u16, 404, 500, 502, 503] {
+            let port = pick_free_tcp_port();
+            let responses = std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::VecDeque::from(vec![MockResponse {
+                    status,
+                    headers: vec!["Content-Length: 0".to_string()],
+                    body: Vec::new(),
+                }]),
+            ));
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (_h, _recorded) = spawn_mock_http(port, responses, stop.clone());
+
+            let url = format!("http://127.0.0.1:{}/anything", port);
+            let outcome = tokio::task::spawn_blocking(move || fetch_source_sync(&url, None, None))
+                .await
+                .unwrap();
+
+            let err = outcome.expect_err(&format!(
+                "HTTP {} should be an error, not a Fresh/NotModified",
+                status
+            ));
+            // Catch `Fresh` regressing (e.g. someone removing the range
+            // check), or `NotModified` regressing (304 handler swallowing
+            // other statuses).
+            let msg = err.to_string();
+            assert!(
+                msg.contains("HTTP") && msg.contains(&status.to_string()),
+                "HTTP {} → expected ExternalApi mentioning the status; got: {}",
+                status,
+                msg
+            );
+
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Same contract, but wired through the higher-level
+    /// `fetch_and_cache_source` to confirm the error reaches
+    /// `record_fetch_error` and surfaces on the source's `last_error`.
+    /// Without this, a 500 from upstream would leave the UI badge stale
+    /// — exactly the PR #131 P1-2 bug class.
+    #[tokio::test]
+    async fn fetch_and_cache_source_records_5xx_on_last_error() {
+        use mhost_storage::storage::FileStorage;
+
+        let port = pick_free_tcp_port();
+        let responses = std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::VecDeque::from(vec![MockResponse {
+                status: 503,
+                headers: vec!["Content-Length: 0".to_string()],
+                body: Vec::new(),
+            }]),
+        ));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_h, _recorded) = spawn_mock_http(port, responses, stop.clone());
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = std::sync::Arc::new(FileStorage::new(temp.path()))
+            as std::sync::Arc<dyn mhost_storage::storage::Storage + Send + Sync>;
+        let ad_block_state = std::sync::Arc::new(tokio::sync::RwLock::new(AdBlockState::default()));
+        let source_id = SourceId(uuid::Uuid::new_v4());
+        {
+            let mut g = ad_block_state.write().await;
+            g.sources.push(AdBlockSource {
+                source_id: source_id.clone(),
+                name: "flaky-upstream".into(),
+                url: format!("http://127.0.0.1:{}/list", port),
+                enabled: true,
+                response: AdBlockResponse::ZeroAddress,
+                last_fetched_at: None,
+                last_error: None,
+                rule_count: 0,
+                etag: None,
+            });
+        }
+
+        let err = fetch_and_cache_source(&storage, &ad_block_state, &source_id)
+            .await
+            .expect_err("503 should propagate as an error");
+        assert!(
+            err.to_string().contains("503"),
+            "503 must surface in the error message, got: {}",
+            err
+        );
+
+        // PR #131 P1-2 invariant: fetch failure → `last_error` populated
+        // on the source, prior state preserved (no cache written).
+        let snap = {
+            let g = ad_block_state.read().await;
+            mhost_storage::adblock::find_source(&g, &source_id)
+                .cloned()
+                .unwrap()
+        };
+        assert!(
+            snap.last_error.is_some(),
+            "last_error must be set when upstream returns 5xx"
+        );
+        assert!(
+            snap.last_error.as_deref().unwrap().contains("503"),
+            "last_error should mention the upstream status: {:?}",
+            snap.last_error
+        );
+        // Nothing else moved — `etag`, `rule_count`, `last_fetched_at`
+        // stay at their pre-fetch values.
+        assert!(snap.etag.is_none());
+        assert_eq!(snap.rule_count, 0);
+        assert!(snap.last_fetched_at.is_none());
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }

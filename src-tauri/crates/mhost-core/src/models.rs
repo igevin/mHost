@@ -236,9 +236,8 @@ pub struct AdBlockSource {
     pub last_error: Option<String>,
     /// Number of rules parsed from the last successful fetch.
     pub rule_count: usize,
-    /// HTTP ETag from the last successful fetch (reserved for future
-    /// conditional GETs — unused in v1 but persisted so we don't need a
-    /// migration when conditional fetch lands).
+    /// HTTP ETag from the last successful fetch (used for conditional GETs —
+    /// see issue #193 / `commands::adblock::fetch_source_sync`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub etag: Option<String>,
 }
