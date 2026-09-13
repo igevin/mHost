@@ -306,6 +306,18 @@ export async function setAdBlockSourceResponse(
   });
 }
 
+/** Issue #207: raise (`limit`) or revoke (`null`) a source's rules-cap
+ * override. The retry is a separate call to `refreshAdBlockSource`. */
+export async function setAdBlockSourceRulesLimitOverride(
+  sourceId: string,
+  limit: number | null,
+): Promise<AdBlockSource> {
+  return invoke<AdBlockSource>("set_ad_block_source_rules_limit_override", {
+    sourceId,
+    limit,
+  });
+}
+
 export async function refreshAdBlockSource(
   sourceId: string,
 ): Promise<AdBlockSource> {

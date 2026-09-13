@@ -240,6 +240,18 @@ pub struct AdBlockSource {
     /// see issue #193 / `commands::adblock::fetch_source_sync`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub etag: Option<String>,
+    /// Per-source raise of the global rules cap (issue #207). `None` → the
+    /// global `MAX_RULES_PER_SOURCE` default applies. Set from the UI's
+    /// one-click override on an over-limit fetch failure; must never exceed
+    /// the backend's absolute cap. Fail-closed contract: an over-limit fetch
+    /// is rejected whole — the parser never truncates.
+    ///
+    /// Unlike the bookkeeping fields above this is serialized
+    /// unconditionally (always emits `null` when unset) so the frontend sees
+    /// a stable `number | null` — the `skip_serializing_if` + truthy-check
+    /// mismatch was the root cause of issue #202.
+    #[serde(default)]
+    pub rules_limit_override: Option<usize>,
 }
 
 /// Persistent state for the DNS-mode ad block subsystem.
@@ -845,11 +857,15 @@ mod tests {
             last_error: None,
             rule_count: 0,
             etag: None,
+            rules_limit_override: None,
         };
         let json = serde_json::to_string(&source).unwrap();
         assert!(!json.contains("last_fetched_at"));
         assert!(!json.contains("last_error"));
         assert!(!json.contains("etag"));
+        // #207: unlike the fields above, `rules_limit_override` is serialized
+        // unconditionally so the frontend sees a stable `number | null`.
+        assert!(json.contains("rules_limit_override"));
         let restored: AdBlockSource = serde_json::from_str(&json).unwrap();
         assert_eq!(source, restored);
     }
@@ -866,6 +882,7 @@ mod tests {
             last_error: Some("timeout".to_string()),
             rule_count: 42,
             etag: Some("W/\"abc\"".to_string()),
+            rules_limit_override: Some(612_003),
         };
         let json = serde_json::to_string(&source).unwrap();
         assert!(json.contains("last_fetched_at"));
@@ -899,6 +916,7 @@ mod tests {
                 last_error: None,
                 rule_count: 100,
                 etag: None,
+                rules_limit_override: None,
             }],
             whitelist: vec!["trusted.example.com".to_string()],
             auto_refresh_enabled: true,
@@ -907,6 +925,39 @@ mod tests {
         let json = serde_json::to_string(&state).unwrap();
         let restored: AdBlockState = serde_json::from_str(&json).unwrap();
         assert_eq!(state, restored);
+    }
+
+    // Issue #207: `rules_limit_override` round-trips as an unconditional
+    // `number | null`, and legacy JSON that predates the field still
+    // deserializes (`#[serde(default)]` → `None`) — the pre-#207
+    // `adblock.json` on user machines has no such key.
+    #[test]
+    fn test_ad_block_source_rules_limit_override_serde() {
+        let source = AdBlockSource {
+            source_id: SourceId(Uuid::new_v4()),
+            name: "Big".to_string(),
+            url: "https://example.com/big.txt".to_string(),
+            enabled: true,
+            response: AdBlockResponse::ZeroAddress,
+            last_fetched_at: None,
+            last_error: None,
+            rule_count: 612_003,
+            etag: None,
+            rules_limit_override: Some(612_003),
+        };
+        let json = serde_json::to_string(&source).unwrap();
+        assert!(json.contains("\"rules_limit_override\":612003"), "{}", json);
+        let restored: AdBlockSource = serde_json::from_str(&json).unwrap();
+        assert_eq!(source, restored);
+
+        // Legacy document without the key → None.
+        let legacy = format!(
+            "{{\"source_id\":\"{}\",\"name\":\"L\",\"url\":\"https://x\",\
+             \"enabled\":true,\"response\":\"zero_address\",\"rule_count\":1}}",
+            Uuid::new_v4()
+        );
+        let restored: AdBlockSource = serde_json::from_str(&legacy).unwrap();
+        assert_eq!(restored.rules_limit_override, None);
     }
 
     // -----------------------------------------------------------------------

@@ -244,3 +244,17 @@
   font-size: 12px;
   padding: 2px 6px;
 }
+
+/* Issue #207: one-click rules-limit override row on an over-limit source. */
+.limitOverrideRow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+  flex-wrap: wrap;
+}
+
+.limitResetBtn {
+  font-size: 12px;
+  padding: 0 4px;
+}

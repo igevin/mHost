@@ -864,6 +864,7 @@ mod tests {
             last_error: None,
             rule_count: 0,
             etag: None,
+            rules_limit_override: None,
         };
         let st = mhost_core::AdBlockState {
             enabled: true, // master switch on — the tick's only observable is the fetch error
@@ -1266,6 +1267,10 @@ pub(crate) fn spawn_ad_block_refresh_task(
                 &ad_block_state,
                 &ids,
                 crate::commands::adblock::REFRESH_CONCURRENCY,
+                // Periodic background refresh keeps conditional GETs
+                // (issue #206 design note 1): only user-initiated refreshes
+                // force a full re-fetch.
+                false,
             )
             .await;
 
