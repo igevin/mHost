@@ -29,6 +29,7 @@ import {
   removeAdBlockSource,
   setAdBlockSourceEnabled,
   setAdBlockSourceResponse,
+  setAdBlockSourceRulesLimitOverride,
   refreshAdBlockSource,
   refreshAllAdBlockSources,
   listAdBlockWhitelist,
@@ -692,6 +693,43 @@ export const setAdBlockSourceResponseAtom = atom(
     } catch (err) {
       set(adBlockErrorAtom, extractErrorMessage(err));
       throw err;
+    }
+  },
+);
+
+export const setAdBlockSourceRulesLimitOverrideAtom = atom(
+  null,
+  async (_get, set, args: { sourceId: string; limit: number | null }) => {
+    set(adBlockErrorAtom, null);
+    try {
+      await setAdBlockSourceRulesLimitOverride(args.sourceId, args.limit);
+      const state = await getAdBlockState();
+      set(adBlockStateAtom, state);
+    } catch (err) {
+      set(adBlockErrorAtom, extractErrorMessage(err));
+      throw err;
+    }
+  },
+);
+
+// Issue #207: one-click override on an over-limit fetch failure — writes
+// the per-source cap, then retries through the existing refresh path so
+// there is no second refresh implementation.
+export const overrideAdBlockSourceRulesLimitAtom = atom(
+  null,
+  async (_get, set, args: { sourceId: string; limit: number }) => {
+    set(isAdBlockLoadingAtom, true);
+    set(adBlockErrorAtom, null);
+    try {
+      await setAdBlockSourceRulesLimitOverride(args.sourceId, args.limit);
+      await refreshAdBlockSource(args.sourceId);
+      const state = await getAdBlockState();
+      set(adBlockStateAtom, state);
+    } catch (err) {
+      set(adBlockErrorAtom, extractErrorMessage(err));
+      throw err;
+    } finally {
+      set(isAdBlockLoadingAtom, false);
     }
   },
 );

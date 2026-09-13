@@ -22,6 +22,9 @@ const mockAddAdBlockWhitelist = vi.fn().mockResolvedValue([]);
 const mockRemoveAdBlockWhitelist = vi.fn().mockResolvedValue([]);
 const mockSetAdBlockRefreshInterval = vi.fn().mockResolvedValue(undefined);
 const mockSetAdBlockAutoRefreshEnabled = vi.fn().mockResolvedValue(undefined);
+const mockSetAdBlockSourceRulesLimitOverride = vi
+  .fn()
+  .mockResolvedValue({});
 
 vi.mock("../../lib/tauri", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../lib/tauri")>();
@@ -33,6 +36,8 @@ vi.mock("../../lib/tauri", async (importOriginal) => {
     removeAdBlockSource: (...args: unknown[]) => mockRemoveAdBlockSource(...args),
     setAdBlockSourceEnabled: (...args: unknown[]) => mockSetAdBlockSourceEnabled(...args),
     setAdBlockSourceResponse: (...args: unknown[]) => mockSetAdBlockSourceResponse(...args),
+    setAdBlockSourceRulesLimitOverride: (...args: unknown[]) =>
+      mockSetAdBlockSourceRulesLimitOverride(...args),
     refreshAdBlockSource: (...args: unknown[]) => mockRefreshAdBlockSource(...args),
     refreshAllAdBlockSources: (...args: unknown[]) => mockRefreshAllAdBlockSources(...args),
     addAdBlockWhitelist: (...args: unknown[]) => mockAddAdBlockWhitelist(...args),
@@ -71,6 +76,7 @@ function makeSource(overrides: Partial<AdBlockSource> = {}): AdBlockSource {
     last_error: null,
     rule_count: 100,
     etag: null,
+    rules_limit_override: null,
     ...overrides,
   };
 }
@@ -176,6 +182,71 @@ describe("AdBlock", () => {
     renderWithProviders(<AdBlock />);
     expect(await screen.findByText("fetch failed")).toBeInTheDocument();
     expect(screen.getByText(/timeout/)).toBeInTheDocument();
+  });
+
+  // ---- issue #207: per-source rules-limit override ----
+  it("offers the one-click override when last_error is an over-limit rejection", async () => {
+    const src = makeSource({
+      last_error: "source produced 612003 rules (limit: 500000)",
+    });
+    const state = makeState({ sources: [src] });
+    setStore((s) => s.set(adBlockStateAtom, state));
+    mockGetAdBlockState.mockResolvedValue(state);
+    renderWithProviders(<AdBlock />);
+
+    const btn = await screen.findByRole("button", {
+      name: /Allow 612,003 rules & retry/,
+    });
+    await act(async () => {
+      fireEvent.click(btn);
+    });
+    // Override written with the actual parsed count…
+    expect(mockSetAdBlockSourceRulesLimitOverride).toHaveBeenCalledWith(
+      "src-1",
+      612003,
+    );
+    // …then retried through the existing refresh path.
+    expect(mockRefreshAdBlockSource).toHaveBeenCalledWith("src-1");
+  });
+
+  it("does not offer an override above the absolute cap", async () => {
+    const src = makeSource({
+      last_error: "source produced 2500000 rules (limit: 500000)",
+    });
+    const state = makeState({ sources: [src] });
+    setStore((s) => s.set(adBlockStateAtom, state));
+    mockGetAdBlockState.mockResolvedValue(state);
+    renderWithProviders(<AdBlock />);
+    await screen.findByText("fetch failed");
+    expect(
+      screen.queryByRole("button", { name: /Allow .* rules & retry/ }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows the raised limit and a reset action when an override is set", async () => {
+    const src = makeSource({
+      rules_limit_override: 612003,
+      rule_count: 612003,
+    });
+    const state = makeState({ sources: [src] });
+    setStore((s) => s.set(adBlockStateAtom, state));
+    mockGetAdBlockState.mockResolvedValue(state);
+    renderWithProviders(<AdBlock />);
+
+    expect(
+      await screen.findByText(/limit 612,003 \(manually raised\)/),
+    ).toBeInTheDocument();
+    const reset = screen.getByRole("button", {
+      name: /Reset rule limit to default/,
+    });
+    await act(async () => {
+      fireEvent.click(reset);
+    });
+    // Revoking passes `null`, not `undefined` — the #202 bug class.
+    expect(mockSetAdBlockSourceRulesLimitOverride).toHaveBeenCalledWith(
+      "src-1",
+      null,
+    );
   });
 
   // ---- issue #134: master switch ----

@@ -270,6 +270,25 @@ impl AppState {
             ad_block_refresh_wake: Arc::new(tokio::sync::Notify::new()),
         };
 
+        // Issue #206 design note 2: startup orphan-cache sweep. The
+        // `adblock-cache/` dir is keyed by `source_id`, but a state-file
+        // corruption / recovery can leave files behind with no live owner
+        // (see the `adblock.json.corrupt-*` backup path). Best-effort: a
+        // failed sweep only logs — stale orphans are dead weight, not a
+        // correctness problem. `try_read` (not `blocking_read`) — we're
+        // inside the async runtime and just constructed the lock; there is
+        // no contention this early.
+        match state
+            .ad_block_state
+            .try_read()
+            .map(|snapshot| mhost_storage::adblock::sweep_orphan_caches(&storage_root, &snapshot))
+        {
+            Ok(Ok(0)) => {}
+            Ok(Ok(n)) => eprintln!("[mHost] ad-block cache sweep removed {} orphan file(s)", n),
+            Ok(Err(e)) => eprintln!("[mHost] ad-block cache sweep failed: {}", e),
+            Err(_) => eprintln!("[mHost] ad-block cache sweep skipped: state lock contended"),
+        }
+
         // 冷启动自动恢复（PR #131 review P1-1）：如果上次退出时
         // dns_enabled=true，DNS server 已经起来 + 持久化的 ad-block
         // 状态已加载；立即 hot-reload 当前规则到刚构造的 engine，并启动

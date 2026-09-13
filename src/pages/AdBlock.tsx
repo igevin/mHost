@@ -16,6 +16,8 @@ import {
   removeAdBlockSourceAtom,
   setAdBlockSourceEnabledAtom,
   setAdBlockSourceResponseAtom,
+  setAdBlockSourceRulesLimitOverrideAtom,
+  overrideAdBlockSourceRulesLimitAtom,
   refreshAdBlockSourceAtom,
   refreshAllAdBlockSourcesAtom,
   addAdBlockWhitelistAtom,
@@ -25,6 +27,25 @@ import { useNavigate } from "react-router-dom";
 import { useWebKitPointerDown } from "../hooks/useWebKitPointerDown";
 import type { AdBlockResponse } from "../types";
 import styles from "./AdBlock.module.css";
+
+// Issue #207: parse "source produced N rules (limit: M)" out of
+// `last_error` so the card can offer a one-click override with the actual
+// numbers. Must mirror the backend error format in
+// `src-tauri/src/commands/adblock.rs::fetch_and_cache_source`.
+const OVER_LIMIT_RE = /source produced (\d+) rules \(limit: (\d+)\)/;
+// Mirror of `ABSOLUTE_MAX_RULES_PER_SOURCE` (commands/adblock.rs): lists
+// above this are rejected outright and MUST NOT get an override entry.
+const ABSOLUTE_MAX_RULES_PER_SOURCE = 2_000_000;
+
+function parseOverLimitError(lastError: string): { actual: number } | null {
+  const match = OVER_LIMIT_RE.exec(lastError);
+  if (!match) return null;
+  const actual = parseInt(match[1], 10);
+  if (Number.isNaN(actual) || actual <= 0) return null;
+  // Above the absolute cap there is no way out — don't render the button.
+  if (actual > ABSOLUTE_MAX_RULES_PER_SOURCE) return null;
+  return { actual };
+}
 
 function AdBlock() {
   const state = useAtomValue(adBlockStateAtom);
@@ -42,6 +63,8 @@ function AdBlock() {
   const removeSource = useSetAtom(removeAdBlockSourceAtom);
   const setSourceEnabled = useSetAtom(setAdBlockSourceEnabledAtom);
   const setSourceResponse = useSetAtom(setAdBlockSourceResponseAtom);
+  const overrideSourceLimit = useSetAtom(overrideAdBlockSourceRulesLimitAtom);
+  const resetSourceLimit = useSetAtom(setAdBlockSourceRulesLimitOverrideAtom);
   const refreshSource = useSetAtom(refreshAdBlockSourceAtom);
   const refreshAll = useSetAtom(refreshAllAdBlockSourcesAtom);
   const addWhitelist = useSetAtom(addAdBlockWhitelistAtom);
@@ -281,6 +304,8 @@ function AdBlock() {
                       <div className={styles.sourceMeta}>{src.url}</div>
                       <div className={styles.sourceMeta}>
                         {src.rule_count.toLocaleString()} rules
+                        {src.rules_limit_override != null &&
+                          ` · limit ${src.rules_limit_override.toLocaleString()} (manually raised)`}
                         {src.last_fetched_at &&
                           ` · fetched ${new Date(src.last_fetched_at).toLocaleString()}`}
                         {src.last_error && (
@@ -292,6 +317,58 @@ function AdBlock() {
                           </>
                         )}
                       </div>
+
+                      {/* Issue #207: one-click way out for legitimately huge
+                          lists. The backend stays fail-closed (no truncation);
+                          this raises the per-source cap to the actual parsed
+                          count and retries through the normal refresh path. */}
+                      {(() => {
+                        const over =
+                          src.last_error != null
+                            ? parseOverLimitError(src.last_error)
+                            : null;
+                        if (!over) return null;
+                        return (
+                          <div className={styles.limitOverrideRow}>
+                            <span className={styles.muted}>
+                              This list has {over.actual.toLocaleString()}{" "}
+                              rules — above the default cap.
+                            </span>
+                            <button
+                              className="btn btn-sm btn-primary"
+                              onClick={() =>
+                                overrideSourceLimit({
+                                  sourceId: src.source_id,
+                                  limit: over.actual,
+                                }).catch(() => {})
+                              }
+                              disabled={isLoading}
+                              onPointerDown={onPointerDown(() => {})}
+                            >
+                              Allow {over.actual.toLocaleString()} rules &amp;
+                              retry
+                            </button>
+                          </div>
+                        );
+                      })()}
+
+                      {src.rules_limit_override != null && (
+                        <div className={styles.limitOverrideRow}>
+                          <button
+                            className={`btn btn-sm btn-ghost ${styles.limitResetBtn}`}
+                            onClick={() =>
+                              resetSourceLimit({
+                                sourceId: src.source_id,
+                                limit: null,
+                              }).catch(() => {})
+                            }
+                            disabled={isLoading}
+                            onPointerDown={onPointerDown(() => {})}
+                          >
+                            Reset rule limit to default
+                          </button>
+                        </div>
+                      )}
                     </div>
 
                     <div className={styles.sourceActions}>

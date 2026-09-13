@@ -65,6 +65,12 @@ export interface AdBlockSource {
   last_error: string | null;
   rule_count: number;
   etag: string | null;
+  /**
+   * Per-source raise of the global rules cap (issue #207). Serialized
+   * unconditionally by the backend (always `null` when unset), so no
+   * undefined-vs-null mismatch here (cf. issue #202).
+   */
+  rules_limit_override: number | null;
 }
 
 export interface AdBlockState {

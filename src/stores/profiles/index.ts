@@ -64,6 +64,8 @@ export {
   removeAdBlockSourceAtom,
   setAdBlockSourceEnabledAtom,
   setAdBlockSourceResponseAtom,
+  setAdBlockSourceRulesLimitOverrideAtom,
+  overrideAdBlockSourceRulesLimitAtom,
   refreshAdBlockSourceAtom,
   refreshAllAdBlockSourcesAtom,
   addAdBlockWhitelistAtom,

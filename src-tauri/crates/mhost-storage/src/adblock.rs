@@ -139,7 +139,11 @@ fn cache_dir(root: &Path) -> PathBuf {
     root.join(CACHE_DIR)
 }
 
-fn cache_path(root: &Path, source_id: &SourceId) -> PathBuf {
+/// On-disk path of a source's cache file (`{root}/adblock-cache/{id}.txt`).
+/// Public so the command layer can `stat` the cache on the 304 path
+/// (issue #206 finding 2) and sweep orphan files at startup (issue #206
+/// design note 2) without re-hardcoding the layout.
+pub fn cache_path(root: &Path, source_id: &SourceId) -> PathBuf {
     let id_str = source_id.to_string();
     // SourceId wraps a UUID; the rendered form is hex + dashes, so neither
     // `/` nor `\` can appear. The assert is belt-and-suspenders against any
@@ -179,6 +183,49 @@ pub fn delete_cache(root: &Path, source_id: &SourceId) -> io::Result<()> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
     }
+}
+
+/// Delete cache files under `adblock-cache/` that have no matching source in
+/// `state` (issue #206 design note 2 — startup orphan sweep).
+///
+/// The cache dir is keyed by `source_id`, but a state-file corruption /
+/// recovery (see the `adblock.json.corrupt-*` backup path) can leave files
+/// behind with no live owner — they are dead weight forever after. A
+/// `*.txt` file is an orphan when its stem is not a parseable UUID or not
+/// in `state.sources`. Non-`.txt` entries (e.g. `.DS_Store`) are left
+/// alone. Returns the number of files removed.
+pub fn sweep_orphan_caches(root: &Path, state: &AdBlockState) -> io::Result<usize> {
+    let mut removed = 0;
+    let entries = match fs::read_dir(cache_dir(root)) {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("txt") {
+            continue;
+        }
+        // Compare the stem against the rendered `SourceId` strings instead
+        // of parsing a UUID — keeps `uuid` a dev-only dependency here. A
+        // stem that doesn't render-match any live id (non-UUID junk or a
+        // purged source) is an orphan either way.
+        let stem = path.file_stem().and_then(|s| s.to_str());
+        let live = stem
+            .map(|s| {
+                state
+                    .sources
+                    .iter()
+                    .any(|src| src.source_id.to_string() == s)
+            })
+            .unwrap_or(false);
+        if !live {
+            fs::remove_file(&path)?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
 }
 
 // ---------------------------------------------------------------------------
@@ -231,6 +278,7 @@ mod tests {
             last_error: None,
             rule_count: 0,
             etag: None,
+            rules_limit_override: None,
         }
     }
 
@@ -254,6 +302,45 @@ mod tests {
         write_state(temp.path(), &state).unwrap();
         let restored = read_state(temp.path()).unwrap();
         assert_eq!(state, restored);
+    }
+
+    // Issue #206 design note 2: startup orphan-cache sweep — cache files
+    // with no live owner (purged source, post-corruption rebuild) are
+    // removed; live caches and non-.txt entries are left alone.
+    #[test]
+    fn sweep_orphan_caches_removes_unowned_files() {
+        let temp = TempDir::new().unwrap();
+        let mut state = AdBlockState::default();
+        let live = sample_source("live");
+        state.sources.push(live.clone());
+
+        write_cache(temp.path(), &live.source_id, b"0.0.0.0 kept.example.com").unwrap();
+        // Orphan: a source that no longer exists in state.
+        let orphan = SourceId(uuid::Uuid::new_v4());
+        write_cache(temp.path(), &orphan, b"0.0.0.0 orphan.example.com").unwrap();
+        // Orphan: junk that doesn't even render as a UUID stem.
+        std::fs::write(temp.path().join(CACHE_DIR).join("not-a-uuid.txt"), b"junk").unwrap();
+        // Non-.txt entries are ignored (e.g. notes.md), whatever their name.
+        std::fs::write(temp.path().join(CACHE_DIR).join("notes.md"), b"x").unwrap();
+
+        let removed = sweep_orphan_caches(temp.path(), &state).unwrap();
+        assert_eq!(removed, 2, "orphan uuid cache + junk stem are removed");
+        assert!(
+            cache_path(temp.path(), &live.source_id).exists(),
+            "live source's cache must survive the sweep"
+        );
+        assert!(!cache_path(temp.path(), &orphan).exists());
+        assert!(
+            temp.path().join(CACHE_DIR).join("notes.md").exists(),
+            "non-.txt entries must not be touched"
+        );
+    }
+
+    #[test]
+    fn sweep_orphan_caches_is_noop_without_cache_dir() {
+        let temp = TempDir::new().unwrap();
+        let state = AdBlockState::default();
+        assert_eq!(sweep_orphan_caches(temp.path(), &state).unwrap(), 0);
     }
 
     #[test]
