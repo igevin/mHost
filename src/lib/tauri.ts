@@ -9,6 +9,7 @@ import type {
   DnsStatus,
   ProfileMode,
   AdBlockState,
+  AdBlockLimits,
   AdBlockSource,
   AdBlockResponse,
 } from "../types";
@@ -256,6 +257,12 @@ export async function listDnsProfiles(): Promise<Profile[]> {
 
 export async function getAdBlockState(): Promise<AdBlockState> {
   return invoke<AdBlockState>("get_ad_block_state");
+}
+
+/** Issue #211-3: the backend's compile-time ad-block limits (single source
+ * of truth for the override-entry gating in the UI). */
+export async function getAdBlockLimits(): Promise<AdBlockLimits> {
+  return invoke<AdBlockLimits>("get_ad_block_limits");
 }
 
 export async function setAdBlockEnabled(enabled: boolean): Promise<void> {

@@ -229,16 +229,26 @@ pub struct AdBlockSource {
     pub enabled: bool,
     pub response: AdBlockResponse,
     /// RFC 3339 timestamp of the last successful fetch. `None` if never fetched.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    ///
+    /// **Issue #202:** the `Option` fields on this struct serialize
+    /// unconditionally (always emit `null` when unset) — the previous
+    /// `#[serde(skip_serializing_if = "Option::is_none")]` made the wire
+    /// value `undefined` while the frontend type claimed `string | null`,
+    /// and `undefined !== null` checks produced the permanent false-positive
+    /// error banner. `#[serde(default)]` keeps old documents that predate
+    /// the key deserializing as `None`.
+    #[serde(default)]
     pub last_fetched_at: Option<DateTime<Utc>>,
     /// Last fetch error message (transport or non-2xx). Cleared on next success.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Always serialized — see the #202 note on `last_fetched_at`.
+    #[serde(default)]
     pub last_error: Option<String>,
     /// Number of rules parsed from the last successful fetch.
     pub rule_count: usize,
     /// HTTP ETag from the last successful fetch (used for conditional GETs —
     /// see issue #193 / `commands::adblock::fetch_source_sync`).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Always serialized — see the #202 note on `last_fetched_at`.
+    #[serde(default)]
     pub etag: Option<String>,
     /// Per-source raise of the global rules cap (issue #207). `None` → the
     /// global `MAX_RULES_PER_SOURCE` default applies. Set from the UI's
@@ -246,10 +256,8 @@ pub struct AdBlockSource {
     /// the backend's absolute cap. Fail-closed contract: an over-limit fetch
     /// is rejected whole — the parser never truncates.
     ///
-    /// Unlike the bookkeeping fields above this is serialized
-    /// unconditionally (always emits `null` when unset) so the frontend sees
-    /// a stable `number | null` — the `skip_serializing_if` + truthy-check
-    /// mismatch was the root cause of issue #202.
+    /// Always serialized for the same #202 reason; `#[serde(default)]`
+    /// accepts documents written before the field existed.
     #[serde(default)]
     pub rules_limit_override: Option<usize>,
 }
@@ -845,8 +853,12 @@ mod tests {
         );
     }
 
+    // Issue #202: the Option fields serialize unconditionally — "no value"
+    // must reach the wire as an explicit `null`, never an omitted key
+    // (which the frontend would see as `undefined` despite the TS type
+    // claiming `| null`).
     #[test]
-    fn test_ad_block_source_serde_skips_none_optionals() {
+    fn test_ad_block_source_serde_nulls_none_optionals() {
         let source = AdBlockSource {
             source_id: SourceId(Uuid::new_v4()),
             name: "StevenBlack".to_string(),
@@ -860,12 +872,10 @@ mod tests {
             rules_limit_override: None,
         };
         let json = serde_json::to_string(&source).unwrap();
-        assert!(!json.contains("last_fetched_at"));
-        assert!(!json.contains("last_error"));
-        assert!(!json.contains("etag"));
-        // #207: unlike the fields above, `rules_limit_override` is serialized
-        // unconditionally so the frontend sees a stable `number | null`.
-        assert!(json.contains("rules_limit_override"));
+        assert!(json.contains("\"last_fetched_at\":null"), "{}", json);
+        assert!(json.contains("\"last_error\":null"), "{}", json);
+        assert!(json.contains("\"etag\":null"), "{}", json);
+        assert!(json.contains("\"rules_limit_override\":null"), "{}", json);
         let restored: AdBlockSource = serde_json::from_str(&json).unwrap();
         assert_eq!(source, restored);
     }

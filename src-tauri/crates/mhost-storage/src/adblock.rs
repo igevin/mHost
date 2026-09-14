@@ -190,10 +190,17 @@ pub fn delete_cache(root: &Path, source_id: &SourceId) -> io::Result<()> {
 ///
 /// The cache dir is keyed by `source_id`, but a state-file corruption /
 /// recovery (see the `adblock.json.corrupt-*` backup path) can leave files
-/// behind with no live owner — they are dead weight forever after. A
-/// `*.txt` file is an orphan when its stem is not a parseable UUID or not
-/// in `state.sources`. Non-`.txt` entries (e.g. `.DS_Store`) are left
-/// alone. Returns the number of files removed.
+/// behind with no live owner — they are dead weight forever after. Per
+/// issue #211, the sweep keeps **only** files named `<live-source-id>.txt`;
+/// everything else goes: orphan `*.txt` from purged sources, junk stems,
+/// and `atomic_write` leftovers from a hard-killed process — note
+/// `tempfile::NamedTempFile` writes dot-prefixed names (`.tmpXXXXXX`)
+/// *without* an extension, so matching by `*.tmp` would miss them. The
+/// sweep runs at startup, before the refresh task spawns and before IPC
+/// serves, so no in-flight write can be caught mid-rename. `.DS_Store`
+/// from Finder is deleted too and harmlessly regenerates.
+///
+/// Returns the number of files removed.
 pub fn sweep_orphan_caches(root: &Path, state: &AdBlockState) -> io::Result<usize> {
     let mut removed = 0;
     let entries = match fs::read_dir(cache_dir(root)) {
@@ -204,20 +211,18 @@ pub fn sweep_orphan_caches(root: &Path, state: &AdBlockState) -> io::Result<usiz
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("txt") {
-            continue;
-        }
-        // Compare the stem against the rendered `SourceId` strings instead
-        // of parsing a UUID — keeps `uuid` a dev-only dependency here. A
-        // stem that doesn't render-match any live id (non-UUID junk or a
-        // purged source) is an orphan either way.
-        let stem = path.file_stem().and_then(|s| s.to_str());
-        let live = stem
-            .map(|s| {
-                state
-                    .sources
-                    .iter()
-                    .any(|src| src.source_id.to_string() == s)
+        // A file is live iff its name is exactly `<rendered SourceId>.txt`.
+        // String comparison (not UUID parsing) keeps `uuid` a dev-only
+        // dependency here; a name that doesn't render-match any live id is
+        // an orphan, temp leftover, or junk either way.
+        let file_name = path.file_name().and_then(|s| s.to_str());
+        let live = file_name
+            .map(|name| {
+                name.ends_with(".txt")
+                    && state
+                        .sources
+                        .iter()
+                        .any(|src| format!("{}.txt", src.source_id) == name)
             })
             .unwrap_or(false);
         if !live {
@@ -304,9 +309,11 @@ mod tests {
         assert_eq!(state, restored);
     }
 
-    // Issue #206 design note 2: startup orphan-cache sweep — cache files
-    // with no live owner (purged source, post-corruption rebuild) are
-    // removed; live caches and non-.txt entries are left alone.
+    // Issue #206 design note 2 + #211: startup orphan-cache sweep — the
+    // dir converges to exactly the live working set: cache files with no
+    // live owner, junk stems, temp leftovers (dot-prefixed `.tmpXXXXXX`
+    // from a hard-killed atomic_write, and explicit `.tmp` names), and
+    // stray non-cache files are all removed.
     #[test]
     fn sweep_orphan_caches_removes_unowned_files() {
         let temp = TempDir::new().unwrap();
@@ -320,20 +327,22 @@ mod tests {
         write_cache(temp.path(), &orphan, b"0.0.0.0 orphan.example.com").unwrap();
         // Orphan: junk that doesn't even render as a UUID stem.
         std::fs::write(temp.path().join(CACHE_DIR).join("not-a-uuid.txt"), b"junk").unwrap();
-        // Non-.txt entries are ignored (e.g. notes.md), whatever their name.
+        // Temp leftover of a hard-killed atomic_write: tempfile's default
+        // naming is a dot-prefixed name with NO extension (issue #211).
+        std::fs::write(temp.path().join(CACHE_DIR).join(".tmpAb12Cd"), b"partial").unwrap();
+        // Explicit .tmp name, for good measure.
+        std::fs::write(temp.path().join(CACHE_DIR).join("leftover.tmp"), b"partial").unwrap();
+        // Stray non-cache file — the dir's contract is "one .txt per live
+        // source", so foreign files (incl. .DS_Store) are garbage.
         std::fs::write(temp.path().join(CACHE_DIR).join("notes.md"), b"x").unwrap();
 
         let removed = sweep_orphan_caches(temp.path(), &state).unwrap();
-        assert_eq!(removed, 2, "orphan uuid cache + junk stem are removed");
+        assert_eq!(removed, 5, "everything except the live .txt is removed");
         assert!(
             cache_path(temp.path(), &live.source_id).exists(),
             "live source's cache must survive the sweep"
         );
         assert!(!cache_path(temp.path(), &orphan).exists());
-        assert!(
-            temp.path().join(CACHE_DIR).join("notes.md").exists(),
-            "non-.txt entries must not be touched"
-        );
     }
 
     #[test]

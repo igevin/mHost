@@ -16,6 +16,7 @@ use chrono::Utc;
 use mhost_core::{AdBlockResponse, AdBlockSource, AdBlockState, MhostError, SourceId};
 use mhost_hosts::Parser;
 use mhost_storage::adblock as adblock_store;
+use serde::Serialize;
 use tauri::State;
 use uuid::Uuid;
 
@@ -568,10 +569,23 @@ pub(crate) async fn fetch_and_cache_source(
         // case a 304 would keep "succeeding" while `domains_for_source`
         // silently yields an empty rule set with a clean `last_error`.
         // Downgrade to an unconditional GET so the body is re-fetched.
+        //
+        // Issue #211-1: if even the *unconditional* GET comes back 304, the
+        // upstream is violating RFC 7232 §4.1 and we have no body and no
+        // cache — fail loudly via `last_error` instead of returning a
+        // "successful" NotModified that would keep the empty rule set
+        // invisible.
         if matches!(outcome, FetchOutcome::NotModified) {
             let cache_file = adblock_store::cache_path(&root, &id_owned);
             if !cache_file.exists() {
                 outcome = fetch_source_sync(&url, None, None, false)?;
+                if matches!(outcome, FetchOutcome::NotModified) {
+                    return Err(MhostError::ExternalApi(format!(
+                        "upstream returned 304 to an unconditional request and the local \
+                         cache is missing; cannot serve rules for source {}",
+                        id_owned
+                    )));
+                }
             }
         }
         match outcome {
@@ -678,6 +692,33 @@ fn rfc7231_date(dt: chrono::DateTime<chrono::Utc>) -> String {
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
+
+/// Compile-time ad-block limits delivered to the frontend (issue #211-3).
+///
+/// The UI needs the absolute rules cap to decide whether to render the
+/// per-source override entry (issue #207). Duplicating the constants as a
+/// frontend mirror risks silent drift; the authoritative values live here
+/// and the UI fetches them. `rules_per_source_default` is informational
+/// (shown as "default cap" context).
+#[derive(Debug, Clone, Serialize)]
+pub struct AdBlockLimits {
+    /// Global default cap applied when a source has no
+    /// `rules_limit_override` (`MAX_RULES_PER_SOURCE`).
+    pub rules_per_source_default: usize,
+    /// Highest value a per-source override may take
+    /// (`ABSOLUTE_MAX_RULES_PER_SOURCE`); lists above this get no override
+    /// entry in the UI.
+    pub rules_per_source_absolute_max: usize,
+}
+
+/// Expose the compile-time ad-block limits to the frontend (issue #211-3).
+#[tauri::command]
+pub async fn get_ad_block_limits() -> Result<AdBlockLimits, MhostError> {
+    Ok(AdBlockLimits {
+        rules_per_source_default: MAX_RULES_PER_SOURCE,
+        rules_per_source_absolute_max: ABSOLUTE_MAX_RULES_PER_SOURCE,
+    })
+}
 
 /// Return the full ad block state (sources + whitelist + meta).
 #[tauri::command]
@@ -2547,6 +2588,82 @@ mod tests {
             .unwrap()
             .expect("cache file must exist after the downgrade fetch");
         assert!(cache.contains("refetched.example.com"));
+
+        stop_mock(&stop, _h);
+    }
+
+    /// Issue #211-1: when the *unconditional* downgrade retry also comes
+    /// back 304 (an RFC 7232-violating upstream) with no local cache, the
+    /// fetch must fail loudly — a "successful" NotModified here would keep
+    /// the empty rule set and a clean `last_error` invisible to the user.
+    #[tokio::test]
+    async fn fetch_and_cache_source_errors_when_downgrade_retry_also_304() {
+        use mhost_storage::storage::FileStorage;
+
+        let listener = bind_mock_listener();
+        let port = listener.local_addr().unwrap().port();
+        let responses = std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::VecDeque::from(vec![
+                MockResponse::not_modified_304(),
+                MockResponse::not_modified_304(),
+            ]),
+        ));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_h, recorded) = spawn_mock_http(listener, responses, stop.clone());
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = std::sync::Arc::new(FileStorage::new(temp.path()))
+            as std::sync::Arc<dyn mhost_storage::storage::Storage + Send + Sync>;
+        let ad_block_state = std::sync::Arc::new(tokio::sync::RwLock::new(AdBlockState::default()));
+        let source_id = SourceId(uuid::Uuid::new_v4());
+        {
+            let mut g = ad_block_state.write().await;
+            g.sources.push(AdBlockSource {
+                source_id: source_id.clone(),
+                name: "rfc-violating".into(),
+                url: format!("http://127.0.0.1:{}/list", port),
+                enabled: true,
+                response: AdBlockResponse::ZeroAddress,
+                last_fetched_at: Some(chrono::Utc::now() - chrono::Duration::hours(1)),
+                last_error: None,
+                rule_count: 7, // stale bookkeeping from a wiped cache
+                etag: Some("\"v1\"".to_string()),
+                rules_limit_override: None,
+            });
+        }
+
+        let err = fetch_and_cache_source(&storage, &ad_block_state, &source_id, false)
+            .await
+            .expect_err("double-304 with no cache must surface as an error");
+        assert!(
+            err.to_string().contains("304 to an unconditional request"),
+            "error must explain the pathological upstream, got: {}",
+            err
+        );
+
+        // Exactly two requests: the conditional one + the downgrade.
+        {
+            let recs = recorded.lock().unwrap();
+            assert_eq!(recs.len(), 2);
+            assert_eq!(recs[0].if_none_match.as_deref(), Some("\"v1\""));
+            assert!(recs[1].if_none_match.is_none());
+        }
+
+        // The error reaches `last_error` (PR #131 P1-2 contract) so the UI
+        // has a signal instead of a silent empty rule set.
+        let snap = {
+            let g = ad_block_state.read().await;
+            mhost_storage::adblock::find_source(&g, &source_id)
+                .cloned()
+                .unwrap()
+        };
+        assert!(
+            snap.last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("304 to an unconditional request")),
+            "last_error must record the pathological 304: {:?}",
+            snap.last_error
+        );
 
         stop_mock(&stop, _h);
     }

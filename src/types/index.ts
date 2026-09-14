@@ -81,6 +81,13 @@ export interface AdBlockState {
   refresh_interval_hours: number;
 }
 
+/** Issue #211-3: compile-time backend limits delivered over IPC instead of
+ * mirrored in the frontend (mirrors drift silently). */
+export interface AdBlockLimits {
+  rules_per_source_default: number;
+  rules_per_source_absolute_max: number;
+}
+
 export interface ApplyPlan {
   rules: ResolvedRule[];
   conflicts: RuleConflict[];

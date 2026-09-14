@@ -73,6 +73,11 @@ export const adBlockStateAtom = atom<AdBlockState | null>(null);
 export const isAdBlockLoadingAtom = atom(false);
 export const adBlockErrorAtom = atom<string | null>(null);
 
+// Issue #211-3: backend-delivered compile-time limits. `null` until the
+// first successful fetch — the UI treats "unknown" as ungated (the backend
+// remains the authority and rejects over-cap overrides itself).
+export const adBlockLimitsAtom = atom<import("../../types").AdBlockLimits | null>(null);
+
 export const adBlockRuleCountAtom = atom((get) => {
   const state = get(adBlockStateAtom);
   if (!state) return 0;
@@ -84,7 +89,11 @@ export const adBlockRuleCountAtom = atom((get) => {
 export const adBlockHasErrorsAtom = atom((get) => {
   const state = get(adBlockStateAtom);
   if (!state) return false;
-  return state.sources.some((s) => s.last_error !== null);
+  // Issue #202: must be `!= null`, not `!== null`. Old wire data (backend
+  // before the always-serialize fix) omits the key entirely, so
+  // `last_error` is `undefined` — and `undefined !== null` is `true`,
+  // which rendered the error banner permanently for healthy sources.
+  return state.sources.some((s) => s.last_error != null);
 });
 
 // ---- User preferences (persisted to localStorage) ----

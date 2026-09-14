@@ -163,6 +163,7 @@ pub fn run() {
             cancel_dns_mode,
             // 广告屏蔽（issue #130）
             get_ad_block_state,
+            get_ad_block_limits,
             set_ad_block_enabled,
             set_ad_block_refresh_interval,
             set_ad_block_auto_refresh_enabled,
