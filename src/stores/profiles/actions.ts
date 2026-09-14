@@ -21,6 +21,7 @@ import {
   reloadDnsRules,
   listDnsProfiles,
   getAdBlockState,
+  getAdBlockLimits,
   setAdBlockEnabled,
   setAdBlockRefreshInterval,
   setAdBlockAutoRefreshEnabled,
@@ -60,6 +61,7 @@ import {
   adBlockStateAtom,
   isAdBlockLoadingAtom,
   adBlockErrorAtom,
+  adBlockLimitsAtom,
   quickApplyOutcomeAtom,
   isQuickApplyToastOpenAtom,
 } from "./state";
@@ -583,6 +585,19 @@ export const fetchAdBlockStateAtom = atom(null, async (_get, set) => {
     throw err;
   } finally {
     set(isAdBlockLoadingAtom, false);
+  }
+});
+
+// Issue #211-3: static compile-time limits from the backend — fetched once
+// on page mount, replaces the drift-prone frontend mirror constant.
+export const fetchAdBlockLimitsAtom = atom(null, async (_get, set) => {
+  try {
+    const limits = await getAdBlockLimits();
+    set(adBlockLimitsAtom, limits);
+  } catch (err) {
+    // Non-fatal: the UI falls back to ungated rendering and the backend
+    // still validates overrides authoritatively.
+    console.warn("failed to load ad-block limits", err);
   }
 });
 

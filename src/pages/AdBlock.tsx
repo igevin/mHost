@@ -7,8 +7,10 @@ import {
   adBlockErrorAtom,
   adBlockRuleCountAtom,
   adBlockHasErrorsAtom,
+  adBlockLimitsAtom,
   dnsEnabledAtom,
   fetchAdBlockStateAtom,
+  fetchAdBlockLimitsAtom,
   toggleAdBlockEnabledAtom,
   setAdBlockIntervalAtom,
   setAdBlockAutoRefreshEnabledAtom,
@@ -33,17 +35,12 @@ import styles from "./AdBlock.module.css";
 // numbers. Must mirror the backend error format in
 // `src-tauri/src/commands/adblock.rs::fetch_and_cache_source`.
 const OVER_LIMIT_RE = /source produced (\d+) rules \(limit: (\d+)\)/;
-// Mirror of `ABSOLUTE_MAX_RULES_PER_SOURCE` (commands/adblock.rs): lists
-// above this are rejected outright and MUST NOT get an override entry.
-const ABSOLUTE_MAX_RULES_PER_SOURCE = 2_000_000;
 
 function parseOverLimitError(lastError: string): { actual: number } | null {
   const match = OVER_LIMIT_RE.exec(lastError);
   if (!match) return null;
   const actual = parseInt(match[1], 10);
   if (Number.isNaN(actual) || actual <= 0) return null;
-  // Above the absolute cap there is no way out — don't render the button.
-  if (actual > ABSOLUTE_MAX_RULES_PER_SOURCE) return null;
   return { actual };
 }
 
@@ -54,8 +51,10 @@ function AdBlock() {
   const dnsEnabled = useAtomValue(dnsEnabledAtom);
   const ruleCount = useAtomValue(adBlockRuleCountAtom);
   const hasErrors = useAtomValue(adBlockHasErrorsAtom);
+  const limits = useAtomValue(adBlockLimitsAtom);
 
   const fetchState = useSetAtom(fetchAdBlockStateAtom);
+  const fetchLimits = useSetAtom(fetchAdBlockLimitsAtom);
   const toggleEnabled = useSetAtom(toggleAdBlockEnabledAtom);
   const setInterval = useSetAtom(setAdBlockIntervalAtom);
   const setAutoRefresh = useSetAtom(setAdBlockAutoRefreshEnabledAtom);
@@ -79,12 +78,16 @@ function AdBlock() {
   const [newResponse, setNewResponse] = useState<AdBlockResponse>("zero_address");
   const [newWhitelistDomain, setNewWhitelistDomain] = useState("");
 
-  // Fetch on mount (idempotent — Tauri handles parallel calls).
+  // Fetch on mount (idempotent — Tauri handles parallel calls). Limits
+  // (issue #211-3) are static backend constants: fetched once, failure is
+  // non-fatal (the override entry stays available and the backend still
+  // rejects over-cap values itself).
   useEffect(() => {
     fetchState().catch(() => {
       /* error already in atom */
     });
-  }, [fetchState]);
+    fetchLimits().catch(() => {});
+  }, [fetchState, fetchLimits]);
 
   const handleAddSource = useCallback(() => {
     if (!newName.trim() || !newUrl.trim()) return;
@@ -321,13 +324,23 @@ function AdBlock() {
                       {/* Issue #207: one-click way out for legitimately huge
                           lists. The backend stays fail-closed (no truncation);
                           this raises the per-source cap to the actual parsed
-                          count and retries through the normal refresh path. */}
+                          count and retries through the normal refresh path.
+                          Issue #211-3: the absolute-cap gate uses the
+                          backend-delivered limits; while limits are unknown
+                          the entry stays available — the backend remains the
+                          authority and rejects over-cap overrides itself. */}
                       {(() => {
                         const over =
                           src.last_error != null
                             ? parseOverLimitError(src.last_error)
                             : null;
                         if (!over) return null;
+                        if (
+                          limits != null &&
+                          over.actual > limits.rules_per_source_absolute_max
+                        ) {
+                          return null;
+                        }
                         return (
                           <div className={styles.limitOverrideRow}>
                             <span className={styles.muted}>

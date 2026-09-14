@@ -6,11 +6,16 @@ import {
   adBlockStateAtom,
   isAdBlockLoadingAtom,
   adBlockErrorAtom,
+  adBlockLimitsAtom,
   dnsEnabledAtom,
 } from "../../stores/profiles";
 import type { AdBlockState, AdBlockSource } from "../../types";
 
 const mockGetAdBlockState = vi.fn();
+const mockGetAdBlockLimits = vi.fn().mockResolvedValue({
+  rules_per_source_default: 500000,
+  rules_per_source_absolute_max: 2000000,
+});
 const mockSetAdBlockEnabled = vi.fn().mockResolvedValue(undefined);
 const mockAddAdBlockSource = vi.fn().mockResolvedValue({});
 const mockRemoveAdBlockSource = vi.fn().mockResolvedValue(undefined);
@@ -31,6 +36,7 @@ vi.mock("../../lib/tauri", async (importOriginal) => {
   return {
     ...actual,
     getAdBlockState: (...args: unknown[]) => mockGetAdBlockState(...args),
+    getAdBlockLimits: (...args: unknown[]) => mockGetAdBlockLimits(...args),
     setAdBlockEnabled: (...args: unknown[]) => mockSetAdBlockEnabled(...args),
     addAdBlockSource: (...args: unknown[]) => mockAddAdBlockSource(...args),
     removeAdBlockSource: (...args: unknown[]) => mockRemoveAdBlockSource(...args),
@@ -102,9 +108,16 @@ describe("AdBlock", () => {
       s.set(adBlockStateAtom, null);
       s.set(isAdBlockLoadingAtom, false);
       s.set(adBlockErrorAtom, null);
+      // Issue #211-3: reset so a previous test's loaded limits don't leak
+      // into tests that rely on "limits unknown".
+      s.set(adBlockLimitsAtom, null);
       s.set(dnsEnabledAtom, false);
     });
     mockGetAdBlockState.mockResolvedValue(makeState());
+    mockGetAdBlockLimits.mockResolvedValue({
+      rules_per_source_default: 500000,
+      rules_per_source_absolute_max: 2000000,
+    });
   });
 
   // ---- issue #134: loading state ----
@@ -184,6 +197,46 @@ describe("AdBlock", () => {
     expect(screen.getByText(/timeout/)).toBeInTheDocument();
   });
 
+  // ---- issue #202: the error banner must not be a permanent false positive ----
+  it("hides the error banner when every source is healthy", async () => {
+    const src = makeSource({ last_error: null });
+    const state = makeState({ sources: [src] });
+    setStore((s) => s.set(adBlockStateAtom, state));
+    mockGetAdBlockState.mockResolvedValue(state);
+    renderWithProviders(<AdBlock />);
+    await screen.findByText(/5,?000 rules|100 rules/);
+    expect(
+      screen.queryByText(/One or more sources have a fetch error/),
+    ).not.toBeInTheDocument();
+  });
+
+  it("treats an undefined last_error as healthy (pre-#202 wire data)", async () => {
+    // Old backends omitted the key entirely (skip_serializing_if), so the
+    // runtime value was `undefined` while the type claimed `string | null`.
+    const src = makeSource({
+      last_error: undefined as unknown as string,
+    });
+    const state = makeState({ sources: [src] });
+    setStore((s) => s.set(adBlockStateAtom, state));
+    mockGetAdBlockState.mockResolvedValue(state);
+    renderWithProviders(<AdBlock />);
+    await screen.findByText("Test List");
+    expect(
+      screen.queryByText(/One or more sources have a fetch error/),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows the error banner when a source has an error", async () => {
+    const src = makeSource({ last_error: "timeout" });
+    const state = makeState({ sources: [src] });
+    setStore((s) => s.set(adBlockStateAtom, state));
+    mockGetAdBlockState.mockResolvedValue(state);
+    renderWithProviders(<AdBlock />);
+    expect(
+      await screen.findByText(/One or more sources have a fetch error/),
+    ).toBeInTheDocument();
+  });
+
   // ---- issue #207: per-source rules-limit override ----
   it("offers the one-click override when last_error is an over-limit rejection", async () => {
     const src = makeSource({
@@ -210,6 +263,8 @@ describe("AdBlock", () => {
   });
 
   it("does not offer an override above the absolute cap", async () => {
+    // Default limits mock: absolute max = 2,000,000. 2.5M exceeds it → no
+    // entry (issue #211-3: gate comes from backend-delivered limits).
     const src = makeSource({
       last_error: "source produced 2500000 rules (limit: 500000)",
     });
@@ -221,6 +276,27 @@ describe("AdBlock", () => {
     expect(
       screen.queryByRole("button", { name: /Allow .* rules & retry/ }),
     ).not.toBeInTheDocument();
+  });
+
+  it("still offers the override while limits are unknown", async () => {
+    // Issue #211-3: `adBlockLimitsAtom` starts null and limits fetches can
+    // fail; the entry must not silently disappear — the backend remains
+    // the authority and rejects over-cap overrides itself.
+    mockGetAdBlockLimits.mockRejectedValue(new Error("ipc down"));
+    const src = makeSource({
+      last_error: "source produced 2500000 rules (limit: 500000)",
+    });
+    const state = makeState({ sources: [src] });
+    setStore((s) => s.set(adBlockStateAtom, state));
+    mockGetAdBlockState.mockResolvedValue(state);
+    renderWithProviders(<AdBlock />);
+    expect(
+      await screen.findByRole("button", { name: /Allow 2,500,000 rules & retry/ }),
+    ).toBeInTheDocument();
+    mockGetAdBlockLimits.mockResolvedValue({
+      rules_per_source_default: 500000,
+      rules_per_source_absolute_max: 2000000,
+    });
   });
 
   it("shows the raised limit and a reset action when an override is set", async () => {
