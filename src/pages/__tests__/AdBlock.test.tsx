@@ -263,13 +263,21 @@ describe("AdBlock", () => {
   });
 
   it("does not offer an override above the absolute cap", async () => {
-    // Default limits mock: absolute max = 2,000,000. 2.5M exceeds it → no
-    // entry (issue #211-3: gate comes from backend-delivered limits).
+    // Absolute max = 2,000,000 (issue #211-3: gate comes from
+    // backend-delivered limits). 2.5M exceeds it → no entry. The atom is
+    // preset explicitly so the assertion doesn't race the mount-effect
+    // limits fetch.
     const src = makeSource({
       last_error: "source produced 2500000 rules (limit: 500000)",
     });
     const state = makeState({ sources: [src] });
-    setStore((s) => s.set(adBlockStateAtom, state));
+    setStore((s) => {
+      s.set(adBlockStateAtom, state);
+      s.set(adBlockLimitsAtom, {
+        rules_per_source_default: 500000,
+        rules_per_source_absolute_max: 2000000,
+      });
+    });
     mockGetAdBlockState.mockResolvedValue(state);
     renderWithProviders(<AdBlock />);
     await screen.findByText("fetch failed");
