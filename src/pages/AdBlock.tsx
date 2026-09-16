@@ -48,6 +48,7 @@ function AdBlock() {
   const state = useAtomValue(adBlockStateAtom);
   const isLoading = useAtomValue(isAdBlockLoadingAtom);
   const error = useAtomValue(adBlockErrorAtom);
+  const setError = useSetAtom(adBlockErrorAtom);
   const dnsEnabled = useAtomValue(dnsEnabledAtom);
   const ruleCount = useAtomValue(adBlockRuleCountAtom);
   const hasErrors = useAtomValue(adBlockHasErrorsAtom);
@@ -137,9 +138,13 @@ function AdBlock() {
     void navigator.clipboard
       .writeText(state.whitelist.join("\n"))
       .catch(() => {
-        /* non-fatal; no UI feedback needed for a clipboard failure */
+        // Self-review finding (PR #217): silently swallowing the
+        // clipboard failure left the user staring at a button that did
+        // nothing. Surface through the existing `adBlockErrorAtom`
+        // toast channel — same UX as the bulk-add rejection toast.
+        setError("Copy failed (clipboard unavailable)");
       });
-  }, [state]);
+  }, [state, setError]);
 
   /**
    * Issue #196: bulk-add sources from a `name<TAB>url` paste (one
@@ -180,13 +185,32 @@ function AdBlock() {
         })
         .filter((e) => e.name && e.url);
       if (entries.length === 0) return;
-      void Promise.all(
+      // Self-review finding (PR #217): the previous Promise.all with
+      // `.catch(() => null)` swallowed every per-source failure and the
+      // last `addSource` atom overwrote any earlier toast. Use
+      // allSettled and surface failures as one summary toast so the
+      // user sees the count and a sample of inputs that failed.
+      void Promise.allSettled(
         entries.map((e) =>
-          addSource({ name: e.name, url: e.url, response: newResponse }).catch(() => null),
+          addSource({ name: e.name, url: e.url, response: newResponse }),
         ),
-      );
+      ).then((results) => {
+        const failures = results
+          .map((r, i) => (r.status === "rejected" ? entries[i] : null))
+          .filter((e): e is { name: string; url: string } => e !== null);
+        if (failures.length > 0) {
+          const sample = failures
+            .slice(0, 5)
+            .map((f) => `${f.name} (${f.url})`)
+            .join("; ");
+          const suffix = failures.length > 5 ? "…" : "";
+          setError(
+            `${failures.length} of ${entries.length} sources failed to add: ${sample}${suffix}`,
+          );
+        }
+      });
     },
-    [addSource, newResponse],
+    [addSource, newResponse, setError],
   );
 
   const handleIntervalChange = useCallback(

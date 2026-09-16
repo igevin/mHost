@@ -445,11 +445,18 @@ fn validate_whitelist_domain(raw: &str) -> Result<String, String> {
     // `foo-.example.com` slipped through. They never matched
     // `walk_parents` (which is literal `HashSet::contains`) and the user
     // had no signal they were broken. We now reject:
+    //   - leading `-` on the trimmed input (clearer error than the
+    //     per-label check, which would otherwise report it as "invalid
+    //     label '-example'")
     //   - trailing dot (FQDN form, but DNS engine expects bare labels)
-    //   - any label starting or ending with `-` (RFC 1123 §2.1 forbids)
+    //   - any other label starting or ending with `-` (RFC 1123 §2.1)
     //   - empty label (`foo..com` collapses to a zero-length segment)
-    // `starts_with('-')` on the trimmed string is implicit in the label
-    // check, but we keep the explicit guard for a clearer error message.
+    if trimmed.starts_with('-') {
+        return Err(format!(
+            "whitelist entry must not start with '-': {:?}",
+            raw
+        ));
+    }
     if trimmed.ends_with('.') {
         return Err(format!("whitelist entry must not end with '.': {:?}", raw));
     }
@@ -1164,14 +1171,21 @@ pub async fn list_ad_block_whitelist(
 
 /// Single-entry wrapper. Internally calls [`add_whitelist_impl`] so the
 /// validation/dedupe/persist path is shared with `add_ad_block_whitelist_many`.
-/// Returns `Vec<String>` to preserve the existing IPC contract — the many
-/// variant exposes the richer `AddWhitelistManyResult` for bulk use.
+/// Returns `Vec<String>` to preserve the existing IPC contract — but if the
+/// single input fails validation we re-raise as `MhostError::InvalidInput`
+/// (mirroring the pre-#196 behavior: a bad input is an error, not a
+/// silent no-op). The bulk variant exposes the richer
+/// `AddWhitelistManyResult` so it can carry per-line rejections without
+/// aborting the whole batch.
 #[tauri::command]
 pub async fn add_ad_block_whitelist(
     domain: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<String>, MhostError> {
     let result = add_whitelist_impl(&state, vec![domain]).await?;
+    if let Some(first) = result.rejected.into_iter().next() {
+        return Err(MhostError::InvalidInput(first.reason));
+    }
     Ok(result.whitelist)
 }
 
@@ -1264,13 +1278,21 @@ pub(crate) async fn remove_whitelist_impl(
         // DNS reload (and the LRU cache clear it triggers).
         return Ok(state.ad_block_state.read().await.whitelist.clone());
     }
+    let mut removed = 0usize;
     {
         let mut guard = state.ad_block_state.write().await;
         for target in &normalized {
+            let before = guard.whitelist.len();
             guard.whitelist.retain(|d| d != target);
+            removed += before.saturating_sub(guard.whitelist.len());
         }
     }
-    persist_and_reload(state).await?;
+    // Mirror `add_whitelist_impl`: skip persist when no state changed.
+    // A 200-entry batch where every target was already absent must be a
+    // no-op — no DNS churn.
+    if removed > 0 {
+        persist_and_reload(state).await?;
+    }
     Ok(state.ad_block_state.read().await.whitelist.clone())
 }
 
@@ -1505,7 +1527,23 @@ mod tests {
     #[test]
     fn validate_whitelist_domain_rejects_leading_dash() {
         assert!(validate_whitelist_domain("-example.com").is_err());
+        // The trim-level guard fires first and yields a clearer error
+        // than the per-label check would. Lock the contract.
         let err = validate_whitelist_domain("-example.com").unwrap_err();
+        assert!(
+            err.contains("must not start with '-'"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn validate_whitelist_domain_rejects_leading_dash_on_inner_label() {
+        // `foo.-bar.com` — only an inner label starts with `-`. The
+        // trim-level guard does not fire (the trimmed input starts with
+        // `foo`), so the per-label check is the only line of defense.
+        assert!(validate_whitelist_domain("foo.-bar.com").is_err());
+        let err = validate_whitelist_domain("foo.-bar.com").unwrap_err();
         assert!(
             err.contains("starts/ends with '-'"),
             "unexpected error: {}",
@@ -1975,6 +2013,39 @@ mod tests {
             result,
             vec!["gamma.example.com".to_string()],
             "remove should leave only the un-removed entry; missing entries are tolerated"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_whitelist_impl_skips_persist_when_all_targets_missing() {
+        // Mirrors `add_whitelist_impl_skips_persist_when_all_duplicates`:
+        // a 200-entry batch where every target is absent must not pay
+        // for a DNS reload (and the LRU cache clear it triggers).
+        let temp = tempfile::TempDir::new().unwrap();
+        let (state, storage) = make_test_app_state(temp.path());
+
+        add_whitelist_impl(&state, vec!["keep.example.com".to_string()])
+            .await
+            .unwrap();
+        let mtime_before = std::fs::metadata(storage.root().join("adblock.json"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let inputs: Vec<String> = (0..200)
+            .map(|i| format!("missing{}.example.com", i))
+            .collect();
+        let result = remove_whitelist_impl(&state, inputs).await.unwrap();
+        assert_eq!(result, vec!["keep.example.com".to_string()]);
+
+        let mtime_after = std::fs::metadata(storage.root().join("adblock.json"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(
+            mtime_before, mtime_after,
+            "all-missing batch must skip persist_and_reload (no DNS churn on a no-op)"
         );
     }
 

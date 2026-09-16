@@ -34,7 +34,6 @@ import {
   refreshAdBlockSource,
   refreshAllAdBlockSources,
   listAdBlockWhitelist,
-  addAdBlockWhitelist,
   addAdBlockWhitelistMany,
   removeAdBlockWhitelist,
   removeAdBlockWhitelistMany,
@@ -784,21 +783,6 @@ export const refreshAllAdBlockSourcesAtom = atom(null, async (_get, set) => {
   }
 });
 
-export const addAdBlockWhitelistAtom = atom(
-  null,
-  async (_get, set, domain: string) => {
-    set(adBlockErrorAtom, null);
-    try {
-      await addAdBlockWhitelist(domain);
-      const state = await getAdBlockState();
-      set(adBlockStateAtom, state);
-    } catch (err) {
-      set(adBlockErrorAtom, extractErrorMessage(err));
-      throw err;
-    }
-  },
-);
-
 export const removeAdBlockWhitelistAtom = atom(
   null,
   async (_get, set, domain: string) => {
@@ -822,6 +806,11 @@ export const removeAdBlockWhitelistAtom = atom(
 export const addAdBlockWhitelistManyAtom = atom(
   null,
   async (_get, set, domains: string[]) => {
+    // Self-review finding (PR #217): toggle the loading flag so the
+    // Add button is disabled while the 200-entry paste is in flight.
+    // Otherwise the user can fire a second paste mid-flight and race
+    // the first persist+reload.
+    set(isAdBlockLoadingAtom, true);
     set(adBlockErrorAtom, null);
     try {
       const result = await addAdBlockWhitelistMany(domains);
@@ -842,6 +831,8 @@ export const addAdBlockWhitelistManyAtom = atom(
     } catch (err) {
       set(adBlockErrorAtom, extractErrorMessage(err));
       throw err;
+    } finally {
+      set(isAdBlockLoadingAtom, false);
     }
   },
 );
@@ -853,6 +844,7 @@ export const addAdBlockWhitelistManyAtom = atom(
 export const removeAdBlockWhitelistManyAtom = atom(
   null,
   async (_get, set, domains: string[]) => {
+    set(isAdBlockLoadingAtom, true);
     set(adBlockErrorAtom, null);
     try {
       await removeAdBlockWhitelistMany(domains);
@@ -861,6 +853,8 @@ export const removeAdBlockWhitelistManyAtom = atom(
     } catch (err) {
       set(adBlockErrorAtom, extractErrorMessage(err));
       throw err;
+    } finally {
+      set(isAdBlockLoadingAtom, false);
     }
   },
 );

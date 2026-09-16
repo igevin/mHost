@@ -644,4 +644,58 @@ describe("AdBlock", () => {
       await screen.findByRole("combobox", { name: "Refresh interval" }),
     ).toBeInTheDocument();
   });
+
+  // ---- PR #217 self-review: bulk source failures aggregate into a toast ----
+  it("surfaces a summary toast when some bulk-source adds fail", async () => {
+    // Make the second call reject so the summary has at least one failure.
+    mockAddAdBlockSource
+      .mockResolvedValueOnce({ source_id: "s1" } as never)
+      .mockRejectedValueOnce(new Error("invalid URL") as never)
+      .mockResolvedValueOnce({ source_id: "s3" } as never);
+    const state = makeState();
+    setStore((s) => s.set(adBlockStateAtom, state));
+    mockGetAdBlockState.mockResolvedValue(state);
+    renderWithProviders(<AdBlock />);
+    await screen.findByRole("heading", { name: "Sources" });
+    const bulk = await screen.findByLabelText(/Bulk add sources/i);
+    await act(async () => {
+      fireEvent.change(bulk, {
+        target: { value: "A\thttps://a.com\nB\thttps://b.com\nC\thttps://c.com" },
+      });
+    });
+    const addAll = screen.getByRole("button", { name: "Add all" });
+    await act(async () => {
+      fireEvent.click(addAll);
+    });
+    expect(
+      await screen.findByText(/1 of 3 sources failed to add: B \(https:\/\/b\.com\)/),
+    ).toBeInTheDocument();
+  });
+
+  // ---- PR #217 self-review: clipboard failure surfaces a toast ----
+  it("surfaces a toast when the clipboard write fails", async () => {
+    // jsdom doesn't expose `navigator.clipboard` by default — assign a
+    // stub directly and restore the original on teardown.
+    const originalClipboard = (navigator as { clipboard?: Clipboard }).clipboard;
+    const writeText = vi.fn().mockRejectedValue(new Error("denied"));
+    (navigator as { clipboard?: Clipboard }).clipboard = {
+      writeText,
+    } as unknown as Clipboard;
+    try {
+      const state = makeState({ whitelist: ["a.com", "b.com"] });
+      setStore((s) => s.set(adBlockStateAtom, state));
+      mockGetAdBlockState.mockResolvedValue(state);
+      renderWithProviders(<AdBlock />);
+      const btn = await screen.findByRole("button", {
+        name: /Copy whitelist to clipboard/i,
+      });
+      await act(async () => {
+        fireEvent.click(btn);
+      });
+      expect(await screen.findByText(/Copy failed/)).toBeInTheDocument();
+      expect(writeText).toHaveBeenCalledWith("a.com\nb.com");
+    } finally {
+      (navigator as { clipboard?: Clipboard }).clipboard = originalClipboard;
+    }
+  });
 });
