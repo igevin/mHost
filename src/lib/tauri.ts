@@ -347,6 +347,43 @@ export async function removeAdBlockWhitelist(domain: string): Promise<string[]> 
   return invoke<string[]>("remove_ad_block_whitelist", { domain });
 }
 
+/** Issue #196: per-entry failure from a bulk whitelist paste. The frontend
+ * toasts `reason` (a human-readable validator message) so the user can
+ * spot which lines were rejected without losing the rest of the batch. */
+export interface WhitelistInputError {
+  input: string;
+  reason: string;
+}
+
+/** Issue #196: result of a bulk whitelist add. `whitelist` is the full
+ * current state (canonical, post-normalization); `rejected` lists the
+ * entries the validator refused. Duplicates are silently deduplicated
+ * — they don't appear in `rejected` because the user pasting 200 lines
+ * into a list that already contains 50 of them shouldn't spam the toast. */
+export interface AddWhitelistManyResult {
+  whitelist: string[];
+  rejected: WhitelistInputError[];
+}
+
+/** Bulk add — triggers exactly one persist + DNS-reload cycle
+ * regardless of how many entries are pasted. Single-entry
+ * `addAdBlockWhitelist` is a thin wrapper over the same backend path. */
+export async function addAdBlockWhitelistMany(
+  domains: string[],
+): Promise<AddWhitelistManyResult> {
+  return invoke<AddWhitelistManyResult>("add_ad_block_whitelist_many", {
+    domains,
+  });
+}
+
+/** Bulk remove — same trim+lowercase normalization as the single-entry
+ * variant, missing entries are silently ignored (no rejected list). */
+export async function removeAdBlockWhitelistMany(
+  domains: string[],
+): Promise<string[]> {
+  return invoke<string[]>("remove_ad_block_whitelist_many", { domains });
+}
+
 // ---- Update commands ----
 
 export interface LatestRelease {

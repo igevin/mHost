@@ -35,7 +35,9 @@ import {
   refreshAllAdBlockSources,
   listAdBlockWhitelist,
   addAdBlockWhitelist,
+  addAdBlockWhitelistMany,
   removeAdBlockWhitelist,
+  removeAdBlockWhitelistMany,
 } from "../../lib/tauri";
 import { extractErrorMessage, isPreviewRequired } from "../../lib/error";
 import { decideApplyMode } from "../../lib/applyPolicy";
@@ -803,6 +805,57 @@ export const removeAdBlockWhitelistAtom = atom(
     set(adBlockErrorAtom, null);
     try {
       await removeAdBlockWhitelist(domain);
+      const state = await getAdBlockState();
+      set(adBlockStateAtom, state);
+    } catch (err) {
+      set(adBlockErrorAtom, extractErrorMessage(err));
+      throw err;
+    }
+  },
+);
+
+/** Issue #196: bulk add. Validates per entry (a single bad line does not
+ * abort the batch), dedupes silently, and triggers exactly one
+ * persist+reload cycle in the backend. On a non-empty `rejected` list we
+ * surface a toast so the user can see which lines were dropped without
+ * losing the rest of the paste. */
+export const addAdBlockWhitelistManyAtom = atom(
+  null,
+  async (_get, set, domains: string[]) => {
+    set(adBlockErrorAtom, null);
+    try {
+      const result = await addAdBlockWhitelistMany(domains);
+      const state = await getAdBlockState();
+      set(adBlockStateAtom, state);
+      if (result.rejected.length > 0) {
+        const sample = result.rejected
+          .slice(0, 5)
+          .map((e) => `${e.input} (${e.reason})`)
+          .join("; ");
+        const suffix = result.rejected.length > 5 ? "…" : "";
+        set(
+          adBlockErrorAtom,
+          `${result.rejected.length} entr${result.rejected.length === 1 ? "y" : "ies"} skipped: ${sample}${suffix}`,
+        );
+      }
+      return result;
+    } catch (err) {
+      set(adBlockErrorAtom, extractErrorMessage(err));
+      throw err;
+    }
+  },
+);
+
+/** Issue #196: bulk remove. The remove contract is intentionally lossy
+ * (tolerates missing entries), so there is no rejected list to surface.
+ * Any IPC failure still goes through the shared `adBlockErrorAtom` toast
+ * channel — same UX as the single-entry variant. */
+export const removeAdBlockWhitelistManyAtom = atom(
+  null,
+  async (_get, set, domains: string[]) => {
+    set(adBlockErrorAtom, null);
+    try {
+      await removeAdBlockWhitelistMany(domains);
       const state = await getAdBlockState();
       set(adBlockStateAtom, state);
     } catch (err) {

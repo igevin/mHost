@@ -258,3 +258,57 @@
   font-size: 12px;
   padding: 0 4px;
 }
+
+/* -----------------------------------------------------------------
+ * Issue #196: bulk-input affordances for the whitelist + sources forms.
+ * Kept here (CSS module) rather than in the global `.input` rule so the
+ * textarea-specific width behavior doesn't bleed into other inputs.
+ * ----------------------------------------------------------------- */
+
+.whitelistHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 4px;
+}
+
+.whitelistHeader .card-title {
+  margin: 0;
+}
+
+.whitelistTextarea {
+  /* textarea grows horizontally to fill the inline form's input slot;
+     min-height keeps it usable even with a single line. */
+  width: 100%;
+  min-height: 72px;
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.bulkAdd {
+  margin-top: 12px;
+  border: 1px dashed rgba(127, 127, 127, 0.4);
+  border-radius: 6px;
+  padding: 8px 12px;
+}
+
+.bulkAddSummary {
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--color-text-muted, #888);
+  user-select: none;
+  /* Native <summary> has default disclosure-triangle styling; keep it. */
+}
+
+.bulkTextarea {
+  margin-top: 8px;
+  width: 100%;
+  min-height: 60px;
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.4;
+}

@@ -24,7 +24,11 @@ const mockSetAdBlockSourceResponse = vi.fn().mockResolvedValue({});
 const mockRefreshAdBlockSource = vi.fn().mockResolvedValue({});
 const mockRefreshAllAdBlockSources = vi.fn().mockResolvedValue([]);
 const mockAddAdBlockWhitelist = vi.fn().mockResolvedValue([]);
+const mockAddAdBlockWhitelistMany = vi
+  .fn()
+  .mockResolvedValue({ whitelist: [], rejected: [] });
 const mockRemoveAdBlockWhitelist = vi.fn().mockResolvedValue([]);
+const mockRemoveAdBlockWhitelistMany = vi.fn().mockResolvedValue([]);
 const mockSetAdBlockRefreshInterval = vi.fn().mockResolvedValue(undefined);
 const mockSetAdBlockAutoRefreshEnabled = vi.fn().mockResolvedValue(undefined);
 const mockSetAdBlockSourceRulesLimitOverride = vi
@@ -47,7 +51,11 @@ vi.mock("../../lib/tauri", async (importOriginal) => {
     refreshAdBlockSource: (...args: unknown[]) => mockRefreshAdBlockSource(...args),
     refreshAllAdBlockSources: (...args: unknown[]) => mockRefreshAllAdBlockSources(...args),
     addAdBlockWhitelist: (...args: unknown[]) => mockAddAdBlockWhitelist(...args),
+    addAdBlockWhitelistMany: (...args: unknown[]) =>
+      mockAddAdBlockWhitelistMany(...args),
     removeAdBlockWhitelist: (...args: unknown[]) => mockRemoveAdBlockWhitelist(...args),
+    removeAdBlockWhitelistMany: (...args: unknown[]) =>
+      mockRemoveAdBlockWhitelistMany(...args),
     setAdBlockRefreshInterval: (...args: unknown[]) => mockSetAdBlockRefreshInterval(...args),
     setAdBlockAutoRefreshEnabled: (...args: unknown[]) =>
       mockSetAdBlockAutoRefreshEnabled(...args),
@@ -408,15 +416,18 @@ describe("AdBlock", () => {
     expect(await screen.findByText("No whitelist entries.")).toBeInTheDocument();
   });
 
-  it("adds a whitelist domain via the input", async () => {
+  it("adds a single whitelist domain via the textarea (one-shot many IPC)", async () => {
+    // Issue #196: a single-line value still goes through the batch IPC
+    // so the backend's persist-and-reload path is shared with the
+    // multi-line case (single IPC, single reload).
     const state = makeState();
     setStore((s) => s.set(adBlockStateAtom, state));
     mockGetAdBlockState.mockResolvedValue(state);
     renderWithProviders(<AdBlock />);
     await screen.findByRole("heading", { name: "Whitelist" });
-    const input = screen.getByPlaceholderText("trusted.example.com");
+    const textarea = screen.getByPlaceholderText("trusted.example.com");
     await act(async () => {
-      fireEvent.change(input, { target: { value: "new.com" } });
+      fireEvent.change(textarea, { target: { value: "new.com" } });
     });
     // The whitelist Add button is the second one.
     const addBtns = screen.getAllByText("Add");
@@ -424,7 +435,143 @@ describe("AdBlock", () => {
     await act(async () => {
       fireEvent.click(whitelistAddBtn);
     });
-    expect(mockAddAdBlockWhitelist).toHaveBeenCalledWith("new.com");
+    expect(mockAddAdBlockWhitelistMany).toHaveBeenCalledWith(["new.com"]);
+  });
+
+  // ---- issue #196: bulk paste ----
+  it("pastes multiple whitelist entries in one many-call", async () => {
+    const state = makeState();
+    setStore((s) => s.set(adBlockStateAtom, state));
+    mockGetAdBlockState.mockResolvedValue(state);
+    renderWithProviders(<AdBlock />);
+    await screen.findByRole("heading", { name: "Whitelist" });
+    const textarea = screen.getByPlaceholderText("trusted.example.com");
+    const lines = Array.from({ length: 50 }, (_, i) => `host${i}.com`).join("\n");
+    await act(async () => {
+      fireEvent.change(textarea, { target: { value: lines } });
+    });
+    const addBtns = screen.getAllByText("Add");
+    await act(async () => {
+      fireEvent.click(addBtns[1]);
+    });
+    expect(mockAddAdBlockWhitelistMany).toHaveBeenCalledTimes(1);
+    const calledWith = mockAddAdBlockWhitelistMany.mock.calls[0][0] as string[];
+    expect(calledWith).toHaveLength(50);
+    expect(calledWith[0]).toBe("host0.com");
+    expect(calledWith[49]).toBe("host49.com");
+  });
+
+  it("surfaces a toast when many-IPC returns rejected entries", async () => {
+    // Mock the many IPC to look like: 2 succeeded, 2 rejected.
+    mockAddAdBlockWhitelistMany.mockResolvedValueOnce({
+      whitelist: ["good.com"],
+      rejected: [
+        { input: "bad.com.", reason: "must not end with '.'" },
+        { input: "-leading.com", reason: "invalid label '-leading'" },
+      ],
+    });
+    const state = makeState();
+    setStore((s) => s.set(adBlockStateAtom, state));
+    mockGetAdBlockState.mockResolvedValue(state);
+    renderWithProviders(<AdBlock />);
+    await screen.findByRole("heading", { name: "Whitelist" });
+    const textarea = screen.getByPlaceholderText("trusted.example.com");
+    await act(async () => {
+      fireEvent.change(textarea, {
+        target: { value: "good.com\nbad.com.\n-leading.com" },
+      });
+    });
+    const addBtns = screen.getAllByText("Add");
+    await act(async () => {
+      fireEvent.click(addBtns[1]);
+    });
+    expect(
+      await screen.findByText(/2 entries skipped/),
+    ).toBeInTheDocument();
+    // Spot-check that the reasons surface for the user to act on.
+    expect(screen.getByText(/bad.com\./)).toBeInTheDocument();
+  });
+
+  it("does nothing when the whitelist textarea is empty or whitespace", async () => {
+    const state = makeState();
+    setStore((s) => s.set(adBlockStateAtom, state));
+    mockGetAdBlockState.mockResolvedValue(state);
+    renderWithProviders(<AdBlock />);
+    await screen.findByRole("heading", { name: "Whitelist" });
+    const textarea = screen.getByPlaceholderText("trusted.example.com");
+    await act(async () => {
+      fireEvent.change(textarea, { target: { value: "   \n   \n  " } });
+    });
+    const addBtns = screen.getAllByText("Add");
+    await act(async () => {
+      fireEvent.click(addBtns[1]);
+    });
+    expect(mockAddAdBlockWhitelistMany).not.toHaveBeenCalled();
+  });
+
+  // ---- issue #196: copy-to-clipboard ----
+  it("renders a Copy button next to the whitelist title", async () => {
+    const state = makeState({ whitelist: ["a.com", "b.com"] });
+    setStore((s) => s.set(adBlockStateAtom, state));
+    mockGetAdBlockState.mockResolvedValue(state);
+    renderWithProviders(<AdBlock />);
+    const btn = await screen.findByRole("button", {
+      name: /Copy whitelist to clipboard/i,
+    });
+    expect(btn).toBeEnabled();
+  });
+
+  it("disables the Copy button when the whitelist is empty", async () => {
+    const state = makeState({ whitelist: [] });
+    setStore((s) => s.set(adBlockStateAtom, state));
+    mockGetAdBlockState.mockResolvedValue(state);
+    renderWithProviders(<AdBlock />);
+    const btn = await screen.findByRole("button", {
+      name: /Copy whitelist to clipboard/i,
+    });
+    expect(btn).toBeDisabled();
+  });
+
+  // ---- issue #196: bulk add sources ----
+  it("bulk-adds sources from a name<TAB>url paste", async () => {
+    const state = makeState();
+    setStore((s) => s.set(adBlockStateAtom, state));
+    mockGetAdBlockState.mockResolvedValue(state);
+    renderWithProviders(<AdBlock />);
+    await screen.findByRole("heading", { name: "Sources" });
+    // The bulk-add textarea is collapsed inside <details>; expand it
+    // first so the textarea is rendered into the DOM (jsdom keeps
+    // <details> contents in the DOM regardless, but expand() mirrors
+    // real-user behavior).
+    const bulk = await screen.findByLabelText(/Bulk add sources/i);
+    const lines = [
+      "StevenBlack\thttps://sb.com/hosts",
+      "My List  https://ml.com/hosts", // 2-space separator
+      "Third https://t.com/hosts",     // single space
+    ].join("\n");
+    await act(async () => {
+      fireEvent.change(bulk, { target: { value: lines } });
+    });
+    const addAll = screen.getByRole("button", { name: "Add all" });
+    await act(async () => {
+      fireEvent.click(addAll);
+    });
+    expect(mockAddAdBlockSource).toHaveBeenCalledTimes(3);
+    expect(mockAddAdBlockSource).toHaveBeenCalledWith(
+      "StevenBlack",
+      "https://sb.com/hosts",
+      "zero_address",
+    );
+    expect(mockAddAdBlockSource).toHaveBeenCalledWith(
+      "My List",
+      "https://ml.com/hosts",
+      "zero_address",
+    );
+    expect(mockAddAdBlockSource).toHaveBeenCalledWith(
+      "Third",
+      "https://t.com/hosts",
+      "zero_address",
+    );
   });
 
   // ---- issue #134: error alert ----

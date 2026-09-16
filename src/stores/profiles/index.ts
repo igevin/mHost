@@ -70,7 +70,7 @@ export {
   overrideAdBlockSourceRulesLimitAtom,
   refreshAdBlockSourceAtom,
   refreshAllAdBlockSourcesAtom,
-  addAdBlockWhitelistAtom,
+  addAdBlockWhitelistManyAtom,
   removeAdBlockWhitelistAtom,
   fetchAdBlockSourcesAtom,
   fetchAdBlockWhitelistAtom,
