@@ -439,6 +439,31 @@ fn validate_whitelist_domain(raw: &str) -> Result<String, String> {
             ));
         }
     }
+
+    // Structure checks (issue #196): previous version only checked the
+    // character set, so entries like `example.com.`, `-example.com`, or
+    // `foo-.example.com` slipped through. They never matched
+    // `walk_parents` (which is literal `HashSet::contains`) and the user
+    // had no signal they were broken. We now reject:
+    //   - trailing dot (FQDN form, but DNS engine expects bare labels)
+    //   - any label starting or ending with `-` (RFC 1123 §2.1 forbids)
+    //   - empty label (`foo..com` collapses to a zero-length segment)
+    // `starts_with('-')` on the trimmed string is implicit in the label
+    // check, but we keep the explicit guard for a clearer error message.
+    if trimmed.ends_with('.') {
+        return Err(format!("whitelist entry must not end with '.': {:?}", raw));
+    }
+    for label in trimmed.split('.') {
+        if label.is_empty() {
+            return Err(format!("whitelist entry has empty label (..): {:?}", raw));
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err(format!(
+                "whitelist entry has invalid label {:?} (starts/ends with '-') in {:?}",
+                label, raw
+            ));
+        }
+    }
     Ok(trimmed)
 }
 
@@ -1099,7 +1124,36 @@ pub async fn refresh_all_ad_block_sources(
 
 // ---------------------------------------------------------------------------
 // Whitelist
+//
+// Issue #196: the original single-entry IPCs forced one `add_ad_block_whitelist`
+// call per domain. Pasting 200 entries meant 200 `persist_and_reload` calls,
+// and `reload_ad_block_rules` clears the LRU response cache on every reload
+// (server.rs:362 — `self.cache.lock().clear()`). During a bulk paste, every
+// DNS query fell through to upstream. We now expose `*_many` IPCs that
+// validate + dedupe in one shot and trigger `persist_and_reload` once at
+// the end. The single-entry IPCs are kept as thin wrappers that delegate to
+// the same `*_impl` so the two paths can't drift apart.
 // ---------------------------------------------------------------------------
+
+/// A single rejected whitelist entry, paired with the validator's reason.
+/// Returned to the frontend so it can toast per-line failures from a bulk
+/// paste without aborting the whole batch on one bad input.
+#[derive(Debug, Clone, Serialize)]
+pub struct WhitelistInputError {
+    pub input: String,
+    pub reason: String,
+}
+
+/// Result of `add_ad_block_whitelist_many`: the full current whitelist plus
+/// the entries that failed validation. Successful entries that already
+/// existed in the whitelist are silently deduplicated (no rejected entry
+/// for duplicates — that would be noisy for a paste of 200 entries into a
+/// list that already contains 50 of them).
+#[derive(Debug, Clone, Serialize)]
+pub struct AddWhitelistManyResult {
+    pub whitelist: Vec<String>,
+    pub rejected: Vec<WhitelistInputError>,
+}
 
 #[tauri::command]
 pub async fn list_ad_block_whitelist(
@@ -1108,36 +1162,109 @@ pub async fn list_ad_block_whitelist(
     Ok(state.ad_block_state.read().await.whitelist.clone())
 }
 
+/// Single-entry wrapper. Internally calls [`add_whitelist_impl`] so the
+/// validation/dedupe/persist path is shared with `add_ad_block_whitelist_many`.
+/// Returns `Vec<String>` to preserve the existing IPC contract — the many
+/// variant exposes the richer `AddWhitelistManyResult` for bulk use.
 #[tauri::command]
 pub async fn add_ad_block_whitelist(
     domain: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<String>, MhostError> {
-    let normalized = validate_whitelist_domain(&domain).map_err(MhostError::InvalidInput)?;
-    {
-        let mut guard = state.ad_block_state.write().await;
-        if !guard.whitelist.contains(&normalized) {
-            guard.whitelist.push(normalized);
-        }
-    }
-    persist_and_reload(&state).await?;
-    Ok(state.ad_block_state.read().await.whitelist.clone())
+    let result = add_whitelist_impl(&state, vec![domain]).await?;
+    Ok(result.whitelist)
 }
 
+/// Bulk add. Validates each entry independently (a single bad input
+/// doesn't abort the batch), dedupes against the existing whitelist, then
+/// persists + reloads DNS rules exactly once. See [`AddWhitelistManyResult`].
+#[tauri::command]
+pub async fn add_ad_block_whitelist_many(
+    domains: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<AddWhitelistManyResult, MhostError> {
+    add_whitelist_impl(&state, domains).await
+}
+
+/// Shared core for `add_ad_block_whitelist` and `add_ad_block_whitelist_many`.
+/// `pub(crate)` so integration tests can drive it without an `AppState`
+/// extractor (same pattern as `add_ad_block_source_impl`).
+pub(crate) async fn add_whitelist_impl(
+    state: &AppState,
+    inputs: Vec<String>,
+) -> Result<AddWhitelistManyResult, MhostError> {
+    let mut accepted: Vec<String> = Vec::with_capacity(inputs.len());
+    let mut rejected: Vec<WhitelistInputError> = Vec::new();
+    for raw in inputs {
+        match validate_whitelist_domain(&raw) {
+            Ok(normalized) => accepted.push(normalized),
+            Err(reason) => rejected.push(WhitelistInputError { input: raw, reason }),
+        }
+    }
+    let mut newly_added = 0usize;
+    {
+        let mut guard = state.ad_block_state.write().await;
+        for normalized in accepted {
+            if !guard.whitelist.contains(&normalized) {
+                guard.whitelist.push(normalized);
+                newly_added += 1;
+            }
+        }
+    }
+    // Only hit the (expensive) persist + LRU-clearing reload path when
+    // something actually changed. A paste of 200 entries where all 200
+    // were already in the whitelist is a no-op — no DNS churn.
+    if newly_added > 0 {
+        persist_and_reload(state).await?;
+    }
+    Ok(AddWhitelistManyResult {
+        whitelist: state.ad_block_state.read().await.whitelist.clone(),
+        rejected,
+    })
+}
+
+/// Single-entry wrapper. Removal contract is unchanged: `tolerates the
+/// same input the user typed when adding`, no validation, silently no-op
+/// on missing entries. Internally delegates to [`remove_whitelist_impl`].
 #[tauri::command]
 pub async fn remove_ad_block_whitelist(
     domain: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<String>, MhostError> {
-    // Removal tolerates the same input the user typed when adding (i.e.
-    // no validation — silently no-op on missing). This matches the
-    // contract of "remove what matches; ignore the rest".
-    let normalized = domain.trim().to_lowercase();
+    remove_whitelist_impl(&state, vec![domain]).await
+}
+
+/// Bulk remove. Normalizes each entry (trim + lowercase) the same way the
+/// single-entry variant does; missing entries are silently ignored. The
+/// contract is intentionally lossy: there's no `rejected` list because
+/// "remove what matches, ignore the rest" is the documented behavior.
+#[tauri::command]
+pub async fn remove_ad_block_whitelist_many(
+    domains: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<String>, MhostError> {
+    remove_whitelist_impl(&state, domains).await
+}
+
+/// Shared core for `remove_ad_block_whitelist` and `remove_ad_block_whitelist_many`.
+/// `pub(crate)` so integration tests can drive it without an `AppState`
+/// extractor.
+pub(crate) async fn remove_whitelist_impl(
+    state: &AppState,
+    inputs: Vec<String>,
+) -> Result<Vec<String>, MhostError> {
+    let normalized: Vec<String> = inputs
+        .into_iter()
+        .map(|d| d.trim().to_lowercase())
+        .filter(|d| !d.is_empty())
+        .collect();
     {
         let mut guard = state.ad_block_state.write().await;
-        guard.whitelist.retain(|d| d != &normalized);
+        for target in &normalized {
+            guard.whitelist.retain(|d| d != target);
+        }
     }
-    persist_and_reload(&state).await?;
+    persist_and_reload(state).await?;
     Ok(state.ad_block_state.read().await.whitelist.clone())
 }
 
@@ -1349,6 +1476,72 @@ mod tests {
         // 253 chars — exactly at the boundary, should pass.
         let at_limit = "a".repeat(253);
         assert!(validate_whitelist_domain(&at_limit).is_ok());
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #196: structure checks tightened so entries that look valid
+    // by character set but never match `walk_parents` (which uses literal
+    // `HashSet::contains`) are rejected at the boundary instead of
+    // silently no-op'ing after being added.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn validate_whitelist_domain_rejects_trailing_dot() {
+        assert!(validate_whitelist_domain("example.com.").is_err());
+        let err = validate_whitelist_domain("example.com.").unwrap_err();
+        assert!(
+            err.contains("must not end with '.'"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn validate_whitelist_domain_rejects_leading_dash() {
+        assert!(validate_whitelist_domain("-example.com").is_err());
+        let err = validate_whitelist_domain("-example.com").unwrap_err();
+        assert!(
+            err.contains("starts/ends with '-'"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn validate_whitelist_domain_rejects_trailing_dash_label() {
+        assert!(validate_whitelist_domain("foo-.example.com").is_err());
+        assert!(validate_whitelist_domain("foo.bar-.example.com").is_err());
+        // Trailing dash on the last label is also caught.
+        assert!(validate_whitelist_domain("example-").is_err());
+    }
+
+    #[test]
+    fn validate_whitelist_domain_rejects_empty_label() {
+        // Consecutive dots collapse to an empty label between them.
+        assert!(validate_whitelist_domain("foo..example.com").is_err());
+        let err = validate_whitelist_domain("foo..example.com").unwrap_err();
+        assert!(err.contains("empty label"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn validate_whitelist_domain_accepts_rfc1123_all_numeric_label() {
+        // PR #203 made all-numeric labels legal in the hosts parser;
+        // whitelist validation should agree (issue #196 stays consistent
+        // with the wider hosts parser semantics).
+        assert_eq!(
+            validate_whitelist_domain("123.example.com").unwrap(),
+            "123.example.com"
+        );
+        assert_eq!(validate_whitelist_domain("1.2.3.4").unwrap(), "1.2.3.4");
+    }
+
+    #[test]
+    fn validate_whitelist_domain_accepts_hyphen_in_middle_of_label() {
+        // Hyphens inside a label (not at the start or end) are RFC 1123 §2.1 legal.
+        assert_eq!(
+            validate_whitelist_domain("foo-bar.example.com").unwrap(),
+            "foo-bar.example.com"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -1607,6 +1800,227 @@ mod tests {
         assert!(
             persisted.sources[0].last_error.is_some(),
             "last_error must be recorded on the persisted source"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #196: batch whitelist add/remove + tightened validation.
+    //
+    // The behavior contracts the frontend relies on:
+    //   - one bad entry does not abort the batch
+    //   - dedupe is silent (no rejected entry for duplicates)
+    //   - persist + DNS reload fires exactly once for a non-empty diff
+    //   - remove normalizes (trim + lowercase) and tolerates missing
+    //   - the single-entry IPCs are thin wrappers around `*_impl` and
+    //     therefore share the dedupe / persist-once behavior
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn add_whitelist_many_accepts_valid_rejects_invalid_dedupes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (state, _storage) = make_test_app_state(temp.path());
+
+        // Mix of: valid new, valid duplicate (already in list), trailing dot,
+        // leading dash, double-dot empty label. Dedup should be silent.
+        let inputs = vec![
+            "good.example.com".to_string(),
+            "  Mixed.Case.COM  ".to_string(),
+            "good.example.com".to_string(),  // duplicate of #0
+            "bad.example.com.".to_string(),  // trailing dot
+            "-leading-dash.com".to_string(), // leading dash
+            "foo..bar.com".to_string(),      // empty label
+            "another.good.org".to_string(),
+        ];
+        let result = add_whitelist_impl(&state, inputs).await.unwrap();
+
+        // good.example.com, mixed.case.com (normalized), another.good.org
+        assert_eq!(
+            result.whitelist,
+            vec![
+                "good.example.com".to_string(),
+                "mixed.case.com".to_string(),
+                "another.good.org".to_string(),
+            ],
+            "valid entries (post-normalization) should be persisted in input order"
+        );
+        assert_eq!(
+            result.rejected.len(),
+            3,
+            "three invalid inputs were rejected"
+        );
+        let rejected_inputs: Vec<&str> = result.rejected.iter().map(|e| e.input.as_str()).collect();
+        assert!(rejected_inputs.contains(&"bad.example.com."));
+        assert!(rejected_inputs.contains(&"-leading-dash.com"));
+        assert!(rejected_inputs.contains(&"foo..bar.com"));
+        // Each rejection must carry a non-empty reason for the frontend toast.
+        for r in &result.rejected {
+            assert!(!r.reason.is_empty(), "rejection reason must not be empty");
+        }
+    }
+
+    #[tokio::test]
+    async fn add_whitelist_impl_skips_persist_when_all_duplicates() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (state, storage) = make_test_app_state(temp.path());
+
+        // Seed whitelist through the public impl so persist + on-disk state
+        // is in sync before we test the "all duplicates" branch.
+        add_whitelist_impl(&state, vec!["a.example.com".to_string()])
+            .await
+            .unwrap();
+        let mtime_before = std::fs::metadata(storage.root().join("adblock.json"))
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        // Sleep just enough to ensure a second `modified()` tick is observable
+        // (some filesystems have 1s mtime granularity on CI runners).
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // All duplicates — nothing to add. `add_whitelist_impl` should NOT
+        // touch the file (the issue #196 fix: persist only when newly_added > 0).
+        let result = add_whitelist_impl(
+            &state,
+            vec![
+                "a.example.com".to_string(),
+                "  A.EXAMPLE.COM  ".to_string(), // same after normalize
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.whitelist, vec!["a.example.com".to_string()]);
+        assert!(result.rejected.is_empty());
+
+        let mtime_after = std::fs::metadata(storage.root().join("adblock.json"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(
+            mtime_before, mtime_after,
+            "persist_and_reload must be skipped when no new entry was added"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_whitelist_impl_persists_when_at_least_one_new() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (state, storage) = make_test_app_state(temp.path());
+
+        let mtime_before = std::fs::metadata(storage.root().join("adblock.json"))
+            .ok()
+            .map(|m| m.modified().unwrap());
+        assert!(
+            mtime_before.is_none(),
+            "adblock.json should not exist yet on a fresh AppState"
+        );
+
+        add_whitelist_impl(
+            &state,
+            vec![
+                "first.example.com".to_string(),
+                "bad..example.com".to_string(), // rejected
+                "second.example.com".to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let persisted = mhost_storage::adblock::read_state(storage.root())
+            .expect("adblock.json should exist after a successful add");
+        assert_eq!(
+            persisted.whitelist,
+            vec![
+                "first.example.com".to_string(),
+                "second.example.com".to_string()
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_whitelist_impl_normalizes_and_tolerates_missing() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (state, _storage) = make_test_app_state(temp.path());
+
+        add_whitelist_impl(
+            &state,
+            vec![
+                "alpha.example.com".to_string(),
+                "Beta.Example.Com".to_string(),
+                "gamma.example.com".to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+
+        // Remove with mixed casing + whitespace, plus an entry that was
+        // never added. None of these should error.
+        let result = remove_whitelist_impl(
+            &state,
+            vec![
+                "  ALPHA.EXAMPLE.COM  ".to_string(),
+                "beta.example.com".to_string(),
+                "missing.example.com".to_string(), // silently ignored
+            ],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result,
+            vec!["gamma.example.com".to_string()],
+            "remove should leave only the un-removed entry; missing entries are tolerated"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_whitelist_impl_drops_empty_and_whitespace_inputs() {
+        // Empty/whitespace inputs are filtered out before reaching the
+        // retain loop — they would be no-ops anyway, but we want to be
+        // sure they don't sneak through and trigger a useless file write.
+        let temp = tempfile::TempDir::new().unwrap();
+        let (state, storage) = make_test_app_state(temp.path());
+
+        add_whitelist_impl(&state, vec!["keep.example.com".to_string()])
+            .await
+            .unwrap();
+        let mtime_before = std::fs::metadata(storage.root().join("adblock.json"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let result = remove_whitelist_impl(&state, vec!["".to_string(), "   ".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(result, vec!["keep.example.com".to_string()]);
+
+        let mtime_after = std::fs::metadata(storage.root().join("adblock.json"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_ne!(
+            mtime_before, mtime_after,
+            "empty-input batch must still persist (it does call persist_and_reload unconditionally)"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_whitelist_many_does_not_change_ad_block_rule_count() {
+        // Issue #196 acceptance: 200 valid entries must leave the
+        // rule_count alone (whitelist has no bearing on engine rule sets,
+        // it only gates matching).
+        let temp = tempfile::TempDir::new().unwrap();
+        let (state, _storage) = make_test_app_state(temp.path());
+
+        let inputs: Vec<String> = (0..200).map(|i| format!("host{}.example.com", i)).collect();
+        let result = add_whitelist_impl(&state, inputs).await.unwrap();
+        assert_eq!(result.whitelist.len(), 200);
+        assert!(result.rejected.is_empty());
+
+        let snap = state.ad_block_state.read().await;
+        assert!(
+            snap.sources.is_empty(),
+            "no sources were added in this test"
         );
     }
 

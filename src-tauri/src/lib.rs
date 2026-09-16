@@ -177,7 +177,9 @@ pub fn run() {
             refresh_all_ad_block_sources,
             list_ad_block_whitelist,
             add_ad_block_whitelist,
+            add_ad_block_whitelist_many,
             remove_ad_block_whitelist,
+            remove_ad_block_whitelist_many,
             check_update,
         ])
         .setup(|app| {
