@@ -1258,6 +1258,12 @@ pub(crate) async fn remove_whitelist_impl(
         .map(|d| d.trim().to_lowercase())
         .filter(|d| !d.is_empty())
         .collect();
+    if normalized.is_empty() {
+        // Skip persist when the batch was all whitespace/empty — same
+        // reasoning as `add_whitelist_impl`: a no-op must not pay for a
+        // DNS reload (and the LRU cache clear it triggers).
+        return Ok(state.ad_block_state.read().await.whitelist.clone());
+    }
     {
         let mut guard = state.ad_block_state.write().await;
         for target in &normalized {
@@ -1975,8 +1981,10 @@ mod tests {
     #[tokio::test]
     async fn remove_whitelist_impl_drops_empty_and_whitespace_inputs() {
         // Empty/whitespace inputs are filtered out before reaching the
-        // retain loop — they would be no-ops anyway, but we want to be
-        // sure they don't sneak through and trigger a useless file write.
+        // retain loop — and a fully-empty batch must not pay for a
+        // persist+reload cycle (mirrors the `add_whitelist_impl`
+        // skip-on-no-new-entry behavior; both avoid clearing the LRU
+        // response cache on a no-op).
         let temp = tempfile::TempDir::new().unwrap();
         let (state, storage) = make_test_app_state(temp.path());
 
@@ -1998,9 +2006,9 @@ mod tests {
             .unwrap()
             .modified()
             .unwrap();
-        assert_ne!(
+        assert_eq!(
             mtime_before, mtime_after,
-            "empty-input batch must still persist (it does call persist_and_reload unconditionally)"
+            "empty-input batch must skip persist_and_reload (no DNS churn on a no-op)"
         );
     }
 
