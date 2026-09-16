@@ -118,7 +118,16 @@ async fn set_dns_mode_enable(
     //      - Tier 1 空                      → DhcpEmpty
     //    Tier 3 公共 DNS 兜底**不**进 snapshot（它表示「系统真没 DNS」，
     //    只作为 upstream 的 fallback —— 见 get_upstream_resolvers）。
-    let original = mhost_dns::platform::capture_dns_state()
+    //    capture_dns_state 跑 sync `networksetup`/`scutil` syscall；包
+    //    `spawn_blocking` 防止 wedged `configd` 阻塞 tokio worker（issue #214）。
+    let original = tokio::task::spawn_blocking(mhost_dns::platform::capture_dns_state)
+        .await
+        .map_err(|e| {
+            MhostError::InvalidInput(format!(
+                "capture dns state blocking task join failed: {}",
+                e
+            ))
+        })?
         .map_err(|e| MhostError::InvalidInput(format!("capture dns state failed: {}", e)))?;
     tracing::info!(
         "set_dns_mode_enable: captured OriginalDns = {:?} \
@@ -140,7 +149,42 @@ async fn set_dns_mode_enable(
             false,
         ),
         OriginalDns::DhcpEmpty => {
-            let (s, src) = mhost_dns::platform::get_upstream_resolvers();
+            // issue #214: get_upstream_resolvers 内部跑 networksetup / ipconfig
+            // sync syscall；wedged configd/scutil 时挂死不返回。函数内部的 tier-3
+            // fallback 只覆盖「Tier 1/2 返回失败」，防不了 syscall 挂死不返回，所以
+            // 这层 timeout 包裹不可省。
+            //
+            // 10s 超时与前端 30s withTimeout（src/lib/tauri.ts）叠加：UI 层 30s
+            // 兜底避免完全卡死，操作层 10s 降级让 wedged 系统上 enable **成功**
+            // （公共 DNS fallback）而不是 30s 失败。refresh_upstream 仍 = true，
+            // 一旦 configd 恢复 DnsServer 后台 task 会重新拉取真上游。
+            let (s, src) = match tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                tokio::task::spawn_blocking(mhost_dns::platform::get_upstream_resolvers),
+            )
+            .await
+            {
+                Ok(Ok(pair)) => pair,
+                Ok(Err(join_err)) => {
+                    tracing::warn!(
+                        "get_upstream_resolvers blocking task join failed: {}; falling back to Tier 3 public DNS",
+                        join_err
+                    );
+                    (
+                        mhost_dns::platform::tier3_fallback(),
+                        mhost_dns::UpstreamTier::Public,
+                    )
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        "get_upstream_resolvers timed out after 10s; falling back to Tier 3 public DNS"
+                    );
+                    (
+                        mhost_dns::platform::tier3_fallback(),
+                        mhost_dns::UpstreamTier::Public,
+                    )
+                }
+            };
             (s, src, true)
         }
     };
