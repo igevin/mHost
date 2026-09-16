@@ -4134,7 +4134,25 @@ networksetup -setdnsservers "$IFACE" 127.0.0.1
         // 关键断言 #3：记录的 PID **不存活** —— 这就是 silent failure：
         // 文件说有 proxy 在跑，实际 proxy 早就 exit 了，53 端口没 listener。
         // 这是 #158 整个 issue 想防止的失败模式。
-        let recorded_alive = unsafe { libc::kill(recorded_pid as libc::pid_t, 0) == 0 };
+        // The fake proxy is forked by the shell but the buggy script
+        // never `wait`s for it, so init inherits the orphan as a zombie
+        // until it gets scheduled to reap. On a busy CI runner that
+        // window can stretch past a single `kill -0` probe (the kernel
+        // reports zombies as "alive"), which used to flake this test
+        // intermittently. Poll with a 2s ceiling: if the process really
+        // exited, ESRCH arrives within a few scheduler ticks; if it
+        // somehow stuck around (a real regression), we still catch it.
+        let probe_start = std::time::Instant::now();
+        let recorded_alive = loop {
+            let alive = unsafe { libc::kill(recorded_pid as libc::pid_t, 0) == 0 };
+            if !alive {
+                break false;
+            }
+            if probe_start.elapsed() > std::time::Duration::from_secs(2) {
+                break true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
         assert!(
             !recorded_alive,
             "演示 silent failure：PID file 记录 PID {recorded_pid}，但这个进程早死了；\
