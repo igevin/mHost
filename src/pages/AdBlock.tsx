@@ -1,4 +1,4 @@
-import { useCallback, useState, useEffect } from "react";
+import { useCallback, useState, useEffect, useRef } from "react";
 import { useAtomValue, useSetAtom } from "jotai";
 import { confirm as confirmDialog } from "@tauri-apps/plugin-dialog";
 import {
@@ -22,7 +22,7 @@ import {
   overrideAdBlockSourceRulesLimitAtom,
   refreshAdBlockSourceAtom,
   refreshAllAdBlockSourcesAtom,
-  addAdBlockWhitelistAtom,
+  addAdBlockWhitelistManyAtom,
   removeAdBlockWhitelistAtom,
 } from "../stores/profiles";
 import { useNavigate } from "react-router-dom";
@@ -48,6 +48,7 @@ function AdBlock() {
   const state = useAtomValue(adBlockStateAtom);
   const isLoading = useAtomValue(isAdBlockLoadingAtom);
   const error = useAtomValue(adBlockErrorAtom);
+  const setError = useSetAtom(adBlockErrorAtom);
   const dnsEnabled = useAtomValue(dnsEnabledAtom);
   const ruleCount = useAtomValue(adBlockRuleCountAtom);
   const hasErrors = useAtomValue(adBlockHasErrorsAtom);
@@ -66,7 +67,7 @@ function AdBlock() {
   const resetSourceLimit = useSetAtom(setAdBlockSourceRulesLimitOverrideAtom);
   const refreshSource = useSetAtom(refreshAdBlockSourceAtom);
   const refreshAll = useSetAtom(refreshAllAdBlockSourcesAtom);
-  const addWhitelist = useSetAtom(addAdBlockWhitelistAtom);
+  const addWhitelistMany = useSetAtom(addAdBlockWhitelistManyAtom);
   const removeWhitelist = useSetAtom(removeAdBlockWhitelistAtom);
 
   const { onPointerDown } = useWebKitPointerDown();
@@ -77,6 +78,9 @@ function AdBlock() {
   const [newUrl, setNewUrl] = useState("");
   const [newResponse, setNewResponse] = useState<AdBlockResponse>("zero_address");
   const [newWhitelistDomain, setNewWhitelistDomain] = useState("");
+  // Issue #196: ref so the bulk-add source button can read its value
+  // without the previousElementSibling hack.
+  const bulkSourceRef = useRef<HTMLTextAreaElement>(null);
 
   // Fetch on mount (idempotent — Tauri handles parallel calls). Limits
   // (issue #211-3) are static backend constants: fetched once, failure is
@@ -101,15 +105,113 @@ function AdBlock() {
       });
   }, [addSource, newName, newUrl, newResponse]);
 
+  /**
+   * Issue #196: parse a multi-line paste into individual entries, drop
+   * blanks/comments, and dispatch as a single batch IPC. The textarea
+   * stays a single source of truth — a paste of 200 domains becomes one
+   * `add_ad_block_whitelist_many` call instead of 200 single-entry
+   * round-trips (each of which clears the DNS LRU response cache).
+   */
   const handleAddWhitelist = useCallback(() => {
-    const d = newWhitelistDomain.trim();
-    if (!d) return;
-    addWhitelist(d)
+    const lines = newWhitelistDomain
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      // Strip inline `# ...` comments (the parser does this for hosts
+      // files; we mirror it so users can paste commented lists).
+      .map((l) => l.replace(/#.*$/, "").trim())
+      .filter(Boolean);
+    if (lines.length === 0) return;
+    addWhitelistMany(lines)
       .then(() => setNewWhitelistDomain(""))
       .catch(() => {
         /* error in atom */
       });
-  }, [addWhitelist, newWhitelistDomain]);
+  }, [addWhitelistMany, newWhitelistDomain]);
+
+  /**
+   * Issue #196: copy the full whitelist to the clipboard for easy
+   * backup / share. Reads from state so the user gets exactly what's
+   * persisted (post-normalization), not whatever was last typed.
+   */
+  const handleCopyWhitelist = useCallback(() => {
+    if (!state || state.whitelist.length === 0) return;
+    void navigator.clipboard
+      .writeText(state.whitelist.join("\n"))
+      .catch(() => {
+        // Self-review finding (PR #217): silently swallowing the
+        // clipboard failure left the user staring at a button that did
+        // nothing. Surface through the existing `adBlockErrorAtom`
+        // toast channel — same UX as the bulk-add rejection toast.
+        setError("Copy failed (clipboard unavailable)");
+      });
+  }, [state, setError]);
+
+  /**
+   * Issue #196: bulk-add sources from a `name<TAB>url` paste (one
+   * source per line). Each line fires the existing single-entry IPC so
+   * the backend can stream the per-source fetch + persist pipeline;
+   * we don't bypass the IPC layer for this — it stays in user space
+   * because source fetches are inherently slow (HTTP) and the user
+   * already expects N sequential network calls when adding N sources.
+   */
+  const handleAddSourcesBulk = useCallback(
+    (raw: string) => {
+      const entries = raw
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter(Boolean)
+        // Match-based parser: each regex is tried left-to-right and the
+        // first one that matches wins, so the 2+space branch (which is
+        // what `My List  https://…` uses) is correctly preferred over a
+        // single-space split. Naively using String.split with an
+        // alternation regex always splits at the first single-space
+        // match, even when a longer 2+space match exists later in the
+        // line — that bug ate multi-word source names.
+        .map((line) => {
+          // The branches are tried in priority order so the longest
+          // separator (2+ spaces) wins over a single-space fallback —
+          // a single space inside a multi-word name must NOT cut the
+          // name. Anchoring with `\S` at the start ensures the name
+          // begins at the first non-space char.
+          const m2 =
+            // 2+ spaces — the canonical "name  url" paste form.
+            line.match(/^(\S(?:.*?\S)?)[ \t]{2,}(.+)$/) ??
+            // Tab-separated.
+            line.match(/^(\S(?:.*?\S)?)\t(.+)$/) ??
+            // Single-space fallback — split at the first whitespace.
+            line.match(/^(\S+)[ \t](.+)$/);
+          if (!m2) return { name: "", url: "" };
+          return { name: m2[1].trim(), url: m2[2].trim() };
+        })
+        .filter((e) => e.name && e.url);
+      if (entries.length === 0) return;
+      // Self-review finding (PR #217): the previous Promise.all with
+      // `.catch(() => null)` swallowed every per-source failure and the
+      // last `addSource` atom overwrote any earlier toast. Use
+      // allSettled and surface failures as one summary toast so the
+      // user sees the count and a sample of inputs that failed.
+      void Promise.allSettled(
+        entries.map((e) =>
+          addSource({ name: e.name, url: e.url, response: newResponse }),
+        ),
+      ).then((results) => {
+        const failures = results
+          .map((r, i) => (r.status === "rejected" ? entries[i] : null))
+          .filter((e): e is { name: string; url: string } => e !== null);
+        if (failures.length > 0) {
+          const sample = failures
+            .slice(0, 5)
+            .map((f) => `${f.name} (${f.url})`)
+            .join("; ");
+          const suffix = failures.length > 5 ? "…" : "";
+          setError(
+            `${failures.length} of ${entries.length} sources failed to add: ${sample}${suffix}`,
+          );
+        }
+      });
+    },
+    [addSource, newResponse, setError],
+  );
 
   const handleIntervalChange = useCallback(
     (hours: number) => {
@@ -281,6 +383,36 @@ function AdBlock() {
             </button>
           </div>
 
+          {/* Issue #196: bulk paste — one source per line as
+              `name<TAB>url` (tab, 2+ spaces, or single space all work).
+              Each line still goes through the single-entry IPC so the
+              backend's per-source fetch + persist pipeline is reused
+              unchanged; this UI just saves the user N clicks. */}
+          <details className={styles.bulkAdd}>
+            <summary className={styles.bulkAddSummary}>
+              Bulk add (one per line: <code>name&lt;TAB&gt;url</code>)
+            </summary>
+            <textarea
+              ref={bulkSourceRef}
+              className={`input ${styles.bulkTextarea ?? ""}`}
+              rows={3}
+              placeholder={"StevenBlack\thttps://example.com/hosts\nMy List  https://ml.com/hosts"}
+              aria-label="Bulk add sources (name<TAB>url per line)"
+              disabled={isLoading}
+            />
+            <button
+              className="btn btn-sm"
+              type="button"
+              disabled={isLoading}
+              onClick={() => {
+                if (bulkSourceRef.current) handleAddSourcesBulk(bulkSourceRef.current.value);
+              }}
+              onPointerDown={onPointerDown(() => {})}
+            >
+              Add all
+            </button>
+          </details>
+
           {/* Source list */}
           {state.sources.length === 0 ? (
             <div className={styles.empty}>No sources yet.</div>
@@ -450,24 +582,44 @@ function AdBlock() {
 
         {/* Whitelist */}
         <div className="card">
-          <h2 className="card-title">Whitelist</h2>
+          <div className={styles.whitelistHeader}>
+            <h2 className="card-title">Whitelist</h2>
+            <button
+              className="btn btn-sm"
+              onClick={handleCopyWhitelist}
+              disabled={state.whitelist.length === 0}
+              aria-label="Copy whitelist to clipboard"
+              title="Copy whitelist to clipboard"
+              onPointerDown={onPointerDown(() => {})}
+            >
+              Copy
+            </button>
+          </div>
           <p className={styles.muted}>
             Domains here are exempt from all ad block rules. Suffix-matched:
             adding <code>example.com</code> also exempts{" "}
-            <code>api.example.com</code>.
+            <code>api.example.com</code>. Paste multiple — one per line —
+            and submit with the Add button or Cmd/Ctrl+Enter.
           </p>
 
           <div className={`${styles.inlineForm} ${styles.sectionGap}`}>
-            <input
-              className="input"
-              type="text"
+            <textarea
+              className={`input ${styles.whitelistTextarea ?? ""}`}
+              rows={4}
               value={newWhitelistDomain}
               placeholder="trusted.example.com"
               onChange={(e) => setNewWhitelistDomain(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === "Enter") handleAddWhitelist();
+                // Cmd/Ctrl+Enter submits the whole batch. Plain Enter
+                // stays as a line break so users can compose multi-line
+                // pastes by hand. Issue #196.
+                if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                  e.preventDefault();
+                  handleAddWhitelist();
+                }
               }}
               disabled={isLoading}
+              aria-label="Whitelist domains (one per line, Cmd/Ctrl+Enter to submit)"
             />
             <button
               className="btn btn-primary btn-sm"
