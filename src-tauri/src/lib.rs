@@ -164,6 +164,7 @@ pub fn run() {
             // 广告屏蔽（issue #130）
             get_ad_block_state,
             get_ad_block_limits,
+            get_ad_block_stats,
             set_ad_block_enabled,
             set_ad_block_refresh_interval,
             set_ad_block_auto_refresh_enabled,

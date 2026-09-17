@@ -22,6 +22,7 @@ import {
   listDnsProfiles,
   getAdBlockState,
   getAdBlockLimits,
+  getAdBlockStats,
   setAdBlockEnabled,
   setAdBlockRefreshInterval,
   setAdBlockAutoRefreshEnabled,
@@ -63,6 +64,7 @@ import {
   isAdBlockLoadingAtom,
   adBlockErrorAtom,
   adBlockLimitsAtom,
+  adBlockStatsAtom,
   quickApplyOutcomeAtom,
   isQuickApplyToastOpenAtom,
 } from "./state";
@@ -599,6 +601,22 @@ export const fetchAdBlockLimitsAtom = atom(null, async (_get, set) => {
     // Non-fatal: the UI falls back to ungated rendering and the backend
     // still validates overrides authoritatively.
     console.warn("failed to load ad-block limits", err);
+  }
+});
+
+// Issue #199 sub-task B: pull the engine's cumulative counters into the
+// `adBlockStatsAtom`. The stats panel calls this on mount; a periodic
+// refresh isn't wired here (out of scope — the engine exposes the
+// IPC, the consumer decides cadence).
+export const fetchAdBlockStatsAtom = atom(null, async (_get, set) => {
+  try {
+    const stats = await getAdBlockStats();
+    set(adBlockStatsAtom, stats);
+  } catch (err) {
+    // Non-fatal: the panel shows the "unknown" placeholder. The
+    // engine counters still increment in-process; the next call
+    // will pick them up.
+    console.warn("failed to load ad-block stats", err);
   }
 });
 

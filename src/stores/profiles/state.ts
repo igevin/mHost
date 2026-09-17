@@ -78,6 +78,13 @@ export const adBlockErrorAtom = atom<string | null>(null);
 // remains the authority and rejects over-cap overrides itself).
 export const adBlockLimitsAtom = atom<import("../../types").AdBlockLimits | null>(null);
 
+// Issue #199 sub-task B: cumulative ad-block engine counters.
+// `null` until the first successful `getAdBlockStats` pull; the UI
+// shows an "unknown" placeholder until then. The atom holds the
+// *latest* snapshot — historical polling rate is a separate
+// concern (out of scope here).
+export const adBlockStatsAtom = atom<import("../../types").AdBlockStats | null>(null);
+
 export const adBlockRuleCountAtom = atom((get) => {
   const state = get(adBlockStateAtom);
   if (!state) return 0;

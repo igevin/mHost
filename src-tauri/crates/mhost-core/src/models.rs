@@ -260,6 +260,28 @@ pub struct AdBlockSource {
     /// accepts documents written before the field existed.
     #[serde(default)]
     pub rules_limit_override: Option<usize>,
+
+    /// Wall-clock duration of the last fetch (issue #199 sub-task B).
+    /// Recorded on every call to `fetch_and_cache_source` regardless
+    /// of success / failure, so the UI's refresh-status panel can
+    /// show "last refresh took 1.4 s" alongside the timestamp.
+    ///
+    /// Issue #202 lesson — always serialized (never `undefined`),
+    /// `#[serde(default)]` for back-compat with documents written
+    /// before this field existed.
+    #[serde(default)]
+    pub last_refresh_duration_ms: Option<u64>,
+
+    /// RFC 3339 timestamp of the last *failed* fetch (issue #199
+    /// sub-task B). Distinct from `last_error` (which carries the
+    /// message of the most recent failure regardless of when) so
+    /// the UI can compute a failure-rate over time. Cleared on
+    /// the next successful fetch (success erases the failure).
+    ///
+    /// Issue #202 lesson — always serialized; `#[serde(default)]`
+    /// for back-compat.
+    #[serde(default)]
+    pub last_refresh_failed_at: Option<DateTime<Utc>>,
 }
 
 /// Persistent state for the DNS-mode ad block subsystem.
@@ -870,6 +892,8 @@ mod tests {
             rule_count: 0,
             etag: None,
             rules_limit_override: None,
+            last_refresh_duration_ms: None,
+            last_refresh_failed_at: None,
         };
         let json = serde_json::to_string(&source).unwrap();
         assert!(json.contains("\"last_fetched_at\":null"), "{}", json);
@@ -893,6 +917,8 @@ mod tests {
             rule_count: 42,
             etag: Some("W/\"abc\"".to_string()),
             rules_limit_override: Some(612_003),
+            last_refresh_duration_ms: None,
+            last_refresh_failed_at: None,
         };
         let json = serde_json::to_string(&source).unwrap();
         assert!(json.contains("last_fetched_at"));
@@ -927,6 +953,8 @@ mod tests {
                 rule_count: 100,
                 etag: None,
                 rules_limit_override: None,
+                last_refresh_duration_ms: None,
+                last_refresh_failed_at: None,
             }],
             whitelist: vec!["trusted.example.com".to_string()],
             auto_refresh_enabled: true,
@@ -954,6 +982,8 @@ mod tests {
             rule_count: 612_003,
             etag: None,
             rules_limit_override: Some(612_003),
+            last_refresh_duration_ms: None,
+            last_refresh_failed_at: None,
         };
         let json = serde_json::to_string(&source).unwrap();
         assert!(json.contains("\"rules_limit_override\":612003"), "{}", json);

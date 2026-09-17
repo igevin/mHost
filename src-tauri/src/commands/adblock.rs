@@ -316,7 +316,10 @@ pub(crate) async fn persist_and_reload(state: &AppState) -> Result<(), MhostErro
             // (See issue #138: spawn_blocking cannot be aborted.)
             if !cancel.is_cancelled() {
                 if let Some(server) = lock_or_recover(&dns_server).as_ref() {
-                    server.reload_ad_block_rules(zero_addr, nxdomain, whitelist);
+                    // Issue #199 sub-task B: pass the master
+                    // switch to the engine so `check()` can
+                    // decide whether misses should accumulate.
+                    server.reload_ad_block_rules(snapshot.enabled, zero_addr, nxdomain, whitelist);
                 }
             }
         }
@@ -547,6 +550,14 @@ pub(crate) async fn fetch_and_cache_source(
     let gate = acquire_source_refresh_gate(source_id).await;
     let _gate_guard = gate.lock().await;
 
+    // Issue #199 sub-task B: time the whole fetch round so the UI
+    // can show "last refresh took N ms" per source. We measure the
+    // *whole* call — from right after the gate is acquired to the
+    // final state mutation — because that's what the user
+    // 9perceives as refresh latency, including the per-source
+    // queue wait, the actual HTTP call, and the in-memory bookkeeping.
+    let started_at = std::time::Instant::now();
+
     // 1. Read the source record under the read lock. We capture both
     //    the URL (for the fetch) and the previous ETag / last_fetched_at
     //    (for the conditional GET — issue #193), plus the effective
@@ -653,6 +664,13 @@ pub(crate) async fn fetch_and_cache_source(
     .await
     .map_err(|e| MhostError::Network(format!("fetch task failed: {}", e)))?;
 
+    // Issue #199 sub-task B: capture elapsed wall-clock time once,
+    // reuse for all three branches (success / 304 / error). We use
+    // `u64` so the field stays `Option<u64>`; `Duration::as_millis`
+    // returns `u128`, but `u64::MAX` ms is ~584 million years so the
+    // narrowing cast is safe.
+    let elapsed_ms = started_at.elapsed().as_millis() as u64;
+
     match fetch_parse {
         Ok(Parsed::Fresh { rule_count, etag }) => {
             // 200 OK path — full update: clear error, set fetched_at,
@@ -663,6 +681,11 @@ pub(crate) async fn fetch_and_cache_source(
                 s.last_fetched_at = Some(Utc::now());
                 s.rule_count = rule_count;
                 s.etag = etag;
+                s.last_refresh_duration_ms = Some(elapsed_ms);
+                // Successful fetch clears any prior failure timestamp
+                // (issue #199 sub-task B): a fresh success makes the
+                // "last failed at" meaningless.
+                s.last_refresh_failed_at = None;
             }
             Ok(())
         }
@@ -672,18 +695,27 @@ pub(crate) async fn fetch_and_cache_source(
             // look stale, and we want to clear any prior `last_error`
             // since we just successfully round-tripped the upstream.
             // `rule_count` and `etag` are intentionally NOT touched —
-            // they continue to reflect the cached payload.
+            // they continue to reflect the cached payload. Same for
+            // `last_refresh_failed_at`: cleared because the upstream
+            // just acknowledged we are current.
             let mut guard = ad_block_state.write().await;
             if let Some(s) = adblock_store::find_source_mut(&mut guard, source_id) {
                 s.last_error = None;
                 s.last_fetched_at = Some(Utc::now());
+                s.last_refresh_duration_ms = Some(elapsed_ms);
+                s.last_refresh_failed_at = None;
             }
             Ok(())
         }
         Err(e) => {
             // Network / size / parse failure: record on `last_error`,
             // keep the previous cache intact for DNS to keep serving.
-            record_fetch_error(ad_block_state, source_id, &e.to_string()).await?;
+            // Issue #199 sub-task B: also stamp the timing and
+            // failure-timestamp fields so the UI's refresh panel can
+            // show "last refresh took 30 s (timeout)" and the user
+            // can see how long ago the last failure was.
+            record_fetch_error_with_timing(ad_block_state, source_id, &e.to_string(), elapsed_ms)
+                .await?;
             Err(e)
         }
     }
@@ -705,6 +737,26 @@ pub(crate) async fn record_fetch_error(
     let mut guard = ad_block_state.write().await;
     if let Some(s) = adblock_store::find_source_mut(&mut guard, source_id) {
         s.last_error = Some(err.to_string());
+    }
+    Ok(())
+}
+
+/// Same as [`record_fetch_error`] but also stamps the issue #199
+/// sub-task B timing fields: `last_refresh_duration_ms` and
+/// `last_refresh_failed_at`. Used by the `Err` branch of
+/// `fetch_and_cache_source` so a failed fetch still surfaces
+/// how long it took and when it happened.
+pub(crate) async fn record_fetch_error_with_timing(
+    ad_block_state: &Arc<tokio::sync::RwLock<AdBlockState>>,
+    source_id: &SourceId,
+    err: &str,
+    elapsed_ms: u64,
+) -> Result<(), MhostError> {
+    let mut guard = ad_block_state.write().await;
+    if let Some(s) = adblock_store::find_source_mut(&mut guard, source_id) {
+        s.last_error = Some(err.to_string());
+        s.last_refresh_duration_ms = Some(elapsed_ms);
+        s.last_refresh_failed_at = Some(Utc::now());
     }
     Ok(())
 }
@@ -732,6 +784,26 @@ fn rfc7231_date(dt: chrono::DateTime<chrono::Utc>) -> String {
 /// frontend mirror risks silent drift; the authoritative values live here
 /// and the UI fetches them. `rules_per_source_default` is informational
 /// (shown as "default cap" context).
+/// Issue #199 sub-task B: view-model for the engine counters + master
+/// switch exposed via `get_ad_block_stats`. Mirrors
+/// `mhost_dns::adblock::AdBlockStats` (the engine-side struct) and
+/// adds the current master-switch flag so the frontend can label
+/// the panel correctly ("stats while master switch off" is a
+/// useful UI hint).
+#[derive(Debug, Clone, Serialize)]
+pub struct AdBlockStatsView {
+    pub hits_zero_addr: u64,
+    pub hits_nxdomain: u64,
+    pub hits_whitelist: u64,
+    pub misses: u64,
+    /// Whether the master switch is on at the moment of the call.
+    /// `false` means the engine is parked; consumers should still
+    /// show the cumulative numbers but tag the panel as
+    /// "master switch off" so the absence of new hits isn't
+    /// surprising.
+    pub enabled: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AdBlockLimits {
     /// Global default cap applied when a source has no
@@ -756,6 +828,38 @@ pub async fn get_ad_block_limits() -> Result<AdBlockLimits, MhostError> {
 #[tauri::command]
 pub async fn get_ad_block_state(state: State<'_, AppState>) -> Result<AdBlockState, MhostError> {
     Ok(state.ad_block_state.read().await.clone())
+}
+
+/// Issue #199 sub-task B: return the engine's cumulative hit / miss
+/// counters for the UI's stats panel.
+///
+/// Returns `AdBlockStats` with zeros if DNS mode is off (no engine
+/// loaded). The four counters are cumulative since process start —
+/// there is no reset path; consumers compute their own deltas if
+/// they want a "today" view.
+#[tauri::command]
+pub async fn get_ad_block_stats(
+    state: State<'_, AppState>,
+) -> Result<AdBlockStatsView, MhostError> {
+    let stats = {
+        let guard = lock_or_recover(&state.dns_server);
+        match guard.as_ref() {
+            Some(server) => server.ad_block_stats(),
+            None => mhost_dns::adblock::AdBlockStats {
+                hits_zero_addr: 0,
+                hits_nxdomain: 0,
+                hits_whitelist: 0,
+                misses: 0,
+            },
+        }
+    };
+    Ok(AdBlockStatsView {
+        hits_zero_addr: stats.hits_zero_addr,
+        hits_nxdomain: stats.hits_nxdomain,
+        hits_whitelist: stats.hits_whitelist,
+        misses: stats.misses,
+        enabled: state.ad_block_state.read().await.enabled,
+    })
 }
 
 /// Master switch. Disabling also clears the engine's rule sets via
@@ -883,6 +987,8 @@ pub(crate) async fn add_ad_block_source_impl(
         rule_count: 0,
         etag: None,
         rules_limit_override: None,
+        last_refresh_duration_ms: None,
+        last_refresh_failed_at: None,
     };
     let new_id = new_source.source_id.clone();
 
@@ -1406,6 +1512,8 @@ mod tests {
             rule_count: 1,
             etag: None,
             rules_limit_override: None,
+            last_refresh_duration_ms: None,
+            last_refresh_failed_at: None,
         });
         let (z, n, w) = classify_rules(&state, temp.path());
         assert!(z.is_empty());
@@ -1427,6 +1535,8 @@ mod tests {
             rule_count: 0,
             etag: None,
             rules_limit_override: None,
+            last_refresh_duration_ms: None,
+            last_refresh_failed_at: None,
         };
         let za_source = mk("za", AdBlockResponse::ZeroAddress, true);
         let nx_source = mk("nx", AdBlockResponse::NxDomain, true);
@@ -1692,6 +1802,8 @@ mod tests {
             rule_count: 2,
             etag: None,
             rules_limit_override: None,
+            last_refresh_duration_ms: None,
+            last_refresh_failed_at: None,
         };
         let za_source = mk("za", AdBlockResponse::ZeroAddress);
         let nx_source = mk("nx", AdBlockResponse::NxDomain);
@@ -1753,6 +1865,8 @@ mod tests {
             rule_count: 1,
             etag: None,
             rules_limit_override: None,
+            last_refresh_duration_ms: None,
+            last_refresh_failed_at: None,
         };
         mhost_storage::adblock::write_cache(
             temp.path(),
@@ -1782,7 +1896,10 @@ mod tests {
             cache_size: 100,
         };
         let server = std::sync::Arc::new(mhost_dns::DnsServer::new(config).unwrap());
-        server.reload_ad_block_rules(za, nx, wl);
+        // Master switch on — the next assertion is `rule_count == 1`
+        // which depends on the rebuild going through with rules
+        // actually fed into the engine.
+        server.reload_ad_block_rules(true, za, nx, wl);
         assert_eq!(server.ad_block_rule_count(), 1);
 
         let server_clone = std::sync::Arc::clone(&server);
@@ -2560,6 +2677,8 @@ mod tests {
                 rule_count: 0,
                 etag: None,
                 rules_limit_override: None,
+                last_refresh_duration_ms: None,
+                last_refresh_failed_at: None,
             });
         }
 
@@ -2687,6 +2806,8 @@ mod tests {
                 rule_count: 0,
                 etag: Some("\"v0-stale\"".to_string()),
                 rules_limit_override: None,
+                last_refresh_duration_ms: None,
+                last_refresh_failed_at: None,
             });
         }
         // Plant a stale cache file so we can assert it gets overwritten.
@@ -2762,6 +2883,8 @@ mod tests {
                 rule_count: 7,
                 etag: None, // no etag → If-None-Match will be omitted
                 rules_limit_override: None,
+                last_refresh_duration_ms: None,
+                last_refresh_failed_at: None,
             });
         }
         // Issue #206 finding 2: the 304 path now verifies the cache file
@@ -2905,6 +3028,8 @@ mod tests {
                 rule_count: 0,
                 etag: None,
                 rules_limit_override: None,
+                last_refresh_duration_ms: None,
+                last_refresh_failed_at: None,
             });
         }
 
@@ -2984,6 +3109,8 @@ mod tests {
                 rule_count: 0,
                 etag: None,
                 rules_limit_override: Some(2), // below the 3-domain list
+                last_refresh_duration_ms: None,
+                last_refresh_failed_at: None,
             });
         }
 
@@ -3054,6 +3181,8 @@ mod tests {
                 rule_count: 0,
                 etag: None,
                 rules_limit_override: None,
+                last_refresh_duration_ms: None,
+                last_refresh_failed_at: None,
             });
         }
 
@@ -3128,6 +3257,8 @@ mod tests {
                 rule_count: 7, // stale bookkeeping from a wiped cache
                 etag: Some("\"v1\"".to_string()),
                 rules_limit_override: None,
+                last_refresh_duration_ms: None,
+                last_refresh_failed_at: None,
             });
         }
         assert!(
@@ -3205,6 +3336,8 @@ mod tests {
                 rule_count: 7, // stale bookkeeping from a wiped cache
                 etag: Some("\"v1\"".to_string()),
                 rules_limit_override: None,
+                last_refresh_duration_ms: None,
+                last_refresh_failed_at: None,
             });
         }
 
@@ -3284,6 +3417,8 @@ mod tests {
                 rule_count: 0,
                 etag: None,
                 rules_limit_override: None,
+                last_refresh_duration_ms: None,
+                last_refresh_failed_at: None,
             });
         }
 
@@ -3369,6 +3504,8 @@ mod tests {
                 rule_count: 1,
                 etag: Some("\"v1\"".to_string()),
                 rules_limit_override: None,
+                last_refresh_duration_ms: None,
+                last_refresh_failed_at: None,
             });
         }
         // Local cache exists but is stale (e.g. canonicalized by an old
@@ -3428,6 +3565,8 @@ mod tests {
                 rule_count: 3,
                 etag: Some("\"v1\"".into()),
                 rules_limit_override: None,
+                last_refresh_duration_ms: None,
+                last_refresh_failed_at: None,
             });
         }
         // Pretend the source has a populated cache on disk.
@@ -3495,6 +3634,8 @@ mod tests {
                 rule_count: 99,
                 etag: Some("\"stale\"".into()),
                 rules_limit_override: None,
+                last_refresh_duration_ms: None,
+                last_refresh_failed_at: None,
             });
         }
         // Confirm the "post-disable" precondition: cache file gone.
@@ -3568,6 +3709,8 @@ mod tests {
                 rule_count: 0,
                 etag: None,
                 rules_limit_override: None,
+                last_refresh_duration_ms: None,
+                last_refresh_failed_at: None,
             });
         }
         mhost_storage::adblock::write_cache(

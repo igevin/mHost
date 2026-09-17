@@ -19,6 +19,7 @@
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::matcher::walk_parents;
@@ -78,15 +79,66 @@ impl RulesSnapshot {
 /// snapshot (issue #132). `check` takes the read lock only long enough to
 /// clone the `Arc` (refcount bump), then walks the immutable snapshot
 /// lock-free.
+/// Snapshot of [`AdBlockEngine`] counters, returned by
+/// [`AdBlockEngine::stats`]. Cumulative since process start — the
+/// engine has no notion of "reset to zero" because the foreground
+/// reads (`get_ad_block_stats` IPC) are pull-based and the consumer
+/// computes its own deltas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdBlockStats {
+    pub hits_zero_addr: u64,
+    pub hits_nxdomain: u64,
+    pub hits_whitelist: u64,
+    pub misses: u64,
+}
+
 pub struct AdBlockEngine {
     current: RwLock<Arc<RulesSnapshot>>,
+    /// Master switch (issue #199 sub-task B): mirrored from
+    /// `state.enabled` by `reload_ad_block_rules`. `check()` reads this
+    /// to decide whether `misses` should accumulate — the issue's
+    /// contract is "misses counts only when the master switch is on",
+    /// and the caller cannot easily thread `state.enabled` through the
+    /// DNS hot path (issue #199).
+    enabled: AtomicBool,
+    /// Hit counters (issue #199 sub-task B). Lock-free so the DNS hot
+    /// path never blocks; `Relaxed` ordering is fine because we only
+    /// care about per-counter monotonic accumulation, not cross-counter
+    /// consistency. The four counters together describe every outcome
+    /// `check()` can produce when `enabled == true`.
+    ///
+    /// * `hits_zero_addr` — matched a `ZeroAddress` source.
+    /// * `hits_nxdomain` — matched an `NxDomain` source.
+    /// * `hits_whitelist` — matched a whitelist entry (bypassed the
+    ///   block layer, fell through to the regular rule engine).
+    /// * `misses` — master switch on, no rule matched, no whitelist
+    ///   match. This is the "would have been blocked if we had a
+    ///   rule" signal; a purely informational volume metric, not a
+    ///   correctness check.
+    hits_zero_addr: AtomicU64,
+    hits_nxdomain: AtomicU64,
+    hits_whitelist: AtomicU64,
+    misses: AtomicU64,
 }
 
 impl AdBlockEngine {
     pub fn new() -> Self {
         Self {
             current: RwLock::new(Arc::new(RulesSnapshot::default())),
+            enabled: AtomicBool::new(false),
+            hits_zero_addr: AtomicU64::new(0),
+            hits_nxdomain: AtomicU64::new(0),
+            hits_whitelist: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
         }
+    }
+
+    /// Mirror the master switch onto the engine. Called from
+    /// `reload_ad_block_rules`; safe to call independently (used by
+    /// tests that exercise the counter accounting without rebuilding
+    /// the full rule set).
+    pub fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::Relaxed);
     }
 
     /// Atomically swap in new rule sets.
@@ -131,33 +183,69 @@ impl AdBlockEngine {
 
     /// Decide what to do with a query.
     ///
-    /// Returns `None` if the domain is whitelisted (fall through to the
-    /// regular rule engine / upstream) or not blocked at all.
+    /// Returns `None` if the domain is whitelisted (fall through to
+    /// the regular rule engine / upstream) or not blocked at all.
+    ///
+    /// **Counter accounting (issue #199 sub-task B):** when the
+    /// master switch is on, exactly one of the four counters
+    /// advances per call:
+    ///
+    /// * `hits_whitelist` — whitelist matched → fall through
+    /// * `hits_nxdomain` — NXDOMAIN rule matched
+    /// * `hits_zero_addr` — zero-address rule matched
+    /// * `misses` — none of the above
+    ///
+    /// When the master switch is off, no counter advances (issue
+    /// contract: "misses 累加（不要把 whitelist 命中算 miss）" — by
+    /// extension, nothing else counts either, because the user has
+    /// not opted in to ad blocking). With master off AND no block
+    /// rules loaded AND no whitelist match, the call returns `None`
+    /// without touching any counter — there is nothing meaningful
+    /// to record.
     pub fn check(&self, domain: &str) -> Option<AdBlockAction> {
         let snap = self.snapshot();
-        // Fast-path: no block rules loaded → no possible hit. Avoids any
-        // domain walking for the common `state.enabled == false` case.
-        // Whitelist is excluded because it's collected regardless of the
-        // master switch (review Medium #2); an empty block-rule set means
-        // `check()` can only return `None`. Unlike the old `AtomicUsize`
-        // short-circuit this reads the very snapshot the walk below uses,
-        // so the empty-check can't disagree with the rule data (issue #132).
+
+        // Master switch off → no counters, no work. The whitelist
+        // walk is skipped because the caller always falls through on
+        // `None`, and `classify_rules` only feeds block rules to the
+        // engine when master is on, so a whitelist hit while master
+        // is off produces no observable behaviour change.
+        if !self.enabled.load(Ordering::Relaxed) {
+            return None;
+        }
+
+        // Whitelist first — wins over both block-rule sets
+        // (whitelist collected regardless of master switch). A
+        // whitelist hit counts toward `hits_whitelist` and returns
+        // `None` to let the regular rule engine / upstream handle
+        // the query.
+        if walk_parents(domain, |d| snap.whitelist.contains(d).then_some(())).is_some() {
+            self.hits_whitelist.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+
+        // No block rules loaded → no possible hit beyond whitelist.
+        // We deliberately do NOT count this as a miss: with no block
+        // rules, "no match" is the empty answer, not a "should have
+        // been blocked" signal. (Master switch is on, so we still
+        // walked the whitelist above and incremented if it matched.)
         if !snap.has_block_rules() {
             return None;
         }
 
-        // 1. whitelist (read once, then release)
-        if walk_parents(domain, |d| snap.whitelist.contains(d).then_some(())).is_some() {
-            return None;
-        }
-        // 2. NXDOMAIN sources first — more aggressive, save a hashmap lookup
+        // NXDOMAIN sources first — more aggressive, save a hashmap lookup
         if walk_parents(domain, |d| snap.nxdomain.contains(d).then_some(())).is_some() {
+            self.hits_nxdomain.fetch_add(1, Ordering::Relaxed);
             return Some(AdBlockAction::NxDomain);
         }
-        // 3. zero-address sources
+        // zero-address sources
         if let Some(ip) = walk_parents(domain, |d| snap.zero_addr.get(d).copied()) {
+            self.hits_zero_addr.fetch_add(1, Ordering::Relaxed);
             return Some(AdBlockAction::ZeroAddress(ip));
         }
+
+        // Master switch on, no whitelist hit, no block rule → genuine miss.
+        self.misses.fetch_add(1, Ordering::Relaxed);
         None
     }
 
@@ -165,6 +253,19 @@ impl AdBlockEngine {
     /// included — it influences `check` outcomes).
     pub fn rule_count(&self) -> usize {
         self.snapshot().total()
+    }
+
+    /// Snapshot the four counters in one place so the
+    /// `get_ad_block_stats` IPC returns a value-typed struct instead
+    /// of four separate IPC calls. `Relaxed` loads are fine — each
+    /// counter is independently monotonically increasing.
+    pub fn stats(&self) -> AdBlockStats {
+        AdBlockStats {
+            hits_zero_addr: self.hits_zero_addr.load(Ordering::Relaxed),
+            hits_nxdomain: self.hits_nxdomain.load(Ordering::Relaxed),
+            hits_whitelist: self.hits_whitelist.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+        }
     }
 
     pub fn whitelist_size(&self) -> usize {
@@ -237,6 +338,7 @@ mod tests {
     fn zero_address_hit_returns_zero_address() {
         let engine = AdBlockEngine::new();
         engine.rebuild(za(&["ad.example.com"]), nx(&[]), wl(&[]));
+        engine.set_enabled(true);
         let action = engine.check("ad.example.com");
         assert_eq!(
             action,
@@ -250,6 +352,7 @@ mod tests {
     fn nxdomain_hit_returns_nxdomain() {
         let engine = AdBlockEngine::new();
         engine.rebuild(za(&[]), nx(&["tracker.example.com"]), wl(&[]));
+        engine.set_enabled(true);
         assert_eq!(
             engine.check("tracker.example.com"),
             Some(AdBlockAction::NxDomain)
@@ -261,6 +364,7 @@ mod tests {
         // ad-blocker semantics: registering example.com hits *.example.com
         let engine = AdBlockEngine::new();
         engine.rebuild(za(&["example.com"]), nx(&[]), wl(&[]));
+        engine.set_enabled(true);
         for d in ["example.com", "ad.example.com", "deep.ad.example.com"] {
             assert!(
                 matches!(engine.check(d), Some(AdBlockAction::ZeroAddress(_))),
@@ -284,6 +388,7 @@ mod tests {
             nx(&["example.com"]),
             wl(&[]),
         );
+        engine.set_enabled(true);
         // The parent NXDOMAIN wins because it's consulted first.
         assert_eq!(
             engine.check("specific.ad.example.com"),
@@ -307,6 +412,7 @@ mod tests {
             nx(&["example.com"]),
             wl(&["good.example.com"]),
         );
+        engine.set_enabled(true);
         // whitelist exact hit
         assert_eq!(engine.check("good.example.com"), None);
         // whitelist suffix hit
@@ -319,11 +425,13 @@ mod tests {
     fn rebuild_replaces_state_atomically() {
         let engine = AdBlockEngine::new();
         engine.rebuild(za(&["a.com"]), nx(&["b.com"]), wl(&["c.com"]));
+        engine.set_enabled(true);
         assert_eq!(engine.zero_addr_count(), 1);
         assert_eq!(engine.nxdomain_count(), 1);
         assert_eq!(engine.whitelist_size(), 1);
 
         engine.rebuild(za(&["d.com", "e.com"]), nx(&[]), wl(&[]));
+        engine.set_enabled(true);
         assert_eq!(engine.zero_addr_count(), 2);
         assert_eq!(engine.nxdomain_count(), 0);
         assert_eq!(engine.whitelist_size(), 0);
@@ -345,6 +453,7 @@ mod tests {
             nx(&["c.com", "d.com", "e.com"]),
             wl(&[]),
         );
+        engine.set_enabled(true);
         assert_eq!(engine.rule_count(), 5);
     }
 
@@ -357,6 +466,7 @@ mod tests {
     fn rule_count_includes_whitelist() {
         let engine = AdBlockEngine::new();
         engine.rebuild(za(&["a.com"]), nx(&[]), wl(&["w1", "w2", "w3"]));
+        engine.set_enabled(true);
         assert_eq!(engine.rule_count(), 4);
     }
 
@@ -406,6 +516,7 @@ mod tests {
         // End-to-end tie-in: behaviour is unchanged by the optimisation.
         let engine = AdBlockEngine::new();
         engine.rebuild(za(&[]), nx(&[]), wl(&["trusted.com"]));
+        engine.set_enabled(true);
         assert_eq!(engine.check("trusted.com"), None);
         assert_eq!(engine.rule_count(), 1);
     }
@@ -417,9 +528,11 @@ mod tests {
     fn rebuild_updates_cached_total() {
         let engine = AdBlockEngine::new();
         engine.rebuild(za(&["a.com"]), nx(&[]), wl(&[]));
+        engine.set_enabled(true);
         assert_eq!(engine.rule_count(), 1);
 
         engine.rebuild(za(&[]), nx(&[]), wl(&[]));
+        engine.set_enabled(true);
         assert_eq!(
             engine.rule_count(),
             0,
@@ -436,6 +549,7 @@ mod tests {
         // `.xyz` TLD used by abuse).
         let engine = AdBlockEngine::new();
         engine.rebuild(za(&["com"]), nx(&[]), wl(&[]));
+        engine.set_enabled(true);
         assert!(matches!(
             engine.check("example.com"),
             Some(AdBlockAction::ZeroAddress(_))
@@ -446,5 +560,142 @@ mod tests {
         ));
         // A different TLD is untouched.
         assert_eq!(engine.check("example.org"), None);
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #199 sub-task B: hit / miss / per-action counters.
+    // -----------------------------------------------------------------
+
+    /// Mixed whitelist + zero-addr + nxdomain + miss traffic
+    /// accumulates into exactly the right counter on each call.
+    /// Drives the engine with `set_enabled(true)` first because
+    /// master switch off is a no-op (verified separately below).
+    #[test]
+    fn counter_accounting_for_mixed_traffic() {
+        let engine = AdBlockEngine::new();
+        engine.rebuild(
+            za(&["ad.example.com"]),
+            nx(&["tracker.example.com"]),
+            wl(&["good.example.com"]),
+        );
+        engine.set_enabled(true);
+
+        // 2 zero-addr hits, 2 nxdomain hits, 9 whitelist hits (3 queries
+        // × 3 iters), 5 misses.
+        for _ in 0..2 {
+            assert_eq!(
+                engine.check("ad.example.com"),
+                Some(AdBlockAction::ZeroAddress(IpAddr::V4(Ipv4Addr::new(
+                    0, 0, 0, 0
+                ))))
+            );
+            assert_eq!(
+                engine.check("tracker.example.com"),
+                Some(AdBlockAction::NxDomain)
+            );
+        }
+        for _ in 0..3 {
+            // exact + suffix whitelist hits; all count toward hits_whitelist
+            assert_eq!(engine.check("good.example.com"), None);
+            assert_eq!(engine.check("api.good.example.com"), None);
+            assert_eq!(engine.check("good.example.com"), None);
+        }
+        for _ in 0..5 {
+            // not in any set → miss
+            assert_eq!(engine.check("untouched.example.org"), None);
+        }
+
+        let s = engine.stats();
+        assert_eq!(s.hits_zero_addr, 2, "zero-addr hits counted");
+        assert_eq!(s.hits_nxdomain, 2, "nxdomain hits counted");
+        assert_eq!(
+            s.hits_whitelist, 9,
+            "whitelist hits counted (3 queries × 3 iters)"
+        );
+        assert_eq!(s.misses, 5, "misses counted");
+    }
+
+    /// Whitelist hits do NOT count as misses (issue #199 contract:
+    /// "misses 累加, 不要把 whitelist 命中算 miss").
+    #[test]
+    fn whitelist_hit_is_not_a_miss() {
+        let engine = AdBlockEngine::new();
+        engine.rebuild(za(&[]), nx(&[]), wl(&["safe.example.com"]));
+        engine.set_enabled(true);
+
+        for _ in 0..10 {
+            assert_eq!(engine.check("safe.example.com"), None);
+        }
+        let s = engine.stats();
+        assert_eq!(s.hits_whitelist, 10);
+        assert_eq!(s.misses, 0, "whitelist hits must not count as misses");
+        assert_eq!(s.hits_zero_addr, 0);
+        assert_eq!(s.hits_nxdomain, 0);
+    }
+
+    /// Master switch off: no counters advance, regardless of rule
+    /// matches. The hot path short-circuits in `check()` before
+    /// any rule walking, so even the whitelist walk is skipped
+    /// (callers can't observe the difference; see `check()` docs).
+    #[test]
+    fn master_switch_off_does_not_advance_any_counter() {
+        let engine = AdBlockEngine::new();
+        engine.rebuild(
+            za(&["ad.example.com"]),
+            nx(&["tracker.example.com"]),
+            wl(&["good.example.com"]),
+        );
+        // Note: NO `set_enabled(true)`. Default is off.
+
+        // `check()` returns None for everything; counters don't move.
+        for _ in 0..5 {
+            assert_eq!(engine.check("ad.example.com"), None);
+            assert_eq!(engine.check("tracker.example.com"), None);
+            assert_eq!(engine.check("good.example.com"), None);
+            assert_eq!(engine.check("untouched.example.org"), None);
+        }
+        let s = engine.stats();
+        assert_eq!(s.hits_zero_addr, 0, "master off: zero-addr counter idle");
+        assert_eq!(s.hits_nxdomain, 0, "master off: nxdomain counter idle");
+        assert_eq!(s.hits_whitelist, 0, "master off: whitelist counter idle");
+        assert_eq!(s.misses, 0, "master off: miss counter idle");
+    }
+
+    /// stats() can be called concurrently with check(); the four
+    /// atomic loads are independent and the result is a coherent
+    /// snapshot at some moment in the call.
+    #[test]
+    fn stats_can_be_read_concurrently_with_check() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let engine = Arc::new(AdBlockEngine::new());
+        engine.rebuild(za(&["ad.example.com"]), nx(&[]), wl(&[]));
+        engine.set_enabled(true);
+
+        let engine_writer = Arc::clone(&engine);
+        let writer = thread::spawn(move || {
+            for _ in 0..1000 {
+                let _ = engine_writer.check("ad.example.com");
+            }
+        });
+
+        // While the writer thread runs, hammer stats() — we don't
+        // assert specific numbers (race-y), only that reads don't
+        // panic and don't deadlock the writer.
+        let mut reads = 0;
+        while !writer.is_finished() {
+            let _ = engine.stats();
+            reads += 1;
+            if reads > 100_000 {
+                break;
+            }
+        }
+        writer.join().unwrap();
+        let final_stats = engine.stats();
+        assert_eq!(final_stats.hits_zero_addr, 1000);
+        assert_eq!(final_stats.hits_nxdomain, 0);
+        assert_eq!(final_stats.hits_whitelist, 0);
+        assert_eq!(final_stats.misses, 0);
     }
 }

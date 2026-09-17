@@ -284,6 +284,8 @@ mod tests {
             rule_count: 0,
             etag: None,
             rules_limit_override: None,
+            last_refresh_duration_ms: None,
+            last_refresh_failed_at: None,
         }
     }
 

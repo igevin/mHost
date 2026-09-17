@@ -312,3 +312,54 @@
   font-size: 13px;
   line-height: 1.4;
 }
+
+/* Issue #199 sub-task B: stats panel layout */
+.statGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.statCounter {
+  display: flex;
+  flex-direction: column;
+  padding: 12px;
+  border: 1px solid var(--border-color, rgba(127, 127, 127, 0.25));
+  border-radius: 6px;
+  background: var(--stat-counter-bg, rgba(127, 127, 127, 0.05));
+}
+
+.statValue {
+  font-size: 24px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.2;
+}
+
+.statLabel {
+  font-size: 12px;
+  opacity: 0.7;
+  margin-top: 4px;
+}
+
+.statTable {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.statTable th,
+.statTable td {
+  text-align: left;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border-color, rgba(127, 127, 127, 0.15));
+}
+
+.statTable th {
+  font-weight: 600;
+  opacity: 0.7;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}

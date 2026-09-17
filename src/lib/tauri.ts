@@ -12,6 +12,7 @@ import type {
   AdBlockLimits,
   AdBlockSource,
   AdBlockResponse,
+  AdBlockStats,
 } from "../types";
 
 // ---- Profile commands ----
@@ -263,6 +264,12 @@ export async function getAdBlockState(): Promise<AdBlockState> {
  * of truth for the override-entry gating in the UI). */
 export async function getAdBlockLimits(): Promise<AdBlockLimits> {
   return invoke<AdBlockLimits>("get_ad_block_limits");
+}
+
+/** Issue #199 sub-task B: cumulative ad-block engine hit / miss
+ * counters. Returns zeros if DNS mode is off. */
+export async function getAdBlockStats(): Promise<AdBlockStats> {
+  return invoke<AdBlockStats>("get_ad_block_stats");
 }
 
 export async function setAdBlockEnabled(enabled: boolean): Promise<void> {
