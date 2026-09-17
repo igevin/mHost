@@ -309,7 +309,10 @@ impl AppState {
             let result = tokio::task::spawn_blocking(move || {
                 let (za, nx, wl) = crate::commands::adblock::classify_rules(&snap, &storage_root);
                 if let Some(server) = crate::state::lock_or_recover(&dns_server).as_ref() {
-                    server.reload_ad_block_rules(za, nx, wl);
+                    // Issue #199 sub-task B: pass the master switch
+                    // to the engine. Read from the snapshot cloned
+                    // just above the spawn_blocking boundary.
+                    server.reload_ad_block_rules(snap.enabled, za, nx, wl);
                 }
             })
             .await;

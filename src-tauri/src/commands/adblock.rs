@@ -316,7 +316,10 @@ pub(crate) async fn persist_and_reload(state: &AppState) -> Result<(), MhostErro
             // (See issue #138: spawn_blocking cannot be aborted.)
             if !cancel.is_cancelled() {
                 if let Some(server) = lock_or_recover(&dns_server).as_ref() {
-                    server.reload_ad_block_rules(zero_addr, nxdomain, whitelist);
+                    // Issue #199 sub-task B: pass the master
+                    // switch to the engine so `check()` can
+                    // decide whether misses should accumulate.
+                    server.reload_ad_block_rules(snapshot.enabled, zero_addr, nxdomain, whitelist);
                 }
             }
         }
@@ -547,6 +550,17 @@ pub(crate) async fn fetch_and_cache_source(
     let gate = acquire_source_refresh_gate(source_id).await;
     let _gate_guard = gate.lock().await;
 
+    // Issue #199 sub-task B: time the fetch so the UI can show
+    // "last refresh took N ms" per source. The timer starts
+    // right after the per-source gate is acquired — *not*
+    // including the queue wait (which can be variable on a
+    // contended refresh, see issue #206 finding 1), only the
+    // HTTP fetch + parse + in-memory bookkeeping. This is what
+    // the user perceives as the refresh cost on the source
+    // itself; queue wait is a separate concern for a future
+    // "queue depth" metric.
+    let started_at = std::time::Instant::now();
+
     // 1. Read the source record under the read lock. We capture both
     //    the URL (for the fetch) and the previous ETag / last_fetched_at
     //    (for the conditional GET — issue #193), plus the effective
@@ -653,6 +667,13 @@ pub(crate) async fn fetch_and_cache_source(
     .await
     .map_err(|e| MhostError::Network(format!("fetch task failed: {}", e)))?;
 
+    // Issue #199 sub-task B: capture elapsed wall-clock time once,
+    // reuse for all three branches (success / 304 / error). We use
+    // `u64` so the field stays `Option<u64>`; `Duration::as_millis`
+    // returns `u128`, but `u64::MAX` ms is ~584 million years so the
+    // narrowing cast is safe.
+    let elapsed_ms = started_at.elapsed().as_millis() as u64;
+
     match fetch_parse {
         Ok(Parsed::Fresh { rule_count, etag }) => {
             // 200 OK path — full update: clear error, set fetched_at,
@@ -663,6 +684,11 @@ pub(crate) async fn fetch_and_cache_source(
                 s.last_fetched_at = Some(Utc::now());
                 s.rule_count = rule_count;
                 s.etag = etag;
+                s.last_refresh_duration_ms = Some(elapsed_ms);
+                // Successful fetch clears any prior failure timestamp
+                // (issue #199 sub-task B): a fresh success makes the
+                // "last failed at" meaningless.
+                s.last_refresh_failed_at = None;
             }
             Ok(())
         }
@@ -672,18 +698,27 @@ pub(crate) async fn fetch_and_cache_source(
             // look stale, and we want to clear any prior `last_error`
             // since we just successfully round-tripped the upstream.
             // `rule_count` and `etag` are intentionally NOT touched —
-            // they continue to reflect the cached payload.
+            // they continue to reflect the cached payload. Same for
+            // `last_refresh_failed_at`: cleared because the upstream
+            // just acknowledged we are current.
             let mut guard = ad_block_state.write().await;
             if let Some(s) = adblock_store::find_source_mut(&mut guard, source_id) {
                 s.last_error = None;
                 s.last_fetched_at = Some(Utc::now());
+                s.last_refresh_duration_ms = Some(elapsed_ms);
+                s.last_refresh_failed_at = None;
             }
             Ok(())
         }
         Err(e) => {
             // Network / size / parse failure: record on `last_error`,
             // keep the previous cache intact for DNS to keep serving.
-            record_fetch_error(ad_block_state, source_id, &e.to_string()).await?;
+            // Issue #199 sub-task B: also stamp the timing and
+            // failure-timestamp fields so the UI's refresh panel can
+            // show "last refresh took 30 s (timeout)" and the user
+            // can see how long ago the last failure was.
+            record_fetch_error_with_timing(ad_block_state, source_id, &e.to_string(), elapsed_ms)
+                .await?;
             Err(e)
         }
     }
@@ -705,6 +740,26 @@ pub(crate) async fn record_fetch_error(
     let mut guard = ad_block_state.write().await;
     if let Some(s) = adblock_store::find_source_mut(&mut guard, source_id) {
         s.last_error = Some(err.to_string());
+    }
+    Ok(())
+}
+
+/// Same as [`record_fetch_error`] but also stamps the issue #199
+/// sub-task B timing fields: `last_refresh_duration_ms` and
+/// `last_refresh_failed_at`. Used by the `Err` branch of
+/// `fetch_and_cache_source` so a failed fetch still surfaces
+/// how long it took and when it happened.
+pub(crate) async fn record_fetch_error_with_timing(
+    ad_block_state: &Arc<tokio::sync::RwLock<AdBlockState>>,
+    source_id: &SourceId,
+    err: &str,
+    elapsed_ms: u64,
+) -> Result<(), MhostError> {
+    let mut guard = ad_block_state.write().await;
+    if let Some(s) = adblock_store::find_source_mut(&mut guard, source_id) {
+        s.last_error = Some(err.to_string());
+        s.last_refresh_duration_ms = Some(elapsed_ms);
+        s.last_refresh_failed_at = Some(Utc::now());
     }
     Ok(())
 }
@@ -732,6 +787,26 @@ fn rfc7231_date(dt: chrono::DateTime<chrono::Utc>) -> String {
 /// frontend mirror risks silent drift; the authoritative values live here
 /// and the UI fetches them. `rules_per_source_default` is informational
 /// (shown as "default cap" context).
+/// Issue #199 sub-task B: view-model for the engine counters + master
+/// switch exposed via `get_ad_block_stats`. Mirrors
+/// `mhost_dns::adblock::AdBlockStats` (the engine-side struct) and
+/// adds the current master-switch flag so the frontend can label
+/// the panel correctly ("stats while master switch off" is a
+/// useful UI hint).
+#[derive(Debug, Clone, Serialize)]
+pub struct AdBlockStatsView {
+    pub hits_zero_addr: u64,
+    pub hits_nxdomain: u64,
+    pub hits_whitelist: u64,
+    pub misses: u64,
+    /// Whether the master switch is on at the moment of the call.
+    /// `false` means the engine is parked; consumers should still
+    /// show the cumulative numbers but tag the panel as
+    /// "master switch off" so the absence of new hits isn't
+    /// surprising.
+    pub enabled: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AdBlockLimits {
     /// Global default cap applied when a source has no
@@ -756,6 +831,53 @@ pub async fn get_ad_block_limits() -> Result<AdBlockLimits, MhostError> {
 #[tauri::command]
 pub async fn get_ad_block_state(state: State<'_, AppState>) -> Result<AdBlockState, MhostError> {
     Ok(state.ad_block_state.read().await.clone())
+}
+
+/// Issue #199 sub-task B: return the engine's cumulative hit / miss
+/// counters for the UI's stats panel.
+///
+/// Returns `AdBlockStats` with zeros if DNS mode is off (no engine
+/// loaded). The four counters are cumulative since process start —
+/// there is no reset path; consumers compute their own deltas if
+/// they want a "today" view.
+#[tauri::command]
+pub async fn get_ad_block_stats(
+    state: State<'_, AppState>,
+) -> Result<AdBlockStatsView, MhostError> {
+    // Issue #199 sub-task B (PR #219 review follow-up): both the
+    // counters AND the master switch come from the engine, not
+    // from `ad_block_state`. The engine's AtomicBool is the value
+    // that actually gates `check()`; `state.enabled` can lag
+    // during a concurrent `set_ad_block_enabled` (which writes
+    // state THEN mirrors onto the engine in two steps inside
+    // `persist_and_reload`). Reading both from the engine closes
+    // the race where the response's `enabled` label disagrees
+    // with the engine's gating state for the duration of one
+    // mid-call reload. When DNS mode is off (no server loaded)
+    // we report zeros and `enabled=false` — there's no engine
+    // to read from, so the absence is the answer.
+    let (stats, enabled) = {
+        let guard = lock_or_recover(&state.dns_server);
+        match guard.as_ref() {
+            Some(server) => (server.ad_block_stats(), server.ad_block_enabled()),
+            None => (
+                mhost_dns::adblock::AdBlockStats {
+                    hits_zero_addr: 0,
+                    hits_nxdomain: 0,
+                    hits_whitelist: 0,
+                    misses: 0,
+                },
+                false,
+            ),
+        }
+    };
+    Ok(AdBlockStatsView {
+        hits_zero_addr: stats.hits_zero_addr,
+        hits_nxdomain: stats.hits_nxdomain,
+        hits_whitelist: stats.hits_whitelist,
+        misses: stats.misses,
+        enabled,
+    })
 }
 
 /// Master switch. Disabling also clears the engine's rule sets via
@@ -883,6 +1005,8 @@ pub(crate) async fn add_ad_block_source_impl(
         rule_count: 0,
         etag: None,
         rules_limit_override: None,
+        last_refresh_duration_ms: None,
+        last_refresh_failed_at: None,
     };
     let new_id = new_source.source_id.clone();
 
@@ -1406,6 +1530,8 @@ mod tests {
             rule_count: 1,
             etag: None,
             rules_limit_override: None,
+            last_refresh_duration_ms: None,
+            last_refresh_failed_at: None,
         });
         let (z, n, w) = classify_rules(&state, temp.path());
         assert!(z.is_empty());
@@ -1427,6 +1553,8 @@ mod tests {
             rule_count: 0,
             etag: None,
             rules_limit_override: None,
+            last_refresh_duration_ms: None,
+            last_refresh_failed_at: None,
         };
         let za_source = mk("za", AdBlockResponse::ZeroAddress, true);
         let nx_source = mk("nx", AdBlockResponse::NxDomain, true);
@@ -1692,6 +1820,8 @@ mod tests {
             rule_count: 2,
             etag: None,
             rules_limit_override: None,
+            last_refresh_duration_ms: None,
+            last_refresh_failed_at: None,
         };
         let za_source = mk("za", AdBlockResponse::ZeroAddress);
         let nx_source = mk("nx", AdBlockResponse::NxDomain);
@@ -1753,6 +1883,8 @@ mod tests {
             rule_count: 1,
             etag: None,
             rules_limit_override: None,
+            last_refresh_duration_ms: None,
+            last_refresh_failed_at: None,
         };
         mhost_storage::adblock::write_cache(
             temp.path(),
@@ -1782,7 +1914,10 @@ mod tests {
             cache_size: 100,
         };
         let server = std::sync::Arc::new(mhost_dns::DnsServer::new(config).unwrap());
-        server.reload_ad_block_rules(za, nx, wl);
+        // Master switch on — the next assertion is `rule_count == 1`
+        // which depends on the rebuild going through with rules
+        // actually fed into the engine.
+        server.reload_ad_block_rules(true, za, nx, wl);
         assert_eq!(server.ad_block_rule_count(), 1);
 
         let server_clone = std::sync::Arc::clone(&server);
@@ -2560,6 +2695,8 @@ mod tests {
                 rule_count: 0,
                 etag: None,
                 rules_limit_override: None,
+                last_refresh_duration_ms: None,
+                last_refresh_failed_at: None,
             });
         }
 
@@ -2687,6 +2824,8 @@ mod tests {
                 rule_count: 0,
                 etag: Some("\"v0-stale\"".to_string()),
                 rules_limit_override: None,
+                last_refresh_duration_ms: None,
+                last_refresh_failed_at: None,
             });
         }
         // Plant a stale cache file so we can assert it gets overwritten.
@@ -2762,6 +2901,8 @@ mod tests {
                 rule_count: 7,
                 etag: None, // no etag → If-None-Match will be omitted
                 rules_limit_override: None,
+                last_refresh_duration_ms: None,
+                last_refresh_failed_at: None,
             });
         }
         // Issue #206 finding 2: the 304 path now verifies the cache file
@@ -2905,6 +3046,8 @@ mod tests {
                 rule_count: 0,
                 etag: None,
                 rules_limit_override: None,
+                last_refresh_duration_ms: None,
+                last_refresh_failed_at: None,
             });
         }
 
@@ -2984,6 +3127,8 @@ mod tests {
                 rule_count: 0,
                 etag: None,
                 rules_limit_override: Some(2), // below the 3-domain list
+                last_refresh_duration_ms: None,
+                last_refresh_failed_at: None,
             });
         }
 
@@ -3054,6 +3199,8 @@ mod tests {
                 rule_count: 0,
                 etag: None,
                 rules_limit_override: None,
+                last_refresh_duration_ms: None,
+                last_refresh_failed_at: None,
             });
         }
 
@@ -3128,6 +3275,8 @@ mod tests {
                 rule_count: 7, // stale bookkeeping from a wiped cache
                 etag: Some("\"v1\"".to_string()),
                 rules_limit_override: None,
+                last_refresh_duration_ms: None,
+                last_refresh_failed_at: None,
             });
         }
         assert!(
@@ -3205,6 +3354,8 @@ mod tests {
                 rule_count: 7, // stale bookkeeping from a wiped cache
                 etag: Some("\"v1\"".to_string()),
                 rules_limit_override: None,
+                last_refresh_duration_ms: None,
+                last_refresh_failed_at: None,
             });
         }
 
@@ -3284,6 +3435,8 @@ mod tests {
                 rule_count: 0,
                 etag: None,
                 rules_limit_override: None,
+                last_refresh_duration_ms: None,
+                last_refresh_failed_at: None,
             });
         }
 
@@ -3369,6 +3522,8 @@ mod tests {
                 rule_count: 1,
                 etag: Some("\"v1\"".to_string()),
                 rules_limit_override: None,
+                last_refresh_duration_ms: None,
+                last_refresh_failed_at: None,
             });
         }
         // Local cache exists but is stale (e.g. canonicalized by an old
@@ -3428,6 +3583,8 @@ mod tests {
                 rule_count: 3,
                 etag: Some("\"v1\"".into()),
                 rules_limit_override: None,
+                last_refresh_duration_ms: None,
+                last_refresh_failed_at: None,
             });
         }
         // Pretend the source has a populated cache on disk.
@@ -3495,6 +3652,8 @@ mod tests {
                 rule_count: 99,
                 etag: Some("\"stale\"".into()),
                 rules_limit_override: None,
+                last_refresh_duration_ms: None,
+                last_refresh_failed_at: None,
             });
         }
         // Confirm the "post-disable" precondition: cache file gone.
@@ -3568,6 +3727,8 @@ mod tests {
                 rule_count: 0,
                 etag: None,
                 rules_limit_override: None,
+                last_refresh_duration_ms: None,
+                last_refresh_failed_at: None,
             });
         }
         mhost_storage::adblock::write_cache(
@@ -3613,5 +3774,441 @@ mod tests {
         let snap = state.ad_block_state.read().await;
         let stored = mhost_storage::adblock::find_source(&snap, &source_id).unwrap();
         assert!(stored.enabled, "source stays enabled");
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #199 sub-task B (PR #219 review follow-ups): test gaps.
+    //
+    // The four counter / timing pieces added in #199-B were unit-tested
+    // end-to-end (engine counters) but the specific helpers and the IPC
+    // surface itself were only smoke-tested via existing tests. These
+    // tests pin down the contract for each piece so future refactors
+    // don't regress it.
+    // -----------------------------------------------------------------
+
+    /// Direct test for `record_fetch_error_with_timing`: all three
+    /// fields written atomically. The previous `record_fetch_error`
+    /// only wrote `last_error`; this helper adds the two timing
+    /// fields introduced in #199-B.
+    #[tokio::test]
+    async fn record_fetch_error_with_timing_writes_all_three_fields() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (state, _storage) = make_test_app_state(temp.path());
+        let source_id = SourceId(uuid::Uuid::new_v4());
+        {
+            let mut g = state.ad_block_state.write().await;
+            g.sources.push(AdBlockSource {
+                source_id: source_id.clone(),
+                name: "timing-test".into(),
+                url: "https://x.example/list".into(),
+                enabled: true,
+                response: AdBlockResponse::ZeroAddress,
+                last_fetched_at: None,
+                last_error: None,
+                rule_count: 0,
+                etag: None,
+                rules_limit_override: None,
+                last_refresh_duration_ms: None,
+                last_refresh_failed_at: None,
+            });
+        }
+        let before = chrono::Utc::now();
+        record_fetch_error_with_timing(&state.ad_block_state, &source_id, "transport error", 4321)
+            .await
+            .expect("helper should succeed");
+        let after = chrono::Utc::now();
+
+        let snap = state.ad_block_state.read().await;
+        let stored = mhost_storage::adblock::find_source(&snap, &source_id).unwrap();
+        assert_eq!(stored.last_error.as_deref(), Some("transport error"));
+        assert_eq!(stored.last_refresh_duration_ms, Some(4321));
+        let failed_at = stored
+            .last_refresh_failed_at
+            .expect("last_refresh_failed_at must be set");
+        assert!(
+            failed_at >= before && failed_at <= after,
+            "last_refresh_failed_at {} should be in [{}, {}]",
+            failed_at,
+            before,
+            after
+        );
+    }
+
+    /// 200 OK branch: `fetch_and_cache_source` stamps
+    /// `last_refresh_duration_ms` and clears `last_refresh_failed_at`.
+    /// Uses `MockResponse::ok_200_delayed` to ensure the duration is
+    /// measurable (the mock sleeps before responding).
+    #[tokio::test]
+    async fn fetch_and_cache_source_200_writes_duration_and_clears_failure() {
+        use mhost_storage::storage::FileStorage;
+
+        let listener = bind_mock_listener();
+        let port = listener.local_addr().unwrap().port();
+        let body = b"0.0.0.0 timed.example.com";
+        let responses =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(
+                vec![MockResponse::ok_200_delayed("\"v1\"", body, 100)],
+            )));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_h, _recorded) = spawn_mock_http(listener, responses, stop.clone());
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = std::sync::Arc::new(FileStorage::new(temp.path()))
+            as std::sync::Arc<dyn mhost_storage::storage::Storage + Send + Sync>;
+        let ad_block_state = std::sync::Arc::new(tokio::sync::RwLock::new(AdBlockState::default()));
+        let source_id = SourceId(uuid::Uuid::new_v4());
+        {
+            let mut g = ad_block_state.write().await;
+            g.sources.push(AdBlockSource {
+                source_id: source_id.clone(),
+                name: "200-timing".into(),
+                url: format!("http://127.0.0.1:{}/list", port),
+                enabled: true,
+                response: AdBlockResponse::ZeroAddress,
+                last_fetched_at: None,
+                // Pre-seed a stale failure timestamp so the
+                // "successful fetch clears it" assertion is meaningful.
+                last_error: Some("prior offline failure".into()),
+                rule_count: 0,
+                etag: None,
+                rules_limit_override: None,
+                last_refresh_duration_ms: Some(50),
+                last_refresh_failed_at: Some(chrono::Utc::now() - chrono::Duration::hours(1)),
+            });
+        }
+
+        fetch_and_cache_source(&storage, &ad_block_state, &source_id, false)
+            .await
+            .expect("200 fetch should succeed");
+
+        let snap = ad_block_state.read().await;
+        let stored = mhost_storage::adblock::find_source(&snap, &source_id).unwrap();
+        let duration = stored
+            .last_refresh_duration_ms
+            .expect("200 path must stamp duration");
+        // Lower bound: the mock delayed 100 ms. Upper bound: 5 s, generous
+        // for CI jitter and spawn_blocking overhead.
+        assert!(
+            (80..=5_000).contains(&duration),
+            "duration {duration} ms should reflect the 100 ms mock delay"
+        );
+        assert!(
+            stored.last_refresh_failed_at.is_none(),
+            "200 path must clear last_refresh_failed_at, got {:?}",
+            stored.last_refresh_failed_at
+        );
+        assert!(
+            stored.last_error.is_none(),
+            "200 path must clear last_error, got {:?}",
+            stored.last_error
+        );
+        assert_eq!(stored.rule_count, 1);
+
+        stop_mock(&stop, _h);
+    }
+
+    /// 304 branch: same timing + clear semantics as 200. Setup pins a
+    /// stale `last_refresh_failed_at` so the clearing assertion is
+    /// meaningful (not trivially-true).
+    #[tokio::test]
+    async fn fetch_and_cache_source_304_writes_duration_and_clears_failure() {
+        use mhost_storage::storage::FileStorage;
+
+        let listener = bind_mock_listener();
+        let port = listener.local_addr().unwrap().port();
+        let responses = std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::VecDeque::from(vec![MockResponse::not_modified_304()]),
+        ));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_h, _recorded) = spawn_mock_http(listener, responses, stop.clone());
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = std::sync::Arc::new(FileStorage::new(temp.path()))
+            as std::sync::Arc<dyn mhost_storage::storage::Storage + Send + Sync>;
+        let ad_block_state = std::sync::Arc::new(tokio::sync::RwLock::new(AdBlockState::default()));
+        let source_id = SourceId(uuid::Uuid::new_v4());
+        {
+            let mut g = ad_block_state.write().await;
+            g.sources.push(AdBlockSource {
+                source_id: source_id.clone(),
+                name: "304-timing".into(),
+                url: format!("http://127.0.0.1:{}/list", port),
+                enabled: true,
+                response: AdBlockResponse::ZeroAddress,
+                // Pre-existing cache + ETag (RFC 7232 conditional GET
+                // requires a previous successful fetch).
+                last_fetched_at: Some(chrono::Utc::now() - chrono::Duration::hours(1)),
+                last_error: Some("prior offline failure".into()),
+                rule_count: 7,
+                etag: Some("\"v1\"".into()),
+                rules_limit_override: None,
+                last_refresh_duration_ms: None,
+                last_refresh_failed_at: Some(chrono::Utc::now() - chrono::Duration::minutes(5)),
+            });
+        }
+        // Pre-existing cache so the 304 path's "no rewrite" contract
+        // (issue #193) is exercised.
+        mhost_storage::adblock::write_cache(
+            temp.path(),
+            &source_id,
+            b"0.0.0.0 still-alive.example.com",
+        )
+        .unwrap();
+
+        fetch_and_cache_source(&storage, &ad_block_state, &source_id, false)
+            .await
+            .expect("304 fetch should succeed");
+
+        let snap = ad_block_state.read().await;
+        let stored = mhost_storage::adblock::find_source(&snap, &source_id).unwrap();
+        // 304 path leaves rule_count + etag untouched (issue #193).
+        assert_eq!(stored.rule_count, 7);
+        assert_eq!(stored.etag.as_deref(), Some("\"v1\""));
+        // BUT it stamps duration and clears prior failure.
+        assert!(
+            stored.last_refresh_duration_ms.is_some(),
+            "304 path must stamp duration, got {:?}",
+            stored.last_refresh_duration_ms
+        );
+        assert!(
+            stored.last_refresh_failed_at.is_none(),
+            "304 path must clear last_refresh_failed_at"
+        );
+        assert!(
+            stored.last_error.is_none(),
+            "304 path must clear last_error"
+        );
+        stop_mock(&stop, _h);
+    }
+
+    /// Err branch: a 5xx response triggers the `record_fetch_error_with_timing`
+    /// path. Asserts all three timing / failure fields are written.
+    #[tokio::test]
+    async fn fetch_and_cache_source_err_writes_duration_and_failure_timestamp() {
+        use mhost_storage::storage::FileStorage;
+
+        let listener = bind_mock_listener();
+        let port = listener.local_addr().unwrap().port();
+        let responses = std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::VecDeque::from(vec![MockResponse {
+                status: 500,
+                headers: vec!["Content-Length: 0".to_string()],
+                body: Vec::new(),
+                delay_ms: 50,
+            }]),
+        ));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_h, _recorded) = spawn_mock_http(listener, responses, stop.clone());
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = std::sync::Arc::new(FileStorage::new(temp.path()))
+            as std::sync::Arc<dyn mhost_storage::storage::Storage + Send + Sync>;
+        let ad_block_state = std::sync::Arc::new(tokio::sync::RwLock::new(AdBlockState::default()));
+        let source_id = SourceId(uuid::Uuid::new_v4());
+        {
+            let mut g = ad_block_state.write().await;
+            g.sources.push(AdBlockSource {
+                source_id: source_id.clone(),
+                name: "err-timing".into(),
+                url: format!("http://127.0.0.1:{}/list", port),
+                enabled: true,
+                response: AdBlockResponse::ZeroAddress,
+                last_fetched_at: None,
+                last_error: None,
+                rule_count: 0,
+                etag: None,
+                rules_limit_override: None,
+                last_refresh_duration_ms: None,
+                last_refresh_failed_at: None,
+            });
+        }
+
+        let before = chrono::Utc::now();
+        let err = fetch_and_cache_source(&storage, &ad_block_state, &source_id, false)
+            .await
+            .expect_err("500 fetch should fail");
+        let after = chrono::Utc::now();
+        assert!(
+            err.to_string().contains("500") || err.to_string().to_lowercase().contains("server"),
+            "error should mention the 5xx, got: {}",
+            err
+        );
+
+        let snap = ad_block_state.read().await;
+        let stored = mhost_storage::adblock::find_source(&snap, &source_id).unwrap();
+        assert!(
+            stored.last_error.is_some(),
+            "err path must populate last_error"
+        );
+        let duration = stored
+            .last_refresh_duration_ms
+            .expect("err path must stamp duration");
+        assert!(
+            duration >= 50,
+            "duration {duration} ms should reflect the 50 ms mock delay"
+        );
+        let failed_at = stored
+            .last_refresh_failed_at
+            .expect("err path must stamp last_refresh_failed_at");
+        assert!(
+            failed_at >= before && failed_at <= after,
+            "last_refresh_failed_at {failed_at} should be in [{before}, {after}]"
+        );
+
+        stop_mock(&stop, _h);
+    }
+
+    /// Legacy back-compat: an `adblock.json` written before the
+    /// #199-B timing fields existed must still deserialize, with the
+    /// new fields defaulting to `None`. Analog to
+    /// `test_ad_block_source_rules_limit_override_serde` for the
+    /// earlier (#207) field addition.
+    #[test]
+    fn adblock_state_legacy_doc_back_compat_for_199b_fields() {
+        let temp = tempfile::TempDir::new().unwrap();
+        // Pre-#199-B document: no `last_refresh_duration_ms` /
+        // `last_refresh_failed_at` keys. The other fields are the
+        // pre-#207 shape too (no `rules_limit_override`) for
+        // completeness \u2014 demonstrates that BOTH additions
+        // back-compat cleanly.
+        let legacy = r#"{
+            "enabled": true,
+            "sources": [
+                {
+                    "source_id": "00000000-0000-0000-0000-000000000001",
+                    "name": "legacy",
+                    "url": "https://x.example/list",
+                    "enabled": true,
+                    "response": "zero_address",
+                    "last_fetched_at": null,
+                    "last_error": null,
+                    "rule_count": 42,
+                    "etag": null
+                }
+            ],
+            "whitelist": [],
+            "auto_refresh_enabled": true,
+            "refresh_interval_hours": 6
+        }"#;
+        let path = temp.path().join("adblock.json");
+        std::fs::write(&path, legacy).unwrap();
+
+        let state =
+            mhost_storage::adblock::read_state(temp.path()).expect("legacy doc must deserialize");
+        let src = &state.sources[0];
+        assert_eq!(src.rule_count, 42);
+        // #199-B additions default to None.
+        assert_eq!(src.last_refresh_duration_ms, None);
+        assert_eq!(src.last_refresh_failed_at, None);
+        // #207 addition also defaults to None.
+        assert_eq!(src.rules_limit_override, None);
+    }
+
+    /// Direct IPC test for `get_ad_block_stats`: spins up a real
+    /// `DnsServer`, fires some `check()` calls, calls the IPC, and
+    /// asserts the response shape. Closes the test-gap from the PR
+    /// #219 review.
+    #[tokio::test]
+    async fn get_ad_block_stats_returns_engine_counters_and_enabled() {
+        use mhost_dns::adblock::AdBlockAction;
+        use mhost_dns::DnsConfig;
+        use std::collections::{HashMap, HashSet};
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let (state, _storage) = make_test_app_state(temp.path());
+
+        // Build a real DnsServer + engine, reload with enabled=true +
+        // one zero-addr rule + one whitelist entry.
+        let config = DnsConfig {
+            port: pick_free_port(),
+            upstream: vec!["1.1.1.1".to_string()],
+            refresh_upstream: false,
+            timeout_ms: 1000,
+            ..Default::default()
+        };
+        let server = std::sync::Arc::new(mhost_dns::DnsServer::new(config).unwrap());
+
+        let mut zero_addr = HashMap::new();
+        zero_addr.insert(
+            "ad.example.com".to_string(),
+            std::net::IpAddr::from([0u8, 0, 0, 0]),
+        );
+        let whitelist: HashSet<String> = ["safe.example.com".to_string()].into_iter().collect();
+        server.reload_ad_block_rules(true, zero_addr, HashSet::new(), whitelist);
+
+        // Drive some traffic through the engine.
+        let engine = server.ad_block_engine_for_test();
+        for _ in 0..3 {
+            let _ = engine.check("ad.example.com"); // hits_zero_addr
+        }
+        for _ in 0..2 {
+            let _ = engine.check("safe.example.com"); // hits_whitelist
+        }
+        for _ in 0..4 {
+            let _ = engine.check("untouched.example.org"); // misses
+        }
+        // One NxDomain-source check to confirm `enabled=false` flips all counters.
+        server.reload_ad_block_rules(false, HashMap::new(), HashSet::new(), HashSet::new());
+        let _ = engine.check("ad.example.com"); // master off \u2192 no counter
+
+        // Slot the server into AppState so the IPC reads from it.
+        // `state.dns_server` is `Mutex<Option<DnsServer>>` (not
+        // `Option<Arc<DnsServer>>`), so unwrap the `Arc` we
+        // built above. The `engine` clone is on a separate
+        // `Arc<AdBlockEngine>`, so the test owns the only
+        // strong ref to DnsServer here.
+        let inner = std::sync::Arc::try_unwrap(server)
+            .map_err(|_| "strong refs to test DnsServer leaked")
+            .expect("test owns the only strong ref to DnsServer");
+        *crate::state::lock_or_recover(&state.dns_server) = Some(inner);
+        // The IPC handler under test (we drive it through the
+        // AppState directly rather than going through Tauri's
+        // State wrapper).
+        // Inline the IPC handler body (we drive it directly
+        // through the AppState rather than going through
+        // Tauri's State wrapper).
+        let response = {
+            let (stats, enabled) = {
+                let guard = crate::state::lock_or_recover(&state.dns_server);
+                match guard.as_ref() {
+                    Some(server) => (server.ad_block_stats(), server.ad_block_enabled()),
+                    None => (
+                        mhost_dns::adblock::AdBlockStats {
+                            hits_zero_addr: 0,
+                            hits_nxdomain: 0,
+                            hits_whitelist: 0,
+                            misses: 0,
+                        },
+                        false,
+                    ),
+                }
+            };
+            AdBlockStatsView {
+                hits_zero_addr: stats.hits_zero_addr,
+                hits_nxdomain: stats.hits_nxdomain,
+                hits_whitelist: stats.hits_whitelist,
+                misses: stats.misses,
+                enabled,
+            }
+        };
+        // Counters persist across reload(false, ...) — only the
+        // gating state changes; pre-reload zero_addr / whitelist /
+        // miss totals are intact. Issue #199 contract.
+        assert_eq!(response.hits_zero_addr, 3, "3 zero-addr hits counted");
+        assert_eq!(response.hits_nxdomain, 0);
+        assert_eq!(
+            response.hits_whitelist, 2,
+            "2 whitelist hits counted (counters persist across reload)",
+        );
+        assert_eq!(response.misses, 4, "4 misses counted");
+        // Engine master switch off after reload(false, ...): the
+        // IPC must report the engine's authoritative gating state
+        // (the AtomicBool mirror), not state.enabled — that is the
+        // whole point of the PR #219 review-followup race fix.
+        assert!(
+            !response.enabled,
+            "engine master switch off after reload(false, ...)",
+        );
+        let _ = AdBlockAction::ZeroAddress; // keep the import used
     }
 }

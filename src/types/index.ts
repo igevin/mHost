@@ -71,6 +71,34 @@ export interface AdBlockSource {
    * undefined-vs-null mismatch here (cf. issue #202).
    */
   rules_limit_override: number | null;
+  /**
+   * Issue #199 sub-task B: wall-clock duration of the last
+   * `fetch_and_cache_source` call (success, 304, or failure).
+   * Always serialized (always `null` when unset, never `undefined`).
+   */
+  last_refresh_duration_ms: number | null;
+  /**
+   * Issue #199 sub-task B: RFC 3339 timestamp of the last *failed*
+   * fetch. Distinct from `last_error` (which carries the message
+   * of the most recent failure regardless of when). Cleared on
+   * the next successful fetch.
+   */
+  last_refresh_failed_at: string | null;
+}
+
+/**
+ * Issue #199 sub-task B: cumulative ad-block engine counters
+ * returned by `getAdBlockStats()`. Numbers are monotonically
+ * increasing since process start; the consumer computes deltas.
+ * `enabled` mirrors the current master switch value at the time
+   of the call.
+ */
+export interface AdBlockStats {
+  hits_zero_addr: number;
+  hits_nxdomain: number;
+  hits_whitelist: number;
+  misses: number;
+  enabled: boolean;
 }
 
 export interface AdBlockState {

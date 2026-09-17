@@ -350,12 +350,22 @@ impl DnsServer {
     /// 与 `reload_rules` 同等语义：rebuild 引擎后清空 LRU 缓存，
     /// 否则 reload 前向上游查过并缓存的域名仍会返回 stale upstream IP，
     /// 覆盖新的 ad-block 命中（issue #132 follow-up）。
+    ///
+    /// **Issue #199 sub-task B:** `enabled` is mirrored onto the
+    /// engine so `check()` can decide whether `misses` should
+    /// accumulate (issue contract: "misses 累加，不要把 whitelist
+    /// 命中算 miss" — by extension, nothing else counts
+    /// when master is off). The caller always knows the master
+    /// switch value at reload time, so we don't need a separate
+    /// `set_enabled` call from the hot reload's caller.
     pub fn reload_ad_block_rules(
         &self,
+        enabled: bool,
         zero_addr_rules: std::collections::HashMap<String, std::net::IpAddr>,
         nxdomain_rules: std::collections::HashSet<String>,
         whitelist: std::collections::HashSet<String>,
     ) {
+        self.ad_block_engine.set_enabled(enabled);
         self.ad_block_engine
             .rebuild(zero_addr_rules, nxdomain_rules, whitelist);
         self.cache.lock().clear();
@@ -369,6 +379,26 @@ impl DnsServer {
     /// 白名单条目数量。
     pub fn ad_block_whitelist_size(&self) -> usize {
         self.ad_block_engine.whitelist_size()
+    }
+
+    /// Issue #199 sub-task B: cumulative ad-block hit / miss
+    /// counters, returned for the `get_ad_block_stats` IPC. Delegates
+    /// to the engine — cheap `Relaxed` loads on the four
+    /// `AtomicU64`s. The counters are cumulative since process start
+    /// (no reset path); the consumer computes deltas.
+    pub fn ad_block_stats(&self) -> crate::adblock::AdBlockStats {
+        self.ad_block_engine.stats()
+    }
+
+    /// Issue #199 sub-task B (PR #219 review follow-up): the
+    /// engine's mirrored master switch (see
+    /// `AdBlockEngine::is_enabled`). Used by `get_ad_block_stats`
+    /// to read the gating state from the engine rather than
+    /// from `ad_block_state` — closes the narrow race window
+    /// where `state.enabled` has been written but the engine's
+    /// AtomicBool hasn't been mirrored yet.
+    pub fn ad_block_enabled(&self) -> bool {
+        self.ad_block_engine.is_enabled()
     }
 
     /// 测试用：直接拿到 AdBlockEngine。
@@ -1941,7 +1971,10 @@ mod tests {
         nxdomain.insert("blocked.example.com".to_string());
         let mut whitelist = HashSet::new();
         whitelist.insert("safe.example.com".to_string());
-        server.reload_ad_block_rules(zero_addr, nxdomain, whitelist);
+        // Master switch on — the test queries ZeroAddress,
+        // NxDomain and whitelist paths, all of which require
+        // `enabled == true` after issue #199 sub-task B.
+        server.reload_ad_block_rules(true, zero_addr, nxdomain, whitelist);
 
         // 3. 启动 server 并查询四种场景
         let s = Arc::clone(&server);

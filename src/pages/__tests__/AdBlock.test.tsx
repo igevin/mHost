@@ -91,6 +91,8 @@ function makeSource(overrides: Partial<AdBlockSource> = {}): AdBlockSource {
     rule_count: 100,
     etag: null,
     rules_limit_override: null,
+    last_refresh_duration_ms: null,
+    last_refresh_failed_at: null,
     ...overrides,
   };
 }

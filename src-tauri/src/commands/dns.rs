@@ -369,7 +369,10 @@ async fn set_dns_mode_enable(
     let snap = state.ad_block_state.read().await.clone();
     let (za, nx, wl) = crate::commands::adblock::classify_rules(&snap, state.storage.root());
     if let Some(server) = lock_or_recover(&state.dns_server).as_ref() {
-        server.reload_ad_block_rules(za, nx, wl);
+        // Issue #199 sub-task B: pass the master switch to the
+        // engine so `check()` can decide whether misses should
+        // accumulate. We snapshot it from the cloned state above.
+        server.reload_ad_block_rules(snap.enabled, za, nx, wl);
     }
     spawn_ad_block_refresh_task(
         &state.ad_block_refresh_task,
@@ -909,6 +912,8 @@ mod tests {
             rule_count: 0,
             etag: None,
             rules_limit_override: None,
+            last_refresh_duration_ms: None,
+            last_refresh_failed_at: None,
         };
         let st = mhost_core::AdBlockState {
             enabled: true, // master switch on — the tick's only observable is the fetch error
@@ -1347,7 +1352,10 @@ pub(crate) fn spawn_ad_block_refresh_task(
                         return;
                     }
                     if let Some(server) = lock_or_recover(&dns_server_clone).as_ref() {
-                        server.reload_ad_block_rules(za, nx, wl);
+                        // Issue #199 sub-task B: pass the master
+                        // switch to the engine. Read from the
+                        // snapshot cloned at the top of this tick.
+                        server.reload_ad_block_rules(snap.enabled, za, nx, wl);
                     }
                 })
                 .await;

@@ -11,6 +11,8 @@ import {
   dnsEnabledAtom,
   fetchAdBlockStateAtom,
   fetchAdBlockLimitsAtom,
+  adBlockStatsAtom,
+  fetchAdBlockStatsAtom,
   toggleAdBlockEnabledAtom,
   setAdBlockIntervalAtom,
   setAdBlockAutoRefreshEnabledAtom,
@@ -56,6 +58,8 @@ function AdBlock() {
 
   const fetchState = useSetAtom(fetchAdBlockStateAtom);
   const fetchLimits = useSetAtom(fetchAdBlockLimitsAtom);
+  const stats = useAtomValue(adBlockStatsAtom);
+  const fetchStats = useSetAtom(fetchAdBlockStatsAtom);
   const toggleEnabled = useSetAtom(toggleAdBlockEnabledAtom);
   const setInterval = useSetAtom(setAdBlockIntervalAtom);
   const setAutoRefresh = useSetAtom(setAdBlockAutoRefreshEnabledAtom);
@@ -91,7 +95,12 @@ function AdBlock() {
       /* error already in atom */
     });
     fetchLimits().catch(() => {});
-  }, [fetchState, fetchLimits]);
+    // Issue #199 sub-task B: pull the cumulative engine counters
+    // for the stats panel. Non-fatal on failure — the panel
+    // shows an "unknown" placeholder and the next interaction
+    // retries.
+    fetchStats().catch(() => {});
+  }, [fetchState, fetchLimits, fetchStats]);
 
   const handleAddSource = useCallback(() => {
     if (!newName.trim() || !newUrl.trim()) return;
@@ -709,7 +718,112 @@ function AdBlock() {
             </div>
           )}
         </div>
+
+        {/* Stats panel (issue #199 sub-task B): cumulative ad-block
+            engine hits + misses + per-source refresh timing. Collapsed by
+            default to keep the page quiet; users can open it when
+            investigating blocked-traffic levels or refresh cadence. */}
+        <details className="card">
+          <summary className={styles.bannerTitle}>
+            Ad-block stats
+          </summary>
+          <div className={styles.sectionGap}>
+            {stats === null ? (
+              <div className={styles.muted}>
+                Stats not loaded yet — waiting for the first
+                `getAdBlockStats` IPC. Counters will appear once the
+                backend responds.
+              </div>
+            ) : !stats.enabled ? (
+              <div className={styles.muted}>
+                Master switch is off. The engine is parked, so no
+                queries are being classified. Cumulative counters
+                below reflect activity from when the switch was last
+                on (they are not reset on toggle).
+              </div>
+            ) : (
+              <div className={styles.muted}>
+                Cumulative since process start. Toggle the master
+                switch off and back on to keep the engine parked
+                without losing history.
+              </div>
+            )}
+            {stats !== null && (
+              <div className={styles.statGrid}>
+                <StatCounter
+                  label="0.0.0.0 hits"
+                  value={stats.hits_zero_addr}
+                />
+                <StatCounter
+                  label="NXDOMAIN hits"
+                  value={stats.hits_nxdomain}
+                />
+                <StatCounter
+                  label="Whitelist hits"
+                  value={stats.hits_whitelist}
+                />
+                <StatCounter label="Misses" value={stats.misses} />
+              </div>
+            )}
+            {/* Per-source refresh timing. The list mirrors the
+                source order on disk; disabled sources are still shown
+                so the user can see when they last refreshed before
+                being parked. */}
+            {state.sources.length > 0 && stats !== null && (
+              <table className={styles.statTable}>
+                <thead>
+                  <tr>
+                    <th>Source</th>
+                    {/* Issue #199 sub-task B: header renamed from
+                        "Last refresh" to "Duration" — the
+                        column shows milliseconds (issue #199
+                        `last_refresh_duration_ms`), not a
+                        timestamp. "Last failed" keeps the
+                        timestamp shape. */}
+                    <th>Duration</th>
+                    <th>Last failed</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {state.sources.map((src) => (
+                    <tr key={src.source_id}>
+                      <td>{src.name}</td>
+                      <td>
+                        {src.last_refresh_duration_ms != null
+                          ? `${src.last_refresh_duration_ms} ms`
+                          : "—"}
+                      </td>
+                      <td>
+                        {src.last_refresh_failed_at
+                          ? new Date(src.last_refresh_failed_at).toLocaleString()
+                          : "—"}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+        </details>
       </div>
+    </div>
+  );
+}
+
+// Issue #199 sub-task B: small counter tile for the stats panel.
+// Kept inline (not exported) because the layout is bespoke to this
+// page; promoting it later is fine but premature now.
+function StatCounter({
+  label,
+  value,
+}: {
+  label: string;
+  value: number;
+}) {
+  return (
+    <div className={styles.statCounter}>
+      <div className={styles.statValue}>{value.toLocaleString()}</div>
+      <div className={styles.statLabel}>{label}</div>
     </div>
   );
 }
