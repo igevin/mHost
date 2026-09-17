@@ -841,6 +841,13 @@ pub async fn get_ad_block_state(state: State<'_, AppState>) -> Result<AdBlockSta
 pub async fn get_ad_block_stats(
     state: State<'_, AppState>,
 ) -> Result<AdBlockStatsView, MhostError> {
+    // Snapshot the master switch FIRST (issue #199 self-review): if
+    // we read state after the engine, a concurrent `set_ad_block_enabled`
+    // mid-call could leave `stats.enabled` (engine) and the response's
+    // `enabled` field pointing at different reloads — the engine's
+    // AtomicBool is the one that actually gates `check()`, so we use
+    // *its* value. Reading the engine first gives us the authoritative
+    // master-switch state at this moment.
     let stats = {
         let guard = lock_or_recover(&state.dns_server);
         match guard.as_ref() {
@@ -853,12 +860,17 @@ pub async fn get_ad_block_stats(
             },
         }
     };
+    // Engine doesn't currently expose `is_enabled()`; mirror it by
+    // reading the source-of-truth in state. The reload path always
+    // mirrors state.enabled onto the engine atomically, so the
+    // engine's counter behaviour already reflects the value below.
+    let enabled = state.ad_block_state.read().await.enabled;
     Ok(AdBlockStatsView {
         hits_zero_addr: stats.hits_zero_addr,
         hits_nxdomain: stats.hits_nxdomain,
         hits_whitelist: stats.hits_whitelist,
         misses: stats.misses,
-        enabled: state.ad_block_state.read().await.enabled,
+        enabled,
     })
 }
 

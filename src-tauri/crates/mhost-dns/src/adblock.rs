@@ -79,6 +79,7 @@ impl RulesSnapshot {
 /// snapshot (issue #132). `check` takes the read lock only long enough to
 /// clone the `Arc` (refcount bump), then walks the immutable snapshot
 /// lock-free.
+
 /// Snapshot of [`AdBlockEngine`] counters, returned by
 /// [`AdBlockEngine::stats`]. Cumulative since process start — the
 /// engine has no notion of "reset to zero" because the foreground
