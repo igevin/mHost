@@ -936,15 +936,98 @@ pub async fn set_ad_block_source_enabled(
     enabled: bool,
     state: State<'_, AppState>,
 ) -> Result<AdBlockSource, MhostError> {
-    {
+    set_ad_block_source_enabled_impl(&state, &source_id, enabled).await
+}
+
+/// `AppState`-by-ref impl so the disable-cache / re-enable-refetch flow
+/// is unit-testable without a Tauri `State` (same pattern as
+/// `add_ad_block_source_impl`).
+///
+/// Issue #199 sub-task C (option A — delete-cache on disable, refetch
+/// on re-enable):
+///
+/// * `true` -> `false` transition drops `adblock-cache/<id>.txt` so a
+///   parked source leaves no on-disk residue. `delete_cache` is
+///   idempotent (treats `NotFound` as success) and we swallow IO errors
+///   here — a missed delete is a hygiene issue, not a correctness
+///   issue, and `sweep_orphan_caches` covers it on the next startup.
+/// * `false` -> `true` transition triggers an inline re-fetch. The
+///   cache was just deleted on the disable path, so without the fetch
+///   the user would see an enabled source with zero rules loaded
+///   until the next auto-refresh tick (issue option A: "下次 enable
+///   时自动重 fetch"). `fetch_and_cache_source` uses conditional GET
+///   (issue #193) and gracefully downgrades a 304 to an unconditional
+///   GET when the on-disk cache is missing (issue #206 finding 2), so
+///   a server-returned 304 still ends with a populated cache. The
+///   pathological edge — a server that returns 304 on BOTH the
+///   conditional AND the unconditional retry (issue #211-1) — is the
+///   one case where the fetch fails and the cache stays empty; the
+///   source is still flipped to enabled and `last_error` records the
+///   upstream's RFC 7232 violation for the UI badge. Fetch errors are
+///   in general logged but not propagated: the toggle succeeded, only
+///   the network leg failed.
+///
+/// **Known race (acknowledged, not fixed here):** if a user clicks
+/// Refresh and then immediately toggles Disabled, the in-flight fetch
+/// is serialized behind the per-source gate (issue #206 finding 1) but
+/// does NOT block on `ad_block_state`. The disable path's
+/// `delete_cache` can therefore run, then the in-flight fetch writes
+/// the cache back. End state: a fresh cache file lingering on disk
+/// for a now-disabled source until the next toggle or
+/// `sweep_orphan_caches` on restart. This is a transient hygiene issue,
+/// not a correctness issue (the engine classifies by `s.enabled` so
+/// the lingering cache stays unloaded), and avoiding it would require
+/// teaching `fetch_and_cache_source` to re-check `s.enabled` post-gate
+/// — out of scope for the cache-cleanup follow-up. Tracked for the
+/// perf/observability audit (issue #199 follow-up).
+pub(crate) async fn set_ad_block_source_enabled_impl(
+    state: &AppState,
+    source_id: &SourceId,
+    enabled: bool,
+) -> Result<AdBlockSource, MhostError> {
+    let root = state.storage.root().to_path_buf();
+    let should_fetch_on_enable = {
         let mut guard = state.ad_block_state.write().await;
-        let s = adblock_store::find_source_mut(&mut guard, &source_id)
+        let s = adblock_store::find_source_mut(&mut guard, source_id)
             .ok_or_else(|| MhostError::InvalidInput(format!("source not found: {}", source_id)))?;
+        let prev_enabled = s.enabled;
         s.enabled = enabled;
+
+        if prev_enabled && !enabled {
+            if let Err(e) = adblock_store::delete_cache(&root, source_id) {
+                eprintln!(
+                    "[adblock] delete_cache on disable for source {}: {}",
+                    source_id, e
+                );
+            }
+        }
+
+        !prev_enabled && enabled
+    };
+
+    if should_fetch_on_enable {
+        if let Err(e) = fetch_and_cache_source(
+            &state.storage,
+            &state.ad_block_state,
+            source_id,
+            // `force=false`: let RFC 7232 conditional GET save bandwidth
+            // if the upstream still has the same ETag (issue #193). The
+            // missing-cache downgrade (issue #206) handles the case
+            // where the disable path's `delete_cache` left no file.
+            false,
+        )
+        .await
+        {
+            eprintln!(
+                "[adblock] post-enable fetch for source {} failed: {}",
+                source_id, e
+            );
+        }
     }
-    persist_and_reload(&state).await?;
+
+    persist_and_reload(state).await?;
     let snap = state.ad_block_state.read().await;
-    Ok(adblock_store::find_source(&snap, &source_id)
+    Ok(adblock_store::find_source(&snap, source_id)
         .cloned()
         .expect("source just updated"))
 }
@@ -3318,5 +3401,217 @@ mod tests {
         assert_eq!(snap.rule_count, 1);
 
         stop_mock(&stop, _h);
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #199 sub-task C: when a source flips from enabled -> disabled,
+    // its `adblock-cache/<id>.txt` is dropped so a parked source leaves
+    // no on-disk residue. The cache file is left intact for any other
+    // state change so this assertion is the only place we test the
+    // delete path explicitly.
+    // -----------------------------------------------------------------
+    #[tokio::test]
+    async fn set_ad_block_source_enabled_impl_disable_drops_cache() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (state, _storage) = make_test_app_state(temp.path());
+        let source_id = SourceId(uuid::Uuid::new_v4());
+        {
+            let mut g = state.ad_block_state.write().await;
+            g.sources.push(AdBlockSource {
+                source_id: source_id.clone(),
+                name: "to-disable".into(),
+                url: "https://x.example/list".into(),
+                enabled: true,
+                response: AdBlockResponse::ZeroAddress,
+                last_fetched_at: Some(chrono::Utc::now()),
+                last_error: None,
+                rule_count: 3,
+                etag: Some("\"v1\"".into()),
+                rules_limit_override: None,
+            });
+        }
+        // Pretend the source has a populated cache on disk.
+        mhost_storage::adblock::write_cache(temp.path(), &source_id, b"0.0.0.0 parked.example.com")
+            .unwrap();
+        assert!(
+            mhost_storage::adblock::cache_path(temp.path(), &source_id).exists(),
+            "precondition: cache file present"
+        );
+
+        set_ad_block_source_enabled_impl(&state, &source_id, false)
+            .await
+            .expect("disable should succeed");
+
+        assert!(
+            !mhost_storage::adblock::cache_path(temp.path(), &source_id).exists(),
+            "disable must delete the cache file"
+        );
+        let snap = state.ad_block_state.read().await;
+        let stored = mhost_storage::adblock::find_source(&snap, &source_id).unwrap();
+        assert!(!stored.enabled, "source flag must be flipped to false");
+        // Bookkeeping intentionally untouched — rule_count still reflects
+        // the last successful fetch (matches issue #193 contract for the
+        // 304 path: don't touch rule_count/etag on a no-content reply).
+        assert_eq!(stored.rule_count, 3);
+        assert_eq!(stored.etag.as_deref(), Some("\"v1\""));
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #199 sub-task C (option A, second half): the disable path
+    // drops the cache, so flipping back to enabled must re-fetch before
+    // persist_and_reload runs. Otherwise the engine sees an enabled
+    // source whose cache is missing and classifies zero rules from it.
+    // -----------------------------------------------------------------
+    #[tokio::test]
+    async fn set_ad_block_source_enabled_impl_re_enable_refetches_cache() {
+        let listener = bind_mock_listener();
+        let port = listener.local_addr().unwrap().port();
+        let body = b"0.0.0.0 fresh.example.com";
+        let responses = std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::VecDeque::from(vec![MockResponse::ok_200("\"fresh\"", body)]),
+        ));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_h, _recorded) = spawn_mock_http(listener, responses, stop.clone());
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let (state, _storage) = make_test_app_state(temp.path());
+        let source_id = SourceId(uuid::Uuid::new_v4());
+        {
+            let mut g = state.ad_block_state.write().await;
+            g.sources.push(AdBlockSource {
+                source_id: source_id.clone(),
+                name: "to-reenable".into(),
+                url: format!("http://127.0.0.1:{}/list", port),
+                enabled: false,
+                response: AdBlockResponse::ZeroAddress,
+                // Pre-disable bookkeeping — the fetch on re-enable must
+                // overwrite this, not preserve the stale rule_count /
+                // etag. We also pin a stale `last_error` so the
+                // `last_error.is_none()` assertion below actually
+                // exercises the "successful fetch clears prior error"
+                // path instead of being trivially true.
+                last_fetched_at: Some(chrono::Utc::now() - chrono::Duration::days(7)),
+                last_error: Some("prior offline failure".into()),
+                rule_count: 99,
+                etag: Some("\"stale\"".into()),
+                rules_limit_override: None,
+            });
+        }
+        // Confirm the "post-disable" precondition: cache file gone.
+        assert!(
+            !mhost_storage::adblock::cache_path(temp.path(), &source_id).exists(),
+            "precondition: cache file is absent (delete_cache on disable)"
+        );
+
+        set_ad_block_source_enabled_impl(&state, &source_id, true)
+            .await
+            .expect("re-enable should succeed");
+
+        // Cache file must exist again with the freshly fetched body.
+        let cache_path = mhost_storage::adblock::cache_path(temp.path(), &source_id);
+        assert!(
+            cache_path.exists(),
+            "re-enable must re-fetch the cache file"
+        );
+        // Compare verbatim — `cache.contains(...)` would pass even if
+        // the file was re-canonicalised with a trailing newline
+        // dropped, but the contract is "byte-for-byte what the
+        // mock sent". `body` is `&[u8]` so go through `str` for
+        // the comparison (the mock body is ASCII).
+        let cache = mhost_storage::adblock::read_cache(temp.path(), &source_id)
+            .unwrap()
+            .expect("cache must be readable");
+        assert_eq!(
+            cache.as_str(),
+            std::str::from_utf8(body).expect("mock body is ASCII"),
+            "cache must contain the freshly fetched body verbatim"
+        );
+
+        let snap = state.ad_block_state.read().await;
+        let stored = mhost_storage::adblock::find_source(&snap, &source_id).unwrap();
+        assert!(stored.enabled, "source flag must be flipped to true");
+        assert_eq!(
+            stored.rule_count, 1,
+            "rule_count must be re-derived from the new body"
+        );
+        assert_eq!(stored.etag.as_deref(), Some("\"fresh\""));
+        assert!(
+            stored.last_error.is_none(),
+            "successful re-fetch must clear prior last_error, got {:?}",
+            stored.last_error
+        );
+
+        stop_mock(&stop, _h);
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #199 sub-task C (no-op edge): toggling to the *current* value
+    // must not delete the cache nor trigger a fetch. Guards against a
+    // future refactor that swaps `prev_enabled` capture for an unconditional
+    // delete-or-fetch.
+    // -----------------------------------------------------------------
+    #[tokio::test]
+    async fn set_ad_block_source_enabled_impl_same_value_is_noop() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (state, _storage) = make_test_app_state(temp.path());
+        let source_id = SourceId(uuid::Uuid::new_v4());
+        {
+            let mut g = state.ad_block_state.write().await;
+            g.sources.push(AdBlockSource {
+                source_id: source_id.clone(),
+                name: "stable".into(),
+                url: "https://x.example/list".into(),
+                enabled: true,
+                response: AdBlockResponse::ZeroAddress,
+                last_fetched_at: None,
+                last_error: None,
+                rule_count: 0,
+                etag: None,
+                rules_limit_override: None,
+            });
+        }
+        mhost_storage::adblock::write_cache(
+            temp.path(),
+            &source_id,
+            b"0.0.0.0 untouched.example.com",
+        )
+        .unwrap();
+        let before_modified =
+            std::fs::metadata(mhost_storage::adblock::cache_path(temp.path(), &source_id))
+                .unwrap()
+                .modified()
+                .unwrap();
+
+        // Sleep a beat so mtime would tick if the file were rewritten.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        set_ad_block_source_enabled_impl(&state, &source_id, true)
+            .await
+            .expect("no-op toggle should succeed");
+
+        // Cache untouched: same path, same content, mtime unchanged.
+        // The mtime check alone could false-pass on filesystems
+        // with coarse mtime granularity (e.g. 1-second
+        // resolution), so we also re-read the bytes and assert
+        // they match verbatim — defence in depth against the
+        // edge case where a no-op toggle accidentally overwrites
+        // the cache file with byte-identical content.
+        let path = mhost_storage::adblock::cache_path(temp.path(), &source_id);
+        assert!(path.exists(), "cache must still exist");
+        let after_modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(
+            before_modified, after_modified,
+            "no-op toggle must not rewrite the cache file"
+        );
+        let content = mhost_storage::adblock::read_cache(temp.path(), &source_id)
+            .unwrap()
+            .expect("cache must still be readable");
+        assert_eq!(
+            content, "0.0.0.0 untouched.example.com",
+            "no-op toggle must not change cache content"
+        );
+        let snap = state.ad_block_state.read().await;
+        let stored = mhost_storage::adblock::find_source(&snap, &source_id).unwrap();
+        assert!(stored.enabled, "source stays enabled");
     }
 }
