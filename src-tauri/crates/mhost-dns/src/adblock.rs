@@ -269,6 +269,21 @@ impl AdBlockEngine {
         }
     }
 
+    /// Issue #199 sub-task B (PR #219 review follow-up): the
+    /// master-switch state mirrored onto the engine. The IPC
+    /// `get_ad_block_stats` reads this directly instead of going
+    /// through `ad_block_state` — the engine's AtomicBool is
+    /// the value that actually gates `check()`, so it's the
+    /// authoritative source for the "is the engine currently
+    /// classifying queries?" UI label. Avoids the narrow race
+    /// window where `state.enabled` has been written by
+    /// `set_ad_block_enabled` but the engine's AtomicBool hasn't
+    /// been mirrored yet (persist_and_reload writes state,
+    /// THEN mirrors onto engine in a separate step).
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
     pub fn whitelist_size(&self) -> usize {
         self.snapshot().whitelist.len()
     }

@@ -774,7 +774,13 @@ function AdBlock() {
                 <thead>
                   <tr>
                     <th>Source</th>
-                    <th>Last refresh</th>
+                    {/* Issue #199 sub-task B: header renamed from
+                        "Last refresh" to "Duration" — the
+                        column shows milliseconds (issue #199
+                        `last_refresh_duration_ms`), not a
+                        timestamp. "Last failed" keeps the
+                        timestamp shape. */}
+                    <th>Duration</th>
                     <th>Last failed</th>
                   </tr>
                 </thead>

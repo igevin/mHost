@@ -390,6 +390,17 @@ impl DnsServer {
         self.ad_block_engine.stats()
     }
 
+    /// Issue #199 sub-task B (PR #219 review follow-up): the
+    /// engine's mirrored master switch (see
+    /// `AdBlockEngine::is_enabled`). Used by `get_ad_block_stats`
+    /// to read the gating state from the engine rather than
+    /// from `ad_block_state` — closes the narrow race window
+    /// where `state.enabled` has been written but the engine's
+    /// AtomicBool hasn't been mirrored yet.
+    pub fn ad_block_enabled(&self) -> bool {
+        self.ad_block_engine.is_enabled()
+    }
+
     /// 测试用：直接拿到 AdBlockEngine。
     #[doc(hidden)]
     pub fn ad_block_engine_for_test(&self) -> Arc<crate::adblock::AdBlockEngine> {
