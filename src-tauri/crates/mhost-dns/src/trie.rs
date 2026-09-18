@@ -412,4 +412,27 @@ mod tests {
         assert_eq!(a.len(), b.len());
         assert_eq!(a.is_empty(), b.is_empty());
     }
+
+    /// Consecutive dots in a domain (e.g. `a..b.com` from a malformed
+    /// input) must not panic and must still find the longest registered
+    /// suffix. The `label.is_empty()` short-circuit in `find_longest_suffix_match`
+    /// skips the empty label between consecutive dots. PR #220 review
+    /// follow-up — lock in the empty-label short-circuit.
+    #[test]
+    fn consecutive_dots_are_skipped() {
+        let mut t: Trie<()> = Trie::new();
+        t.insert("b.com", ());
+
+        // `a..b.com` — consecutive dots between `a` and `b`. The
+        // empty label is skipped during both insertion and lookup;
+        // the lookup returns `b.com`'s data via the normal suffix
+        // walk.
+        assert!(t.find_longest_suffix_match("a..b.com").is_some());
+
+        // Pure-consecutive-dots input: no non-empty labels exist
+        // between the dots, so the suffix walk has nothing to
+        // descend into. The trie correctly returns None — not a
+        // crash, not a wrong hit.
+        assert!(t.find_longest_suffix_match("....").is_none());
+    }
 }
