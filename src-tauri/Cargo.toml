@@ -26,6 +26,10 @@ edition = "2021"
 name = "mhost_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[[bench]]
+name = "adblock_trie"
+harness = false
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

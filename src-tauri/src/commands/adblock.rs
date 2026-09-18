@@ -392,7 +392,10 @@ pub(crate) fn domains_for_source(root: &std::path::Path, source: &AdBlockSource)
 /// **PR #154 review (P2):** the original code only checked for empty
 /// input, so entries like `*.example.com`, `example.com/path`, or
 /// `not a domain at all` were persisted silently and never matched in
-/// `walk_parents` (it does literal `HashSet::contains`). They also
+/// `walk_parents` (it does literal `HashSet::contains`, and the trie
+/// that replaced it in issue #199 sub-task A has the same
+/// suffix-match contract — these inputs don't match the trie either).
+/// They also
 /// didn't surface in `last_error`, so the user had no signal that the
 /// entry was broken.
 ///
@@ -446,7 +449,9 @@ fn validate_whitelist_domain(raw: &str) -> Result<String, String> {
     // Structure checks (issue #196): previous version only checked the
     // character set, so entries like `example.com.`, `-example.com`, or
     // `foo-.example.com` slipped through. They never matched
-    // `walk_parents` (which is literal `HashSet::contains`) and the user
+    // `walk_parents` (which is literal `HashSet::contains`, and the
+    // trie that replaced it in issue #199 sub-task A inherits the
+    // same literal-match contract). The user
     // had no signal they were broken. We now reject:
     //   - leading `-` on the trimmed input (clearer error than the
     //     per-label check, which would otherwise report it as "invalid
@@ -1720,6 +1725,8 @@ mod tests {
     // -----------------------------------------------------------------
     // Issue #196: structure checks tightened so entries that look valid
     // by character set but never match `walk_parents` (which uses literal
+    // `HashSet::contains`; the trie that replaced walk_parents in
+    // issue #199 sub-task A inherits the same contract)
     // `HashSet::contains`) are rejected at the boundary instead of
     // silently no-op'ing after being added.
     // -----------------------------------------------------------------

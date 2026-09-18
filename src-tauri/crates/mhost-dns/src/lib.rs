@@ -1,10 +1,10 @@
 pub mod adblock;
 pub mod config;
-pub mod matcher;
 pub mod platform;
 pub mod proxy;
 pub mod resolver;
 pub mod server;
+pub mod trie;
 
 pub use adblock::{AdBlockAction, AdBlockEngine};
 pub use config::DnsConfig;
