@@ -12,7 +12,9 @@ import {
   fetchAdBlockStateAtom,
   fetchAdBlockLimitsAtom,
   adBlockStatsAtom,
+  adBlockOverlapReportAtom,
   fetchAdBlockStatsAtom,
+  fetchAdBlockOverlapsAtom,
   toggleAdBlockEnabledAtom,
   setAdBlockIntervalAtom,
   setAdBlockAutoRefreshEnabledAtom,
@@ -23,6 +25,7 @@ import {
   setAdBlockSourceRulesLimitOverrideAtom,
   overrideAdBlockSourceRulesLimitAtom,
   refreshAdBlockSourceAtom,
+  reorderAdBlockSourceAtom,
   refreshAllAdBlockSourcesAtom,
   addAdBlockWhitelistManyAtom,
   removeAdBlockWhitelistAtom,
@@ -59,6 +62,8 @@ function AdBlock() {
   const fetchState = useSetAtom(fetchAdBlockStateAtom);
   const fetchLimits = useSetAtom(fetchAdBlockLimitsAtom);
   const stats = useAtomValue(adBlockStatsAtom);
+  const overlapReport = useAtomValue(adBlockOverlapReportAtom);
+  const fetchOverlaps = useSetAtom(fetchAdBlockOverlapsAtom);
   const fetchStats = useSetAtom(fetchAdBlockStatsAtom);
   const toggleEnabled = useSetAtom(toggleAdBlockEnabledAtom);
   const setInterval = useSetAtom(setAdBlockIntervalAtom);
@@ -70,6 +75,7 @@ function AdBlock() {
   const overrideSourceLimit = useSetAtom(overrideAdBlockSourceRulesLimitAtom);
   const resetSourceLimit = useSetAtom(setAdBlockSourceRulesLimitOverrideAtom);
   const refreshSource = useSetAtom(refreshAdBlockSourceAtom);
+  const reorderSource = useSetAtom(reorderAdBlockSourceAtom);
   const refreshAll = useSetAtom(refreshAllAdBlockSourcesAtom);
   const addWhitelistMany = useSetAtom(addAdBlockWhitelistManyAtom);
   const removeWhitelist = useSetAtom(removeAdBlockWhitelistAtom);
@@ -81,6 +87,9 @@ function AdBlock() {
   const [newName, setNewName] = useState("");
   const [newUrl, setNewUrl] = useState("");
   const [newResponse, setNewResponse] = useState<AdBlockResponse>("zero_address");
+  // Issue #215 §1: id of the source whose overlap drawer is
+  // open, or null. The drawer reads from `overlapReport`.
+  const [overlapDrawerSrcId, setOverlapDrawerSrcId] = useState<string | null>(null);
   const [newWhitelistDomain, setNewWhitelistDomain] = useState("");
   // Issue #196: ref so the bulk-add source button can read its value
   // without the previousElementSibling hack.
@@ -100,7 +109,11 @@ function AdBlock() {
     // shows an "unknown" placeholder and the next interaction
     // retries.
     fetchStats().catch(() => {});
-  }, [fetchState, fetchLimits, fetchStats]);
+    // Issue #215: pull the cross-source overlap report so each
+    // source card can render its chip without an extra round
+    // trip when the user opens the drawer.
+    fetchOverlaps().catch(() => {});
+  }, [fetchState, fetchLimits, fetchStats, fetchOverlaps]);
 
   const handleAddSource = useCallback(() => {
     if (!newName.trim() || !newUrl.trim()) return;
@@ -427,7 +440,11 @@ function AdBlock() {
             <div className={styles.empty}>No sources yet.</div>
           ) : (
             <div className={styles.columnGap}>
-              {state.sources.map((src) => (
+              {state.sources.map((src, index) => {
+                const overlapSummary = overlapReport?.per_source.find(
+                  (s) => s.source_id === src.source_id,
+                );
+                return (
                 <div
                   key={src.source_id}
                   className={`${styles.sourceCard} ${!src.enabled ? styles.dimmed : ""}`}
@@ -462,6 +479,29 @@ function AdBlock() {
                         )}
                       </div>
 
+
+                      {/* Issue #215 §1: overlap chip — visible only when
+                          this source shares at least one domain with
+                          another enabled source. Clicking opens the
+                          drill-down drawer at the bottom of the page.
+                          The chip is intentionally outside the existing
+                          `sourceMeta` line so it doesn't clutter the
+                          status text for sources with zero overlaps. */}
+                      {overlapSummary &&
+                        overlapSummary.overlapping_domain_count > 0 && (
+                          <button
+                            type="button"
+                            className={styles.overlapChip}
+                            onClick={() =>
+                              setOverlapDrawerSrcId(src.source_id)
+                            }
+                            aria-label={`Show ${overlapSummary.overlapping_domain_count} overlapping domains for ${src.name}`}
+                            onPointerDown={onPointerDown(() => {})}
+                          >
+                            {overlapSummary.overlapping_domain_count.toLocaleString()}{" "}
+                            domains also covered by other sources
+                          </button>
+                        )}
                       {/* Issue #207: one-click way out for legitimately huge
                           lists. The backend stays fail-closed (no truncation);
                           this raises the per-source cap to the actual parsed
@@ -556,6 +596,51 @@ function AdBlock() {
                         <option value="nx_domain">NXDOMAIN</option>
                       </select>
 
+
+                      {/* Issue #215: source reorder. Two ↑/↓ buttons
+                          (no dnd — see AGENTS.md / spec; the project
+                          has no draggable primitive). The Up button
+                          is disabled at the head and the Down
+                          button at the tail, so the boundary no-op
+                          case on the server can't be reached from
+                          the UI. Order is purely a presentation
+                          concern — never affects interception
+                          (covered by the backend regression tests
+                          in `commands::adblock::tests`). */}
+                      <button
+                        type="button"
+                        className="btn btn-sm btn-ghost"
+                        onClick={() =>
+                          reorderSource({
+                            sourceId: src.source_id,
+                            direction: "up",
+                          }).catch(() => {})
+                        }
+                        disabled={isLoading || index === 0}
+                        aria-label={`Move source ${src.name} up`}
+                        title="Move up"
+                        onPointerDown={onPointerDown(() => {})}
+                      >
+                        ↑
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-sm btn-ghost"
+                        onClick={() =>
+                          reorderSource({
+                            sourceId: src.source_id,
+                            direction: "down",
+                          }).catch(() => {})
+                        }
+                        disabled={
+                          isLoading || index === state.sources.length - 1
+                        }
+                        aria-label={`Move source ${src.name} down`}
+                        title="Move down"
+                        onPointerDown={onPointerDown(() => {})}
+                      >
+                        ↓
+                      </button>
                       <button
                         className="btn btn-sm btn-ghost"
                         onClick={() =>
@@ -584,7 +669,7 @@ function AdBlock() {
                     </div>
                   </div>
                 </div>
-              ))}
+              );})}
             </div>
           )}
         </div>
@@ -805,6 +890,87 @@ function AdBlock() {
             )}
           </div>
         </details>
+
+      {/* Issue #215 §1: overlap drill-down drawer. The drawer reads
+          `overlapDrawerSrcId` and the cached `overlapReport.details`
+          for that source. Closing clears the id; opening re-fetches
+          the report so reorders / source mutations are reflected
+          without a manual reload. The "No overlapping domains" empty
+          state handles the case where the chip was clicked after a
+          mutation cleared the overlap (rare race — `fetchOverlaps`
+          is fired on every mutation but is async). */}
+      {overlapDrawerSrcId !== null && (
+        <>
+          <div
+            className={styles.overlapOverlay}
+            onClick={() => setOverlapDrawerSrcId(null)}
+          />
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="Cross-source overlap drill-down"
+            className={styles.overlapModal}
+          >
+            <div className={styles.overlapModalHeader}>
+              <h2 className={styles.overlapModalTitle}>
+                Overlapping domains —{" "}
+                {state.sources.find(
+                  (s) => s.source_id === overlapDrawerSrcId,
+                )?.name ?? "—"}
+              </h2>
+              <button
+                className="btn btn-sm"
+                onClick={() => setOverlapDrawerSrcId(null)}
+                aria-label="Close overlap drawer"
+                onPointerDown={onPointerDown(() => {})}
+              >
+                ×
+              </button>
+            </div>
+            {(() => {
+              const entries = overlapReport?.details[overlapDrawerSrcId] ?? [];
+              if (entries.length === 0) {
+                return (
+                  <div className={styles.muted}>
+                    No overlapping domains with other sources. (The chip
+                    may have been clicked while a mutation was in
+                    flight.)
+                  </div>
+                );
+              }
+              return (
+                <div>
+                  <div className={`${styles.muted} ${styles.mutedGap}`}>
+                    {entries.length.toLocaleString()} domains are also
+                    covered by at least one other enabled source. The
+                    "effective" badge shows what the engine will return
+                    for each — derived from the priority chain whitelist
+                    &gt; NXDOMAIN &gt; 0.0.0.0.
+                  </div>
+                  {entries.map((entry) => (
+                    <div key={entry.domain} className={styles.overlapEntry}>
+                      <div>
+                        <span className={styles.overlapEntryDomain}>
+                          {entry.domain}
+                        </span>
+                        <span className={styles.overlapEffectiveBadge}>
+                          {entry.effective}
+                        </span>
+                      </div>
+                      <div className={styles.overlapEntryMeta}>
+                        Also in:{" "}
+                        {entry.covered_by
+                          .map((s) => `${s.name} (${s.response})`)
+                          .join(", ")}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              );
+            })()}
+          </div>
+        </>
+      )}
       </div>
     </div>
   );

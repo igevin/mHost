@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, act } from "@testing-library/react";
+import { render, screen, fireEvent, act, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { getDefaultStore, Provider as JotaiProvider } from "jotai";
 import {
@@ -22,6 +22,8 @@ const mockRemoveAdBlockSource = vi.fn().mockResolvedValue(undefined);
 const mockSetAdBlockSourceEnabled = vi.fn().mockResolvedValue({});
 const mockSetAdBlockSourceResponse = vi.fn().mockResolvedValue({});
 const mockRefreshAdBlockSource = vi.fn().mockResolvedValue({});
+const mockReorderAdBlockSources = vi.fn().mockResolvedValue([]);
+const mockGetAdBlockOverlaps = vi.fn().mockResolvedValue({ per_source: [], details: {} });
 const mockRefreshAllAdBlockSources = vi.fn().mockResolvedValue([]);
 const mockAddAdBlockWhitelist = vi.fn().mockResolvedValue([]);
 const mockAddAdBlockWhitelistMany = vi
@@ -49,6 +51,8 @@ vi.mock("../../lib/tauri", async (importOriginal) => {
     setAdBlockSourceRulesLimitOverride: (...args: unknown[]) =>
       mockSetAdBlockSourceRulesLimitOverride(...args),
     refreshAdBlockSource: (...args: unknown[]) => mockRefreshAdBlockSource(...args),
+    reorderAdBlockSources: (...args: unknown[]) => mockReorderAdBlockSources(...args),
+    getAdBlockOverlaps: (...args: unknown[]) => mockGetAdBlockOverlaps(...args),
     refreshAllAdBlockSources: (...args: unknown[]) => mockRefreshAllAdBlockSources(...args),
     addAdBlockWhitelist: (...args: unknown[]) => mockAddAdBlockWhitelist(...args),
     addAdBlockWhitelistMany: (...args: unknown[]) =>
@@ -699,5 +703,206 @@ describe("AdBlock", () => {
     } finally {
       (navigator as { clipboard?: Clipboard }).clipboard = originalClipboard;
     }
+  });
+
+  // Issue #215: source reorder UI. The buttons are ↑/↓ on each source
+  // card; the backend IPC accepts a single-step relative move. The
+  // tests below cover: (1) the boundary buttons (first/last) are
+  // disabled in the UI so the user can't trigger a server-side
+  // no-op; (2) clicking ↑/↓ calls the IPC with the right args.
+  //
+  // Note: the page's useEffect calls fetchState() which OVERWRITES
+  // the pre-set store state with mockGetAdBlockState's resolved
+  // value. Each test must therefore set mockGetAdBlockState to the
+  // desired state BEFORE rendering — same pattern as the other
+  // source-rendering tests in this file (e.g. "renders source cards
+  // with name, url, and rule count").
+  describe("source reorder (issue #215)", () => {
+    beforeEach(() => {
+      mockReorderAdBlockSources.mockReset();
+      mockReorderAdBlockSources.mockResolvedValue([]);
+    });
+
+    it("disables Up on the first source and Down on the last", async () => {
+      const a = makeSource({ source_id: "src-a", name: "A" });
+      const b = makeSource({ source_id: "src-b", name: "B" });
+      const c = makeSource({ source_id: "src-c", name: "C" });
+      const state = makeState({ sources: [a, b, c] });
+      setStore((s) => s.set(adBlockStateAtom, state));
+      mockGetAdBlockState.mockResolvedValue(state);
+      renderWithProviders(<AdBlock />);
+
+      // First source's Up is disabled.
+      const firstUp = await screen.findByRole("button", { name: /Move source A up/i });
+      expect(firstUp).toBeDisabled();
+      // First source's Down is enabled.
+      const firstDown = screen.getByRole("button", { name: /Move source A down/i });
+      expect(firstDown).not.toBeDisabled();
+
+      // Middle source's both buttons enabled.
+      expect(screen.getByRole("button", { name: /Move source B up/i })).not.toBeDisabled();
+      expect(screen.getByRole("button", { name: /Move source B down/i })).not.toBeDisabled();
+
+      // Last source's Down is disabled; Up enabled.
+      expect(screen.getByRole("button", { name: /Move source C up/i })).not.toBeDisabled();
+      expect(screen.getByRole("button", { name: /Move source C down/i })).toBeDisabled();
+    });
+
+    it("clicking Up invokes the IPC with sourceId + direction 'up'", async () => {
+      const a = makeSource({ source_id: "src-a", name: "A" });
+      const b = makeSource({ source_id: "src-b", name: "B" });
+      const state = makeState({ sources: [a, b] });
+      setStore((s) => s.set(adBlockStateAtom, state));
+      mockGetAdBlockState.mockResolvedValue(state);
+      renderWithProviders(<AdBlock />);
+
+      const upBtn = await screen.findByRole("button", { name: /Move source B up/i });
+      await act(async () => {
+        fireEvent.click(upBtn);
+      });
+      // Sub-agent review (PR #221, finding 1): the click triggers
+      // `reorderSource(...)` which calls `reorderAdBlockSources`
+      // IPC; the assertion runs before that microtask reliably
+      // flushes, so wrap in waitFor to dodge the race. Apply
+      // symmetrically to the corresponding Down test below.
+      await waitFor(() => {
+        expect(mockReorderAdBlockSources).toHaveBeenCalledWith("src-b", "up");
+      });
+    });
+
+    it("clicking Down invokes the IPC with sourceId + direction 'down'", async () => {
+      const a = makeSource({ source_id: "src-a", name: "A" });
+      const b = makeSource({ source_id: "src-b", name: "B" });
+      const state = makeState({ sources: [a, b] });
+      setStore((s) => s.set(adBlockStateAtom, state));
+      mockGetAdBlockState.mockResolvedValue(state);
+      renderWithProviders(<AdBlock />);
+
+      const downBtn = await screen.findByRole("button", { name: /Move source A down/i });
+      await act(async () => {
+        fireEvent.click(downBtn);
+      });
+      await waitFor(() => {
+        expect(mockReorderAdBlockSources).toHaveBeenCalledWith("src-a", "down");
+      });
+    });
+  });
+
+  // Issue #215 §1: cross-source overlap UI. Two tests:
+  //  1. The chip renders only on sources with overlapping_domain_count > 0
+  //     and opens the drawer when clicked.
+  //  2. The drawer shows the per-domain entries from
+  //     `overlapReport.details[source_id]` with the `effective` badge.
+  //
+  // Like the reorder tests, each test sets `mockGetAdBlockState` so
+  // the page's `useEffect` `fetchState()` doesn't overwrite the
+  // pre-set `adBlockStateAtom` with an empty state.
+  describe("source overlap (issue #215)", () => {
+    beforeEach(() => {
+      mockGetAdBlockOverlaps.mockReset();
+      mockGetAdBlockOverlaps.mockResolvedValue({
+        per_source: [],
+        details: {},
+      });
+    });
+
+    it("renders an overlap chip only on sources with overlapping domains", async () => {
+      const a = makeSource({ source_id: "src-a", name: "A" });
+      const b = makeSource({ source_id: "src-b", name: "B" });
+      const c = makeSource({ source_id: "src-c", name: "C" });
+      const state = makeState({ sources: [a, b, c] });
+      setStore((s) => s.set(adBlockStateAtom, state));
+      mockGetAdBlockState.mockResolvedValue(state);
+      // Only `src-a` overlaps with `src-b`. `src-c` has zero overlaps
+      // so the chip must not render.
+      mockGetAdBlockOverlaps.mockResolvedValue({
+        per_source: [
+          {
+            source_id: "src-a",
+            source_name: "A",
+            overlapping_domain_count: 7,
+          },
+          {
+            source_id: "src-b",
+            source_name: "B",
+            overlapping_domain_count: 3,
+          },
+          {
+            source_id: "src-c",
+            source_name: "C",
+            overlapping_domain_count: 0,
+          },
+        ],
+        details: {},
+      });
+      renderWithProviders(<AdBlock />);
+
+      const chipA = await screen.findByRole("button", {
+        name: /Show 7 overlapping domains for A/i,
+      });
+      expect(chipA).toBeInTheDocument();
+      const chipB = screen.getByRole("button", {
+        name: /Show 3 overlapping domains for B/i,
+      });
+      expect(chipB).toBeInTheDocument();
+      // No chip for source C because count is 0.
+      expect(
+        screen.queryByRole("button", {
+          name: /overlapping domains for C/i,
+        }),
+      ).not.toBeInTheDocument();
+    });
+
+    it("clicking the chip opens a drawer with per-domain details", async () => {
+      const a = makeSource({ source_id: "src-a", name: "A" });
+      const b = makeSource({ source_id: "src-b", name: "B" });
+      const state = makeState({ sources: [a, b] });
+      setStore((s) => s.set(adBlockStateAtom, state));
+      mockGetAdBlockState.mockResolvedValue(state);
+      mockGetAdBlockOverlaps.mockResolvedValue({
+        per_source: [
+          {
+            source_id: "src-a",
+            source_name: "A",
+            overlapping_domain_count: 1,
+          },
+        ],
+        details: {
+          "src-a": [
+            {
+              domain: "shared.example.com",
+              covered_by: [
+                {
+                  source_id: "src-b",
+                  name: "B",
+                  response: "nx_domain",
+                },
+              ],
+              effective: "NxDomain",
+            },
+          ],
+        },
+      });
+      renderWithProviders(<AdBlock />);
+
+      const chip = await screen.findByRole("button", {
+        name: /Show 1 overlapping domains for A/i,
+      });
+      await act(async () => {
+        fireEvent.click(chip);
+      });
+
+      // Drawer header + entry show up.
+      expect(
+        screen.getByRole("heading", { name: /Overlapping domains/i }),
+      ).toBeInTheDocument();
+      expect(screen.getByText("shared.example.com")).toBeInTheDocument();
+      // Use getAllByText then assert the overlap badge is present;
+      // the response-type select also contains "NXDOMAIN" as an option
+      // value, which would falsely match a plain `getByText`.
+      expect(screen.getByText("shared.example.com").nextElementSibling).toHaveTextContent("NxDomain");
+      // The covered_by line lists the other source + its response.
+      expect(screen.getByText(/B \(nx_domain\)/)).toBeInTheDocument();
+    });
   });
 });

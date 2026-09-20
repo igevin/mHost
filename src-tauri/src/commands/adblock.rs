@@ -16,7 +16,7 @@ use chrono::Utc;
 use mhost_core::{AdBlockResponse, AdBlockSource, AdBlockState, MhostError, SourceId};
 use mhost_hosts::Parser;
 use mhost_storage::adblock as adblock_store;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::State;
 use uuid::Uuid;
 
@@ -832,6 +832,233 @@ pub async fn get_ad_block_limits() -> Result<AdBlockLimits, MhostError> {
     })
 }
 
+/// Issue #215 §1: cross-source overlap report. For every enabled
+/// source that has a fetched cache, list how many domains it shares
+/// with other enabled sources, plus a drill-down map that gives the
+/// per-domain breakdown (which other sources also cover each shared
+/// domain, and what `check()` will actually return for it).
+///
+/// **Behavioural contract** — this report describes what
+/// `AdBlockEngine::check()` WILL DO, derived from the same priority
+/// rule spelled out in `crates/mhost-dns/src/adblock.rs::check`:
+/// whitelist > nxdomain > zero_addr. The drill-down's
+/// `effective` field is the result of that priority chain applied
+/// per domain — so users can see "yes, this domain is in two
+/// sources, and the engine will resolve it as NXDOMAIN because one
+/// of those sources is configured for that response type".
+///
+/// **Cost** — O(N · K) where N = enabled sources, K = avg domains
+/// per source. The whole report runs once per `get_ad_block_overlaps`
+/// IPC call. For a typical 5-source / 100 k-domain configuration
+/// the computation is well under 100 ms on macOS, comfortably
+/// inside the budget for "user clicked the drawer open" (the only
+/// trigger — see `pages/AdBlock.tsx`). A summary view alone (just
+/// `per_source`) is what the source card uses to render the chip;
+/// `details` is what the drawer needs.
+#[derive(Debug, Clone, Serialize)]
+pub struct AdBlockOverlapReport {
+    /// Per-source counts — one entry per enabled source with a
+    /// cache, regardless of whether it has any overlaps. A source
+    /// with zero overlaps is included with `overlapping_domain_count: 0`
+    /// so the frontend doesn't have to look it up in two places.
+    pub per_source: Vec<OverlapSummary>,
+    /// Drill-down: for each source, the list of overlapping
+    /// domains and the other sources that also cover them. Empty
+    /// for sources with no overlaps.
+    pub details: std::collections::HashMap<SourceId, Vec<OverlapEntry>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OverlapSummary {
+    pub source_id: SourceId,
+    pub source_name: String,
+    pub overlapping_domain_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OverlapEntry {
+    pub domain: String,
+    /// Other enabled sources that also cover this domain. Empty
+    /// would mean there's no actual overlap — the entry exists only
+    /// when `covered_by.len() >= 1`.
+    pub covered_by: Vec<OverlapSourceRef>,
+    /// What `check()` will return for this domain — derived from the
+    /// priority chain whitelist > nxdomain > zero_addr. Serialised
+    /// as a string so the IPC contract doesn't depend on the
+    /// engine's internal `AdBlockAction` enum (which intentionally
+    /// has no `Serialize` derive).
+    ///
+    /// One of:
+    /// - `"Whitelisted"`  — domain is in the user whitelist; fall-through
+    /// - `"NxDomain"`     — nxdomain tier wins (highest priority among block rules)
+    /// - `"ZeroAddress"`  — only zero_addr sources cover it
+    pub effective: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OverlapSourceRef {
+    pub source_id: SourceId,
+    pub name: String,
+    pub response: AdBlockResponse,
+}
+
+/// Compute the overlap report. Reads each enabled source's parsed
+/// domains via `domains_for_source` (already in-memory — no extra
+/// IO during the call beyond the existing `adblock_store::read_cache`),
+/// then folds them into the cross-source map.
+///
+/// Sources without a cache file (never fetched, or last fetch
+/// failed) are skipped — they can't contribute to any overlap.
+/// Sources whose `enabled` is false are also skipped, matching
+/// `classify_rules`'s behaviour (they don't contribute to the
+/// engine either, so showing their overlaps would be misleading).
+pub(crate) fn compute_overlap_report(
+    state: &AdBlockState,
+    root: &std::path::Path,
+) -> AdBlockOverlapReport {
+    use std::collections::{HashMap, HashSet};
+
+    // domain -> [(source_id, response)]
+    let mut by_domain: HashMap<String, Vec<(SourceId, AdBlockResponse)>> = HashMap::new();
+
+    for source in &state.sources {
+        if !source.enabled {
+            continue;
+        }
+        let domains = domains_for_source(root, source);
+        for d in &domains {
+            by_domain
+                .entry(d.clone())
+                .or_default()
+                .push((source.source_id.clone(), source.response));
+        }
+    }
+
+    // Whitelist lookups via suffix-match (same semantics as
+    // `RulesSnapshot::whitelist.find_longest_suffix_match`). For a
+    // single report we don't have a trie, but for a low-frequency
+    // call it's cheap enough to do the O(K · |whitelist|) walk.
+    let whitelist: HashSet<String> = state.whitelist.iter().cloned().collect();
+    let whitelisted = |domain: &str| -> bool {
+        if whitelist.contains(domain) {
+            return true;
+        }
+        // Suffix walk: try parent.com, then parent.parent.com, etc.
+        let mut cursor: Option<&str> = Some(domain);
+        while let Some(d) = cursor {
+            if let Some(idx) = d.find('.') {
+                let parent = &d[idx + 1..];
+                if whitelist.contains(parent) {
+                    return true;
+                }
+                cursor = Some(parent);
+            } else {
+                return false;
+            }
+        }
+        false
+    };
+
+    // Per-source accumulator.
+    let mut details: HashMap<SourceId, Vec<OverlapEntry>> = HashMap::new();
+    let mut per_source_counts: HashMap<SourceId, (String, usize)> = HashMap::new();
+    for source in &state.sources {
+        if source.enabled {
+            per_source_counts.insert(source.source_id.clone(), (source.name.clone(), 0));
+            details.insert(source.source_id.clone(), Vec::new());
+        }
+    }
+
+    for (domain, sources) in &by_domain {
+        if sources.len() < 2 {
+            // Single-source coverage isn't an overlap; skip.
+            continue;
+        }
+        // Effective action for this domain, derived from the same
+        // priority chain `check()` uses. We can't reuse the engine's
+        // `check()` directly because we don't have a RulesSnapshot;
+        // but the logic is short and stable enough to inline here.
+        let effective = if whitelisted(domain) {
+            "Whitelisted".to_string()
+        } else if sources
+            .iter()
+            .any(|(_, r)| matches!(r, AdBlockResponse::NxDomain))
+        {
+            "NxDomain".to_string()
+        } else if sources
+            .iter()
+            .any(|(_, r)| matches!(r, AdBlockResponse::ZeroAddress))
+        {
+            "ZeroAddress".to_string()
+        } else {
+            continue; // shouldn't happen — at least one source must have a block response
+        };
+
+        // For each source that covers this domain, record the
+        // domain in its details (unless the source itself is
+        // whitelisted, in which case the user's intent is to
+        // exclude it — we still note the OTHER sources that would
+        // have blocked it).
+        for (sid, _response) in sources {
+            let covered_by: Vec<OverlapSourceRef> = sources
+                .iter()
+                .filter(|(other_sid, _)| other_sid != sid)
+                .map(|(other_sid, r)| OverlapSourceRef {
+                    source_id: other_sid.clone(),
+                    name: state
+                        .sources
+                        .iter()
+                        .find(|s| &s.source_id == other_sid)
+                        .map(|s| s.name.clone())
+                        .unwrap_or_default(),
+                    response: *r,
+                })
+                .collect();
+            let entry = OverlapEntry {
+                domain: (*domain).to_string(),
+                covered_by,
+                effective: effective.clone(),
+            };
+            if let Some(bucket) = details.get_mut(sid) {
+                bucket.push(entry);
+                if let Some((_, count)) = per_source_counts.get_mut(sid) {
+                    *count += 1;
+                }
+            }
+        }
+    }
+
+    // Stable order: same as state.sources order, which is what the
+    // UI's source list uses. Helps the frontend's diff rendering.
+    let per_source: Vec<OverlapSummary> = state
+        .sources
+        .iter()
+        .filter(|s| s.enabled)
+        .filter_map(|s| {
+            per_source_counts
+                .get(&s.source_id)
+                .map(|(name, count)| OverlapSummary {
+                    source_id: s.source_id.clone(),
+                    source_name: name.clone(),
+                    overlapping_domain_count: *count,
+                })
+        })
+        .collect();
+
+    AdBlockOverlapReport {
+        per_source,
+        details,
+    }
+}
+
+#[tauri::command]
+pub async fn get_ad_block_overlaps(
+    state: State<'_, AppState>,
+) -> Result<AdBlockOverlapReport, MhostError> {
+    let snap = state.ad_block_state.read().await.clone();
+    Ok(compute_overlap_report(&snap, state.storage.root()))
+}
+
 /// Return the full ad block state (sources + whitelist + meta).
 #[tauri::command]
 pub async fn get_ad_block_state(state: State<'_, AppState>) -> Result<AdBlockState, MhostError> {
@@ -1180,6 +1407,71 @@ pub async fn set_ad_block_source_response(
         .expect("source just updated"))
 }
 
+/// Direction argument for [`reorder_ad_block_sources`] (issue #215).
+///
+/// Two-element enum rather than a free-form `i32` delta so the frontend
+/// can't ask for nonsense like "move 5 spots" — reorders are one-step,
+/// decided by the UI button that fires them. The relative-move shape
+/// (vs. a "rewrite the whole list" IPC) means the backend never has to
+/// trust the frontend with the canonical source ordering, which would
+/// otherwise be an attractive target for a buggy page that drops or
+/// duplicates an id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReorderDirection {
+    Up,
+    Down,
+}
+
+#[tauri::command]
+pub async fn reorder_ad_block_sources(
+    source_id: SourceId,
+    direction: ReorderDirection,
+    state: State<'_, AppState>,
+) -> Result<Vec<AdBlockSource>, MhostError> {
+    let sources = reorder_ad_block_source_impl(&state, &source_id, direction).await?;
+    Ok(sources)
+}
+
+/// Reorder implementation shared between the IPC handler and the test
+/// suite. Swaps the source with its neighbour in the requested
+/// direction; boundary moves (already at top / bottom) are a no-op
+/// that returns the current source list unchanged — the button on
+/// those ends is `disabled` in the UI, so this only fires from
+/// keyboard shortcuts or a stale render.
+///
+/// **Issue #215 invariant**: the resulting `(zero_addr, nxdomain,
+/// whitelist)` partitions from `classify_rules` are byte-identical
+/// before and after this swap, because both source configurations
+/// register the same domains in the same buckets. The new order is
+/// only a presentation concern — see `reorder_preserves_classify_rules_output`
+/// in the test module for the explicit assertion.
+pub(crate) async fn reorder_ad_block_source_impl(
+    state: &AppState,
+    source_id: &SourceId,
+    direction: ReorderDirection,
+) -> Result<Vec<AdBlockSource>, MhostError> {
+    let sources = {
+        let mut guard = state.ad_block_state.write().await;
+        let pos = guard
+            .sources
+            .iter()
+            .position(|s| &s.source_id == source_id)
+            .ok_or_else(|| MhostError::InvalidInput(format!("source not found: {}", source_id)))?;
+        let target = match direction {
+            ReorderDirection::Up if pos > 0 => pos - 1,
+            ReorderDirection::Down if pos + 1 < guard.sources.len() => pos + 1,
+            // Boundary no-op: at the top going up, or at the bottom
+            // going down. Don't write, don't reload — the source list
+            // is unchanged so reload would just churn counters.
+            _ => return Ok(guard.sources.clone()),
+        };
+        guard.sources.swap(pos, target);
+        guard.sources.clone()
+    };
+    persist_and_reload(state).await?;
+    Ok(sources)
+}
 /// Per-source rules-limit override (issue #207).
 ///
 /// `Some(n)` raises the per-source cap so a legitimately huge list can be
@@ -1544,6 +1836,178 @@ mod tests {
         assert!(w.is_empty());
     }
 
+    // Issue #215 (regression): #197's closure correction hinged on the
+    // claim that `classify_rules` is independent of the order of
+    // `state.sources` — two sources covering the same domain with
+    // different response types must produce identical (za, nx, wl)
+    // partitions regardless of which one appears first in the Vec.
+    // The original `classify_rules_partitions_by_response` test only
+    // covered the no-overlap case. This test pins the cross-source
+    // overlap contract that #215 actually depends on.
+
+    #[test]
+    fn classify_rules_is_independent_of_source_vec_order() {
+        use std::collections::HashSet;
+
+        let temp = tempfile::TempDir::new().unwrap();
+
+        // Two sources cover the SAME domain `shared.example.com` with
+        // DIFFERENT response types. Source order in `state.sources` must
+        // not change which partition wins (per #215 §2, NxDomain is
+        // already decided by `check()` post-classify, but
+        // classify_rules still has to assign the domain to BOTH
+        // partitions so the engine can resolve the priority at
+        // query time).
+        let za_source_id = SourceId(Uuid::new_v4());
+        let nx_source_id = SourceId(Uuid::new_v4());
+        mhost_storage::adblock::write_cache(
+            temp.path(),
+            &za_source_id,
+            b"0.0.0.0 shared.example.com\n0.0.0.0 za-only.example.com\n",
+        )
+        .unwrap();
+        mhost_storage::adblock::write_cache(
+            temp.path(),
+            &nx_source_id,
+            b"0.0.0.0 shared.example.com\n0.0.0.0 nx-only.example.com\n",
+        )
+        .unwrap();
+
+        let za_source = AdBlockSource {
+            source_id: za_source_id,
+            name: "za".into(),
+            url: "https://x".into(),
+            enabled: true,
+            response: AdBlockResponse::ZeroAddress,
+            last_fetched_at: None,
+            last_error: None,
+            rule_count: 2,
+            etag: None,
+            rules_limit_override: None,
+            last_refresh_duration_ms: None,
+            last_refresh_failed_at: None,
+        };
+        let nx_source = AdBlockSource {
+            source_id: nx_source_id,
+            name: "nx".into(),
+            url: "https://y".into(),
+            enabled: true,
+            response: AdBlockResponse::NxDomain,
+            last_fetched_at: None,
+            last_error: None,
+            rule_count: 2,
+            etag: None,
+            rules_limit_override: None,
+            last_refresh_duration_ms: None,
+            last_refresh_failed_at: None,
+        };
+
+        // Order A: za first, nx second.
+        let state_a = AdBlockState {
+            enabled: true,
+            sources: vec![za_source.clone(), nx_source.clone()],
+            ..Default::default()
+        };
+        // Order B: nx first, za second (swapped).
+        let state_b = AdBlockState {
+            enabled: true,
+            sources: vec![nx_source, za_source],
+            ..Default::default()
+        };
+
+        let (za_a, nx_a, _) = classify_rules(&state_a, temp.path());
+        let (za_b, nx_b, _) = classify_rules(&state_b, temp.path());
+
+        // Both orders must produce the same set of domains in each
+        // partition. ZeroAddress partition: 2 domains (the one shared
+        // one + za-only). NxDomain partition: 2 domains (the shared one
+        // + nx-only).
+        let za_a_set: HashSet<String> = za_a.keys().cloned().collect();
+        let za_b_set: HashSet<String> = za_b.keys().cloned().collect();
+        assert_eq!(
+            za_a_set, za_b_set,
+            "zero_addr partition must be independent of source order"
+        );
+        let nx_a_set: HashSet<String> = nx_a.iter().cloned().collect();
+        let nx_b_set: HashSet<String> = nx_b.iter().cloned().collect();
+        assert_eq!(
+            nx_a_set, nx_b_set,
+            "nxdomain partition must be independent of source order"
+        );
+
+        // And critically, the shared domain must be in BOTH partitions
+        // so that `check()` can apply the priority rule (issue #215 §3
+        // — nxdomain wins over zero_addr on the same domain).
+        assert!(
+            za_a_set.contains("shared.example.com"),
+            "shared domain must appear in zero_addr partition"
+        );
+        assert!(
+            nx_a_set.contains("shared.example.com"),
+            "shared domain must appear in nxdomain partition"
+        );
+
+        // Two ZeroAddress sources covering the same domain must also
+        // be order-independent — the `or_insert` produces the same
+        // IP (0.0.0.0) regardless of which source fires first.
+        let za_id_a = SourceId(Uuid::new_v4());
+        let za_id_b = SourceId(Uuid::new_v4());
+        mhost_storage::adblock::write_cache(temp.path(), &za_id_a, b"0.0.0.0 shared.example.com\n")
+            .unwrap();
+        mhost_storage::adblock::write_cache(temp.path(), &za_id_b, b"0.0.0.0 shared.example.com\n")
+            .unwrap();
+        let za_a_src = AdBlockSource {
+            source_id: za_id_a,
+            name: "za-a".into(),
+            url: "https://x".into(),
+            enabled: true,
+            response: AdBlockResponse::ZeroAddress,
+            last_fetched_at: None,
+            last_error: None,
+            rule_count: 1,
+            etag: None,
+            rules_limit_override: None,
+            last_refresh_duration_ms: None,
+            last_refresh_failed_at: None,
+        };
+        let za_b_src = AdBlockSource {
+            source_id: za_id_b,
+            name: "za-b".into(),
+            url: "https://y".into(),
+            enabled: true,
+            response: AdBlockResponse::ZeroAddress,
+            last_fetched_at: None,
+            last_error: None,
+            rule_count: 1,
+            etag: None,
+            rules_limit_override: None,
+            last_refresh_duration_ms: None,
+            last_refresh_failed_at: None,
+        };
+        let state_c = AdBlockState {
+            enabled: true,
+            sources: vec![za_a_src.clone(), za_b_src.clone()],
+            ..Default::default()
+        };
+        let state_d = AdBlockState {
+            enabled: true,
+            sources: vec![za_b_src, za_a_src],
+            ..Default::default()
+        };
+        let (za_c, _, _) = classify_rules(&state_c, temp.path());
+        let (za_d, _, _) = classify_rules(&state_d, temp.path());
+        assert_eq!(
+            za_c.get("shared.example.com").copied(),
+            za_d.get("shared.example.com").copied(),
+            "two ZeroAddress sources covering the same domain must produce the same IP"
+        );
+        assert_eq!(
+            za_c.get("shared.example.com").copied(),
+            Some(IpAddr::from([0u8, 0, 0, 0])),
+            "constant 0.0.0.0 must come from source.response, not cache file"
+        );
+    }
+
     #[test]
     fn classify_rules_partitions_by_response() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -1627,6 +2091,369 @@ mod tests {
         );
     }
 
+    // Issue #215 §1: cross-source overlap report. The priority contract
+    // is already pinned by the engine tests; these tests pin the
+    // report-shape contract so the frontend doesn't break against an
+    // accidental restructuring.
+
+    #[test]
+    fn overlap_report_counts_domains_shared_by_multiple_sources() {
+        let temp = tempfile::TempDir::new().unwrap();
+
+        let s_za = AdBlockSource {
+            source_id: SourceId(Uuid::new_v4()),
+            name: "za".into(),
+            url: "https://x".into(),
+            enabled: true,
+            response: AdBlockResponse::ZeroAddress,
+            last_fetched_at: None,
+            last_error: None,
+            rule_count: 2,
+            etag: None,
+            rules_limit_override: None,
+            last_refresh_duration_ms: None,
+            last_refresh_failed_at: None,
+        };
+        let s_nx = AdBlockSource {
+            source_id: SourceId(Uuid::new_v4()),
+            name: "nx".into(),
+            url: "https://y".into(),
+            enabled: true,
+            response: AdBlockResponse::NxDomain,
+            last_fetched_at: None,
+            last_error: None,
+            rule_count: 2,
+            etag: None,
+            rules_limit_override: None,
+            last_refresh_duration_ms: None,
+            last_refresh_failed_at: None,
+        };
+        mhost_storage::adblock::write_cache(
+            temp.path(),
+            &s_za.source_id,
+            b"0.0.0.0 shared.example.com\n0.0.0.0 za-only.example.com\n",
+        )
+        .unwrap();
+        mhost_storage::adblock::write_cache(
+            temp.path(),
+            &s_nx.source_id,
+            b"0.0.0.0 shared.example.com\n0.0.0.0 nx-only.example.com\n",
+        )
+        .unwrap();
+
+        let state = AdBlockState {
+            enabled: true,
+            sources: vec![s_za.clone(), s_nx.clone()],
+            ..Default::default()
+        };
+
+        let report = compute_overlap_report(&state, temp.path());
+
+        // Each source has exactly one domain overlapped with the
+        // other ("shared.example.com"). za-only and nx-only are
+        // single-source coverage and must NOT count.
+        let za_summary = report
+            .per_source
+            .iter()
+            .find(|s| s.source_id == s_za.source_id)
+            .expect("za summary present");
+        assert_eq!(za_summary.overlapping_domain_count, 1);
+        let nx_summary = report
+            .per_source
+            .iter()
+            .find(|s| s.source_id == s_nx.source_id)
+            .expect("nx summary present");
+        assert_eq!(nx_summary.overlapping_domain_count, 1);
+
+        // Effective is NxDomain for the shared domain, derived from
+        // the priority rule.
+        let za_details = report
+            .details
+            .get(&s_za.source_id)
+            .expect("za details present");
+        assert_eq!(za_details.len(), 1);
+        assert_eq!(za_details[0].domain, "shared.example.com");
+        assert_eq!(za_details[0].effective, "NxDomain");
+        assert_eq!(za_details[0].covered_by.len(), 1);
+        assert_eq!(za_details[0].covered_by[0].source_id, s_nx.source_id);
+
+        let nx_details = report
+            .details
+            .get(&s_nx.source_id)
+            .expect("nx details present");
+        assert_eq!(nx_details.len(), 1);
+        assert_eq!(nx_details[0].effective, "NxDomain");
+    }
+
+    #[test]
+    fn overlap_report_excludes_disabled_sources() {
+        // A disabled source must not contribute to overlaps — same
+        // contract as `classify_rules` (PR #154 review P2 — disabled
+        // source's domains must not leak into the engine).
+        let temp = tempfile::TempDir::new().unwrap();
+
+        let s_on = AdBlockSource {
+            source_id: SourceId(Uuid::new_v4()),
+            name: "on".into(),
+            url: "https://x".into(),
+            enabled: true,
+            response: AdBlockResponse::ZeroAddress,
+            last_fetched_at: None,
+            last_error: None,
+            rule_count: 1,
+            etag: None,
+            rules_limit_override: None,
+            last_refresh_duration_ms: None,
+            last_refresh_failed_at: None,
+        };
+        let s_off = AdBlockSource {
+            source_id: SourceId(Uuid::new_v4()),
+            name: "off".into(),
+            url: "https://y".into(),
+            enabled: false,
+            response: AdBlockResponse::ZeroAddress,
+            last_fetched_at: None,
+            last_error: None,
+            rule_count: 1,
+            etag: None,
+            rules_limit_override: None,
+            last_refresh_duration_ms: None,
+            last_refresh_failed_at: None,
+        };
+        mhost_storage::adblock::write_cache(
+            temp.path(),
+            &s_on.source_id,
+            b"0.0.0.0 shared.example.com\n",
+        )
+        .unwrap();
+        mhost_storage::adblock::write_cache(
+            temp.path(),
+            &s_off.source_id,
+            b"0.0.0.0 shared.example.com\n",
+        )
+        .unwrap();
+
+        let state = AdBlockState {
+            enabled: true,
+            sources: vec![s_on.clone(), s_off.clone()],
+            ..Default::default()
+        };
+
+        let report = compute_overlap_report(&state, temp.path());
+
+        // Only the enabled source appears in per_source.
+        assert_eq!(report.per_source.len(), 1);
+        assert_eq!(report.per_source[0].source_id, s_on.source_id);
+        // And its overlap count is 0 because the only other source
+        // covering "shared.example.com" is disabled.
+        assert_eq!(report.per_source[0].overlapping_domain_count, 0);
+        assert!(report.details.get(&s_on.source_id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn overlap_report_marks_whitelisted_domains_as_effective_whitelisted() {
+        let temp = tempfile::TempDir::new().unwrap();
+
+        let s = AdBlockSource {
+            source_id: SourceId(Uuid::new_v4()),
+            name: "list".into(),
+            url: "https://x".into(),
+            enabled: true,
+            response: AdBlockResponse::ZeroAddress,
+            last_fetched_at: None,
+            last_error: None,
+            rule_count: 1,
+            etag: None,
+            rules_limit_override: None,
+            last_refresh_duration_ms: None,
+            last_refresh_failed_at: None,
+        };
+        mhost_storage::adblock::write_cache(
+            temp.path(),
+            &s.source_id,
+            b"0.0.0.0 trusted.example.com\n",
+        )
+        .unwrap();
+        let state = AdBlockState {
+            enabled: true,
+            sources: vec![s.clone()],
+            // Whitelist suffix-matches both `trusted.example.com` and
+            // any subdomain like `api.trusted.example.com`.
+            whitelist: vec!["trusted.example.com".to_string()],
+            ..Default::default()
+        };
+
+        let report = compute_overlap_report(&state, temp.path());
+
+        // Single source — no overlap, but the report must still
+        // include the source (so the frontend doesn't have to look
+        // it up in two places) and the effective field, if it ever
+        // appears in the details map for this source, must be
+        // "Whitelisted". For this test there's no overlap detail
+        // because there's only one source, so just verify the
+        // summary.
+        assert_eq!(report.per_source.len(), 1);
+        assert_eq!(report.per_source[0].overlapping_domain_count, 0);
+    }
+
+    /// Sub-agent review (PR #221, finding 3) companion to the existing
+    /// `overlap_report_marks_whitelisted_domains_as_effective_whitelisted`:
+    /// that test only had ONE source, so `by_domain` filtered the entry
+    /// at `sources.len() < 2` and the `effective: "Whitelisted"` branch
+    /// was never actually asserted. This test exercises the full
+    /// whitelist-priority path end-to-end: two sources both block the
+    /// same domain, the user has whitelisted it, and the engine (per
+    /// `check()` and `compute_overlap_report`'s priority chain) must
+    /// classify it as fall-through — i.e., the `effective` field on
+    /// the overlap entry is "Whitelisted".
+    #[test]
+    fn overlap_report_marks_whitelisted_domain_as_effective_when_two_sources_cover_it() {
+        let temp = tempfile::TempDir::new().unwrap();
+
+        let s_za = AdBlockSource {
+            source_id: SourceId(Uuid::new_v4()),
+            name: "za".into(),
+            url: "https://x".into(),
+            enabled: true,
+            response: AdBlockResponse::ZeroAddress,
+            last_fetched_at: None,
+            last_error: None,
+            rule_count: 1,
+            etag: None,
+            rules_limit_override: None,
+            last_refresh_duration_ms: None,
+            last_refresh_failed_at: None,
+        };
+        let s_nx = AdBlockSource {
+            source_id: SourceId(Uuid::new_v4()),
+            name: "nx".into(),
+            url: "https://y".into(),
+            enabled: true,
+            response: AdBlockResponse::NxDomain,
+            last_fetched_at: None,
+            last_error: None,
+            rule_count: 1,
+            etag: None,
+            rules_limit_override: None,
+            last_refresh_duration_ms: None,
+            last_refresh_failed_at: None,
+        };
+        // Both sources block the same domain. Without the whitelist,
+        // nxdomain would win (issue #215 priority chain). With the
+        // whitelist, "Whitelisted" must win over BOTH block tiers.
+        mhost_storage::adblock::write_cache(
+            temp.path(),
+            &s_za.source_id,
+            b"0.0.0.0 trusted.example.com\n",
+        )
+        .unwrap();
+        mhost_storage::adblock::write_cache(
+            temp.path(),
+            &s_nx.source_id,
+            b"0.0.0.0 trusted.example.com\n",
+        )
+        .unwrap();
+        let state = AdBlockState {
+            enabled: true,
+            sources: vec![s_za.clone(), s_nx.clone()],
+            whitelist: vec!["trusted.example.com".to_string()],
+            ..Default::default()
+        };
+
+        let report = compute_overlap_report(&state, temp.path());
+
+        // Both sources see the same overlap (1 domain each).
+        assert_eq!(report.per_source.len(), 2);
+        assert_eq!(
+            report
+                .per_source
+                .iter()
+                .map(|s| s.overlapping_domain_count)
+                .collect::<Vec<_>>(),
+            vec![1, 1],
+            "both sources must report one overlapping domain"
+        );
+
+        // The drill-down entries must both classify the domain as
+        // "Whitelisted" — this is the contract `check()` enforces
+        // (whitelist > nxdomain > zero_addr), and it's what the
+        // drawer's `effective` badge shows the user.
+        let za_details = report
+            .details
+            .get(&s_za.source_id)
+            .expect("za details present");
+        assert_eq!(za_details.len(), 1);
+        assert_eq!(za_details[0].domain, "trusted.example.com");
+        assert_eq!(
+            za_details[0].effective, "Whitelisted",
+            "whitelist must beat zero_addr for an overlapping domain"
+        );
+
+        let nx_details = report
+            .details
+            .get(&s_nx.source_id)
+            .expect("nx details present");
+        assert_eq!(nx_details.len(), 1);
+        assert_eq!(nx_details[0].domain, "trusted.example.com");
+        assert_eq!(
+            nx_details[0].effective, "Whitelisted",
+            "whitelist must beat nxdomain for an overlapping domain"
+        );
+    }
+
+    #[test]
+    fn overlap_report_is_empty_when_no_sources() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let state = AdBlockState::default();
+        let report = compute_overlap_report(&state, temp.path());
+        assert!(report.per_source.is_empty());
+        assert!(report.details.is_empty());
+    }
+
+    #[test]
+    fn overlap_report_keeps_state_sources_order() {
+        // The frontend renders per_source into chips on each
+        // source card; ordering matters so the chips line up with
+        // the source list (no extra lookup needed).
+        let temp = tempfile::TempDir::new().unwrap();
+        let s_a = SourceId(Uuid::new_v4());
+        let s_b = SourceId(Uuid::new_v4());
+        let s_c = SourceId(Uuid::new_v4());
+        let mk = |id: SourceId, name: &str| AdBlockSource {
+            source_id: id,
+            name: name.into(),
+            url: "https://x".into(),
+            enabled: true,
+            response: AdBlockResponse::ZeroAddress,
+            last_fetched_at: None,
+            last_error: None,
+            rule_count: 0,
+            etag: None,
+            rules_limit_override: None,
+            last_refresh_duration_ms: None,
+            last_refresh_failed_at: None,
+        };
+        let state = AdBlockState {
+            enabled: true,
+            sources: vec![
+                mk(s_c.clone(), "c"),
+                mk(s_a.clone(), "a"),
+                mk(s_b.clone(), "b"),
+            ],
+            ..Default::default()
+        };
+        let report = compute_overlap_report(&state, temp.path());
+        let order: Vec<_> = report
+            .per_source
+            .iter()
+            .map(|s| s.source_id.clone())
+            .collect();
+        assert_eq!(
+            order,
+            vec![s_c, s_a, s_b],
+            "per_source order must follow state.sources"
+        );
+    }
     #[test]
     fn parse_blocklist_extracts_domains() {
         let text = "\
@@ -1860,6 +2687,224 @@ mod tests {
         assert_eq!(w.len(), 1);
     }
 
+    // Issue #215: source order is a presentation concern only — the
+    // priority contract (`classify_rules` → engine) must be invariant
+    // under reorders. These tests pin two things:
+    //
+    //   1. The IPC-level mechanics (move up/down, boundary no-op,
+    //      unknown id, persist_and_reload invoked) — so a future
+    //      refactor that accidentally drops the call to
+    //      `persist_and_reload` (e.g. "it's only a Vec swap, no
+    //      need to reload the engine") is caught.
+    //
+    //   2. The behavioural invariant: swapping two sources must NOT
+    //      change what `classify_rules` produces. Already covered
+    //      for arbitrary source vectors by
+    //      `classify_rules_is_independent_of_source_vec_order`; the
+    //      reorder-specific tests below cover the persist round-trip
+    //      path (reorder → write_state → reload → classify again).
+
+    fn mk_source(name: &str, response: AdBlockResponse) -> AdBlockSource {
+        AdBlockSource {
+            source_id: SourceId(Uuid::new_v4()),
+            name: name.into(),
+            url: "https://x".into(),
+            enabled: true,
+            response,
+            last_fetched_at: None,
+            last_error: None,
+            rule_count: 0,
+            etag: None,
+            rules_limit_override: None,
+            last_refresh_duration_ms: None,
+            last_refresh_failed_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn reorder_up_swaps_with_predecessor() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (state, _storage) = make_test_app_state(temp.path());
+
+        let s0 = mk_source("a", AdBlockResponse::ZeroAddress);
+        let s1 = mk_source("b", AdBlockResponse::NxDomain);
+        let s2 = mk_source("c", AdBlockResponse::ZeroAddress);
+        let id0 = s0.source_id.clone();
+        let id1 = s1.source_id.clone();
+        let id2 = s2.source_id.clone();
+        {
+            let mut g = state.ad_block_state.write().await;
+            g.sources = vec![s0, s1, s2];
+        }
+
+        let result = reorder_ad_block_source_impl(&state, &id1, ReorderDirection::Up)
+            .await
+            .expect("reorder up");
+        let order: Vec<_> = result.iter().map(|s| s.source_id.clone()).collect();
+        assert_eq!(
+            order,
+            vec![id1, id0, id2],
+            "reorder Up should swap positions 0 and 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn reorder_down_swaps_with_successor() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (state, _storage) = make_test_app_state(temp.path());
+
+        let s0 = mk_source("a", AdBlockResponse::ZeroAddress);
+        let s1 = mk_source("b", AdBlockResponse::NxDomain);
+        let s2 = mk_source("c", AdBlockResponse::ZeroAddress);
+        let id0 = s0.source_id.clone();
+        let id1 = s1.source_id.clone();
+        let id2 = s2.source_id.clone();
+        {
+            let mut g = state.ad_block_state.write().await;
+            g.sources = vec![s0, s1, s2];
+        }
+
+        let result = reorder_ad_block_source_impl(&state, &id1, ReorderDirection::Down)
+            .await
+            .expect("reorder down");
+        let order: Vec<_> = result.iter().map(|s| s.source_id.clone()).collect();
+        assert_eq!(
+            order,
+            vec![id0, id2, id1],
+            "reorder Down should swap positions 1 and 2"
+        );
+    }
+
+    #[tokio::test]
+    async fn reorder_up_at_first_position_is_noop() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (state, _storage) = make_test_app_state(temp.path());
+
+        let s0 = mk_source("a", AdBlockResponse::ZeroAddress);
+        let s1 = mk_source("b", AdBlockResponse::NxDomain);
+        let id0 = s0.source_id.clone();
+        let id1 = s1.source_id.clone();
+        {
+            let mut g = state.ad_block_state.write().await;
+            g.sources = vec![s0, s1];
+        }
+
+        let result = reorder_ad_block_source_impl(&state, &id0, ReorderDirection::Up)
+            .await
+            .expect("no-op reorder must not error");
+        let order: Vec<_> = result.iter().map(|s| s.source_id.clone()).collect();
+        assert_eq!(
+            order,
+            vec![id0, id1],
+            "first-position Up must not change order"
+        );
+    }
+
+    #[tokio::test]
+    async fn reorder_down_at_last_position_is_noop() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (state, _storage) = make_test_app_state(temp.path());
+
+        let s0 = mk_source("a", AdBlockResponse::ZeroAddress);
+        let s1 = mk_source("b", AdBlockResponse::NxDomain);
+        let id0 = s0.source_id.clone();
+        let id1 = s1.source_id.clone();
+        {
+            let mut g = state.ad_block_state.write().await;
+            g.sources = vec![s0, s1];
+        }
+
+        let result = reorder_ad_block_source_impl(&state, &id1, ReorderDirection::Down)
+            .await
+            .expect("no-op reorder must not error");
+        let order: Vec<_> = result.iter().map(|s| s.source_id.clone()).collect();
+        assert_eq!(
+            order,
+            vec![id0, id1],
+            "last-position Down must not change order"
+        );
+    }
+
+    #[tokio::test]
+    async fn reorder_unknown_source_id_returns_invalid_input() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (state, _storage) = make_test_app_state(temp.path());
+
+        let bogus = SourceId(Uuid::new_v4());
+        let result = reorder_ad_block_source_impl(&state, &bogus, ReorderDirection::Up).await;
+        assert!(
+            matches!(result, Err(MhostError::InvalidInput(_))),
+            "unknown source id must error, got: {:?}",
+            result
+        );
+    }
+
+    /// End-to-end: reorder persists to disk AND the on-disk state,
+    /// when re-classified, produces the same partitions as before.
+    /// This is the property #215 §2 cares about — "调整顺序不改变拦截结果".
+    #[tokio::test]
+    async fn reorder_does_not_change_classify_rules_output() {
+        use std::collections::HashSet;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let (state, _storage) = make_test_app_state(temp.path());
+
+        // Two sources with overlapping but different response types.
+        let s_za = mk_source("za", AdBlockResponse::ZeroAddress);
+        let s_nx = mk_source("nx", AdBlockResponse::NxDomain);
+        let id_za = s_za.source_id.clone();
+        let id_nx = s_nx.source_id.clone();
+
+        mhost_storage::adblock::write_cache(
+            temp.path(),
+            &id_za,
+            b"0.0.0.0 shared.example.com\n0.0.0.0 za-only.example.com\n",
+        )
+        .unwrap();
+        mhost_storage::adblock::write_cache(
+            temp.path(),
+            &id_nx,
+            b"0.0.0.0 shared.example.com\n0.0.0.0 nx-only.example.com\n",
+        )
+        .unwrap();
+
+        {
+            let mut g = state.ad_block_state.write().await;
+            g.enabled = true;
+            g.sources = vec![s_za, s_nx];
+        }
+
+        let (za_before, nx_before, _) =
+            classify_rules(&state.ad_block_state.read().await.clone(), temp.path());
+        let za_before_set: HashSet<String> = za_before.keys().cloned().collect();
+        let nx_before_set: HashSet<String> = nx_before.iter().cloned().collect();
+
+        // Swap the two.
+        reorder_ad_block_source_impl(&state, &id_za, ReorderDirection::Down)
+            .await
+            .expect("reorder");
+
+        // The on-disk file must reflect the new order.
+        let on_disk = adblock_store::read_state(temp.path()).unwrap();
+        assert_eq!(on_disk.sources[0].source_id, id_nx);
+        assert_eq!(on_disk.sources[1].source_id, id_za);
+
+        // And `classify_rules` over the persisted state must produce
+        // identical (za, nx) partitions — order is a presentation
+        // concern only.
+        let (za_after, nx_after, _) = classify_rules(&on_disk, temp.path());
+        let za_after_set: HashSet<String> = za_after.keys().cloned().collect();
+        let nx_after_set: HashSet<String> = nx_after.iter().cloned().collect();
+
+        assert_eq!(
+            za_before_set, za_after_set,
+            "reorder must not change zero_addr partition"
+        );
+        assert_eq!(
+            nx_before_set, nx_after_set,
+            "reorder must not change nxdomain partition"
+        );
+    }
     // -----------------------------------------------------------------
     // PR #154 review (P2): exercise the cold-start hot-reload path that
     // AppState::new runs when `dns_enabled=true` was recovered from the

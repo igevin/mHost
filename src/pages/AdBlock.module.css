@@ -363,3 +363,79 @@
   text-transform: uppercase;
   letter-spacing: 0.05em;
 }
+
+/* Issue #215 §1: overlap chip on each source card + drawer. */
+.overlapChip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  padding: 2px 8px;
+  font-size: 12px;
+  background: var(--color-bg-alt, rgba(255, 255, 255, 0.05));
+  border: 1px solid var(--color-border, rgba(255, 255, 255, 0.12));
+  border-radius: 999px;
+  cursor: pointer;
+  color: var(--color-text, var(--ink));
+}
+.overlapChip:hover {
+  background: var(--color-bg-hover, rgba(255, 255, 255, 0.1));
+}
+
+.overlapOverlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  z-index: 50;
+}
+.overlapModal {
+  position: fixed;
+  top: 10vh;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(560px, 92vw);
+  max-height: 80vh;
+  overflow-y: auto;
+  background: var(--color-bg, #1f2024);
+  color: var(--color-text, var(--ink));
+  border: 1px solid var(--color-border, var(--ink-muted));
+  border-radius: 8px;
+  padding: 18px 20px;
+  z-index: 51;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.45);
+}
+.overlapModalHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.overlapModalTitle {
+  margin: 0;
+  font-size: 16px;
+}
+.overlapEntry {
+  border-top: 1px solid var(--color-border, rgba(255, 255, 255, 0.08));
+  padding: 10px 0;
+}
+.overlapEntry:first-child {
+  border-top: 0;
+}
+.overlapEntryDomain {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 13px;
+}
+.overlapEntryMeta {
+  font-size: 12px;
+  color: var(--color-muted, var(--ink-muted));
+  margin-top: 4px;
+}
+.overlapEffectiveBadge {
+  display: inline-block;
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  margin-left: 6px;
+  background: var(--color-bg-alt, rgba(255, 255, 255, 0.08));
+}

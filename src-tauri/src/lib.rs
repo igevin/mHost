@@ -164,6 +164,7 @@ pub fn run() {
             // 广告屏蔽（issue #130）
             get_ad_block_state,
             get_ad_block_limits,
+            get_ad_block_overlaps,
             get_ad_block_stats,
             set_ad_block_enabled,
             set_ad_block_refresh_interval,
@@ -175,6 +176,7 @@ pub fn run() {
             set_ad_block_source_response,
             set_ad_block_source_rules_limit_override,
             refresh_ad_block_source,
+            reorder_ad_block_sources,
             refresh_all_ad_block_sources,
             list_ad_block_whitelist,
             add_ad_block_whitelist,

@@ -13,6 +13,7 @@ import type {
   AdBlockSource,
   AdBlockResponse,
   AdBlockStats,
+  AdBlockOverlapReport,
 } from "../types";
 
 // ---- Profile commands ----
@@ -288,6 +289,18 @@ export async function listAdBlockSources(): Promise<AdBlockSource[]> {
   return invoke<AdBlockSource[]>("list_ad_block_sources");
 }
 
+/**
+ * Issue #215 §1: cross-source overlap report. Computed
+ * lazily on the server (only when this IPC is called) —
+ * not part of `getAdBlockState()` so the page-load IPC
+ * stays cheap. The UI calls this when the overlap chip
+ * is clicked (drawer open) and on first mount with a
+ * small refresh strategy if needed.
+ */
+export async function getAdBlockOverlaps(): Promise<AdBlockOverlapReport> {
+  return invoke<AdBlockOverlapReport>("get_ad_block_overlaps");
+}
+
 export async function addAdBlockSource(
   name: string,
   url: string,
@@ -336,6 +349,28 @@ export async function refreshAdBlockSource(
   sourceId: string,
 ): Promise<AdBlockSource> {
   return invoke<AdBlockSource>("refresh_ad_block_source", { sourceId });
+}
+
+/**
+ * Issue #215: move a source up or down in the display order.
+ * Boundary moves (first → up, last → down) are no-ops on the
+ * server, so the caller does NOT need to disable the buttons
+ * first — but the UI does so the user gets immediate feedback
+ * (a disabled button is less surprising than an apparently
+ * un-actionable click).
+ *
+ * Returns the full (re-ordered) source list so the caller can
+ * patch its local state without an extra `getAdBlockState`
+ * round trip.
+ */
+export async function reorderAdBlockSources(
+  sourceId: string,
+  direction: "up" | "down",
+): Promise<AdBlockSource[]> {
+  return invoke<AdBlockSource[]>("reorder_ad_block_sources", {
+    sourceId,
+    direction,
+  });
 }
 
 export async function refreshAllAdBlockSources(): Promise<AdBlockSource[]> {

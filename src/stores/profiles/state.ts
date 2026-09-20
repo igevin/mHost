@@ -85,6 +85,14 @@ export const adBlockLimitsAtom = atom<import("../../types").AdBlockLimits | null
 // concern (out of scope here).
 export const adBlockStatsAtom = atom<import("../../types").AdBlockStats | null>(null);
 
+// Issue #215 §1: cross-source overlap report. Cached on first read
+// and refreshed by `fetchAdBlockOverlapsAtom`. `null` until the
+// first fetch resolves; the UI shows nothing on a source card
+// while null (no chip).
+export const adBlockOverlapReportAtom = atom<
+  import("../../types").AdBlockOverlapReport | null
+>(null);
+
 export const adBlockRuleCountAtom = atom((get) => {
   const state = get(adBlockStateAtom);
   if (!state) return 0;

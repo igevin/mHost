@@ -23,6 +23,7 @@ import {
   getAdBlockState,
   getAdBlockLimits,
   getAdBlockStats,
+  getAdBlockOverlaps,
   setAdBlockEnabled,
   setAdBlockRefreshInterval,
   setAdBlockAutoRefreshEnabled,
@@ -33,6 +34,7 @@ import {
   setAdBlockSourceResponse,
   setAdBlockSourceRulesLimitOverride,
   refreshAdBlockSource,
+  reorderAdBlockSources,
   refreshAllAdBlockSources,
   listAdBlockWhitelist,
   addAdBlockWhitelistMany,
@@ -65,6 +67,7 @@ import {
   adBlockErrorAtom,
   adBlockLimitsAtom,
   adBlockStatsAtom,
+  adBlockOverlapReportAtom,
   quickApplyOutcomeAtom,
   isQuickApplyToastOpenAtom,
 } from "./state";
@@ -620,6 +623,31 @@ export const fetchAdBlockStatsAtom = atom(null, async (_get, set) => {
   }
 });
 
+/** Issue #215 §1: refresh the cross-source overlap report.
+ *
+ * **v1 scope (per PR #221 review):** currently invoked once on
+ * page mount (see `pages/AdBlock.tsx::useEffect`). It is NOT
+ * called from any mutation atom (add / remove / enable /
+ * disable / response / rules_limit_override / reorder), so
+ * chips and drawer details stay at their mount-time values
+ * until the page is reloaded. This is the explicit v1 trade-off
+ * — re-fetching on every mutation costs an extra IPC round-trip
+ * per click, and the chip is informational rather than
+ * blocking. Follow-ups that need a live count can either re-mount
+ * the page or call this atom directly from the mutation atoms.
+ *
+ * Non-fatal on failure: the chip disappears rather than showing
+ * a stale count.
+ */
+export const fetchAdBlockOverlapsAtom = atom(null, async (_get, set) => {
+  try {
+    const report = await getAdBlockOverlaps();
+    set(adBlockOverlapReportAtom, report);
+  } catch (err) {
+    console.warn("failed to load ad-block overlap report", err);
+  }
+});
+
 export const toggleAdBlockEnabledAtom = atom(
   null,
   async (_get, set, enabled: boolean) => {
@@ -722,6 +750,33 @@ export const setAdBlockSourceResponseAtom = atom(
     set(adBlockErrorAtom, null);
     try {
       await setAdBlockSourceResponse(args.sourceId, args.response);
+      const state = await getAdBlockState();
+      set(adBlockStateAtom, state);
+    } catch (err) {
+      set(adBlockErrorAtom, extractErrorMessage(err));
+      throw err;
+    }
+  },
+);
+
+/**
+ * Issue #215: move a source up or down in the display order.
+ * The backend re-orders and persists in one IPC, then we
+ * refresh the local ad-block state so the next render reflects
+ * the new ordering without a separate `getAdBlockState` call.
+ * Errors are surfaced via `adBlockErrorAtom` like the other
+ * mutation atoms.
+ */
+export const reorderAdBlockSourceAtom = atom(
+  null,
+  async (
+    _get,
+    set,
+    args: { sourceId: string; direction: "up" | "down" },
+  ) => {
+    set(adBlockErrorAtom, null);
+    try {
+      await reorderAdBlockSources(args.sourceId, args.direction);
       const state = await getAdBlockState();
       set(adBlockStateAtom, state);
     } catch (err) {

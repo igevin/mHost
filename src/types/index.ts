@@ -116,6 +116,41 @@ export interface AdBlockLimits {
   rules_per_source_absolute_max: number;
 }
 
+/**
+ * Issue #215 §1: cross-source overlap report. Returned by
+ * `getAdBlockOverlaps()`. Each entry in `per_source` matches a
+ * row in `AdBlockState.sources` (enabled only — disabled sources
+ * are never in the report). `details` is keyed by the same
+ * SourceId and contains the per-domain breakdown for the drawer.
+ */
+export interface OverlapSummary {
+  source_id: string;
+  source_name: string;
+  overlapping_domain_count: number;
+}
+
+/** One row in the overlap drill-down — a domain that is covered
+ * by the owner source AND at least one other source. */
+export interface OverlapEntry {
+  domain: string;
+  covered_by: OverlapSourceRef[];
+  /** What `check()` will return for this domain — derived from
+   * the priority chain whitelist > nxdomain > zero_addr. One of
+   * "Whitelisted" | "NxDomain" | "ZeroAddress". */
+  effective: string;
+}
+
+export interface OverlapSourceRef {
+  source_id: string;
+  name: string;
+  response: AdBlockResponse;
+}
+
+export interface AdBlockOverlapReport {
+  per_source: OverlapSummary[];
+  details: Record<string, OverlapEntry[]>;
+}
+
 export interface ApplyPlan {
   rules: ResolvedRule[];
   conflicts: RuleConflict[];
