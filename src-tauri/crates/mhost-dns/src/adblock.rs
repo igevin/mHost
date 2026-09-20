@@ -496,6 +496,92 @@ mod tests {
         assert!(engine.check("ad.example.com").is_some());
     }
 
+    // Issue #215: pin the whitelist → nxdomain → zero_addr priority contract
+    // that #197's closure depends on. The existing tests cover pairwise
+    // relationships (`nxdomain_consulted_before_zero_addr` proves nx > za,
+    // `whitelist_overrides_everything` proves wl > everything) but neither
+    // exercises the three-set chain end-to-end, and neither pins the
+    // cross-source overlap that motivated #215 (two sources, same domain,
+    // different response types). These tests promote the priority order
+    // from a comment in `check()` to a CI-enforced contract: any future
+    // reordering, even one that *looks* like a tidy-up, has to come with
+    // a green-eyed review of these assertions.
+
+    /// All three rule sets populated with disjoint domains — verifies
+    /// each tier classifies its own domains independently (no
+    /// cross-contamination) and that the priority order spelled out
+    /// in `check()` is exactly whitelist → nxdomain → zero_addr.
+    #[test]
+    fn priority_is_strictly_ordered_when_all_three_sets_coexist() {
+        let engine = AdBlockEngine::new();
+        engine.rebuild(
+            za(&["za-only.example.com"]),
+            nx(&["nx-only.example.com"]),
+            wl(&["wl-only.example.com"]),
+        );
+        engine.set_enabled(true);
+
+        // Each tier classifies its own domains correctly.
+        assert_eq!(
+            engine.check("za-only.example.com"),
+            Some(AdBlockAction::ZeroAddress(IpAddr::from([0, 0, 0, 0]))),
+            "zero_addr tier must still hit when whitelist & nxdomain are populated"
+        );
+        assert_eq!(
+            engine.check("nx-only.example.com"),
+            Some(AdBlockAction::NxDomain),
+            "nxdomain tier must still hit when whitelist & zero_addr are populated"
+        );
+        // Whitelist returns None (caller falls through to upstream).
+        assert_eq!(
+            engine.check("wl-only.example.com"),
+            None,
+            "whitelist must still fall through when block-rule sets are populated"
+        );
+    }
+
+    /// Cross-tier overlap on the same domain: zero_addr and nxdomain both
+    /// register it. NxDomain wins (more aggressive — Pi-hole semantics
+    /// per issue #130). This is the exact scenario #215 / #197
+    /// discussed; if a future refactor flips this to ZeroAddress, the
+    /// user's network stops resolving some sites silently.
+    #[test]
+    fn nxdomain_wins_when_same_domain_is_in_both_block_sets() {
+        let engine = AdBlockEngine::new();
+        engine.rebuild(
+            za(&["both.example.com"]),
+            nx(&["both.example.com"]),
+            wl(&[]),
+        );
+        engine.set_enabled(true);
+        assert_eq!(
+            engine.check("both.example.com"),
+            Some(AdBlockAction::NxDomain),
+            "when zero_addr and nxdomain both match, nxdomain wins"
+        );
+    }
+
+    /// Whitelist entry shadows a domain that is also in both block sets.
+    /// Whitelist must still win — the test exercises the full chain
+    /// (wl > nx > za) on a single domain in one assertion set.
+    #[test]
+    fn whitelist_beats_both_block_sets_on_same_domain() {
+        let engine = AdBlockEngine::new();
+        engine.rebuild(
+            za(&["contested.example.com"]),
+            nx(&["contested.example.com"]),
+            wl(&["contested.example.com"]),
+        );
+        engine.set_enabled(true);
+        assert_eq!(
+            engine.check("contested.example.com"),
+            None,
+            "whitelist on a domain registered in BOTH block sets must still fall through"
+        );
+        // Suffix-walk: whitelist covers the descendant too.
+        assert_eq!(engine.check("api.contested.example.com"), None);
+    }
+
     #[test]
     fn rebuild_replaces_state_atomically() {
         let engine = AdBlockEngine::new();

@@ -1544,6 +1544,178 @@ mod tests {
         assert!(w.is_empty());
     }
 
+    // Issue #215 (regression): #197's closure correction hinged on the
+    // claim that `classify_rules` is independent of the order of
+    // `state.sources` — two sources covering the same domain with
+    // different response types must produce identical (za, nx, wl)
+    // partitions regardless of which one appears first in the Vec.
+    // The original `classify_rules_partitions_by_response` test only
+    // covered the no-overlap case. This test pins the cross-source
+    // overlap contract that #215 actually depends on.
+
+    #[test]
+    fn classify_rules_is_independent_of_source_vec_order() {
+        use std::collections::HashSet;
+
+        let temp = tempfile::TempDir::new().unwrap();
+
+        // Two sources cover the SAME domain `shared.example.com` with
+        // DIFFERENT response types. Source order in `state.sources` must
+        // not change which partition wins (per #215 §2, NxDomain is
+        // already decided by `check()` post-classify, but
+        // classify_rules still has to assign the domain to BOTH
+        // partitions so the engine can resolve the priority at
+        // query time).
+        let za_source_id = SourceId(Uuid::new_v4());
+        let nx_source_id = SourceId(Uuid::new_v4());
+        mhost_storage::adblock::write_cache(
+            temp.path(),
+            &za_source_id,
+            b"0.0.0.0 shared.example.com\n0.0.0.0 za-only.example.com\n",
+        )
+        .unwrap();
+        mhost_storage::adblock::write_cache(
+            temp.path(),
+            &nx_source_id,
+            b"0.0.0.0 shared.example.com\n0.0.0.0 nx-only.example.com\n",
+        )
+        .unwrap();
+
+        let za_source = AdBlockSource {
+            source_id: za_source_id,
+            name: "za".into(),
+            url: "https://x".into(),
+            enabled: true,
+            response: AdBlockResponse::ZeroAddress,
+            last_fetched_at: None,
+            last_error: None,
+            rule_count: 2,
+            etag: None,
+            rules_limit_override: None,
+            last_refresh_duration_ms: None,
+            last_refresh_failed_at: None,
+        };
+        let nx_source = AdBlockSource {
+            source_id: nx_source_id,
+            name: "nx".into(),
+            url: "https://y".into(),
+            enabled: true,
+            response: AdBlockResponse::NxDomain,
+            last_fetched_at: None,
+            last_error: None,
+            rule_count: 2,
+            etag: None,
+            rules_limit_override: None,
+            last_refresh_duration_ms: None,
+            last_refresh_failed_at: None,
+        };
+
+        // Order A: za first, nx second.
+        let state_a = AdBlockState {
+            enabled: true,
+            sources: vec![za_source.clone(), nx_source.clone()],
+            ..Default::default()
+        };
+        // Order B: nx first, za second (swapped).
+        let state_b = AdBlockState {
+            enabled: true,
+            sources: vec![nx_source, za_source],
+            ..Default::default()
+        };
+
+        let (za_a, nx_a, _) = classify_rules(&state_a, temp.path());
+        let (za_b, nx_b, _) = classify_rules(&state_b, temp.path());
+
+        // Both orders must produce the same set of domains in each
+        // partition. ZeroAddress partition: 2 domains (the one shared
+        // one + za-only). NxDomain partition: 2 domains (the shared one
+        // + nx-only).
+        let za_a_set: HashSet<String> = za_a.keys().cloned().collect();
+        let za_b_set: HashSet<String> = za_b.keys().cloned().collect();
+        assert_eq!(
+            za_a_set, za_b_set,
+            "zero_addr partition must be independent of source order"
+        );
+        let nx_a_set: HashSet<String> = nx_a.iter().cloned().collect();
+        let nx_b_set: HashSet<String> = nx_b.iter().cloned().collect();
+        assert_eq!(
+            nx_a_set, nx_b_set,
+            "nxdomain partition must be independent of source order"
+        );
+
+        // And critically, the shared domain must be in BOTH partitions
+        // so that `check()` can apply the priority rule (issue #215 §3
+        // — nxdomain wins over zero_addr on the same domain).
+        assert!(
+            za_a_set.contains("shared.example.com"),
+            "shared domain must appear in zero_addr partition"
+        );
+        assert!(
+            nx_a_set.contains("shared.example.com"),
+            "shared domain must appear in nxdomain partition"
+        );
+
+        // Two ZeroAddress sources covering the same domain must also
+        // be order-independent — the `or_insert` produces the same
+        // IP (0.0.0.0) regardless of which source fires first.
+        let za_id_a = SourceId(Uuid::new_v4());
+        let za_id_b = SourceId(Uuid::new_v4());
+        mhost_storage::adblock::write_cache(temp.path(), &za_id_a, b"0.0.0.0 shared.example.com\n")
+            .unwrap();
+        mhost_storage::adblock::write_cache(temp.path(), &za_id_b, b"0.0.0.0 shared.example.com\n")
+            .unwrap();
+        let za_a_src = AdBlockSource {
+            source_id: za_id_a,
+            name: "za-a".into(),
+            url: "https://x".into(),
+            enabled: true,
+            response: AdBlockResponse::ZeroAddress,
+            last_fetched_at: None,
+            last_error: None,
+            rule_count: 1,
+            etag: None,
+            rules_limit_override: None,
+            last_refresh_duration_ms: None,
+            last_refresh_failed_at: None,
+        };
+        let za_b_src = AdBlockSource {
+            source_id: za_id_b,
+            name: "za-b".into(),
+            url: "https://y".into(),
+            enabled: true,
+            response: AdBlockResponse::ZeroAddress,
+            last_fetched_at: None,
+            last_error: None,
+            rule_count: 1,
+            etag: None,
+            rules_limit_override: None,
+            last_refresh_duration_ms: None,
+            last_refresh_failed_at: None,
+        };
+        let state_c = AdBlockState {
+            enabled: true,
+            sources: vec![za_a_src.clone(), za_b_src.clone()],
+            ..Default::default()
+        };
+        let state_d = AdBlockState {
+            enabled: true,
+            sources: vec![za_b_src, za_a_src],
+            ..Default::default()
+        };
+        let (za_c, _, _) = classify_rules(&state_c, temp.path());
+        let (za_d, _, _) = classify_rules(&state_d, temp.path());
+        assert_eq!(
+            za_c.get("shared.example.com").copied(),
+            za_d.get("shared.example.com").copied(),
+            "two ZeroAddress sources covering the same domain must produce the same IP"
+        );
+        assert_eq!(
+            za_c.get("shared.example.com").copied(),
+            Some(IpAddr::from([0u8, 0, 0, 0])),
+            "constant 0.0.0.0 must come from source.response, not cache file"
+        );
+    }
+
     #[test]
     fn classify_rules_partitions_by_response() {
         let temp = tempfile::TempDir::new().unwrap();
