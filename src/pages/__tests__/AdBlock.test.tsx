@@ -23,6 +23,7 @@ const mockSetAdBlockSourceEnabled = vi.fn().mockResolvedValue({});
 const mockSetAdBlockSourceResponse = vi.fn().mockResolvedValue({});
 const mockRefreshAdBlockSource = vi.fn().mockResolvedValue({});
 const mockReorderAdBlockSources = vi.fn().mockResolvedValue([]);
+const mockGetAdBlockOverlaps = vi.fn().mockResolvedValue({ per_source: [], details: {} });
 const mockRefreshAllAdBlockSources = vi.fn().mockResolvedValue([]);
 const mockAddAdBlockWhitelist = vi.fn().mockResolvedValue([]);
 const mockAddAdBlockWhitelistMany = vi
@@ -51,6 +52,7 @@ vi.mock("../../lib/tauri", async (importOriginal) => {
       mockSetAdBlockSourceRulesLimitOverride(...args),
     refreshAdBlockSource: (...args: unknown[]) => mockRefreshAdBlockSource(...args),
     reorderAdBlockSources: (...args: unknown[]) => mockReorderAdBlockSources(...args),
+    getAdBlockOverlaps: (...args: unknown[]) => mockGetAdBlockOverlaps(...args),
     refreshAllAdBlockSources: (...args: unknown[]) => mockRefreshAllAdBlockSources(...args),
     addAdBlockWhitelist: (...args: unknown[]) => mockAddAdBlockWhitelist(...args),
     addAdBlockWhitelistMany: (...args: unknown[]) =>
@@ -774,6 +776,124 @@ describe("AdBlock", () => {
         fireEvent.click(downBtn);
       });
       expect(mockReorderAdBlockSources).toHaveBeenCalledWith("src-a", "down");
+    });
+  });
+
+  // Issue #215 §1: cross-source overlap UI. Two tests:
+  //  1. The chip renders only on sources with overlapping_domain_count > 0
+  //     and opens the drawer when clicked.
+  //  2. The drawer shows the per-domain entries from
+  //     `overlapReport.details[source_id]` with the `effective` badge.
+  //
+  // Like the reorder tests, each test sets `mockGetAdBlockState` so
+  // the page's `useEffect` `fetchState()` doesn't overwrite the
+  // pre-set `adBlockStateAtom` with an empty state.
+  describe("source overlap (issue #215)", () => {
+    beforeEach(() => {
+      mockGetAdBlockOverlaps.mockReset();
+      mockGetAdBlockOverlaps.mockResolvedValue({
+        per_source: [],
+        details: {},
+      });
+    });
+
+    it("renders an overlap chip only on sources with overlapping domains", async () => {
+      const a = makeSource({ source_id: "src-a", name: "A" });
+      const b = makeSource({ source_id: "src-b", name: "B" });
+      const c = makeSource({ source_id: "src-c", name: "C" });
+      const state = makeState({ sources: [a, b, c] });
+      setStore((s) => s.set(adBlockStateAtom, state));
+      mockGetAdBlockState.mockResolvedValue(state);
+      // Only `src-a` overlaps with `src-b`. `src-c` has zero overlaps
+      // so the chip must not render.
+      mockGetAdBlockOverlaps.mockResolvedValue({
+        per_source: [
+          {
+            source_id: "src-a",
+            source_name: "A",
+            overlapping_domain_count: 7,
+          },
+          {
+            source_id: "src-b",
+            source_name: "B",
+            overlapping_domain_count: 3,
+          },
+          {
+            source_id: "src-c",
+            source_name: "C",
+            overlapping_domain_count: 0,
+          },
+        ],
+        details: {},
+      });
+      renderWithProviders(<AdBlock />);
+
+      const chipA = await screen.findByRole("button", {
+        name: /Show 7 overlapping domains for A/i,
+      });
+      expect(chipA).toBeInTheDocument();
+      const chipB = screen.getByRole("button", {
+        name: /Show 3 overlapping domains for B/i,
+      });
+      expect(chipB).toBeInTheDocument();
+      // No chip for source C because count is 0.
+      expect(
+        screen.queryByRole("button", {
+          name: /overlapping domains for C/i,
+        }),
+      ).not.toBeInTheDocument();
+    });
+
+    it("clicking the chip opens a drawer with per-domain details", async () => {
+      const a = makeSource({ source_id: "src-a", name: "A" });
+      const b = makeSource({ source_id: "src-b", name: "B" });
+      const state = makeState({ sources: [a, b] });
+      setStore((s) => s.set(adBlockStateAtom, state));
+      mockGetAdBlockState.mockResolvedValue(state);
+      mockGetAdBlockOverlaps.mockResolvedValue({
+        per_source: [
+          {
+            source_id: "src-a",
+            source_name: "A",
+            overlapping_domain_count: 1,
+          },
+        ],
+        details: {
+          "src-a": [
+            {
+              domain: "shared.example.com",
+              covered_by: [
+                {
+                  source_id: "src-b",
+                  name: "B",
+                  response: "nx_domain",
+                },
+              ],
+              effective: "NxDomain",
+            },
+          ],
+        },
+      });
+      renderWithProviders(<AdBlock />);
+
+      const chip = await screen.findByRole("button", {
+        name: /Show 1 overlapping domains for A/i,
+      });
+      await act(async () => {
+        fireEvent.click(chip);
+      });
+
+      // Drawer header + entry show up.
+      expect(
+        screen.getByRole("heading", { name: /Overlapping domains/i }),
+      ).toBeInTheDocument();
+      expect(screen.getByText("shared.example.com")).toBeInTheDocument();
+      // Use getAllByText then assert the overlap badge is present;
+      // the response-type select also contains "NXDOMAIN" as an option
+      // value, which would falsely match a plain `getByText`.
+      expect(screen.getByText("shared.example.com").nextElementSibling).toHaveTextContent("NxDomain");
+      // The covered_by line lists the other source + its response.
+      expect(screen.getByText(/B \(nx_domain\)/)).toBeInTheDocument();
     });
   });
 });

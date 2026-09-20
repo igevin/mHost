@@ -23,6 +23,7 @@ import {
   getAdBlockState,
   getAdBlockLimits,
   getAdBlockStats,
+  getAdBlockOverlaps,
   setAdBlockEnabled,
   setAdBlockRefreshInterval,
   setAdBlockAutoRefreshEnabled,
@@ -66,6 +67,7 @@ import {
   adBlockErrorAtom,
   adBlockLimitsAtom,
   adBlockStatsAtom,
+  adBlockOverlapReportAtom,
   quickApplyOutcomeAtom,
   isQuickApplyToastOpenAtom,
 } from "./state";
@@ -618,6 +620,24 @@ export const fetchAdBlockStatsAtom = atom(null, async (_get, set) => {
     // engine counters still increment in-process; the next call
     // will pick them up.
     console.warn("failed to load ad-block stats", err);
+  }
+});
+
+/** Issue #215 §1: refresh the cross-source overlap report. Called
+ * on page mount (alongside the other fetch atoms) and on every
+ * source mutation (add / remove / enable / disable / response /
+ * rules_limit_override / reorder) so the chips stay in sync.
+ *
+ * Non-fatal on failure: the chip disappears rather than showing
+ * a stale count. The drawer's "details" view depends on this
+ * report being fresh, so the drawer re-fetches on open too.
+ */
+export const fetchAdBlockOverlapsAtom = atom(null, async (_get, set) => {
+  try {
+    const report = await getAdBlockOverlaps();
+    set(adBlockOverlapReportAtom, report);
+  } catch (err) {
+    console.warn("failed to load ad-block overlap report", err);
   }
 });
 

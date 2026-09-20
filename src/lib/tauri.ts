@@ -13,6 +13,7 @@ import type {
   AdBlockSource,
   AdBlockResponse,
   AdBlockStats,
+  AdBlockOverlapReport,
 } from "../types";
 
 // ---- Profile commands ----
@@ -286,6 +287,18 @@ export async function setAdBlockAutoRefreshEnabled(enabled: boolean): Promise<vo
 
 export async function listAdBlockSources(): Promise<AdBlockSource[]> {
   return invoke<AdBlockSource[]>("list_ad_block_sources");
+}
+
+/**
+ * Issue #215 §1: cross-source overlap report. Computed
+ * lazily on the server (only when this IPC is called) —
+ * not part of `getAdBlockState()` so the page-load IPC
+ * stays cheap. The UI calls this when the overlap chip
+ * is clicked (drawer open) and on first mount with a
+ * small refresh strategy if needed.
+ */
+export async function getAdBlockOverlaps(): Promise<AdBlockOverlapReport> {
+  return invoke<AdBlockOverlapReport>("get_ad_block_overlaps");
 }
 
 export async function addAdBlockSource(
