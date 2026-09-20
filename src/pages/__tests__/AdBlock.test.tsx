@@ -22,6 +22,7 @@ const mockRemoveAdBlockSource = vi.fn().mockResolvedValue(undefined);
 const mockSetAdBlockSourceEnabled = vi.fn().mockResolvedValue({});
 const mockSetAdBlockSourceResponse = vi.fn().mockResolvedValue({});
 const mockRefreshAdBlockSource = vi.fn().mockResolvedValue({});
+const mockReorderAdBlockSources = vi.fn().mockResolvedValue([]);
 const mockRefreshAllAdBlockSources = vi.fn().mockResolvedValue([]);
 const mockAddAdBlockWhitelist = vi.fn().mockResolvedValue([]);
 const mockAddAdBlockWhitelistMany = vi
@@ -49,6 +50,7 @@ vi.mock("../../lib/tauri", async (importOriginal) => {
     setAdBlockSourceRulesLimitOverride: (...args: unknown[]) =>
       mockSetAdBlockSourceRulesLimitOverride(...args),
     refreshAdBlockSource: (...args: unknown[]) => mockRefreshAdBlockSource(...args),
+    reorderAdBlockSources: (...args: unknown[]) => mockReorderAdBlockSources(...args),
     refreshAllAdBlockSources: (...args: unknown[]) => mockRefreshAllAdBlockSources(...args),
     addAdBlockWhitelist: (...args: unknown[]) => mockAddAdBlockWhitelist(...args),
     addAdBlockWhitelistMany: (...args: unknown[]) =>
@@ -699,5 +701,79 @@ describe("AdBlock", () => {
     } finally {
       (navigator as { clipboard?: Clipboard }).clipboard = originalClipboard;
     }
+  });
+
+  // Issue #215: source reorder UI. The buttons are ↑/↓ on each source
+  // card; the backend IPC accepts a single-step relative move. The
+  // tests below cover: (1) the boundary buttons (first/last) are
+  // disabled in the UI so the user can't trigger a server-side
+  // no-op; (2) clicking ↑/↓ calls the IPC with the right args.
+  //
+  // Note: the page's useEffect calls fetchState() which OVERWRITES
+  // the pre-set store state with mockGetAdBlockState's resolved
+  // value. Each test must therefore set mockGetAdBlockState to the
+  // desired state BEFORE rendering — same pattern as the other
+  // source-rendering tests in this file (e.g. "renders source cards
+  // with name, url, and rule count").
+  describe("source reorder (issue #215)", () => {
+    beforeEach(() => {
+      mockReorderAdBlockSources.mockReset();
+      mockReorderAdBlockSources.mockResolvedValue([]);
+    });
+
+    it("disables Up on the first source and Down on the last", async () => {
+      const a = makeSource({ source_id: "src-a", name: "A" });
+      const b = makeSource({ source_id: "src-b", name: "B" });
+      const c = makeSource({ source_id: "src-c", name: "C" });
+      const state = makeState({ sources: [a, b, c] });
+      setStore((s) => s.set(adBlockStateAtom, state));
+      mockGetAdBlockState.mockResolvedValue(state);
+      renderWithProviders(<AdBlock />);
+
+      // First source's Up is disabled.
+      const firstUp = await screen.findByRole("button", { name: /Move source A up/i });
+      expect(firstUp).toBeDisabled();
+      // First source's Down is enabled.
+      const firstDown = screen.getByRole("button", { name: /Move source A down/i });
+      expect(firstDown).not.toBeDisabled();
+
+      // Middle source's both buttons enabled.
+      expect(screen.getByRole("button", { name: /Move source B up/i })).not.toBeDisabled();
+      expect(screen.getByRole("button", { name: /Move source B down/i })).not.toBeDisabled();
+
+      // Last source's Down is disabled; Up enabled.
+      expect(screen.getByRole("button", { name: /Move source C up/i })).not.toBeDisabled();
+      expect(screen.getByRole("button", { name: /Move source C down/i })).toBeDisabled();
+    });
+
+    it("clicking Up invokes the IPC with sourceId + direction 'up'", async () => {
+      const a = makeSource({ source_id: "src-a", name: "A" });
+      const b = makeSource({ source_id: "src-b", name: "B" });
+      const state = makeState({ sources: [a, b] });
+      setStore((s) => s.set(adBlockStateAtom, state));
+      mockGetAdBlockState.mockResolvedValue(state);
+      renderWithProviders(<AdBlock />);
+
+      const upBtn = await screen.findByRole("button", { name: /Move source B up/i });
+      await act(async () => {
+        fireEvent.click(upBtn);
+      });
+      expect(mockReorderAdBlockSources).toHaveBeenCalledWith("src-b", "up");
+    });
+
+    it("clicking Down invokes the IPC with sourceId + direction 'down'", async () => {
+      const a = makeSource({ source_id: "src-a", name: "A" });
+      const b = makeSource({ source_id: "src-b", name: "B" });
+      const state = makeState({ sources: [a, b] });
+      setStore((s) => s.set(adBlockStateAtom, state));
+      mockGetAdBlockState.mockResolvedValue(state);
+      renderWithProviders(<AdBlock />);
+
+      const downBtn = await screen.findByRole("button", { name: /Move source A down/i });
+      await act(async () => {
+        fireEvent.click(downBtn);
+      });
+      expect(mockReorderAdBlockSources).toHaveBeenCalledWith("src-a", "down");
+    });
   });
 });

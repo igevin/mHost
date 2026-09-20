@@ -338,6 +338,28 @@ export async function refreshAdBlockSource(
   return invoke<AdBlockSource>("refresh_ad_block_source", { sourceId });
 }
 
+/**
+ * Issue #215: move a source up or down in the display order.
+ * Boundary moves (first → up, last → down) are no-ops on the
+ * server, so the caller does NOT need to disable the buttons
+ * first — but the UI does so the user gets immediate feedback
+ * (a disabled button is less surprising than an apparently
+ * un-actionable click).
+ *
+ * Returns the full (re-ordered) source list so the caller can
+ * patch its local state without an extra `getAdBlockState`
+ * round trip.
+ */
+export async function reorderAdBlockSources(
+  sourceId: string,
+  direction: "up" | "down",
+): Promise<AdBlockSource[]> {
+  return invoke<AdBlockSource[]>("reorder_ad_block_sources", {
+    sourceId,
+    direction,
+  });
+}
+
 export async function refreshAllAdBlockSources(): Promise<AdBlockSource[]> {
   return invoke<AdBlockSource[]>("refresh_all_ad_block_sources");
 }

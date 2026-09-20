@@ -23,6 +23,7 @@ import {
   setAdBlockSourceRulesLimitOverrideAtom,
   overrideAdBlockSourceRulesLimitAtom,
   refreshAdBlockSourceAtom,
+  reorderAdBlockSourceAtom,
   refreshAllAdBlockSourcesAtom,
   addAdBlockWhitelistManyAtom,
   removeAdBlockWhitelistAtom,
@@ -70,6 +71,7 @@ function AdBlock() {
   const overrideSourceLimit = useSetAtom(overrideAdBlockSourceRulesLimitAtom);
   const resetSourceLimit = useSetAtom(setAdBlockSourceRulesLimitOverrideAtom);
   const refreshSource = useSetAtom(refreshAdBlockSourceAtom);
+  const reorderSource = useSetAtom(reorderAdBlockSourceAtom);
   const refreshAll = useSetAtom(refreshAllAdBlockSourcesAtom);
   const addWhitelistMany = useSetAtom(addAdBlockWhitelistManyAtom);
   const removeWhitelist = useSetAtom(removeAdBlockWhitelistAtom);
@@ -427,7 +429,7 @@ function AdBlock() {
             <div className={styles.empty}>No sources yet.</div>
           ) : (
             <div className={styles.columnGap}>
-              {state.sources.map((src) => (
+              {state.sources.map((src, index) => (
                 <div
                   key={src.source_id}
                   className={`${styles.sourceCard} ${!src.enabled ? styles.dimmed : ""}`}
@@ -556,6 +558,51 @@ function AdBlock() {
                         <option value="nx_domain">NXDOMAIN</option>
                       </select>
 
+
+                      {/* Issue #215: source reorder. Two ↑/↓ buttons
+                          (no dnd — see AGENTS.md / spec; the project
+                          has no draggable primitive). The Up button
+                          is disabled at the head and the Down
+                          button at the tail, so the boundary no-op
+                          case on the server can't be reached from
+                          the UI. Order is purely a presentation
+                          concern — never affects interception
+                          (covered by the backend regression tests
+                          in `commands::adblock::tests`). */}
+                      <button
+                        type="button"
+                        className="btn btn-sm btn-ghost"
+                        onClick={() =>
+                          reorderSource({
+                            sourceId: src.source_id,
+                            direction: "up",
+                          }).catch(() => {})
+                        }
+                        disabled={isLoading || index === 0}
+                        aria-label={`Move source ${src.name} up`}
+                        title="Move up"
+                        onPointerDown={onPointerDown(() => {})}
+                      >
+                        ↑
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-sm btn-ghost"
+                        onClick={() =>
+                          reorderSource({
+                            sourceId: src.source_id,
+                            direction: "down",
+                          }).catch(() => {})
+                        }
+                        disabled={
+                          isLoading || index === state.sources.length - 1
+                        }
+                        aria-label={`Move source ${src.name} down`}
+                        title="Move down"
+                        onPointerDown={onPointerDown(() => {})}
+                      >
+                        ↓
+                      </button>
                       <button
                         className="btn btn-sm btn-ghost"
                         onClick={() =>

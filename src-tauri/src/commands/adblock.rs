@@ -16,7 +16,7 @@ use chrono::Utc;
 use mhost_core::{AdBlockResponse, AdBlockSource, AdBlockState, MhostError, SourceId};
 use mhost_hosts::Parser;
 use mhost_storage::adblock as adblock_store;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::State;
 use uuid::Uuid;
 
@@ -1180,6 +1180,71 @@ pub async fn set_ad_block_source_response(
         .expect("source just updated"))
 }
 
+/// Direction argument for [`reorder_ad_block_sources`] (issue #215).
+///
+/// Two-element enum rather than a free-form `i32` delta so the frontend
+/// can't ask for nonsense like "move 5 spots" — reorders are one-step,
+/// decided by the UI button that fires them. The relative-move shape
+/// (vs. a "rewrite the whole list" IPC) means the backend never has to
+/// trust the frontend with the canonical source ordering, which would
+/// otherwise be an attractive target for a buggy page that drops or
+/// duplicates an id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReorderDirection {
+    Up,
+    Down,
+}
+
+#[tauri::command]
+pub async fn reorder_ad_block_sources(
+    source_id: SourceId,
+    direction: ReorderDirection,
+    state: State<'_, AppState>,
+) -> Result<Vec<AdBlockSource>, MhostError> {
+    let sources = reorder_ad_block_source_impl(&state, &source_id, direction).await?;
+    Ok(sources)
+}
+
+/// Reorder implementation shared between the IPC handler and the test
+/// suite. Swaps the source with its neighbour in the requested
+/// direction; boundary moves (already at top / bottom) are a no-op
+/// that returns the current source list unchanged — the button on
+/// those ends is `disabled` in the UI, so this only fires from
+/// keyboard shortcuts or a stale render.
+///
+/// **Issue #215 invariant**: the resulting `(zero_addr, nxdomain,
+/// whitelist)` partitions from `classify_rules` are byte-identical
+/// before and after this swap, because both source configurations
+/// register the same domains in the same buckets. The new order is
+/// only a presentation concern — see `reorder_preserves_classify_rules_output`
+/// in the test module for the explicit assertion.
+pub(crate) async fn reorder_ad_block_source_impl(
+    state: &AppState,
+    source_id: &SourceId,
+    direction: ReorderDirection,
+) -> Result<Vec<AdBlockSource>, MhostError> {
+    let sources = {
+        let mut guard = state.ad_block_state.write().await;
+        let pos = guard
+            .sources
+            .iter()
+            .position(|s| &s.source_id == source_id)
+            .ok_or_else(|| MhostError::InvalidInput(format!("source not found: {}", source_id)))?;
+        let target = match direction {
+            ReorderDirection::Up if pos > 0 => pos - 1,
+            ReorderDirection::Down if pos + 1 < guard.sources.len() => pos + 1,
+            // Boundary no-op: at the top going up, or at the bottom
+            // going down. Don't write, don't reload — the source list
+            // is unchanged so reload would just churn counters.
+            _ => return Ok(guard.sources.clone()),
+        };
+        guard.sources.swap(pos, target);
+        guard.sources.clone()
+    };
+    persist_and_reload(state).await?;
+    Ok(sources)
+}
 /// Per-source rules-limit override (issue #207).
 ///
 /// `Some(n)` raises the per-source cap so a legitimately huge list can be
@@ -2032,6 +2097,224 @@ mod tests {
         assert_eq!(w.len(), 1);
     }
 
+    // Issue #215: source order is a presentation concern only — the
+    // priority contract (`classify_rules` → engine) must be invariant
+    // under reorders. These tests pin two things:
+    //
+    //   1. The IPC-level mechanics (move up/down, boundary no-op,
+    //      unknown id, persist_and_reload invoked) — so a future
+    //      refactor that accidentally drops the call to
+    //      `persist_and_reload` (e.g. "it's only a Vec swap, no
+    //      need to reload the engine") is caught.
+    //
+    //   2. The behavioural invariant: swapping two sources must NOT
+    //      change what `classify_rules` produces. Already covered
+    //      for arbitrary source vectors by
+    //      `classify_rules_is_independent_of_source_vec_order`; the
+    //      reorder-specific tests below cover the persist round-trip
+    //      path (reorder → write_state → reload → classify again).
+
+    fn mk_source(name: &str, response: AdBlockResponse) -> AdBlockSource {
+        AdBlockSource {
+            source_id: SourceId(Uuid::new_v4()),
+            name: name.into(),
+            url: "https://x".into(),
+            enabled: true,
+            response,
+            last_fetched_at: None,
+            last_error: None,
+            rule_count: 0,
+            etag: None,
+            rules_limit_override: None,
+            last_refresh_duration_ms: None,
+            last_refresh_failed_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn reorder_up_swaps_with_predecessor() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (state, _storage) = make_test_app_state(temp.path());
+
+        let s0 = mk_source("a", AdBlockResponse::ZeroAddress);
+        let s1 = mk_source("b", AdBlockResponse::NxDomain);
+        let s2 = mk_source("c", AdBlockResponse::ZeroAddress);
+        let id0 = s0.source_id.clone();
+        let id1 = s1.source_id.clone();
+        let id2 = s2.source_id.clone();
+        {
+            let mut g = state.ad_block_state.write().await;
+            g.sources = vec![s0, s1, s2];
+        }
+
+        let result = reorder_ad_block_source_impl(&state, &id1, ReorderDirection::Up)
+            .await
+            .expect("reorder up");
+        let order: Vec<_> = result.iter().map(|s| s.source_id.clone()).collect();
+        assert_eq!(
+            order,
+            vec![id1, id0, id2],
+            "reorder Up should swap positions 0 and 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn reorder_down_swaps_with_successor() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (state, _storage) = make_test_app_state(temp.path());
+
+        let s0 = mk_source("a", AdBlockResponse::ZeroAddress);
+        let s1 = mk_source("b", AdBlockResponse::NxDomain);
+        let s2 = mk_source("c", AdBlockResponse::ZeroAddress);
+        let id0 = s0.source_id.clone();
+        let id1 = s1.source_id.clone();
+        let id2 = s2.source_id.clone();
+        {
+            let mut g = state.ad_block_state.write().await;
+            g.sources = vec![s0, s1, s2];
+        }
+
+        let result = reorder_ad_block_source_impl(&state, &id1, ReorderDirection::Down)
+            .await
+            .expect("reorder down");
+        let order: Vec<_> = result.iter().map(|s| s.source_id.clone()).collect();
+        assert_eq!(
+            order,
+            vec![id0, id2, id1],
+            "reorder Down should swap positions 1 and 2"
+        );
+    }
+
+    #[tokio::test]
+    async fn reorder_up_at_first_position_is_noop() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (state, _storage) = make_test_app_state(temp.path());
+
+        let s0 = mk_source("a", AdBlockResponse::ZeroAddress);
+        let s1 = mk_source("b", AdBlockResponse::NxDomain);
+        let id0 = s0.source_id.clone();
+        let id1 = s1.source_id.clone();
+        {
+            let mut g = state.ad_block_state.write().await;
+            g.sources = vec![s0, s1];
+        }
+
+        let result = reorder_ad_block_source_impl(&state, &id0, ReorderDirection::Up)
+            .await
+            .expect("no-op reorder must not error");
+        let order: Vec<_> = result.iter().map(|s| s.source_id.clone()).collect();
+        assert_eq!(
+            order,
+            vec![id0, id1],
+            "first-position Up must not change order"
+        );
+    }
+
+    #[tokio::test]
+    async fn reorder_down_at_last_position_is_noop() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (state, _storage) = make_test_app_state(temp.path());
+
+        let s0 = mk_source("a", AdBlockResponse::ZeroAddress);
+        let s1 = mk_source("b", AdBlockResponse::NxDomain);
+        let id0 = s0.source_id.clone();
+        let id1 = s1.source_id.clone();
+        {
+            let mut g = state.ad_block_state.write().await;
+            g.sources = vec![s0, s1];
+        }
+
+        let result = reorder_ad_block_source_impl(&state, &id1, ReorderDirection::Down)
+            .await
+            .expect("no-op reorder must not error");
+        let order: Vec<_> = result.iter().map(|s| s.source_id.clone()).collect();
+        assert_eq!(
+            order,
+            vec![id0, id1],
+            "last-position Down must not change order"
+        );
+    }
+
+    #[tokio::test]
+    async fn reorder_unknown_source_id_returns_invalid_input() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (state, _storage) = make_test_app_state(temp.path());
+
+        let bogus = SourceId(Uuid::new_v4());
+        let result = reorder_ad_block_source_impl(&state, &bogus, ReorderDirection::Up).await;
+        assert!(
+            matches!(result, Err(MhostError::InvalidInput(_))),
+            "unknown source id must error, got: {:?}",
+            result
+        );
+    }
+
+    /// End-to-end: reorder persists to disk AND the on-disk state,
+    /// when re-classified, produces the same partitions as before.
+    /// This is the property #215 §2 cares about — "调整顺序不改变拦截结果".
+    #[tokio::test]
+    async fn reorder_does_not_change_classify_rules_output() {
+        use std::collections::HashSet;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let (state, _storage) = make_test_app_state(temp.path());
+
+        // Two sources with overlapping but different response types.
+        let s_za = mk_source("za", AdBlockResponse::ZeroAddress);
+        let s_nx = mk_source("nx", AdBlockResponse::NxDomain);
+        let id_za = s_za.source_id.clone();
+        let id_nx = s_nx.source_id.clone();
+
+        mhost_storage::adblock::write_cache(
+            temp.path(),
+            &id_za,
+            b"0.0.0.0 shared.example.com\n0.0.0.0 za-only.example.com\n",
+        )
+        .unwrap();
+        mhost_storage::adblock::write_cache(
+            temp.path(),
+            &id_nx,
+            b"0.0.0.0 shared.example.com\n0.0.0.0 nx-only.example.com\n",
+        )
+        .unwrap();
+
+        {
+            let mut g = state.ad_block_state.write().await;
+            g.enabled = true;
+            g.sources = vec![s_za, s_nx];
+        }
+
+        let (za_before, nx_before, _) =
+            classify_rules(&state.ad_block_state.read().await.clone(), temp.path());
+        let za_before_set: HashSet<String> = za_before.keys().cloned().collect();
+        let nx_before_set: HashSet<String> = nx_before.iter().cloned().collect();
+
+        // Swap the two.
+        reorder_ad_block_source_impl(&state, &id_za, ReorderDirection::Down)
+            .await
+            .expect("reorder");
+
+        // The on-disk file must reflect the new order.
+        let on_disk = adblock_store::read_state(temp.path()).unwrap();
+        assert_eq!(on_disk.sources[0].source_id, id_nx);
+        assert_eq!(on_disk.sources[1].source_id, id_za);
+
+        // And `classify_rules` over the persisted state must produce
+        // identical (za, nx) partitions — order is a presentation
+        // concern only.
+        let (za_after, nx_after, _) = classify_rules(&on_disk, temp.path());
+        let za_after_set: HashSet<String> = za_after.keys().cloned().collect();
+        let nx_after_set: HashSet<String> = nx_after.iter().cloned().collect();
+
+        assert_eq!(
+            za_before_set, za_after_set,
+            "reorder must not change zero_addr partition"
+        );
+        assert_eq!(
+            nx_before_set, nx_after_set,
+            "reorder must not change nxdomain partition"
+        );
+    }
     // -----------------------------------------------------------------
     // PR #154 review (P2): exercise the cold-start hot-reload path that
     // AppState::new runs when `dns_enabled=true` was recovered from the

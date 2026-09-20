@@ -33,6 +33,7 @@ import {
   setAdBlockSourceResponse,
   setAdBlockSourceRulesLimitOverride,
   refreshAdBlockSource,
+  reorderAdBlockSources,
   refreshAllAdBlockSources,
   listAdBlockWhitelist,
   addAdBlockWhitelistMany,
@@ -722,6 +723,33 @@ export const setAdBlockSourceResponseAtom = atom(
     set(adBlockErrorAtom, null);
     try {
       await setAdBlockSourceResponse(args.sourceId, args.response);
+      const state = await getAdBlockState();
+      set(adBlockStateAtom, state);
+    } catch (err) {
+      set(adBlockErrorAtom, extractErrorMessage(err));
+      throw err;
+    }
+  },
+);
+
+/**
+ * Issue #215: move a source up or down in the display order.
+ * The backend re-orders and persists in one IPC, then we
+ * refresh the local ad-block state so the next render reflects
+ * the new ordering without a separate `getAdBlockState` call.
+ * Errors are surfaced via `adBlockErrorAtom` like the other
+ * mutation atoms.
+ */
+export const reorderAdBlockSourceAtom = atom(
+  null,
+  async (
+    _get,
+    set,
+    args: { sourceId: string; direction: "up" | "down" },
+  ) => {
+    set(adBlockErrorAtom, null);
+    try {
+      await reorderAdBlockSources(args.sourceId, args.direction);
       const state = await getAdBlockState();
       set(adBlockStateAtom, state);
     } catch (err) {

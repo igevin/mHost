@@ -175,6 +175,7 @@ pub fn run() {
             set_ad_block_source_response,
             set_ad_block_source_rules_limit_override,
             refresh_ad_block_source,
+            reorder_ad_block_sources,
             refresh_all_ad_block_sources,
             list_ad_block_whitelist,
             add_ad_block_whitelist,
