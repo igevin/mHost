@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, act } from "@testing-library/react";
+import { render, screen, fireEvent, act, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { getDefaultStore, Provider as JotaiProvider } from "jotai";
 import {
@@ -760,7 +760,14 @@ describe("AdBlock", () => {
       await act(async () => {
         fireEvent.click(upBtn);
       });
-      expect(mockReorderAdBlockSources).toHaveBeenCalledWith("src-b", "up");
+      // Sub-agent review (PR #221, finding 1): the click triggers
+      // `reorderSource(...)` which calls `reorderAdBlockSources`
+      // IPC; the assertion runs before that microtask reliably
+      // flushes, so wrap in waitFor to dodge the race. Apply
+      // symmetrically to the corresponding Down test below.
+      await waitFor(() => {
+        expect(mockReorderAdBlockSources).toHaveBeenCalledWith("src-b", "up");
+      });
     });
 
     it("clicking Down invokes the IPC with sourceId + direction 'down'", async () => {
@@ -775,7 +782,9 @@ describe("AdBlock", () => {
       await act(async () => {
         fireEvent.click(downBtn);
       });
-      expect(mockReorderAdBlockSources).toHaveBeenCalledWith("src-a", "down");
+      await waitFor(() => {
+        expect(mockReorderAdBlockSources).toHaveBeenCalledWith("src-a", "down");
+      });
     });
   });
 

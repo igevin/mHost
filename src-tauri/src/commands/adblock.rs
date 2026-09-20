@@ -2296,6 +2296,111 @@ mod tests {
         assert_eq!(report.per_source[0].overlapping_domain_count, 0);
     }
 
+    /// Sub-agent review (PR #221, finding 3) companion to the existing
+    /// `overlap_report_marks_whitelisted_domains_as_effective_whitelisted`:
+    /// that test only had ONE source, so `by_domain` filtered the entry
+    /// at `sources.len() < 2` and the `effective: "Whitelisted"` branch
+    /// was never actually asserted. This test exercises the full
+    /// whitelist-priority path end-to-end: two sources both block the
+    /// same domain, the user has whitelisted it, and the engine (per
+    /// `check()` and `compute_overlap_report`'s priority chain) must
+    /// classify it as fall-through — i.e., the `effective` field on
+    /// the overlap entry is "Whitelisted".
+    #[test]
+    fn overlap_report_marks_whitelisted_domain_as_effective_when_two_sources_cover_it() {
+        let temp = tempfile::TempDir::new().unwrap();
+
+        let s_za = AdBlockSource {
+            source_id: SourceId(Uuid::new_v4()),
+            name: "za".into(),
+            url: "https://x".into(),
+            enabled: true,
+            response: AdBlockResponse::ZeroAddress,
+            last_fetched_at: None,
+            last_error: None,
+            rule_count: 1,
+            etag: None,
+            rules_limit_override: None,
+            last_refresh_duration_ms: None,
+            last_refresh_failed_at: None,
+        };
+        let s_nx = AdBlockSource {
+            source_id: SourceId(Uuid::new_v4()),
+            name: "nx".into(),
+            url: "https://y".into(),
+            enabled: true,
+            response: AdBlockResponse::NxDomain,
+            last_fetched_at: None,
+            last_error: None,
+            rule_count: 1,
+            etag: None,
+            rules_limit_override: None,
+            last_refresh_duration_ms: None,
+            last_refresh_failed_at: None,
+        };
+        // Both sources block the same domain. Without the whitelist,
+        // nxdomain would win (issue #215 priority chain). With the
+        // whitelist, "Whitelisted" must win over BOTH block tiers.
+        mhost_storage::adblock::write_cache(
+            temp.path(),
+            &s_za.source_id,
+            b"0.0.0.0 trusted.example.com\n",
+        )
+        .unwrap();
+        mhost_storage::adblock::write_cache(
+            temp.path(),
+            &s_nx.source_id,
+            b"0.0.0.0 trusted.example.com\n",
+        )
+        .unwrap();
+        let state = AdBlockState {
+            enabled: true,
+            sources: vec![s_za.clone(), s_nx.clone()],
+            whitelist: vec!["trusted.example.com".to_string()],
+            ..Default::default()
+        };
+
+        let report = compute_overlap_report(&state, temp.path());
+
+        // Both sources see the same overlap (1 domain each).
+        assert_eq!(report.per_source.len(), 2);
+        assert_eq!(
+            report
+                .per_source
+                .iter()
+                .map(|s| s.overlapping_domain_count)
+                .collect::<Vec<_>>(),
+            vec![1, 1],
+            "both sources must report one overlapping domain"
+        );
+
+        // The drill-down entries must both classify the domain as
+        // "Whitelisted" — this is the contract `check()` enforces
+        // (whitelist > nxdomain > zero_addr), and it's what the
+        // drawer's `effective` badge shows the user.
+        let za_details = report
+            .details
+            .get(&s_za.source_id)
+            .expect("za details present");
+        assert_eq!(za_details.len(), 1);
+        assert_eq!(za_details[0].domain, "trusted.example.com");
+        assert_eq!(
+            za_details[0].effective, "Whitelisted",
+            "whitelist must beat zero_addr for an overlapping domain"
+        );
+
+        let nx_details = report
+            .details
+            .get(&s_nx.source_id)
+            .expect("nx details present");
+        assert_eq!(nx_details.len(), 1);
+        assert_eq!(nx_details[0].domain, "trusted.example.com");
+        assert_eq!(
+            nx_details[0].effective, "Whitelisted",
+            "whitelist must beat nxdomain for an overlapping domain"
+        );
+    }
+
     #[test]
     fn overlap_report_is_empty_when_no_sources() {
         let temp = tempfile::TempDir::new().unwrap();

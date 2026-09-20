@@ -623,14 +623,21 @@ export const fetchAdBlockStatsAtom = atom(null, async (_get, set) => {
   }
 });
 
-/** Issue #215 §1: refresh the cross-source overlap report. Called
- * on page mount (alongside the other fetch atoms) and on every
- * source mutation (add / remove / enable / disable / response /
- * rules_limit_override / reorder) so the chips stay in sync.
+/** Issue #215 §1: refresh the cross-source overlap report.
+ *
+ * **v1 scope (per PR #221 review):** currently invoked once on
+ * page mount (see `pages/AdBlock.tsx::useEffect`). It is NOT
+ * called from any mutation atom (add / remove / enable /
+ * disable / response / rules_limit_override / reorder), so
+ * chips and drawer details stay at their mount-time values
+ * until the page is reloaded. This is the explicit v1 trade-off
+ * — re-fetching on every mutation costs an extra IPC round-trip
+ * per click, and the chip is informational rather than
+ * blocking. Follow-ups that need a live count can either re-mount
+ * the page or call this atom directly from the mutation atoms.
  *
  * Non-fatal on failure: the chip disappears rather than showing
- * a stale count. The drawer's "details" view depends on this
- * report being fresh, so the drawer re-fetches on open too.
+ * a stale count.
  */
 export const fetchAdBlockOverlapsAtom = atom(null, async (_get, set) => {
   try {
