@@ -1,5 +1,7 @@
 # mHost
 
+> A lightweight, fast, low-footprint hosts & local DNS manager for desktop — built with Tauri 2 + Rust. *Cross-platform Hosts management for dev/staging/production switching and ad blocking.*
+
 一个轻量、快速、低打扰的跨平台 Hosts 管理应用，面向开发、测试、生产环境切换以及广告屏蔽场景。
 
 mHost 的目标不是简单地提供一个 `/etc/hosts` 编辑器，而是把常见的域名解析切换、环境隔离、广告拦截规则管理做成一个更安全、更易用的桌面工具。它优先考虑性能、稳定性和用户体验，尽可能减少后台开销，并通过安全的写入、备份和回滚机制降低操作风险。
@@ -167,23 +169,21 @@ mHost 同时支持两种域名解析管理方式，互不冲突：
 | Windows | 🚧 规划中 | ✅ v0.1 | DNS 模式需 Windows 服务化（详见 #67） |
 | Linux | 🚧 规划中 | ✅ v0.1 | 需用户态 DNS 转发方案 |
 
-## 技术方向
+## 技术栈
 
-项目计划采用跨平台桌面技术开发，兼顾开发效率、运行性能和系统集成能力。
+mHost 采用 **Tauri 2** 构建：Rust 实现核心逻辑，Web 前端负责界面，兼顾安装包体积、运行性能和系统集成能力。
 
-候选技术方向包括：
+- **后端核心**：Rust workspace（`mhost-core` / `mhost-hosts` / `mhost-storage` / `mhost-apply` / `mhost-dns`），解析、合并、校验、写入、回滚全部在 Rust 侧完成，通过强类型 IPC 与前端通信，前端不承载规则逻辑。
+- **DNS 服务**：内置本地 DNS server（`mhost-dns` crate）+ 独立 root 权限转发进程 `mhost-dns-proxy`，规则匹配使用 reversed-domain trie 优化热路径。
+- **前端**：React 18 + TypeScript + Jotai + Vite，测试使用 Vitest。
+- **工程化**：GitHub Actions CI（macOS 双架构 aarch64 / x86_64 矩阵），强制 `cargo fmt` / `clippy -D warnings` / 全量测试；release 流程自动化产出双架构安装包。
 
-- Tauri：适合构建低体积、低资源占用的跨平台桌面应用。
-- Rust：适合实现高性能、稳定的核心网络和规则处理能力。
-- Web 前端技术：适合构建灵活、易维护的桌面界面。
+## 项目状态
 
-最终技术选型应围绕几个目标展开：
-
-- 启动速度快。
-- 安装包体积小。
-- 后台资源占用低。
-- 跨平台行为一致。
-- 网络配置能力可靠。
+- 当前版本：v0.3.3（见 [Releases](https://github.com/igevin/mHost/releases)）
+- 开源协议：Apache License 2.0
+- Hosts 模式已在 macOS / Windows / Linux 规划内落地推进，DNS 模式已随 v0.2 发布（详见上文平台支持表）
+- 项目持续活跃开发中，采用分阶段交付（`spec/` 目录存档各阶段计划），历史问题审计与性能优化记录公开可查
 
 ## 项目愿景
 
@@ -197,16 +197,19 @@ mHost 希望成为一个简单、稳定、可信赖的 Hosts 与域名解析管�
 
 ## Roadmap
 
-- 创建、编辑、删除 Profile。
-- 一键启用和切换 Profile。
-- 支持 macOS 和 Windows。
-- 支持广告屏蔽规则。
-- 支持广告规则导入和更新。
-- 支持域名白名单。
-- 支持 Profile 导入和导出。
-- 支持配置备份和恢复。
-- 支持规则冲突检测。
-- 支持安全、可回滚的 Hosts 写入流程。
+已完成：
+
+- Profile 增删改查、一键启用切换。
+- 广告屏蔽规则，支持导入 `domains` 格式屏蔽列表、规则冲突/重叠检测。
+- Profile 导入导出、快照备份与恢复。
+- 安全、可回滚的 Hosts 写入流程（原子写入 + 自动备份）。
+- DNS 模式（macOS）。
+
+进行中 / 规划：
+
+- Windows / Linux 的 DNS 模式（见 #67）。
+- 广告屏蔽域名白名单。
+- 屏蔽规则命中统计可视化。
 
 ## 适合谁使用
 
@@ -217,4 +220,4 @@ mHost 希望成为一个简单、稳定、可信赖的 Hosts 与域名解析管�
 
 ## License
 
-本项目使用仓库中的 `LICENSE` 文件所声明的许可证。
+本项目基于 [Apache License 2.0](LICENSE) 开源发布。
