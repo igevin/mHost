@@ -12,6 +12,7 @@ import type {
   AdBlockLimits,
   AdBlockSource,
   AdBlockResponse,
+  BlocklistFormat,
   AdBlockStats,
   AdBlockOverlapReport,
 } from "../types";
@@ -305,8 +306,9 @@ export async function addAdBlockSource(
   name: string,
   url: string,
   response: AdBlockResponse,
+  format: BlocklistFormat,
 ): Promise<AdBlockSource> {
-  return invoke<AdBlockSource>("add_ad_block_source", { name, url, response });
+  return invoke<AdBlockSource>("add_ad_block_source", { name, url, response, format });
 }
 
 export async function removeAdBlockSource(sourceId: string): Promise<void> {

@@ -1,5 +1,5 @@
 import { atom } from "jotai";
-import type { Profile, AdBlockResponse } from "../../types";
+import type { Profile, AdBlockResponse, BlocklistFormat } from "../../types";
 import {
   listProfiles,
   getProfile,
@@ -698,11 +698,15 @@ export const setAdBlockAutoRefreshEnabledAtom = atom(
 
 export const addAdBlockSourceAtom = atom(
   null,
-  async (_get, set, args: { name: string; url: string; response: AdBlockResponse }) => {
+  async (
+    _get,
+    set,
+    args: { name: string; url: string; response: AdBlockResponse; format: BlocklistFormat },
+  ) => {
     set(isAdBlockLoadingAtom, true);
     set(adBlockErrorAtom, null);
     try {
-      await addAdBlockSource(args.name, args.url, args.response);
+      await addAdBlockSource(args.name, args.url, args.response, args.format);
       const state = await getAdBlockState();
       set(adBlockStateAtom, state);
     } catch (err) {

@@ -37,6 +37,7 @@ pnpm-debug.log*
 
 # Dependencies
 node_modules/
+.pnpm-store/
 .npm
 .pnp
 .pnp.js

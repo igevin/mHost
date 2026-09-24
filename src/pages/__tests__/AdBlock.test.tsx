@@ -90,6 +90,7 @@ function makeSource(overrides: Partial<AdBlockSource> = {}): AdBlockSource {
     url: "https://example.com/hosts",
     enabled: true,
     response: "zero_address",
+    format: "hosts",
     last_fetched_at: null,
     last_error: null,
     rule_count: 100,
@@ -390,6 +391,40 @@ describe("AdBlock", () => {
       "MyList",
       "https://ml.com/hosts",
       "zero_address",
+      "hosts",
+    );
+  });
+
+  // Issue #213: the Format dropdown defaults to hosts and a domains
+  // selection is passed through to the IPC as the 4th argument.
+  it("passes the selected blocklist format to add_ad_block_source", async () => {
+    const state = makeState();
+    setStore((s) => s.set(adBlockStateAtom, state));
+    mockGetAdBlockState.mockResolvedValue(state);
+    renderWithProviders(<AdBlock />);
+    await screen.findByRole("heading", { name: "Sources" });
+    // No sources in state → the only comboboxes are the add form's
+    // Response and Format selects (in DOM order).
+    const formatSelect = screen.getAllByRole("combobox")[1];
+    expect(formatSelect).toHaveValue("hosts");
+    await act(async () => {
+      fireEvent.change(screen.getByPlaceholderText("StevenBlack"), {
+        target: { value: "anti-AD" },
+      });
+      fireEvent.change(screen.getByPlaceholderText("https://example.com/hosts"), {
+        target: { value: "https://anti-ad.net/domains.txt" },
+      });
+      fireEvent.change(formatSelect, { target: { value: "domains" } });
+    });
+    const sourceAddBtn = screen.getAllByText("Add")[0];
+    await act(async () => {
+      fireEvent.click(sourceAddBtn);
+    });
+    expect(mockAddAdBlockSource).toHaveBeenCalledWith(
+      "anti-AD",
+      "https://anti-ad.net/domains.txt",
+      "zero_address",
+      "domains",
     );
   });
 
@@ -567,16 +602,19 @@ describe("AdBlock", () => {
       "StevenBlack",
       "https://sb.com/hosts",
       "zero_address",
+      "hosts",
     );
     expect(mockAddAdBlockSource).toHaveBeenCalledWith(
       "My List",
       "https://ml.com/hosts",
       "zero_address",
+      "hosts",
     );
     expect(mockAddAdBlockSource).toHaveBeenCalledWith(
       "Third",
       "https://t.com/hosts",
       "zero_address",
+      "hosts",
     );
   });
 
