@@ -218,6 +218,10 @@ mHost 希望成为一个简单、稳定、可信赖的 Hosts 与域名解析管�
 - 想减少广告和追踪请求的普通用户。
 - 希望使用轻量工具管理网络解析规则的桌面用户。
 
+## 开发工具
+
+mHost 使用 JetBrains IDE 开发：Rust 后端使用 **RustRover**，React + TypeScript 前端使用 **WebStorm**。项目的构建、测试与 CI 均围绕 Cargo、clippy 和 Vitest 展开。
+
 ## License
 
 本项目基于 [Apache License 2.0](LICENSE) 开源发布。
