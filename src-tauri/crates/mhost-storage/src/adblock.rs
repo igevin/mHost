@@ -269,7 +269,7 @@ pub fn find_source_mut<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mhost_core::AdBlockResponse;
+    use mhost_core::{AdBlockResponse, BlocklistFormat};
     use tempfile::TempDir;
 
     fn sample_source(name: &str) -> AdBlockSource {
@@ -279,6 +279,7 @@ mod tests {
             url: format!("https://example.com/{}.txt", name),
             enabled: true,
             response: AdBlockResponse::ZeroAddress,
+            format: BlocklistFormat::Hosts,
             last_fetched_at: None,
             last_error: None,
             rule_count: 0,
