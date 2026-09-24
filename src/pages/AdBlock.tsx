@@ -32,7 +32,7 @@ import {
 } from "../stores/profiles";
 import { useNavigate } from "react-router-dom";
 import { useWebKitPointerDown } from "../hooks/useWebKitPointerDown";
-import type { AdBlockResponse } from "../types";
+import type { AdBlockResponse, BlocklistFormat } from "../types";
 import styles from "./AdBlock.module.css";
 
 // Issue #207: parse "source produced N rules (limit: M)" out of
@@ -87,6 +87,10 @@ function AdBlock() {
   const [newName, setNewName] = useState("");
   const [newUrl, setNewUrl] = useState("");
   const [newResponse, setNewResponse] = useState<AdBlockResponse>("zero_address");
+  // Issue #213: upstream blocklist format, chosen explicitly at add
+  // time (the backend never sniffs). Defaults to hosts — the format
+  // every source predating this feature uses.
+  const [newFormat, setNewFormat] = useState<BlocklistFormat>("hosts");
   // Issue #215 §1: id of the source whose overlap drawer is
   // open, or null. The drawer reads from `overlapReport`.
   const [overlapDrawerSrcId, setOverlapDrawerSrcId] = useState<string | null>(null);
@@ -117,7 +121,7 @@ function AdBlock() {
 
   const handleAddSource = useCallback(() => {
     if (!newName.trim() || !newUrl.trim()) return;
-    addSource({ name: newName.trim(), url: newUrl.trim(), response: newResponse })
+    addSource({ name: newName.trim(), url: newUrl.trim(), response: newResponse, format: newFormat })
       .then(() => {
         setNewName("");
         setNewUrl("");
@@ -125,7 +129,7 @@ function AdBlock() {
       .catch(() => {
         /* error in atom */
       });
-  }, [addSource, newName, newUrl, newResponse]);
+  }, [addSource, newName, newUrl, newResponse, newFormat]);
 
   /**
    * Issue #196: parse a multi-line paste into individual entries, drop
@@ -214,7 +218,10 @@ function AdBlock() {
       // user sees the count and a sample of inputs that failed.
       void Promise.allSettled(
         entries.map((e) =>
-          addSource({ name: e.name, url: e.url, response: newResponse }),
+          // Bulk-added lines share the form's current format selection
+          // (issue #213) — a paste of domains-format URLs needs one
+          // dropdown flip, not N re-adds.
+          addSource({ name: e.name, url: e.url, response: newResponse, format: newFormat }),
         ),
       ).then((results) => {
         const failures = results
@@ -232,7 +239,7 @@ function AdBlock() {
         }
       });
     },
-    [addSource, newResponse, setError],
+    [addSource, newResponse, newFormat, setError],
   );
 
   const handleIntervalChange = useCallback(
@@ -355,7 +362,8 @@ function AdBlock() {
         <div className="card">
           <h2 className="card-title">Sources</h2>
           <p className={styles.mutedGap}>
-            Hosts-format blocklist URLs (one domain per line, IP ignored).
+            Blocklist subscription URLs — hosts format (0.0.0.0 domain) or
+            plain domains (one per line), picked via the Format dropdown.
           </p>
 
           <div className={styles.addSourceForm}>
@@ -393,6 +401,25 @@ function AdBlock() {
               >
                 <option value="zero_address">0.0.0.0</option>
                 <option value="nx_domain">NXDOMAIN</option>
+              </select>
+            </div>
+            {/* Issue #213: explicit upstream format. `hosts` is the
+                default every pre-#213 source uses; `domains` covers
+                anti-AD domains.txt / oisd-style one-domain-per-line
+                lists. Not editable post-add — re-add the source to
+                change it (mirrors the no-edit-source IPC contract). */}
+            <div className="form-group">
+              <label className="form-label">Format</label>
+              <select
+                className="input"
+                value={newFormat}
+                onChange={(e) =>
+                  setNewFormat(e.target.value as BlocklistFormat)
+                }
+                disabled={isLoading}
+              >
+                <option value="hosts">hosts (0.0.0.0 …)</option>
+                <option value="domains">domains (one per line)</option>
               </select>
             </div>
             <button
@@ -465,6 +492,7 @@ function AdBlock() {
                       <div className={styles.sourceMeta}>{src.url}</div>
                       <div className={styles.sourceMeta}>
                         {src.rule_count.toLocaleString()} rules
+                        {` · ${src.format} format`}
                         {src.rules_limit_override != null &&
                           ` · limit ${src.rules_limit_override.toLocaleString()} (manually raised)`}
                         {src.last_fetched_at &&

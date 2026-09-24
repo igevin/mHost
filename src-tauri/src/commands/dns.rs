@@ -907,6 +907,7 @@ mod tests {
             url: "http://127.0.0.1:1/blocklist".into(),
             enabled: true,
             response: mhost_core::AdBlockResponse::ZeroAddress,
+            format: mhost_core::BlocklistFormat::Hosts,
             last_fetched_at: None,
             last_error: None,
             rule_count: 0,

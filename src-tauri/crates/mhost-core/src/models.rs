@@ -215,6 +215,23 @@ pub enum AdBlockResponse {
     NxDomain,
 }
 
+/// File format of an upstream blocklist (issue #213).
+///
+/// `Hosts` — classic hosts syntax (`0.0.0.0 example.com`), parsed by
+/// `mhost-hosts`'s `Parser`. `Domains` — one bare domain per line
+/// (anti-AD domains 版, oisd, Peter Lowe's list), parsed by a
+/// lightweight line reader in `commands::adblock`.
+///
+/// Explicitly chosen at source-add time; no runtime format sniffing —
+/// sniffing produced silent 0-rule failures (the bug this issue fixes).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BlocklistFormat {
+    #[default]
+    Hosts,
+    Domains,
+}
+
 /// A remote ad block subscription source.
 ///
 /// One source = one URL of hosts-format blocklist. Persisted as part of
@@ -228,6 +245,13 @@ pub struct AdBlockSource {
     pub url: String,
     pub enabled: bool,
     pub response: AdBlockResponse,
+    /// 上游 blocklist 的文件格式（issue #213）。默认 `hosts` —— 旧
+    /// `adblock.json` 文档没有此键，`#[serde(default)]` 反序列化为
+    /// `Hosts`，行为与旧版完全一致。Always serialized（issue #202
+    /// 教训：绝不 `skip_serializing_if`，前端类型是
+    /// `BlocklistFormat` 而非 `| null`）。
+    #[serde(default)]
+    pub format: BlocklistFormat,
     /// RFC 3339 timestamp of the last successful fetch. `None` if never fetched.
     ///
     /// **Issue #202:** the `Option` fields on this struct serialize
@@ -887,6 +911,7 @@ mod tests {
             url: "https://example.com/list.txt".to_string(),
             enabled: true,
             response: AdBlockResponse::NxDomain,
+            format: BlocklistFormat::Hosts,
             last_fetched_at: None,
             last_error: None,
             rule_count: 0,
@@ -912,6 +937,7 @@ mod tests {
             url: "https://example.com/list.txt".to_string(),
             enabled: false,
             response: AdBlockResponse::ZeroAddress,
+            format: BlocklistFormat::Domains,
             last_fetched_at: Some("2026-07-28T00:00:00Z".parse().unwrap()),
             last_error: Some("timeout".to_string()),
             rule_count: 42,
@@ -948,6 +974,7 @@ mod tests {
                 url: "https://example.com/s1".to_string(),
                 enabled: true,
                 response: AdBlockResponse::NxDomain,
+                format: BlocklistFormat::Hosts,
                 last_fetched_at: None,
                 last_error: None,
                 rule_count: 100,
@@ -977,6 +1004,7 @@ mod tests {
             url: "https://example.com/big.txt".to_string(),
             enabled: true,
             response: AdBlockResponse::ZeroAddress,
+            format: BlocklistFormat::Hosts,
             last_fetched_at: None,
             last_error: None,
             rule_count: 612_003,
@@ -998,6 +1026,39 @@ mod tests {
         );
         let restored: AdBlockSource = serde_json::from_str(&legacy).unwrap();
         assert_eq!(restored.rules_limit_override, None);
+    }
+
+    // Issue #213: `BlocklistFormat` wire format is snake_case, default Hosts.
+    #[test]
+    fn test_blocklist_format_serde_roundtrip() {
+        for (variant, wire) in [
+            (BlocklistFormat::Hosts, "\"hosts\""),
+            (BlocklistFormat::Domains, "\"domains\""),
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, wire);
+            let restored: BlocklistFormat = serde_json::from_str(&json).unwrap();
+            assert_eq!(variant, restored);
+        }
+        assert_eq!(BlocklistFormat::default(), BlocklistFormat::Hosts);
+    }
+
+    // Issue #213: legacy `adblock.json` documents predate the `format`
+    // key — they must deserialize as `Hosts` (the only format the old
+    // parser understood), never fail.
+    #[test]
+    fn test_ad_block_source_format_legacy_doc_defaults_to_hosts() {
+        let legacy = format!(
+            "{{\"source_id\":\"{}\",\"name\":\"L\",\"url\":\"https://x\",\
+             \"enabled\":true,\"response\":\"zero_address\",\"rule_count\":1}}",
+            Uuid::new_v4()
+        );
+        let restored: AdBlockSource = serde_json::from_str(&legacy).unwrap();
+        assert_eq!(restored.format, BlocklistFormat::Hosts);
+
+        // And the field serializes unconditionally (issue #202 lesson).
+        let json = serde_json::to_string(&restored).unwrap();
+        assert!(json.contains("\"format\":\"hosts\""), "{}", json);
     }
 
     // -----------------------------------------------------------------------

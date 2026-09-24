@@ -55,12 +55,27 @@ export type RuleSource =
 
 export type AdBlockResponse = "zero_address" | "nx_domain";
 
+/**
+ * Issue #213: file format of an upstream blocklist. `hosts` is the
+ * classic `0.0.0.0 example.com` syntax; `domains` is one bare domain
+ * per line (anti-AD domains 版, oisd, Peter Lowe's list). Chosen
+ * explicitly at source-add time — the backend never sniffs at runtime.
+ * Mirrors `mhost_core::BlocklistFormat` (serde snake_case).
+ */
+export type BlocklistFormat = "hosts" | "domains";
+
 export interface AdBlockSource {
   source_id: string;
   name: string;
   url: string;
   enabled: boolean;
   response: AdBlockResponse;
+  /**
+   * Issue #213: declared upstream format. Always serialized by the
+   * backend (never `null` / `undefined`); documents written before the
+   * field existed deserialize as `"hosts"`.
+   */
+  format: BlocklistFormat;
   last_fetched_at: string | null;
   last_error: string | null;
   rule_count: number;

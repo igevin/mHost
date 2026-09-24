@@ -13,7 +13,9 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use chrono::Utc;
-use mhost_core::{AdBlockResponse, AdBlockSource, AdBlockState, MhostError, SourceId};
+use mhost_core::{
+    AdBlockResponse, AdBlockSource, AdBlockState, BlocklistFormat, MhostError, SourceId,
+};
 use mhost_hosts::Parser;
 use mhost_storage::adblock as adblock_store;
 use serde::{Deserialize, Serialize};
@@ -73,6 +75,17 @@ const MAX_DOMAIN_LEN: usize = 253;
 /// background refresh (PR #131 review finding 1.4 — refresh was a serial
 /// loop, blocking the UI for up to N × FETCH_TIMEOUT_SECS).
 pub(crate) const REFRESH_CONCURRENCY: usize = 4;
+
+/// Parse-error warning thresholds (issue #213). A successful fetch whose
+/// body produced some rules but also dropped lines is only worth
+/// flagging when the dropped share is both absolutely and relatively
+/// significant: at least [`PARSE_ERROR_WARN_MIN`] lines AND more than
+/// 1 in [`PARSE_ERROR_WARN_RATIO_DEN`] of the kept rules. Below that the
+/// noise (stray blank-ish lines, oddball entries in real-world lists)
+/// would train users to ignore the badge. Above it, the most likely
+/// cause is a wrong `format` setting — the warning says so.
+const PARSE_ERROR_WARN_MIN: usize = 10;
+const PARSE_ERROR_WARN_RATIO_DEN: usize = 20;
 
 const USER_AGENT: &str = "mHost-Desktop/1.0";
 
@@ -373,7 +386,7 @@ pub(crate) fn classify_rules(
 /// the cache file is missing or fails to parse (caller logs and continues).
 pub(crate) fn domains_for_source(root: &std::path::Path, source: &AdBlockSource) -> Vec<String> {
     match adblock_store::read_cache(root, &source.source_id) {
-        Ok(Some(content)) => parse_blocklist_domains(&content),
+        Ok(Some(content)) => parse_blocklist_domains(&content).domains,
         Ok(None) => Vec::new(),
         Err(e) => {
             eprintln!(
@@ -482,8 +495,40 @@ fn validate_whitelist_domain(raw: &str) -> Result<String, String> {
     Ok(trimmed)
 }
 
+/// Outcome of parsing a blocklist body (issue #213): the accepted
+/// domains plus the number of non-comment lines that failed to parse.
+/// `error_count` powers the anti-silent-failure contract — the pre-#213
+/// code discarded `ParseResult.errors`, which is how a domains-format
+/// list fed to the hosts parser could yield 0 rules with no signal.
+#[derive(Debug, Default)]
+pub(crate) struct BlocklistParse {
+    pub domains: Vec<String>,
+    pub error_count: usize,
+}
+
+/// Decide whether a successful parse dropped enough lines to warrant a
+/// user-visible warning (issue #213). See [`PARSE_ERROR_WARN_MIN`] /
+/// [`PARSE_ERROR_WARN_RATIO_DEN`] for the threshold rationale.
+fn parse_error_warning(parsed: &BlocklistParse) -> Option<String> {
+    if parsed.error_count >= PARSE_ERROR_WARN_MIN
+        && parsed.error_count > parsed.domains.len() / PARSE_ERROR_WARN_RATIO_DEN
+    {
+        Some(format!(
+            "{} lines failed to parse ({} rules kept); if this looks wrong, \
+             check the source format setting (hosts vs domains)",
+            parsed.error_count,
+            parsed.domains.len()
+        ))
+    } else {
+        None
+    }
+}
+
 /// Parse hosts-format blocklist content into a flat list of domains.
-/// Comments (`#`) and empty lines are filtered out by `Parser::parse_line`.
+/// Comments (`#`) and empty lines are filtered out by `Parser::parse_line`;
+/// malformed non-comment lines land in `ParseResult.errors` and are
+/// counted into [`BlocklistParse::error_count`] (issue #213 — previously
+/// they were silently dropped).
 ///
 /// **PR #154 review (P2)**: no-op — after analysis, the original
 /// `d.to_lowercase()` is correct and the only allocation we can avoid
@@ -496,7 +541,7 @@ fn validate_whitelist_domain(raw: &str) -> Result<String, String> {
 /// straightforward `to_lowercase()` — the work runs in
 /// `spawn_blocking` (PR #131 P1-2 + issue #133), so DNS queries
 /// aren't blocked during the parse.
-fn parse_blocklist_domains(content: &str) -> Vec<String> {
+fn parse_blocklist_domains(content: &str) -> BlocklistParse {
     let result = Parser::parse(content);
     let mut domains: Vec<String> = Vec::new();
     for rule in result.rules {
@@ -507,7 +552,44 @@ fn parse_blocklist_domains(content: &str) -> Vec<String> {
             domains.push(d.to_lowercase());
         }
     }
-    domains
+    BlocklistParse {
+        domains,
+        error_count: result.errors.len(),
+    }
+}
+
+/// Parse a domains-format blocklist (issue #213): one bare domain per
+/// line — the shape used by anti-AD's `domains.txt`, oisd, Peter Lowe's
+/// ad servers list, etc.
+///
+/// Per line: trim → skip empty lines and `#` comments (inline comments
+/// are stripped too) → validate via [`validate_whitelist_domain`]
+/// (which also lowercases and enforces the RFC 1123 label structure).
+/// Invalid lines are counted, never silently kept: the fetch path turns
+/// "0 rules + N errors" into a hard failure and "some rules + many
+/// errors" into a `last_error` warning, so a wrong `format` setting
+/// can never again degrade into an invisible empty blocklist.
+fn parse_domains_blocklist(content: &str) -> BlocklistParse {
+    let mut domains: Vec<String> = Vec::new();
+    let mut error_count: usize = 0;
+    for line in content.lines() {
+        // Strip inline comments first: `example.com # comment` is not a
+        // thing in the canonical domains lists, but tolerating it costs
+        // one `split` and keeps the reader robust against hand-edited
+        // files. `#` is not a valid domain character, so this is safe.
+        let candidate = line.split('#').next().unwrap_or("").trim();
+        if candidate.is_empty() {
+            continue;
+        }
+        match validate_whitelist_domain(candidate) {
+            Ok(d) => domains.push(d),
+            Err(_) => error_count += 1,
+        }
+    }
+    BlocklistParse {
+        domains,
+        error_count,
+    }
 }
 
 /// Fetch a remote blocklist over HTTP(S), validate, and persist the raw
@@ -569,8 +651,9 @@ pub(crate) async fn fetch_and_cache_source(
     // 1. Read the source record under the read lock. We capture both
     //    the URL (for the fetch) and the previous ETag / last_fetched_at
     //    (for the conditional GET — issue #193), plus the effective
-    //    rules limit for this source (issue #207).
-    let (url, if_none_match, if_modified_since, rules_limit) = {
+    //    rules limit for this source (issue #207) and the declared
+    //    blocklist format (issue #213 — selects the parser).
+    let (url, if_none_match, if_modified_since, rules_limit, format) = {
         let guard = ad_block_state.read().await;
         match adblock_store::find_source(&guard, source_id) {
             Some(s) => (
@@ -578,6 +661,7 @@ pub(crate) async fn fetch_and_cache_source(
                 s.etag.clone(),
                 s.last_fetched_at.map(rfc7231_date),
                 s.rules_limit_override.unwrap_or(MAX_RULES_PER_SOURCE),
+                s.format,
             ),
             None => {
                 return Err(MhostError::InvalidInput(format!(
@@ -602,6 +686,10 @@ pub(crate) async fn fetch_and_cache_source(
         Fresh {
             rule_count: usize,
             etag: Option<String>,
+            /// Parse-error warning (issue #213): `Some` when the fetch
+            /// succeeded but dropped enough malformed lines to be worth
+            /// surfacing on `last_error`; `None` clears it.
+            warning: Option<String>,
         },
         NotModified,
     }
@@ -645,26 +733,47 @@ pub(crate) async fn fetch_and_cache_source(
                 let content_str = std::str::from_utf8(&body).map_err(|e| {
                     MhostError::InvalidInput(format!("response is not valid UTF-8: {}", e))
                 })?;
-                let domains = parse_blocklist_domains(content_str);
-                if domains.len() > rules_limit {
+                // Issue #213: the parser is selected by the source's
+                // declared format — never sniffed at runtime.
+                let parsed = match format {
+                    BlocklistFormat::Hosts => parse_blocklist_domains(content_str),
+                    BlocklistFormat::Domains => parse_domains_blocklist(content_str),
+                };
+                if parsed.domains.len() > rules_limit {
                     return Err(MhostError::InvalidInput(format!(
                         "source produced {} rules (limit: {})",
-                        domains.len(),
+                        parsed.domains.len(),
                         rules_limit
                     )));
                 }
+                // Issue #213 (anti-silent-failure): a body that yields
+                // zero rules AND has malformed lines almost certainly
+                // means the wrong `format` was picked (e.g. a domains
+                // list fed to the hosts parser). Fail loudly and keep
+                // the previous cache instead of caching an empty
+                // blocklist that silently stops blocking.
+                if parsed.domains.is_empty() && parsed.error_count > 0 {
+                    return Err(MhostError::InvalidInput(format!(
+                        "parsed 0 rules but {} lines failed to parse — \
+                         check the source format setting (hosts vs domains)",
+                        parsed.error_count
+                    )));
+                }
+                let warning = parse_error_warning(&parsed);
                 // Re-serialize as canonical hosts text so the cache is
                 // always valid hosts format (drops comments the original
                 // may have). Skipped entirely on 304 — see issue #193.
-                let canon = domains
+                let canon = parsed
+                    .domains
                     .iter()
                     .map(|d| format!("0.0.0.0 {}", d))
                     .collect::<Vec<_>>()
                     .join("\n");
                 adblock_store::write_cache(&root, &id_owned, canon.as_bytes())?;
                 Ok(Parsed::Fresh {
-                    rule_count: domains.len(),
+                    rule_count: parsed.domains.len(),
                     etag,
+                    warning,
                 })
             }
         }
@@ -680,12 +789,19 @@ pub(crate) async fn fetch_and_cache_source(
     let elapsed_ms = started_at.elapsed().as_millis() as u64;
 
     match fetch_parse {
-        Ok(Parsed::Fresh { rule_count, etag }) => {
-            // 200 OK path — full update: clear error, set fetched_at,
-            // rule_count, and the new ETag.
+        Ok(Parsed::Fresh {
+            rule_count,
+            etag,
+            warning,
+        }) => {
+            // 200 OK path — full update: set fetched_at, rule_count, and
+            // the new ETag. `last_error` is cleared on a clean parse, or
+            // set to the parse-error warning when the body dropped enough
+            // malformed lines to be worth flagging (issue #213) — the
+            // rules ARE live in this case, the badge is advisory.
             let mut guard = ad_block_state.write().await;
             if let Some(s) = adblock_store::find_source_mut(&mut guard, source_id) {
-                s.last_error = None;
+                s.last_error = warning;
                 s.last_fetched_at = Some(Utc::now());
                 s.rule_count = rule_count;
                 s.etag = etag;
@@ -1196,9 +1312,10 @@ pub async fn add_ad_block_source(
     name: String,
     url: String,
     response: AdBlockResponse,
+    format: BlocklistFormat,
     state: State<'_, AppState>,
 ) -> Result<AdBlockSource, MhostError> {
-    add_ad_block_source_impl(&state, name, url, response).await
+    add_ad_block_source_impl(&state, name, url, response, format).await
 }
 
 /// `AppState`-by-ref impl so the persistence-on-fetch-failure contract
@@ -1208,6 +1325,7 @@ pub(crate) async fn add_ad_block_source_impl(
     name: String,
     url: String,
     response: AdBlockResponse,
+    format: BlocklistFormat,
 ) -> Result<AdBlockSource, MhostError> {
     if name.trim().is_empty() {
         return Err(MhostError::InvalidInput("source name is empty".into()));
@@ -1232,6 +1350,7 @@ pub(crate) async fn add_ad_block_source_impl(
         url,
         enabled: true,
         response,
+        format,
         last_fetched_at: None,
         last_error: None,
         rule_count: 0,
@@ -1822,6 +1941,7 @@ mod tests {
             url: "https://x".into(),
             enabled: true,
             response: AdBlockResponse::ZeroAddress,
+            format: BlocklistFormat::Hosts,
             last_fetched_at: None,
             last_error: None,
             rule_count: 1,
@@ -1879,6 +1999,7 @@ mod tests {
             url: "https://x".into(),
             enabled: true,
             response: AdBlockResponse::ZeroAddress,
+            format: BlocklistFormat::Hosts,
             last_fetched_at: None,
             last_error: None,
             rule_count: 2,
@@ -1893,6 +2014,7 @@ mod tests {
             url: "https://y".into(),
             enabled: true,
             response: AdBlockResponse::NxDomain,
+            format: BlocklistFormat::Hosts,
             last_fetched_at: None,
             last_error: None,
             rule_count: 2,
@@ -1962,6 +2084,7 @@ mod tests {
             url: "https://x".into(),
             enabled: true,
             response: AdBlockResponse::ZeroAddress,
+            format: BlocklistFormat::Hosts,
             last_fetched_at: None,
             last_error: None,
             rule_count: 1,
@@ -1976,6 +2099,7 @@ mod tests {
             url: "https://y".into(),
             enabled: true,
             response: AdBlockResponse::ZeroAddress,
+            format: BlocklistFormat::Hosts,
             last_fetched_at: None,
             last_error: None,
             rule_count: 1,
@@ -2017,6 +2141,7 @@ mod tests {
             url: "https://x".into(),
             enabled,
             response,
+            format: BlocklistFormat::Hosts,
             last_fetched_at: None,
             last_error: None,
             rule_count: 0,
@@ -2106,6 +2231,7 @@ mod tests {
             url: "https://x".into(),
             enabled: true,
             response: AdBlockResponse::ZeroAddress,
+            format: BlocklistFormat::Hosts,
             last_fetched_at: None,
             last_error: None,
             rule_count: 2,
@@ -2120,6 +2246,7 @@ mod tests {
             url: "https://y".into(),
             enabled: true,
             response: AdBlockResponse::NxDomain,
+            format: BlocklistFormat::Hosts,
             last_fetched_at: None,
             last_error: None,
             rule_count: 2,
@@ -2198,6 +2325,7 @@ mod tests {
             url: "https://x".into(),
             enabled: true,
             response: AdBlockResponse::ZeroAddress,
+            format: BlocklistFormat::Hosts,
             last_fetched_at: None,
             last_error: None,
             rule_count: 1,
@@ -2212,6 +2340,7 @@ mod tests {
             url: "https://y".into(),
             enabled: false,
             response: AdBlockResponse::ZeroAddress,
+            format: BlocklistFormat::Hosts,
             last_fetched_at: None,
             last_error: None,
             rule_count: 1,
@@ -2260,6 +2389,7 @@ mod tests {
             url: "https://x".into(),
             enabled: true,
             response: AdBlockResponse::ZeroAddress,
+            format: BlocklistFormat::Hosts,
             last_fetched_at: None,
             last_error: None,
             rule_count: 1,
@@ -2316,6 +2446,7 @@ mod tests {
             url: "https://x".into(),
             enabled: true,
             response: AdBlockResponse::ZeroAddress,
+            format: BlocklistFormat::Hosts,
             last_fetched_at: None,
             last_error: None,
             rule_count: 1,
@@ -2330,6 +2461,7 @@ mod tests {
             url: "https://y".into(),
             enabled: true,
             response: AdBlockResponse::NxDomain,
+            format: BlocklistFormat::Hosts,
             last_fetched_at: None,
             last_error: None,
             rule_count: 1,
@@ -2425,6 +2557,7 @@ mod tests {
             url: "https://x".into(),
             enabled: true,
             response: AdBlockResponse::ZeroAddress,
+            format: BlocklistFormat::Hosts,
             last_fetched_at: None,
             last_error: None,
             rule_count: 0,
@@ -2464,18 +2597,35 @@ mod tests {
 
 # comment
 ";
-        let domains = parse_blocklist_domains(text);
+        let parsed = parse_blocklist_domains(text);
+        let domains = parsed.domains;
         assert!(domains.contains(&"ad.example.com".to_string()));
         assert!(domains.contains(&"tracker.example.com".to_string()));
         assert!(domains.contains(&"also.example.com".to_string()));
-        // comments and blanks are filtered by the parser
+        // comments and blanks are filtered by the parser — not errors
+        assert_eq!(parsed.error_count, 0);
     }
 
     #[test]
     fn parse_blocklist_lowercases() {
         let text = "0.0.0.0 MiXed.ExAmPlE.com\n";
-        let domains = parse_blocklist_domains(text);
-        assert_eq!(domains, vec!["mixed.example.com".to_string()]);
+        let parsed = parse_blocklist_domains(text);
+        assert_eq!(parsed.domains, vec!["mixed.example.com".to_string()]);
+    }
+
+    #[test]
+    fn parse_blocklist_counts_malformed_lines() {
+        // Bare-domain lines are malformed in hosts format — the pre-#213
+        // behaviour silently dropped them; now they surface in
+        // error_count (this is the wrong-format signal).
+        let text = "\
+0.0.0.0 good.example.com
+bare.example.com
+another-bare.example.com
+";
+        let parsed = parse_blocklist_domains(text);
+        assert_eq!(parsed.domains, vec!["good.example.com".to_string()]);
+        assert_eq!(parsed.error_count, 2);
     }
 
     // -----------------------------------------------------------------
@@ -2649,6 +2799,7 @@ mod tests {
             url: "https://x".into(),
             enabled: true,
             response,
+            format: BlocklistFormat::Hosts,
             last_fetched_at: None,
             last_error: None,
             rule_count: 2,
@@ -2711,6 +2862,7 @@ mod tests {
             url: "https://x".into(),
             enabled: true,
             response,
+            format: BlocklistFormat::Hosts,
             last_fetched_at: None,
             last_error: None,
             rule_count: 0,
@@ -2930,6 +3082,7 @@ mod tests {
             url: "https://x".into(),
             enabled: true,
             response: AdBlockResponse::ZeroAddress,
+            format: BlocklistFormat::Hosts,
             last_fetched_at: None,
             last_error: None,
             rule_count: 1,
@@ -3092,10 +3245,15 @@ mod tests {
 
         // Port 1 on loopback refuses connections → fetch_source errors fast.
         let url = "http://127.0.0.1:1/blocklist".to_string();
-        let err =
-            add_ad_block_source_impl(&state, "failing".into(), url, AdBlockResponse::ZeroAddress)
-                .await
-                .expect_err("fetch should fail (connection refused)");
+        let err = add_ad_block_source_impl(
+            &state,
+            "failing".into(),
+            url,
+            AdBlockResponse::ZeroAddress,
+            BlocklistFormat::Hosts,
+        )
+        .await
+        .expect_err("fetch should fail (connection refused)");
         assert!(
             err.to_string().contains("fetch")
                 || err.to_string().to_lowercase().contains("connect")
@@ -3742,6 +3900,7 @@ mod tests {
                 url: format!("http://127.0.0.1:{}/list", port),
                 enabled: true,
                 response: AdBlockResponse::ZeroAddress,
+                format: BlocklistFormat::Hosts,
                 last_fetched_at: None,
                 last_error: None,
                 rule_count: 0,
@@ -3871,6 +4030,7 @@ mod tests {
                 url: format!("http://127.0.0.1:{}/list", port),
                 enabled: true,
                 response: AdBlockResponse::ZeroAddress,
+                format: BlocklistFormat::Hosts,
                 last_fetched_at: None,
                 last_error: None,
                 rule_count: 0,
@@ -3948,6 +4108,7 @@ mod tests {
                 url: format!("http://127.0.0.1:{}/list", port),
                 enabled: true,
                 response: AdBlockResponse::ZeroAddress,
+                format: BlocklistFormat::Hosts,
                 last_fetched_at: Some(prior_fetch),
                 last_error: Some("prior boom".into()),
                 rule_count: 7,
@@ -4093,6 +4254,7 @@ mod tests {
                 url: format!("http://127.0.0.1:{}/list", port),
                 enabled: true,
                 response: AdBlockResponse::ZeroAddress,
+                format: BlocklistFormat::Hosts,
                 last_fetched_at: None,
                 last_error: None,
                 rule_count: 0,
@@ -4174,6 +4336,7 @@ mod tests {
                 url: format!("http://127.0.0.1:{}/list", port),
                 enabled: true,
                 response: AdBlockResponse::ZeroAddress,
+                format: BlocklistFormat::Hosts,
                 last_fetched_at: None,
                 last_error: None,
                 rule_count: 0,
@@ -4246,6 +4409,7 @@ mod tests {
                 url: "https://x".into(),
                 enabled: true,
                 response: AdBlockResponse::ZeroAddress,
+                format: BlocklistFormat::Hosts,
                 last_fetched_at: None,
                 last_error: None,
                 rule_count: 0,
@@ -4322,6 +4486,7 @@ mod tests {
                 url: format!("http://127.0.0.1:{}/list", port),
                 enabled: true,
                 response: AdBlockResponse::ZeroAddress,
+                format: BlocklistFormat::Hosts,
                 last_fetched_at: Some(chrono::Utc::now() - chrono::Duration::hours(1)),
                 last_error: None,
                 rule_count: 7, // stale bookkeeping from a wiped cache
@@ -4401,6 +4566,7 @@ mod tests {
                 url: format!("http://127.0.0.1:{}/list", port),
                 enabled: true,
                 response: AdBlockResponse::ZeroAddress,
+                format: BlocklistFormat::Hosts,
                 last_fetched_at: Some(chrono::Utc::now() - chrono::Duration::hours(1)),
                 last_error: None,
                 rule_count: 7, // stale bookkeeping from a wiped cache
@@ -4482,6 +4648,7 @@ mod tests {
                 url: format!("http://127.0.0.1:{}/list", port),
                 enabled: true,
                 response: AdBlockResponse::ZeroAddress,
+                format: BlocklistFormat::Hosts,
                 last_fetched_at: None,
                 last_error: None,
                 rule_count: 0,
@@ -4569,6 +4736,7 @@ mod tests {
                 url: format!("http://127.0.0.1:{}/list", port),
                 enabled: true,
                 response: AdBlockResponse::ZeroAddress,
+                format: BlocklistFormat::Hosts,
                 last_fetched_at: Some(chrono::Utc::now() - chrono::Duration::hours(1)),
                 last_error: None,
                 rule_count: 1,
@@ -4630,6 +4798,7 @@ mod tests {
                 url: "https://x.example/list".into(),
                 enabled: true,
                 response: AdBlockResponse::ZeroAddress,
+                format: BlocklistFormat::Hosts,
                 last_fetched_at: Some(chrono::Utc::now()),
                 last_error: None,
                 rule_count: 3,
@@ -4693,6 +4862,7 @@ mod tests {
                 url: format!("http://127.0.0.1:{}/list", port),
                 enabled: false,
                 response: AdBlockResponse::ZeroAddress,
+                format: BlocklistFormat::Hosts,
                 // Pre-disable bookkeeping — the fetch on re-enable must
                 // overwrite this, not preserve the stale rule_count /
                 // etag. We also pin a stale `last_error` so the
@@ -4774,6 +4944,7 @@ mod tests {
                 url: "https://x.example/list".into(),
                 enabled: true,
                 response: AdBlockResponse::ZeroAddress,
+                format: BlocklistFormat::Hosts,
                 last_fetched_at: None,
                 last_error: None,
                 rule_count: 0,
@@ -4855,6 +5026,7 @@ mod tests {
                 url: "https://x.example/list".into(),
                 enabled: true,
                 response: AdBlockResponse::ZeroAddress,
+                format: BlocklistFormat::Hosts,
                 last_fetched_at: None,
                 last_error: None,
                 rule_count: 0,
@@ -4917,6 +5089,7 @@ mod tests {
                 url: format!("http://127.0.0.1:{}/list", port),
                 enabled: true,
                 response: AdBlockResponse::ZeroAddress,
+                format: BlocklistFormat::Hosts,
                 last_fetched_at: None,
                 // Pre-seed a stale failure timestamp so the
                 // "successful fetch clears it" assertion is meaningful.
@@ -4987,6 +5160,7 @@ mod tests {
                 url: format!("http://127.0.0.1:{}/list", port),
                 enabled: true,
                 response: AdBlockResponse::ZeroAddress,
+                format: BlocklistFormat::Hosts,
                 // Pre-existing cache + ETag (RFC 7232 conditional GET
                 // requires a previous successful fetch).
                 last_fetched_at: Some(chrono::Utc::now() - chrono::Duration::hours(1)),
@@ -5065,6 +5239,7 @@ mod tests {
                 url: format!("http://127.0.0.1:{}/list", port),
                 enabled: true,
                 response: AdBlockResponse::ZeroAddress,
+                format: BlocklistFormat::Hosts,
                 last_fetched_at: None,
                 last_error: None,
                 rule_count: 0,
@@ -5262,5 +5437,280 @@ mod tests {
             "engine master switch off after reload(false, ...)",
         );
         let _ = AdBlockAction::ZeroAddress; // keep the import used
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #213: domains-format blocklist sources.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn parse_domains_blocklist_happy_path() {
+        let text = "\
+# anti-AD style header comment
+ads.example.com
+
+Tracker.Example.COM
+cdn.ads.net # inline comment tolerated
+";
+        let parsed = parse_domains_blocklist(text);
+        assert_eq!(
+            parsed.domains,
+            vec![
+                "ads.example.com".to_string(),
+                "tracker.example.com".to_string(),
+                "cdn.ads.net".to_string(),
+            ]
+        );
+        assert_eq!(parsed.error_count, 0);
+    }
+
+    #[test]
+    fn parse_domains_blocklist_counts_invalid_lines() {
+        // Each of these violates the whitelist validation rules and must
+        // be counted, never silently kept. A hosts-format line is the
+        // most important case: it means the user picked `domains` for a
+        // hosts list (or vice versa) and we must surface that.
+        let text = "\
+good.example.com
+0.0.0.0 hosts-format-line.example.com
+example.com/path
+*.wildcard.example.com
+-leading-dash.example.com
+trailing-dot.example.com.
+";
+        let parsed = parse_domains_blocklist(text);
+        assert_eq!(parsed.domains, vec!["good.example.com".to_string()]);
+        assert_eq!(parsed.error_count, 5);
+    }
+
+    #[test]
+    fn parse_error_warning_thresholds() {
+        // Below the absolute minimum → silent.
+        let below_min = BlocklistParse {
+            domains: (0..100).map(|i| format!("d{}.example.com", i)).collect(),
+            error_count: 9,
+        };
+        assert!(parse_error_warning(&below_min).is_none());
+
+        // Above the minimum but below the ratio (10 errors vs 1000 rules
+        // is 1%) → silent.
+        let below_ratio = BlocklistParse {
+            domains: (0..1000).map(|i| format!("d{}.example.com", i)).collect(),
+            error_count: 10,
+        };
+        assert!(parse_error_warning(&below_ratio).is_none());
+
+        // Above both → warning mentioning the format hint.
+        let above = BlocklistParse {
+            domains: (0..100).map(|i| format!("d{}.example.com", i)).collect(),
+            error_count: 10,
+        };
+        let warning = parse_error_warning(&above).expect("threshold exceeded");
+        assert!(warning.contains("10 lines failed to parse"), "{}", warning);
+        assert!(warning.contains("100 rules kept"), "{}", warning);
+        assert!(warning.contains("format"), "{}", warning);
+
+        // Zero rules with zero errors (pure-comment file) → no warning;
+        // the 0-rules-with-errors case is a hard failure upstream and
+        // never reaches this helper.
+        let empty = BlocklistParse::default();
+        assert!(parse_error_warning(&empty).is_none());
+    }
+
+    /// Issue #213 acceptance 1: a domains-format source parses bare
+    /// domains end-to-end — rule_count is correct and the on-disk cache
+    /// is canonical hosts text (so `domains_for_source` / the DNS engine
+    /// path needs no format awareness).
+    #[tokio::test]
+    async fn fetch_and_cache_source_domains_format_parses_bare_domains() {
+        use mhost_storage::adblock as adblock_store;
+        use mhost_storage::storage::FileStorage;
+
+        let listener = bind_mock_listener();
+        let port = listener.local_addr().unwrap().port();
+        let body = b"# domains list\nads.example.com\nTracker.Example.COM\n";
+        let responses = std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::VecDeque::from(vec![MockResponse::ok_200("\"d1\"", body)]),
+        ));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_h, _recorded) = spawn_mock_http(listener, responses, stop.clone());
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = std::sync::Arc::new(FileStorage::new(temp.path()))
+            as std::sync::Arc<dyn mhost_storage::storage::Storage + Send + Sync>;
+        let ad_block_state = std::sync::Arc::new(tokio::sync::RwLock::new(AdBlockState::default()));
+
+        let source_id = SourceId(uuid::Uuid::new_v4());
+        {
+            let mut g = ad_block_state.write().await;
+            g.sources.push(AdBlockSource {
+                source_id: source_id.clone(),
+                name: "domains-source".into(),
+                url: format!("http://127.0.0.1:{}/list", port),
+                enabled: true,
+                response: AdBlockResponse::ZeroAddress,
+                format: BlocklistFormat::Domains,
+                last_fetched_at: None,
+                last_error: None,
+                rule_count: 0,
+                etag: None,
+                rules_limit_override: None,
+                last_refresh_duration_ms: None,
+                last_refresh_failed_at: None,
+            });
+        }
+
+        fetch_and_cache_source(&storage, &ad_block_state, &source_id, false)
+            .await
+            .expect("domains-format fetch should succeed");
+
+        let snap = {
+            let g = ad_block_state.read().await;
+            adblock_store::find_source(&g, &source_id).cloned().unwrap()
+        };
+        assert_eq!(snap.rule_count, 2);
+        assert!(snap.last_error.is_none());
+        assert_eq!(snap.etag.as_deref(), Some("\"d1\""));
+
+        // Cache is canonical hosts text, lowercased.
+        let cache = adblock_store::read_cache(temp.path(), &source_id)
+            .unwrap()
+            .expect("cache written");
+        assert_eq!(
+            cache, "0.0.0.0 ads.example.com\n0.0.0.0 tracker.example.com",
+            "cache must be canonical hosts text regardless of source format"
+        );
+
+        stop_mock(&stop, _h);
+    }
+
+    /// Issue #213 anti-silent-failure: a hosts-format source whose body
+    /// is actually a domains list must NOT degrade into "0 rules, no
+    /// error". The fetch fails loudly, `last_error` points at the format
+    /// setting, and no empty cache is written.
+    #[tokio::test]
+    async fn fetch_and_cache_source_zero_rules_with_errors_fails_loudly() {
+        use mhost_storage::adblock as adblock_store;
+        use mhost_storage::storage::FileStorage;
+
+        let listener = bind_mock_listener();
+        let port = listener.local_addr().unwrap().port();
+        // Bare domains fed to the hosts parser → every line malformed.
+        let body = b"ads.example.com\ntracker.example.com\n";
+        let responses = std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::VecDeque::from(vec![MockResponse::ok_200("\"v1\"", body)]),
+        ));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_h, _recorded) = spawn_mock_http(listener, responses, stop.clone());
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = std::sync::Arc::new(FileStorage::new(temp.path()))
+            as std::sync::Arc<dyn mhost_storage::storage::Storage + Send + Sync>;
+        let ad_block_state = std::sync::Arc::new(tokio::sync::RwLock::new(AdBlockState::default()));
+
+        let source_id = SourceId(uuid::Uuid::new_v4());
+        {
+            let mut g = ad_block_state.write().await;
+            g.sources.push(AdBlockSource {
+                source_id: source_id.clone(),
+                name: "wrong-format".into(),
+                url: format!("http://127.0.0.1:{}/list", port),
+                enabled: true,
+                response: AdBlockResponse::ZeroAddress,
+                format: BlocklistFormat::Hosts,
+                last_fetched_at: None,
+                last_error: None,
+                rule_count: 0,
+                etag: None,
+                rules_limit_override: None,
+                last_refresh_duration_ms: None,
+                last_refresh_failed_at: None,
+            });
+        }
+
+        let err = fetch_and_cache_source(&storage, &ad_block_state, &source_id, false)
+            .await
+            .expect_err("0 rules + malformed lines must be a hard failure");
+        assert!(err.to_string().contains("0 rules"), "{}", err);
+        assert!(err.to_string().contains("format"), "{}", err);
+
+        let snap = {
+            let g = ad_block_state.read().await;
+            adblock_store::find_source(&g, &source_id).cloned().unwrap()
+        };
+        let last_error = snap.last_error.expect("last_error recorded on failure");
+        assert!(last_error.contains("0 rules"), "{}", last_error);
+        assert!(
+            !adblock_store::cache_path(temp.path(), &source_id).exists(),
+            "no empty cache may be written on the hard-failure path"
+        );
+
+        stop_mock(&stop, _h);
+    }
+
+    /// Issue #213 acceptance 4: enough malformed lines on an otherwise
+    /// successful fetch → the rules go live AND `last_error` carries the
+    /// warning so the UI badge shows it.
+    #[tokio::test]
+    async fn fetch_and_cache_source_warns_when_error_lines_exceed_threshold() {
+        use mhost_storage::adblock as adblock_store;
+        use mhost_storage::storage::FileStorage;
+
+        let listener = bind_mock_listener();
+        let port = listener.local_addr().unwrap().port();
+        // 100 valid hosts lines + 10 bare-domain lines: 10 >=
+        // PARSE_ERROR_WARN_MIN and 10 > 100 / PARSE_ERROR_WARN_RATIO_DEN.
+        let mut body = String::new();
+        for i in 0..100 {
+            body.push_str(&format!("0.0.0.0 good{}.example.com\n", i));
+        }
+        for i in 0..10 {
+            body.push_str(&format!("bad{}.example.com\n", i));
+        }
+        let responses = std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::VecDeque::from(vec![MockResponse::ok_200("\"v1\"", body.as_bytes())]),
+        ));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_h, _recorded) = spawn_mock_http(listener, responses, stop.clone());
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = std::sync::Arc::new(FileStorage::new(temp.path()))
+            as std::sync::Arc<dyn mhost_storage::storage::Storage + Send + Sync>;
+        let ad_block_state = std::sync::Arc::new(tokio::sync::RwLock::new(AdBlockState::default()));
+
+        let source_id = SourceId(uuid::Uuid::new_v4());
+        {
+            let mut g = ad_block_state.write().await;
+            g.sources.push(AdBlockSource {
+                source_id: source_id.clone(),
+                name: "noisy".into(),
+                url: format!("http://127.0.0.1:{}/list", port),
+                enabled: true,
+                response: AdBlockResponse::ZeroAddress,
+                format: BlocklistFormat::Hosts,
+                last_fetched_at: None,
+                last_error: None,
+                rule_count: 0,
+                etag: None,
+                rules_limit_override: None,
+                last_refresh_duration_ms: None,
+                last_refresh_failed_at: None,
+            });
+        }
+
+        fetch_and_cache_source(&storage, &ad_block_state, &source_id, false)
+            .await
+            .expect("fetch succeeds — the warning is advisory");
+
+        let snap = {
+            let g = ad_block_state.read().await;
+            adblock_store::find_source(&g, &source_id).cloned().unwrap()
+        };
+        assert_eq!(snap.rule_count, 100, "valid rules still go live");
+        let warning = snap.last_error.expect("warning recorded");
+        assert!(warning.contains("10 lines failed to parse"), "{}", warning);
+        assert!(warning.contains("format"), "{}", warning);
+
+        stop_mock(&stop, _h);
     }
 }
