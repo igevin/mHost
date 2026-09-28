@@ -1051,6 +1051,67 @@ mod tests {
             "tick must follow the NEW interval, not the spawn-time 168h one; elapsed={elapsed:?}"
         );
     }
+
+    /// **issue #153（review #231 跟进）**：探测失败的错误分类。
+    ///
+    /// 原来所有失败一律 `InvalidInput`。这不是分类，是偷懒 —— 而且
+    /// 会骗到人：非 macOS 上的
+    /// 「invalid input: system DNS probe is only supported on macOS」
+    /// 暗示用户输入了什么东西，而用户根本没输入。
+    #[test]
+    fn test_map_probe_error_classification() {
+        use mhost_dns::platform::PlatformError;
+
+        // 平台限制 → Unsupported（不是 InvalidInput）。
+        let mapped = map_probe_error(PlatformError::UnsupportedPlatform(
+            "system DNS probe is only supported on macOS",
+        ));
+        match &mapped {
+            MhostError::Unsupported(msg) => {
+                assert_eq!(msg, "system DNS probe is only supported on macOS")
+            }
+            other => panic!("expected Unsupported, got {:?}", other),
+        }
+        // Display 必须读成平台限制，不能出现 "invalid input"。
+        let display = mapped.to_string();
+        assert!(
+            display.starts_with("unsupported on this platform:"),
+            "unexpected display: {}",
+            display
+        );
+        assert!(
+            !display.contains("invalid input"),
+            "a platform limitation must never read as invalid input: {}",
+            display
+        );
+
+        // 读 OS 失败 → Io + 固定 kind（前端据此识别来源）。
+        // PlatformError 不 Clone，所以每种情况各自构造一次。
+        let cases: Vec<(&str, PlatformError)> = vec![
+            (
+                "detect_interface",
+                PlatformError::DetectInterface("route failed".into()),
+            ),
+            (
+                "get_dns",
+                PlatformError::GetDns("networksetup failed".into()),
+            ),
+            (
+                "invalid_interface_name",
+                PlatformError::InvalidInterfaceName("bad; name".into()),
+            ),
+            ("empty_interface_name", PlatformError::EmptyInterfaceName),
+        ];
+        for (name, e) in cases {
+            match map_probe_error(e) {
+                MhostError::Io { kind, message } => {
+                    assert_eq!(kind, "system-dns-probe", "case: {}", name);
+                    assert!(!message.is_empty(), "case: {}", name);
+                }
+                other => panic!("case {}: expected Io, got {:?}", name, other),
+            }
+        }
+    }
 }
 
 /// 获取 DNS 服务运行状态。
@@ -1107,6 +1168,31 @@ pub async fn get_dns_status(
 ///
 /// 非 macOS（DNS mode 尚未支持，见 #67）返回
 /// `UnsupportedPlatform` 错误；前端会静默吞掉，不影响其它功能。
+/// **issue #153（review #231 跟进）**：探测错误 → IPC 错误的映射。
+///
+/// 原来所有失败一律 `InvalidInput`，但探测失败里没有一类是「输入无效」：
+///
+/// - `UnsupportedPlatform` 是**平台限制**（DNS mode 目前 macOS-only，#67）
+///   → `MhostError::Unsupported`。当前前端两边都静默吞掉，没有行为差异；
+///   但一旦有人把这个 message 渲染给用户，写成「invalid input: system
+///   DNS probe is only supported on macOS」是在骗人。
+/// - 其余（`route` 找不到默认路由、`networksetup` 失败、接口名非法）都是
+///   **读 OS 失败** → `MhostError::Io` + `kind: "system-dns-probe"`，
+///   `extractErrorMessage` 渲染成 `<message> (system-dns-probe)`。
+///
+/// 抽成独立函数而不是内联在闭包里：这样这段「为什么不是 InvalidInput」
+/// 的理由不会随着闭包一起被压扁掉。
+fn map_probe_error(e: mhost_dns::platform::PlatformError) -> MhostError {
+    use mhost_dns::platform::PlatformError;
+    match e {
+        PlatformError::UnsupportedPlatform(msg) => MhostError::Unsupported(msg.to_string()),
+        other => MhostError::Io {
+            kind: "system-dns-probe".to_string(),
+            message: other.to_string(),
+        },
+    }
+}
+
 #[tauri::command]
 pub async fn probe_system_dns() -> Result<SystemDnsSnapshot, MhostError> {
     // `route` / `networksetup` 是同步 syscall，可能因 wedged configd
@@ -1114,10 +1200,11 @@ pub async fn probe_system_dns() -> Result<SystemDnsSnapshot, MhostError> {
     // 与 set_dns_mode_enable 里 capture_dns_state 的处理同款（issue #214）。
     let snapshot = tokio::task::spawn_blocking(mhost_dns::platform::probe_system_dns_state)
         .await
-        .map_err(|e| {
-            MhostError::InvalidInput(format!("probe system dns blocking task join failed: {}", e))
+        .map_err(|e| MhostError::Io {
+            kind: "system-dns-probe".to_string(),
+            message: format!("probe blocking task join failed: {}", e),
         })?
-        .map_err(|e| MhostError::InvalidInput(format!("probe system dns failed: {}", e)))?;
+        .map_err(map_probe_error)?;
     tracing::debug!(
         "probe_system_dns: interface={} servers={:?} points_at_loopback={}",
         snapshot.interface,

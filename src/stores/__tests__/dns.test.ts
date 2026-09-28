@@ -16,6 +16,7 @@ vi.mock("../../lib/tauri", () => ({
   probeSystemDns: vi.fn().mockResolvedValue(null),
 }));
 
+import type { SystemDnsSnapshot } from "../../types";
 import {
   toggleDnsModeAtom,
   cancelActiveDnsToggle,
@@ -416,5 +417,117 @@ describe("fetchDnsModeAtom with probe (issue #153)", () => {
     expect(store.get(dnsErrorAtom)).toBeNull();
     // 只有探测那部分降级。
     expect(store.get(systemDnsAtom)).toBeNull();
+  });
+});
+
+/**
+ * 回归测试（issue #153，review #231 跟进）：晚到的旧代探测必须被丢弃。
+ *
+ * 竞态形态：启动时的探测 P1 因 wedged configd 卡住；期间用户完成一次
+ * toggle，P2 已经拿到**新**快照并写入 atom；P1 随后返回，若无守卫就会用
+ * **toggle 之前**的旧快照覆盖 P2，横幅短暂指向错误方向。
+ *
+ * 用可控 deferred promise 精确复现这个时序：让 P1 一直 pending，先跑
+ * P2 落地，再让 P1 返回。
+ */
+describe("late-arriving probe is discarded (issue #153)", () => {
+  const store = getDefaultStore();
+
+  /** 一个由测试手动 resolve 的探测 promise。 */
+  function deferred() {
+    let resolve!: (v: SystemDnsSnapshot) => void;
+    let reject!: (e: unknown) => void;
+    const promise = new Promise<SystemDnsSnapshot>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return { promise, resolve, reject };
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    store.set(dnsEnabledAtom, false);
+    store.set(systemDnsAtom, null);
+    store.set(dnsErrorAtom, null);
+    store.set(isDnsLoadingAtom, false);
+    (getDnsMode as unknown as { mockResolvedValue: (v: unknown) => void })
+      .mockResolvedValue(false);
+    (getDnsStatus as unknown as { mockResolvedValue: (v: unknown) => void })
+      .mockResolvedValue(null);
+  });
+
+  it("a slow older probe must not overwrite a newer probe's snapshot", async () => {
+    const P1 = deferred(); // 启动探测：卡住（wedged configd）
+    const P2 = deferred(); // toggle 后的 re-probe
+
+    // 返回类型也要是 mock 本身，否则链式第二次调用过不了 tsc。
+    const asProbeMock = probeSystemDns as unknown as {
+      mockReturnValueOnce: (v: unknown) => { mockReturnValueOnce: (v: unknown) => void };
+    };
+    asProbeMock.mockReturnValueOnce(P1.promise).mockReturnValueOnce(P2.promise);
+
+    // P1 起飞（不 await —— 它还没返回）。
+    const p1Task = store.set(probeSystemDnsAtom);
+    // P2 起飞并先落地：系统 DNS 现在指向 mHost。
+    const p2Task = store.set(probeSystemDnsAtom);
+    P2.resolve({
+      interface: "Wi-Fi",
+      servers: ["127.0.0.1"],
+      points_at_loopback: true,
+    });
+    await p2Task;
+    expect(store.get(systemDnsAtom)).toEqual({
+      interface: "Wi-Fi",
+      servers: ["127.0.0.1"],
+      points_at_loopback: true,
+    });
+
+    // P1 现在才返回，带的是 toggle **之前**的状态：用户把 DNS 关了，
+    // 系统回到公网 DNS。
+    P1.resolve({
+      interface: "Wi-Fi",
+      servers: ["8.8.8.8"],
+      points_at_loopback: false,
+    });
+    await p1Task;
+
+    // 代数守卫必须让 P1 的结果作废 —— 否则这里会变成 8.8.8.8，
+    // 横幅也会短暂指向 not_pointing 这个错误方向。
+    expect(store.get(systemDnsAtom)).toEqual({
+      interface: "Wi-Fi",
+      servers: ["127.0.0.1"],
+      points_at_loopback: true,
+    });
+  });
+
+  it("a late *failure* must not wipe a newer probe's snapshot either", async () => {
+    const P1 = deferred();
+    const P2 = deferred();
+    // 返回类型也要是 mock 本身，否则链式第二次调用过不了 tsc。
+    const asProbeMock = probeSystemDns as unknown as {
+      mockReturnValueOnce: (v: unknown) => { mockReturnValueOnce: (v: unknown) => void };
+    };
+    asProbeMock.mockReturnValueOnce(P1.promise).mockReturnValueOnce(P2.promise);
+
+    const p1Task = store.set(probeSystemDnsAtom);
+    const p2Task = store.set(probeSystemDnsAtom);
+    P2.resolve({
+      interface: "Wi-Fi",
+      servers: ["127.0.0.1"],
+      points_at_loopback: true,
+    });
+    await p2Task;
+
+    // P1 失败（比如它启动时用户还没联网，probe 耗了几秒才返回错误）。
+    // 无守卫的话这里走 catch 分支把 P2 的快照擦成 null，横幅无缘无故消失。
+    P1.reject(new Error("route: no default route"));
+    await p1Task;
+
+    expect(store.get(systemDnsAtom)).toEqual({
+      interface: "Wi-Fi",
+      servers: ["127.0.0.1"],
+      points_at_loopback: true,
+    });
+    expect(store.get(dnsErrorAtom)).toBeNull();
   });
 });

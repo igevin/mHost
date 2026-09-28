@@ -8,6 +8,7 @@
  *   MhostError::Io { kind, message }      → { Io: { kind, message } }
  *   MhostError::InvalidInput(String)      → { InvalidInput: "…" }
  *   MhostError::Network(String)           → { Network: "…" }
+ *   MhostError::Unsupported(String)       → { Unsupported: "…" }
  *   MhostError::ExternalApi(String)       → { ExternalApi: "…" }
  *   MhostError::Parse(ParseError)         → { Parse: { <variant>: <payload> } }
  *   MhostError::Apply(ApplyError)         → { Apply: { <variant>: <payload> } }
@@ -49,6 +50,13 @@ export function extractErrorMessage(err: unknown): string {
     // unexpected path never leaks the raw JSON envelope to the UI.
     if (typeof obj.PreviewRequired === "string") {
       return `preview required: ${obj.PreviewRequired}`;
+    }
+
+    // MhostError::Unsupported(String) — issue #153. A platform limitation,
+    // NOT a user input problem: "probe_system_dns only works on macOS"
+    // must never read as "invalid input: ...".
+    if (typeof obj.Unsupported === "string") {
+      return `unsupported on this platform: ${obj.Unsupported}`;
     }
 
     // MhostError::Network(String)

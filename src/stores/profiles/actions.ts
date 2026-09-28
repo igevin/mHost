@@ -1,5 +1,10 @@
 import { atom } from "jotai";
-import type { Profile, AdBlockResponse, BlocklistFormat } from "../../types";
+import type {
+  Profile,
+  AdBlockResponse,
+  BlocklistFormat,
+  SystemDnsSnapshot,
+} from "../../types";
 import {
   listProfiles,
   getProfile,
@@ -363,41 +368,91 @@ export const deleteSnapshotAtom = atom(null, async (get, set, id: string) => {
 // ---- DNS action atoms ----
 
 /**
+ * Issue #153（review #231 跟进）：探测代数守卫。
+ *
+ * 竞态形态：启动时 `fetchDnsModeAtom` 发出的探测 P1 若因 wedged configd
+ * 卡住几秒，期间用户完成了一次 toggle（`toggleDnsModeAtom` 的 re-probe
+ * P2 已经拿到新快照并写入 atom），P1 随后才返回 —— 它会把这份**toggle
+ * 之前**的旧快照覆盖回去，横幅可能短暂指向错误方向。
+ *
+ * 修法是给每次探测发一个递增代数，结果回来时若已经不是最新一代就
+ * 丢弃。所有写入 `systemDnsAtom` 的路径（focus / toggle 成功 / toggle
+ * 取消 / 启动）都必须走 {@link applyProbe}，否则守卫就漏了。
+ *
+ * 放在 Jotai 之外（模块级）的原因同 `activeDnsToggleController`：这是
+ * 跨 atom 的可变命令式状态，不该让每个订阅 `systemDnsAtom` 的组件在
+ * 每次发探测时都重渲染。
+ */
+let probeGeneration = 0;
+
+/**
+ * 发一次探测并标记代数。**永不 reject** —— `value` 为 null 表示「探测
+ * 不可用」（非 macOS / route 失败 / 没联网），和「还没探测过」在
+ * `dnsDiscrepancyAtom` 里是同一种语义：不报警。
+ *
+ * 不直接 set atom：调用方可能想先 await 完再决定（`fetchDnsModeAtom`
+ * 要把探测并进 `Promise.all`），所以把代数一起交回去。
+ */
+async function runProbe(): Promise<ProbeResult> {
+  const generation = ++probeGeneration;
+  try {
+    return { generation, value: await probeSystemDns() };
+  } catch (e) {
+    // 静默：探测是建议性功能，`route` 失败几乎总是因为用户没联网，
+    // 弹 toast 只会制造噪音。写 dnsErrorAtom 会更糟 —— Settings 页顶部
+    // 有 alert 区域，一条「route failed」会盖在页面上而用户无能为力。
+    console.warn("[mHost] probeSystemDns failed (treating as unavailable):", e);
+    return { generation, value: null };
+  }
+}
+
+/**
+ * 写入探测结果，但**丢弃晚到的旧代**。
+ *
+ * `null` 结果同样受代数保护：探测失败的 P1 也不能把更新的 P2 快照擦掉。
+ */
+function applyProbe(set: ProbeSetter, r: ProbeResult): void {
+  if (r.generation !== probeGeneration) {
+    // 已有更新的探测在飞（或已落地）—— 这份结果是过时的，丢掉。
+    return;
+  }
+  set(systemDnsAtom, r.value);
+}
+
+interface ProbeResult {
+  generation: number;
+  value: SystemDnsSnapshot | null;
+}
+
+/** Jotai write-atom 的 `set`，这里只用到写 `systemDnsAtom` 这一种。 */
+type ProbeSetter = (atom: typeof systemDnsAtom, value: SystemDnsSnapshot | null) => void;
+
+/**
  * Issue #153: 探测系统 DNS 的实际状态，写入 `systemDnsAtom`。
  *
- * **失败静默**：catch 后置 `systemDnsAtom = null`，不写 `dnsErrorAtom`、
- * 不弹 toast、不设 `isDnsLoadingAtom`。探测是**建议性**功能 —— `route`
- * 失败几乎总是因为用户没联网，这种场景弹错误只会制造噪音；而
- * `systemDnsAtom === null` 已经让 `dnsDiscrepancyAtom` 返回 null
- * （不显示横幅），语义上正好是「无从判断就不报警」。
+ * **失败静默**：见 {@link runProbe}。绝不 reject —— 调用方都是
+ * fire-and-forget 或并行 await，一个 reject 会连带污染主路径。
  *
- * 绝不 reject：调用方都是 fire-and-forget 或并行 await，一个 reject
- * 会连带污染主路径。
+ * **代数守卫**：见 {@link applyProbe}。
  */
 export const probeSystemDnsAtom = atom(null, async (_get, set) => {
-  try {
-    set(systemDnsAtom, await probeSystemDns());
-  } catch (e) {
-    set(systemDnsAtom, null);
-    console.warn("[mHost] probeSystemDns failed (treating as unavailable):", e);
-  }
+  applyProbe(set, await runProbe());
 });
 
 export const fetchDnsModeAtom = atom(null, async (_get, set) => {
   set(isDnsLoadingAtom, true);
   set(dnsErrorAtom, null);
   try {
-    // Issue #153: 探测与内存态 truth-fetch **并行**启动。`probeSystemDns()`
+    // Issue #153: 探测与内存态 truth-fetch **并行**启动。`runProbe()`
     // 自带 catch（永不 reject），所以不会拖垮也不会被主路径的 catch 吞掉。
-    const probe = probeSystemDns().catch(() => null);
     const [enabled, status, probed] = await Promise.all([
       getDnsMode(),
       getDnsStatus(),
-      probe,
+      runProbe(),
     ]);
     set(dnsEnabledAtom, enabled);
     set(dnsStatusAtom, status);
-    set(systemDnsAtom, probed);
+    applyProbe(set, probed);
   } catch (err) {
     set(dnsErrorAtom, extractErrorMessage(err));
     set(dnsStatusAtom, null);
@@ -460,6 +515,11 @@ export const toggleDnsModeAtom = atom(null, async (_get, set, enabled: boolean) 
   // 置 null 而不是改判定逻辑：整个 toggle 窗口内真相是「不知道」，
   // 而 `dnsDiscrepancyAtom` 对 null 返回 null（无从判断就不报警）——
   // 和探测失败的处理是同一条原则。
+  //
+  // **刻意不经过 `applyProbe` 的代数守卫**：这不是一次探测的结果，
+  // 而是「主动宣布现有结论失效」。代数守卫的语义是「新探测比旧探测新，
+  // 别被旧结果覆盖」；这里恰恰相反 —— 我们要在新探测回来之前先把结论
+  // 清空。若改成走守卫，一次更早的探测结果就会把它挡回来，假警报重现。
   set(systemDnsAtom, null);
 
   const ctrl = new AbortController();
@@ -490,9 +550,7 @@ export const toggleDnsModeAtom = atom(null, async (_get, set, enabled: boolean) 
     // Issue #153: toggle 之后重新探测 —— enable/disable 的部分失败正是
     // #152 那类分歧的高发时刻。不 await：探测是建议性的，不该让 toggle
     // 的 UI 卡在 loading 上；横幅晚几十毫秒出现无妨。
-    void probeSystemDns()
-      .then((probed) => set(systemDnsAtom, probed))
-      .catch(() => set(systemDnsAtom, null));
+    void runProbe().then((probed) => applyProbe(set, probed));
   } catch (err) {
     if (cancelled) {
       // 用户主动 cancel —— issue #149：
@@ -510,9 +568,7 @@ export const toggleDnsModeAtom = atom(null, async (_get, set, enabled: boolean) 
         set(dnsStatusAtom, status);
         // Issue #153: cancel 触发后端 rollback，rollback 期间正是系统 DNS
         // 可能停在 127.0.0.1 的时刻（#152 同款）。跟着拨正一次真值。
-        void probeSystemDns()
-          .then((probed) => set(systemDnsAtom, probed))
-          .catch(() => set(systemDnsAtom, null));
+        void runProbe().then((probed) => applyProbe(set, probed));
       } catch {
         // 后端 truth fetch 失败,保留旧 UI 状态,等下次 fetch。
       }

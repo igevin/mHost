@@ -30,6 +30,20 @@ pub enum MhostError {
     #[error("invalid input: {0}")]
     InvalidInput(String),
 
+    /// The requested OS-level capability doesn't exist on this platform.
+    ///
+    /// Distinct from [`MhostError::InvalidInput`] because the caller did
+    /// nothing wrong: `probe_system_dns` (issue #153) returns this on
+    /// non-macOS, where DNS mode itself isn't available yet (#67 tracks
+    /// Windows / Linux). Reporting a platform limitation as "invalid input"
+    /// would be a lie that surfaces verbatim if any future code path ever
+    /// renders the message to the user.
+    ///
+    /// Serializes as `{ Unsupported: "<reason>" }`; `extractErrorMessage`
+    /// renders it as `unsupported on this platform: <reason>`.
+    #[error("unsupported on this platform: {0}")]
+    Unsupported(String),
+
     /// A quick apply requested with `require_safe` was rejected because the
     /// change is destructive (conflicts, would disable another profile, or a
     /// bulk change over the threshold). The caller must fall back to the

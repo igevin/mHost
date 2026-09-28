@@ -696,10 +696,31 @@ pub(crate) fn probe_snapshot_from(
 /// 这样前端 TS 类型在所有平台保持一致。
 #[cfg(target_os = "macos")]
 pub fn probe_system_dns_state() -> Result<SystemDnsSnapshot, PlatformError> {
-    let interface = get_active_network_interface()?;
-    // get_active_network_interface 在返回前已跑过 validate_interface_name
-    // （issue #77 的 osascript 注入防护），这里直接复用其结果。
-    let raw_stdout = networksetup_get_dns_stdout(&interface)?;
+    probe_system_dns_state_with(get_active_network_interface, networksetup_get_dns_stdout)
+}
+
+/// 组合层核心，两个 IO 步骤都注入 —— 纯逻辑（除了注入的 IO 本身），
+/// 所以组合层也能在 CI 上单测。
+///
+/// **review #231 跟进**：上一版 `probe_system_dns_state` 把
+/// `get_active_network_interface` → 读数 → `probe_snapshot_from` 三步
+/// 写死在函数体里，护栏测试只覆盖了 `probe_snapshot_from`（纯函数层）。
+/// 于是「有人把组合层改成直接调**带过滤**的 `networksetup_get_dns`
+/// 再拼 snapshot」这条最现实的破坏路径**能让所有测试全绿** ——
+/// 它绕开的就是唯一被测的那一层。
+///
+/// 现在 IO 可注入，组合层本身有测试。
+///
+/// 注意这**不能**替代 `test_probe_read_path_wires_unfiltered_reader`：
+/// 注入的 reader 是测试自己给的，测不到真实 wiring 指向哪个 reader。
+/// 那条 source-grep 护栏才是钉死真实组合关系的，两条一起才完整。
+#[cfg(target_os = "macos")]
+fn probe_system_dns_state_with(
+    resolve_interface: impl Fn() -> Result<String, PlatformError>,
+    read_dns: impl Fn(&str) -> Result<String, PlatformError>,
+) -> Result<SystemDnsSnapshot, PlatformError> {
+    let interface = resolve_interface()?;
+    let raw_stdout = read_dns(&interface)?;
     probe_snapshot_from(&interface, &raw_stdout)
 }
 
@@ -2979,6 +3000,112 @@ Ethernet Address: aa:bb:cc:dd:ee:ff
             );
             assert_eq!(snapshot.interface, "Wi-Fi", "case: {}", c.name);
         }
+    }
+
+    /// **组合层护栏（issue #153，review #231 跟进）**：真实的
+    /// `probe_system_dns_state` 必须把 IO 接到**不过滤**的
+    /// `networksetup_get_dns_stdout` 上。
+    ///
+    /// 上一版护栏（`..._is_not_merged_with_capture_read_path`）只钉住了
+    /// 纯函数层，于是「组合层直接改调带过滤的 `networksetup_get_dns`」
+    /// 这条最现实的破坏路径能让全部测试全绿。注入式测试也测不到这一点
+    /// —— 注入的 reader 是测试自己给的。
+    ///
+    /// 所以这里用 source-grep 把真实 wiring 钉死（本仓库同类问题的既有
+    /// 手法，见 `test_try_recover_dns_reads_canonical_marker_path`）：
+    /// 匹配 `networksetup_get_dns(`（带左括号）而不是
+    /// `networksetup_get_dns`（不带）—— 后者是前者的前缀，会误伤
+    /// `networksetup_get_dns_stdout(`。
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_probe_read_path_wires_unfiltered_reader() {
+        let src = include_str!("platform.rs");
+
+        // 只看 probe_system_dns_state 的函数体（到下一个独立的 `}` 为止）。
+        let start = src
+            .find("pub fn probe_system_dns_state()")
+            .expect("probe_system_dns_state must exist");
+        let body_end = src[start..].find("\n}").expect("function must have a body");
+        let body = &src[start..start + body_end];
+
+        assert!(
+            body.contains("networksetup_get_dns_stdout"),
+            "probe_system_dns_state must wire the UNFILTERED reader \
+             (networksetup_get_dns_stdout). Wiring it to the capture-path \
+             reader silently disables issue #153 — points_at_loopback would \
+             be permanently false. body: {}",
+            body
+        );
+        assert!(
+            !body.contains("networksetup_get_dns("),
+            "probe_system_dns_state must NOT use the capture-path reader \
+             `networksetup_get_dns(` — it filters loopback (issue #152 root \
+             cause 2) and would make points_at_loopback permanently false. \
+             body: {}",
+            body
+        );
+    }
+
+    /// **组合层行为测试（issue #153，review #231 跟进）**：注入假的接口
+    /// 解析 + 假的读数函数，验证 `probe_system_dns_state_with` 的三步
+    /// 编排 —— 尤其是**读数函数收到的是解析出来的接口名**（而不是
+    /// 硬编码的 "Wi-Fi"），以及 raw stdout 原样透传给解析层（未被过滤）。
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_probe_system_dns_state_with_composition() {
+        // 1. happy path：假 reader 返回 127.0.0.1，必须原样到达判定层。
+        let snapshot = probe_system_dns_state_with(
+            || Ok("USB 10/100/1000 LAN".to_string()),
+            |iface| {
+                assert_eq!(
+                    iface, "USB 10/100/1000 LAN",
+                    "reader must receive the resolved interface"
+                );
+                Ok("127.0.0.1
+"
+                .to_string())
+            },
+        )
+        .expect("probe should succeed");
+        assert_eq!(snapshot.interface, "USB 10/100/1000 LAN");
+        assert_eq!(snapshot.servers, vec!["127.0.0.1".to_string()]);
+        assert!(
+            snapshot.points_at_loopback,
+            "127.0.0.1 must survive the composition layer"
+        );
+
+        // 2. 读数是公网 DNS → 不判定为接管。
+        let snapshot = probe_system_dns_state_with(
+            || Ok("Wi-Fi".to_string()),
+            |_| Ok("8.8.8.8\n1.1.1.1\n".to_string()),
+        )
+        .unwrap();
+        assert!(!snapshot.points_at_loopback);
+
+        // 3. 接口解析失败 → 短路，**不**调用读数函数。
+        //    用 Cell 而不是 `mut bool`：闭包是 `Fn`，不能改捕获的可变变量。
+        let reader_called = std::cell::Cell::new(false);
+        let err = probe_system_dns_state_with(
+            || Err(PlatformError::DetectInterface("no default route".into())),
+            |_| {
+                reader_called.set(true);
+                Ok("127.0.0.1\n".to_string())
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, PlatformError::DetectInterface(_)));
+        assert!(
+            !reader_called.get(),
+            "reader must not run when the interface is unknown"
+        );
+
+        // 4. 读数失败 → 向上传播。
+        let err = probe_system_dns_state_with(
+            || Ok("Wi-Fi".to_string()),
+            |_| Err(PlatformError::GetDns("networksetup exploded".into())),
+        )
+        .unwrap_err();
+        assert!(matches!(err, PlatformError::GetDns(_)));
     }
 
     /// **回归护栏（issue #153）**：`networksetup_get_dns_stdout`（探测用，
