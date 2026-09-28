@@ -31,6 +31,39 @@ export interface DnsStatus {
   cache_capacity: number;
 }
 
+/**
+ * Issue #153: OS 侧系统 DNS 的实际配置（`probe_system_dns` IPC）。
+ *
+ * 这是**独立于 Rust 内存态**的第二个数据源 —— `dnsEnabledAtom` 只反映
+ * 「mHost 认为 DNS 模式是开是关」，本快照反映「系统实际上指向哪里」。
+ * 两者分歧时（#152: disable 报告成功但系统仍卡在 127.0.0.1）Settings 页
+ * 会显示不一致横幅。
+ *
+ * 镜像 Rust `mhost_core::SystemDnsSnapshot`。
+ */
+export interface SystemDnsSnapshot {
+  /** 默认路由对应的 hardware port，如 `Wi-Fi`。 */
+  interface: string;
+  /**
+   * `networksetup -getdnsservers` 的原始条目，**未过滤**（含 `127.0.0.1`）。
+   * 仅用于展示。空数组 = 用户没手动配（DHCP 默认）。
+   */
+  servers: string[];
+  /** 任一条目指向 loopback / unspecified。 */
+  points_at_loopback: boolean;
+}
+
+/**
+ * Issue #153: `dnsEnabledAtom` 与 `SystemDnsSnapshot.points_at_loopback`
+ * 的分歧类型。`null` = 一致，或探测不可用（此时不显示横幅）。
+ *
+ * - `stuck_at_loopback` — 显示已关闭，但系统 DNS 仍指向 127.0.0.1。
+ *   **危险方向**：用户的网络解析可能已完全中断。可一键恢复。
+ * - `not_pointing` — 显示已开启，但系统 DNS 没指向 mHost。mHost 规则
+ *   未生效，但 DNS 本身还能用。仅提示，不提供一键修复。
+ */
+export type DnsDiscrepancy = "stuck_at_loopback" | "not_pointing";
+
 export interface HostRule {
   id: string;
   ip: string | null;

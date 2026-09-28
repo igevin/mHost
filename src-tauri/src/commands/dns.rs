@@ -2,7 +2,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use crate::state::{lock_or_recover, AppState};
-use mhost_core::{MhostError, OriginalDns, ProfileMode};
+use mhost_core::{MhostError, OriginalDns, ProfileMode, SystemDnsSnapshot};
 use tauri::State;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -1085,6 +1085,46 @@ pub async fn get_dns_status(
 
     let status = build(lock_or_recover(&state.dns_server).as_ref(), original_dns);
     Ok(status)
+}
+
+/// **issue #153**：探测 OS 上系统 DNS 的**实际**配置。
+///
+/// 与 `get_dns_mode` 的关系是刻意的互补而非重复：
+///
+/// - `get_dns_mode` 返回 `state.dns_enabled`（in-memory `AtomicBool`）
+///   —— 「mHost **认为** DNS 模式是开还是关」。
+/// - 本命令直接读 `networksetup` —— 「**系统实际上**指向哪里」。
+///
+/// #152 的 bug（`disable` 报告成功、系统 DNS 仍卡在 127.0.0.1）之所以让
+/// 用户完全无计可施，正是因为当时前端**只有前一个数据源**：Rust 说关了，
+/// 而真相在另一个进程手里，没人去读。
+///
+/// 纯只读 —— 不写文件、不改系统 DNS、不需要 sudo，因此可以在启动 /
+/// 每次 toggle / 窗口重新聚焦这些时机无副作用地调用。
+///
+/// 签名**不带** `State<'_, AppState>`：探测不依赖任何应用状态，这正是
+/// 它的价值所在（内存态已经不可信时，探测仍要能给出真值）。
+///
+/// 非 macOS（DNS mode 尚未支持，见 #67）返回
+/// `UnsupportedPlatform` 错误；前端会静默吞掉，不影响其它功能。
+#[tauri::command]
+pub async fn probe_system_dns() -> Result<SystemDnsSnapshot, MhostError> {
+    // `route` / `networksetup` 是同步 syscall，可能因 wedged configd
+    // 阻塞调用线程。包 spawn_blocking 防止占死 tokio worker ——
+    // 与 set_dns_mode_enable 里 capture_dns_state 的处理同款（issue #214）。
+    let snapshot = tokio::task::spawn_blocking(mhost_dns::platform::probe_system_dns_state)
+        .await
+        .map_err(|e| {
+            MhostError::InvalidInput(format!("probe system dns blocking task join failed: {}", e))
+        })?
+        .map_err(|e| MhostError::InvalidInput(format!("probe system dns failed: {}", e)))?;
+    tracing::debug!(
+        "probe_system_dns: interface={} servers={:?} points_at_loopback={}",
+        snapshot.interface,
+        snapshot.servers,
+        snapshot.points_at_loopback
+    );
+    Ok(snapshot)
 }
 /// Abort the periodic ad-block refresh task if one is registered.
 ///

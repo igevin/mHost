@@ -13,6 +13,7 @@ import {
   fetchDnsProfilesAtom,
   fetchDnsModeAtom,
   fetchAdBlockStateAtom,
+  probeSystemDnsAtom,
 } from "./stores/profiles";
 
 function App() {
@@ -20,6 +21,7 @@ function App() {
   const fetchDnsProfiles = useSetAtom(fetchDnsProfilesAtom);
   const fetchDnsMode = useSetAtom(fetchDnsModeAtom);
   const fetchAdBlock = useSetAtom(fetchAdBlockStateAtom);
+  const probeSystemDns = useSetAtom(probeSystemDnsAtom);
   const navigate = useNavigate();
 
   useEffect(() => {
@@ -65,6 +67,39 @@ function App() {
       unlistenNavigate.then((fn) => fn()).catch(() => {});
     };
   }, [fetchProfiles, fetchDnsProfiles, fetchDnsMode, fetchAdBlock, navigate]);
+
+  /**
+   * Issue #153: 窗口重新获得焦点时重新探测系统 DNS。
+   *
+   * 覆盖「用户在 mHost 开着的时候，在 System Settings 或别的工具里改了
+   * 系统 DNS」这个场景 —— 启动时的探测看不到它，但用户切回 app 的瞬间
+   * 就是天然的复检时机（而且比任何定时器都便宜：只有真的切回来才跑）。
+   *
+   * 两道闸门防止来回切窗口时刷 IPC：
+   * - in-flight 标志：上一次探测还没回来就不再发一次
+   * - 1s 冷却：macOS 上 focus 事件会成簇触发（点标题栏、Cmd-Tab
+   *   回弹、点通知中心再点回来……）
+   *
+   * 探测失败由 `probeSystemDnsAtom` 自己吞掉，这里不处理。
+   */
+  useEffect(() => {
+    let inFlight = false;
+    let lastProbeAt = 0;
+    const COOLDOWN_MS = 1000;
+
+    const onFocus = () => {
+      const now = Date.now();
+      if (inFlight || now - lastProbeAt < COOLDOWN_MS) return;
+      inFlight = true;
+      lastProbeAt = now;
+      probeSystemDns().finally(() => {
+        inFlight = false;
+      });
+    };
+
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [probeSystemDns]);
 
   return (
     <Routes>

@@ -670,6 +670,59 @@ pub struct DnsStatus {
 }
 
 // ---------------------------------------------------------------------------
+// SystemDnsSnapshot (issue #153)
+// ---------------------------------------------------------------------------
+
+/// **issue #153**：系统 DNS 的**只读真相快照**，由 `probe_system_dns` IPC
+/// 直接从 OS 读出（`networksetup -getdnsservers`），不经过任何 Rust 内存
+/// 状态。
+///
+/// 与 [`DnsStatus`] 的区别是本 issue 的核心：
+///
+/// - `DnsStatus` 是 **mHost 自己视角**的运行态（`DnsServer` 是否在跑、
+///   `state.dns_enabled` 捕获的 original…）。它只反映「mHost 认为自己是
+///   什么状态」。
+/// - `SystemDnsSnapshot` 是 **OS 视角**的实际配置。两者可能不一致 ——
+///   #152（DNS 关掉后卡在 127.0.0.1）就是这类分歧的实例，而当时前端
+///   根本没有第二个数据源能发现它。
+///
+/// `servers` **保留原始未过滤内容**（含 `127.0.0.1`），仅供 UI 展示；
+/// 判定 `points_at_loopback` 一律走 [`is_local_resolver`]。
+///
+/// **不要用这个类型替换 `capture_dns_state()` 的返回类型**：后者服务于
+/// 「用户的原始 DNS 是什么」并**必须**过滤掉 loopback（#152 root cause 2：
+/// 把 mHost 自己注入的 `127.0.0.1` 当成用户原始值持久化，会永久污染后续
+/// 还原）。两者语义相反，任何「顺手合并」都会重新引入那个 bug。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SystemDnsSnapshot {
+    /// 默认路由对应的 hardware port（如 `Wi-Fi`、`USB 10/100/1000 LAN`）。
+    pub interface: String,
+    /// `networksetup -getdnsservers` 的原始条目，**未过滤**。
+    /// 空 = 用户没手动配（DHCP 默认）。
+    pub servers: Vec<String>,
+    /// 任一条目指向 loopback / unspecified。
+    pub points_at_loopback: bool,
+}
+
+impl SystemDnsSnapshot {
+    /// 从接口名 + 原始 server 列表构造，`points_at_loopback` 由
+    /// [`is_local_resolver`] 推导。
+    ///
+    /// 语义是 **any**（不是 all）：enable 路径把系统 DNS 设成单个
+    /// `127.0.0.1`，所以 any 命中即代表「mHost 在接管」。混排
+    /// （`127.0.0.1, 8.8.8.8`）按接管处理 —— 保守方向，与
+    /// `platform::any_local_resolver`（#152 hardening Step 3）一致。
+    pub fn new(interface: impl Into<String>, servers: Vec<String>) -> Self {
+        let points_at_loopback = servers.iter().any(|s| is_local_resolver(s));
+        Self {
+            interface: interface.into(),
+            servers,
+            points_at_loopback,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1454,5 +1507,133 @@ mod tests {
         let r: ApplyMode = serde_json::from_str("\"require_preview\"").unwrap();
         assert_eq!(q, ApplyMode::QuickApply);
         assert_eq!(r, ApplyMode::RequirePreview);
+    }
+
+    // -----------------------------------------------------------------------
+    // SystemDnsSnapshot tests (issue #153)
+    // -----------------------------------------------------------------------
+
+    /// `points_at_loopback` 判定是 issue #153 整个特性的地基：前端拿它和
+    /// `dnsEnabledAtom` 对比来决定是否报不一致。判定错 = 用户要么被假警报
+    /// 骚扰，要么在真卡住时看不到横幅。
+    ///
+    /// 表格驱动覆盖：
+    /// - `127.0.0.1` / `::1` / `0.0.0.0` → true（loopback + unspecified）
+    /// - `host:port` / `[v6]:port` 形式也走 is_local_resolver 的解析
+    /// - 公共 DNS → false
+    /// - 空列表（DHCP 默认）→ false
+    /// - **混排 any 语义**：`127.0.0.1, 8.8.8.8` → true
+    #[test]
+    fn test_system_dns_snapshot_points_at_loopback() {
+        struct Case {
+            name: &'static str,
+            servers: Vec<&'static str>,
+            expected: bool,
+        }
+        let cases = vec![
+            Case {
+                name: "single_ipv4_loopback",
+                servers: vec!["127.0.0.1"],
+                expected: true,
+            },
+            Case {
+                name: "ipv6_loopback",
+                servers: vec!["::1"],
+                expected: true,
+            },
+            Case {
+                name: "ipv4_unspecified",
+                servers: vec!["0.0.0.0"],
+                expected: true,
+            },
+            Case {
+                name: "loopback_with_port",
+                servers: vec!["127.0.0.1:53"],
+                expected: true,
+            },
+            Case {
+                name: "bracketed_ipv6_loopback_with_port",
+                servers: vec!["[::1]:53"],
+                expected: true,
+            },
+            Case {
+                name: "public_resolvers",
+                servers: vec!["8.8.8.8", "1.1.1.1"],
+                expected: false,
+            },
+            Case {
+                name: "empty_dhcp_default",
+                servers: vec![],
+                expected: false,
+            },
+            // any 语义：只要有一条指向 loopback 就算接管。enable 路径把
+            // 系统 DNS 设成单个 127.0.0.1，混排是异常状态但仍要按接管
+            // 判定（保守方向，与 platform::any_local_resolver 一致）。
+            Case {
+                name: "mixed_loopback_first_is_any_semantics",
+                servers: vec!["127.0.0.1", "8.8.8.8"],
+                expected: true,
+            },
+            // 畸形字符串按「非本地」处理（is_local_resolver 的既有契约）。
+            Case {
+                name: "malformed_entry_is_not_loopback",
+                servers: vec!["not-an-ip"],
+                expected: false,
+            },
+        ];
+
+        for c in cases {
+            let snapshot =
+                SystemDnsSnapshot::new("Wi-Fi", c.servers.iter().map(|s| s.to_string()).collect());
+            assert_eq!(snapshot.points_at_loopback, c.expected, "case: {}", c.name);
+            assert_eq!(snapshot.interface, "Wi-Fi", "case: {}", c.name);
+            assert_eq!(snapshot.servers.len(), c.servers.len(), "case: {}", c.name);
+        }
+    }
+
+    /// `servers` 必须**原样保留**（含 loopback），只用于 UI 展示。
+    ///
+    /// 如果这里有人「顺手」加个 filter（因为 #152 在 `capture_dns_state`
+    /// 路径上加过一次），探测会永远返回空列表，`points_at_loopback` 恒为
+    /// false，issue #153 静默退化成 no-op —— 且不会有任何测试失败。
+    /// 这个断言就是那堵墙。
+    #[test]
+    fn test_system_dns_snapshot_preserves_loopback_in_servers() {
+        let snapshot = SystemDnsSnapshot::new("Wi-Fi", vec!["127.0.0.1".to_string()]);
+        assert_eq!(
+            snapshot.servers,
+            vec!["127.0.0.1".to_string()],
+            "servers must be the RAW networksetup output — filtering here silently \
+             disables issue #153's probe"
+        );
+        assert!(snapshot.points_at_loopback);
+    }
+
+    #[test]
+    fn test_system_dns_snapshot_serde_roundtrip() {
+        let cases = vec![
+            (
+                "loopback",
+                SystemDnsSnapshot::new("Wi-Fi", vec!["127.0.0.1".into()]),
+            ),
+            (
+                "public",
+                SystemDnsSnapshot::new("Ethernet", vec!["1.1.1.1".into()]),
+            ),
+            ("empty", SystemDnsSnapshot::new("Wi-Fi", vec![])),
+        ];
+
+        for (name, snapshot) in cases {
+            let json = serde_json::to_string(&snapshot).unwrap();
+            let restored: SystemDnsSnapshot = serde_json::from_str(&json).unwrap();
+            assert_eq!(snapshot, restored, "case: {}", name);
+            // points_at_loopback 必须在线上（前端直接读这个字段决定横幅）。
+            let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert!(
+                parsed.get("points_at_loopback").is_some(),
+                "case {}: points_at_loopback missing from wire format",
+                name
+            );
+        }
     }
 }

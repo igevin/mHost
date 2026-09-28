@@ -30,6 +30,10 @@ vi.mock("./lib/tauri", () => ({
     auto_refresh_enabled: true,
     refresh_interval_hours: 24,
   }),
+  // DNS truth-fetch + 系统 DNS 探测（issue #153）— App 在 mount 时并发调用。
+  getDnsMode: vi.fn().mockResolvedValue(false),
+  getDnsStatus: vi.fn().mockResolvedValue(null),
+  probeSystemDns: vi.fn().mockResolvedValue(null),
 }));
 
 vi.mock("@tauri-apps/plugin-dialog", () => ({

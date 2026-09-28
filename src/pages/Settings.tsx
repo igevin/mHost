@@ -8,6 +8,9 @@ import {
   cancelActiveDnsToggle,
   dnsErrorAtom,
   quickApplyOnToggleAtom,
+  // issue #153
+  systemDnsAtom,
+  dnsDiscrepancyAtom,
 } from "../stores/profiles";
 import { useWebKitPointerDown } from "../hooks/useWebKitPointerDown";
 import { checkUpdate } from "../lib/tauri";
@@ -19,6 +22,9 @@ function Settings() {
   const dnsStatus = useAtomValue(dnsStatusAtom);
   const isDnsLoading = useAtomValue(isDnsLoadingAtom);
   const dnsError = useAtomValue(dnsErrorAtom);
+  // issue #153: 系统 DNS 实际状态 vs mHost 内存态的分歧
+  const systemDns = useAtomValue(systemDnsAtom);
+  const dnsDiscrepancy = useAtomValue(dnsDiscrepancyAtom);
   const toggleDnsMode = useSetAtom(toggleDnsModeAtom);
   // issue #149 / #123 follow-up: DNS toggle must dedupe pointerdown + click.
   // The `useWebKitPointerDown.onPointerDown` wrapper is NOT used here —
@@ -203,6 +209,81 @@ function Settings() {
         {/* DNS Mode Card */}
         <div className="card">
           <h3 className="card-title">DNS Mode</h3>
+          {/*
+            Issue #153: `dnsEnabledAtom`（Rust 内存态）与系统 DNS 实际状态
+            分歧时的横幅。
+
+            两种方向的用户含义完全不同，所以处理方式也不同：
+
+            - `stuck_at_loopback`（显示 Stopped，但系统仍指向 127.0.0.1）
+              —— **危险**：用户的 DNS 已经指向一个没人监听的地址，解析会
+              直接失败。给一键恢复：调 `set_dns_mode(false)`。该后端路径
+              **没有**「已禁用就短路」的分支（`set_dns_mode_disable` 直接
+              走 `disable_dns_mode()`），所以即使内存态已经是 false，它仍
+              会真的执行系统 DNS 还原 —— 这正是这里需要的能力。
+
+            - `not_pointing`（显示 Running，但系统没指向 mHost）
+              —— **不危险**：DNS 本身还能用，只是 mHost 的规则没生效。
+              只提示，不给一键修复 —— 要修就得重启 enable 流程
+              （disable → enable），那会弹两次 sudo 并重建 DNS server，
+              为「省一次手动开关」在特权路径上新增代码不值得
+              （见 issue #153 的 Assumptions）。
+          */}
+          {dnsDiscrepancy && (
+            <div
+              className={styles.dnsDiscrepancyBanner}
+              data-testid="dns-discrepancy-banner"
+              data-discrepancy={dnsDiscrepancy}
+              role="alert"
+            >
+              <div className={styles.dnsDiscrepancyText}>
+                <div className={styles.dnsDiscrepancyTitle}>
+                  {dnsDiscrepancy === "stuck_at_loopback"
+                    ? "System DNS still points at mHost"
+                    : "System DNS does not point at mHost"}
+                </div>
+                <div className={styles.dnsDiscrepancyDetail}>
+                  {dnsDiscrepancy === "stuck_at_loopback" ? (
+                    <>
+                      mHost reports DNS mode as{" "}
+                      <strong>Stopped</strong>, but your system DNS is{" "}
+                      <strong>{systemDns?.servers.join(", ") || "127.0.0.1"}</strong>{" "}
+                      on {systemDns?.interface}. Domain resolution may be
+                      broken right now.
+                    </>
+                  ) : (
+                    <>
+                      mHost reports DNS mode as <strong>Running</strong>, but{" "}
+                      {systemDns?.interface} is using{" "}
+                      <strong>
+                        {systemDns && systemDns.servers.length > 0
+                          ? systemDns.servers.join(", ")
+                          : "the system default"}
+                      </strong>
+                      . mHost rules are not being applied. Toggle DNS mode
+                      off and on to re-apply.
+                    </>
+                  )}
+                </div>
+              </div>
+              {dnsDiscrepancy === "stuck_at_loopback" && (
+                <button
+                  className="btn btn-sm btn-primary"
+                  disabled={isDnsLoading}
+                  data-testid="dns-restore-button"
+                  // 复用主开关的 handler（不要在这里自己调 `fire()`：
+                  // `useWebKitPointerDown` 的 firedRef 只在
+                  // `releaseSoon()` 里复位，只 fire 不 release 会让这个
+                  // 按钮在 Settings 挂载期内**永久失效**一次点击）。
+                  // 语义也正好是我们要的：后端 disable 路径会真的跑一次
+                  // 系统 DNS 还原，不依赖内存态是否为 false。
+                  onClick={() => handleToggleDns(false)}
+                >
+                  {isDnsLoading ? "Restoring…" : "Restore system DNS"}
+                </button>
+              )}
+            </div>
+          )}
           <div className={styles.dnsStatusRow}>
             <span className={styles.dnsStatusLabel}>Status:</span>
             <span className={dnsEnabled ? styles.dnsStatusOn : styles.dnsStatusOff}>

@@ -16,6 +16,7 @@ import {
   deleteSnapshot,
   getDnsMode,
   getDnsStatus,
+  probeSystemDns,
   setDnsMode,
   cancelDnsMode,
   reloadDnsRules,
@@ -62,6 +63,7 @@ import {
   dnsStatusAtom,
   isDnsLoadingAtom,
   dnsErrorAtom,
+  systemDnsAtom,
   adBlockStateAtom,
   isAdBlockLoadingAtom,
   adBlockErrorAtom,
@@ -360,14 +362,42 @@ export const deleteSnapshotAtom = atom(null, async (get, set, id: string) => {
 
 // ---- DNS action atoms ----
 
+/**
+ * Issue #153: 探测系统 DNS 的实际状态，写入 `systemDnsAtom`。
+ *
+ * **失败静默**：catch 后置 `systemDnsAtom = null`，不写 `dnsErrorAtom`、
+ * 不弹 toast、不设 `isDnsLoadingAtom`。探测是**建议性**功能 —— `route`
+ * 失败几乎总是因为用户没联网，这种场景弹错误只会制造噪音；而
+ * `systemDnsAtom === null` 已经让 `dnsDiscrepancyAtom` 返回 null
+ * （不显示横幅），语义上正好是「无从判断就不报警」。
+ *
+ * 绝不 reject：调用方都是 fire-and-forget 或并行 await，一个 reject
+ * 会连带污染主路径。
+ */
+export const probeSystemDnsAtom = atom(null, async (_get, set) => {
+  try {
+    set(systemDnsAtom, await probeSystemDns());
+  } catch (e) {
+    set(systemDnsAtom, null);
+    console.warn("[mHost] probeSystemDns failed (treating as unavailable):", e);
+  }
+});
+
 export const fetchDnsModeAtom = atom(null, async (_get, set) => {
   set(isDnsLoadingAtom, true);
   set(dnsErrorAtom, null);
   try {
-    const enabled = await getDnsMode();
+    // Issue #153: 探测与内存态 truth-fetch **并行**启动。`probeSystemDns()`
+    // 自带 catch（永不 reject），所以不会拖垮也不会被主路径的 catch 吞掉。
+    const probe = probeSystemDns().catch(() => null);
+    const [enabled, status, probed] = await Promise.all([
+      getDnsMode(),
+      getDnsStatus(),
+      probe,
+    ]);
     set(dnsEnabledAtom, enabled);
-    const status = await getDnsStatus();
     set(dnsStatusAtom, status);
+    set(systemDnsAtom, probed);
   } catch (err) {
     set(dnsErrorAtom, extractErrorMessage(err));
     set(dnsStatusAtom, null);
@@ -419,6 +449,18 @@ export function cancelActiveDnsToggle(): void {
 export const toggleDnsModeAtom = atom(null, async (_get, set, enabled: boolean) => {
   set(isDnsLoadingAtom, true);
   set(dnsErrorAtom, null);
+  // Issue #153: 同步作废旧探测结果。
+  //
+  // 不这么做会闪一条假警报：disable 成功时 `dnsEnabledAtom` 先翻成 false，
+  // 而 `systemDnsAtom` 还停留在「DNS 开着时探测到的 points_at_loopback=true」
+  // —— 两者组合立刻推导出 `stuck_at_loopback`，横幅闪现一个
+  // 「系统 DNS 卡在 127.0.0.1 / 点我恢复」的按钮，几百毫秒后新探测回来
+  // 才消失。用户看到的就是一次凭空的惊吓。
+  //
+  // 置 null 而不是改判定逻辑：整个 toggle 窗口内真相是「不知道」，
+  // 而 `dnsDiscrepancyAtom` 对 null 返回 null（无从判断就不报警）——
+  // 和探测失败的处理是同一条原则。
+  set(systemDnsAtom, null);
 
   const ctrl = new AbortController();
   activeDnsToggleController = ctrl;
@@ -445,6 +487,12 @@ export const toggleDnsModeAtom = atom(null, async (_get, set, enabled: boolean) 
     set(dnsEnabledAtom, enabled);
     const status = await getDnsStatus();
     set(dnsStatusAtom, status);
+    // Issue #153: toggle 之后重新探测 —— enable/disable 的部分失败正是
+    // #152 那类分歧的高发时刻。不 await：探测是建议性的，不该让 toggle
+    // 的 UI 卡在 loading 上；横幅晚几十毫秒出现无妨。
+    void probeSystemDns()
+      .then((probed) => set(systemDnsAtom, probed))
+      .catch(() => set(systemDnsAtom, null));
   } catch (err) {
     if (cancelled) {
       // 用户主动 cancel —— issue #149：
@@ -460,6 +508,11 @@ export const toggleDnsModeAtom = atom(null, async (_get, set, enabled: boolean) 
         set(dnsEnabledAtom, truth);
         const status = await getDnsStatus();
         set(dnsStatusAtom, status);
+        // Issue #153: cancel 触发后端 rollback，rollback 期间正是系统 DNS
+        // 可能停在 127.0.0.1 的时刻（#152 同款）。跟着拨正一次真值。
+        void probeSystemDns()
+          .then((probed) => set(systemDnsAtom, probed))
+          .catch(() => set(systemDnsAtom, null));
       } catch {
         // 后端 truth fetch 失败,保留旧 UI 状态,等下次 fetch。
       }

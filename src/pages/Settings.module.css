@@ -167,6 +167,49 @@
 
 /* ---- DNS Mode Card ---- */
 
+/* ---- System DNS discrepancy banner (issue #153) ----
+   视觉沿用 AdBlock.module.css 的 .banner（warning-soft 底 + 右侧按钮），
+   但用更重的边框/底色：这里报告的是「你的 DNS 现在是坏的」，比
+   「编辑暂不生效」严重一个量级。 */
+
+.dnsDiscrepancyBanner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+  padding: 10px 14px;
+  border-radius: var(--radius-md, 6px);
+  border: 1px solid var(--color-warning, var(--warning));
+  background: var(--color-warning-soft, #fff5e0);
+  color: var(--color-text, var(--ink));
+  font-size: 13px;
+}
+
+.dnsDiscrepancyText {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.dnsDiscrepancyTitle {
+  font-weight: 600;
+  color: var(--color-text, var(--ink));
+}
+
+.dnsDiscrepancyDetail {
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  /* servers 列表可能很长（用户手动配了一串），别把按钮挤出卡片 */
+  overflow-wrap: anywhere;
+}
+
+.dnsDiscrepancyBanner button {
+  margin-left: auto;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
 .dnsStatusRow {
   display: flex;
   align-items: center;

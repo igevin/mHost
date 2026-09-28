@@ -20,6 +20,9 @@ export {
   dnsStatusAtom,
   isDnsLoadingAtom,
   dnsErrorAtom,
+  // issue #153: 系统 DNS 实际状态 + 与内存态的分歧派生
+  systemDnsAtom,
+  dnsDiscrepancyAtom,
   enabledDnsProfilesAtom,
   dnsRuleCountAtom,
   adBlockStateAtom,
@@ -51,6 +54,7 @@ export {
   loadSnapshotAtom,
   deleteSnapshotAtom,
   fetchDnsModeAtom,
+  probeSystemDnsAtom,
   toggleDnsModeAtom,
   cancelActiveDnsToggle,
   fetchDnsProfilesAtom,
