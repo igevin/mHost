@@ -10,21 +10,31 @@ vi.mock("../../lib/tauri", () => ({
   cancelDnsMode: vi.fn(),
   getDnsMode: vi.fn().mockResolvedValue(false),
   getDnsStatus: vi.fn().mockResolvedValue(null),
+  // issue #153: toggleDnsModeAtom 的成功分支会 fire-and-forget 探测。
+  // 这个 mock 是全量替换（无 importOriginal），漏掉它会让
+  // `probeSystemDns` 变成 undefined 并抛 TypeError。
+  probeSystemDns: vi.fn().mockResolvedValue(null),
 }));
 
+import type { SystemDnsSnapshot } from "../../types";
 import {
   toggleDnsModeAtom,
   cancelActiveDnsToggle,
+  fetchDnsModeAtom,
+  probeSystemDnsAtom,
   dnsEnabledAtom,
   isDnsLoadingAtom,
   dnsErrorAtom,
   dnsStatusAtom,
+  systemDnsAtom,
+  dnsDiscrepancyAtom,
 } from "../profiles";
 import {
   setDnsMode,
   cancelDnsMode,
   getDnsMode,
   getDnsStatus,
+  probeSystemDns,
 } from "../../lib/tauri";
 
 /**
@@ -155,5 +165,369 @@ describe("toggleDnsModeAtom cancel path (issue #149)", () => {
     expect(store.get(dnsErrorAtom)).not.toBeNull();
     // cancelDnsMode was NOT called because we didn't abort.
     expect(cancelDnsMode).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #153 — 系统 DNS 独立探测
+// ---------------------------------------------------------------------------
+
+/**
+ * `dnsDiscrepancyAtom` 是 issue #153 的判定核心：它把「mHost 内存态」
+ * 和「系统实际状态」两份数据源合成一个三态结果。
+ *
+ * 表格驱动覆盖 issue 原文那张真值表的全部四行，外加「探测不可用」
+ * 这一行 —— 最后这行同样重要：`systemDnsAtom === null` 必须退回 null
+ * （不报警），否则非 macOS / 断网的用户会看到一条无法处理的假警报。
+ */
+describe("dnsDiscrepancyAtom (issue #153)", () => {
+  const store = getDefaultStore();
+
+  beforeEach(() => {
+    store.set(dnsEnabledAtom, false);
+    store.set(systemDnsAtom, null);
+  });
+
+  interface Case {
+    name: string;
+    enabled: boolean;
+    pointsAtLoopback: boolean;
+    expected: string | null;
+  }
+  const cases: Case[] = [
+    {
+      name: "enabled + loopback = consistent",
+      enabled: true,
+      pointsAtLoopback: true,
+      expected: null,
+    },
+    {
+      name: "disabled + non-loopback = consistent",
+      enabled: false,
+      pointsAtLoopback: false,
+      expected: null,
+    },
+    {
+      name: "enabled + non-loopback = not_pointing",
+      enabled: true,
+      pointsAtLoopback: false,
+      expected: "not_pointing",
+    },
+    {
+      name: "disabled + loopback = stuck_at_loopback (the #152 bug)",
+      enabled: false,
+      pointsAtLoopback: true,
+      expected: "stuck_at_loopback",
+    },
+  ];
+
+  for (const c of cases) {
+    it(`maps ${c.name} -> ${c.expected}`, () => {
+      store.set(dnsEnabledAtom, c.enabled);
+      store.set(systemDnsAtom, {
+        interface: "Wi-Fi",
+        servers: c.pointsAtLoopback ? ["127.0.0.1"] : ["8.8.8.8"],
+        points_at_loopback: c.pointsAtLoopback,
+      });
+      expect(store.get(dnsDiscrepancyAtom)).toBe(c.expected);
+    });
+  }
+
+  it("returns null when the probe is unavailable (no data source = no alarm)", () => {
+    store.set(dnsEnabledAtom, false);
+    store.set(systemDnsAtom, null);
+    expect(store.get(dnsDiscrepancyAtom)).toBeNull();
+  });
+});
+
+/**
+ * `probeSystemDnsAtom` 的契约：**永不 reject，失败静默**。
+ *
+ * 静默的具体含义（三条都要守住）：
+ * 1. reject 被吞掉 —— 调用方是 fire-and-forget 或并行 await
+ * 2. `dnsErrorAtom` 不被写 —— 探测失败不是用户该看到的错误
+ * 3. `isDnsLoadingAtom` 不被写 —— 探测不是用户发起的加载态
+ *
+ * 写 `dnsErrorAtom` 特别危险：Settings 页顶部有 `alert alert-error`
+ * 区域，一个「route failed」会盖在页面上，而用户对此完全无能为力
+ * （`route` 失败几乎总是因为没联网，用户自己知道）。
+ */
+describe("probeSystemDnsAtom (issue #153)", () => {
+  const store = getDefaultStore();
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    store.set(dnsEnabledAtom, false);
+    store.set(systemDnsAtom, null);
+    store.set(dnsErrorAtom, null);
+    store.set(isDnsLoadingAtom, false);
+    (probeSystemDns as unknown as { mockResolvedValue: (v: unknown) => void })
+      .mockResolvedValue(null);
+  });
+
+  it("stores the snapshot on success", async () => {
+    (probeSystemDns as unknown as { mockResolvedValueOnce: (v: unknown) => void })
+      .mockResolvedValueOnce({
+        interface: "Wi-Fi",
+        servers: ["127.0.0.1"],
+        points_at_loopback: true,
+      });
+
+    await store.set(probeSystemDnsAtom);
+
+    expect(store.get(systemDnsAtom)).toEqual({
+      interface: "Wi-Fi",
+      servers: ["127.0.0.1"],
+      points_at_loopback: true,
+    });
+  });
+
+  it("swallows rejection: clears snapshot, no error atom, no loading state", async () => {
+    (probeSystemDns as unknown as { mockRejectedValueOnce: (v: unknown) => void })
+      .mockRejectedValueOnce("unsupported platform: system DNS probe is only supported on macOS");
+
+    // 关键：不抛。
+    await expect(store.set(probeSystemDnsAtom)).resolves.toBeUndefined();
+
+    expect(store.get(systemDnsAtom)).toBeNull();
+    expect(store.get(dnsErrorAtom)).toBeNull();
+    expect(store.get(isDnsLoadingAtom)).toBe(false);
+    // 无从判断 → 不报警。
+    expect(store.get(dnsDiscrepancyAtom)).toBeNull();
+  });
+
+  it("clears a stale snapshot when a later probe fails", async () => {
+    // 先成功一次，让 UI 上已经挂着横幅。
+    store.set(systemDnsAtom, {
+      interface: "Wi-Fi",
+      servers: ["127.0.0.1"],
+      points_at_loopback: true,
+    });
+    expect(store.get(dnsDiscrepancyAtom)).toBe("stuck_at_loopback");
+
+    // 再失败 —— 必须清掉，否则横幅会永久停在一个已经无法验证的结论上。
+    (probeSystemDns as unknown as { mockRejectedValueOnce: (v: unknown) => void })
+      .mockRejectedValueOnce(new Error("network gone"));
+
+    await store.set(probeSystemDnsAtom);
+
+    expect(store.get(systemDnsAtom)).toBeNull();
+    expect(store.get(dnsDiscrepancyAtom)).toBeNull();
+  });
+});
+
+/**
+ * 回归测试：toggle 期间不得闪现假警报。
+ *
+ * 缺陷形态：disable 成功时 `dnsEnabledAtom` 先翻 false，而 `systemDnsAtom`
+ * 还留着「DNS 开着时 points_at_loopback=true」的旧快照 —— 组合起来立刻
+ * 推导出 `stuck_at_loopback`，横幅凭空闪现一个「系统 DNS 卡在 127.0.0.1 /
+ * 点我恢复」的按钮。用户看到的是一次惊吓，而且他点的那个 Restore 按钮
+ * 语义上完全错误（DNS 模式刚才是开着的，不存在卡住）。
+ *
+ * 契约：toggle 一开始就作废旧探测（置 null = 不知道 = 不报警），
+ * 等新探测回来再决定横幅。
+ */
+describe("toggleDnsModeAtom clears stale probe (issue #153)", () => {
+  const store = getDefaultStore();
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    store.set(dnsEnabledAtom, true);
+    store.set(dnsStatusAtom, null);
+    store.set(dnsErrorAtom, null);
+    store.set(isDnsLoadingAtom, false);
+    (setDnsMode as unknown as { mockResolvedValue: (v: unknown) => void })
+      .mockResolvedValue(undefined);
+    (getDnsStatus as unknown as { mockResolvedValue: (v: unknown) => void })
+      .mockResolvedValue(null);
+    // 探测永远 pending：这样只断言「旧值被作废」，不受新值干扰。
+    (probeSystemDns as unknown as { mockReturnValue: (v: unknown) => void })
+      .mockReturnValue(new Promise(() => {}));
+  });
+
+  it("drops the stale snapshot at toggle start so no false banner flashes", async () => {
+    // toggle 前：DNS 开着 + 系统指向 127.0.0.1 —— 完全一致，无横幅。
+    store.set(systemDnsAtom, {
+      interface: "Wi-Fi",
+      servers: ["127.0.0.1"],
+      points_at_loopback: true,
+    });
+    expect(store.get(dnsDiscrepancyAtom)).toBeNull();
+
+    // toggle 之后、探测回来之前：内存态 false + 旧快照仍在
+    // → 会推导出 stuck_at_loopback。契约要求此时是 null。
+    await store.set(toggleDnsModeAtom, false);
+
+    expect(store.get(systemDnsAtom)).toBeNull();
+    expect(store.get(dnsDiscrepancyAtom)).toBeNull();
+  });
+});
+
+/**
+ * `fetchDnsModeAtom` 现在并行跑三件事：内存态 truth-fetch + status +
+ * 系统 DNS 探测。探测失败**不能**污染主路径。
+ */
+describe("fetchDnsModeAtom with probe (issue #153)", () => {
+  const store = getDefaultStore();
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    store.set(dnsEnabledAtom, false);
+    store.set(systemDnsAtom, null);
+    store.set(dnsErrorAtom, null);
+    store.set(dnsStatusAtom, null);
+    (getDnsMode as unknown as { mockResolvedValue: (v: unknown) => void })
+      .mockResolvedValue(true);
+    (getDnsStatus as unknown as { mockResolvedValue: (v: unknown) => void })
+      .mockResolvedValue({
+        running: true,
+        port: 1053,
+        upstream: ["8.8.8.8"],
+        original_dns: { kind: "dhcp_empty" },
+        rule_count: 3,
+        cache_capacity: 100,
+      });
+    (probeSystemDns as unknown as { mockResolvedValue: (v: unknown) => void })
+      .mockResolvedValue({
+        interface: "Wi-Fi",
+        servers: ["127.0.0.1"],
+        points_at_loopback: true,
+      });
+  });
+
+  it("populates all three atoms on the happy path", async () => {
+    await store.set(fetchDnsModeAtom);
+
+    expect(store.get(dnsEnabledAtom)).toBe(true);
+    expect(store.get(systemDnsAtom)).not.toBeNull();
+    expect(store.get(dnsDiscrepancyAtom)).toBeNull(); // 一致
+    expect(store.get(dnsErrorAtom)).toBeNull();
+  });
+
+  it("a failing probe does not fail the truth-fetch", async () => {
+    (probeSystemDns as unknown as { mockRejectedValueOnce: (v: unknown) => void })
+      .mockRejectedValueOnce(new Error("networksetup exploded"));
+
+    await store.set(fetchDnsModeAtom);
+
+    // 主路径完整成功。
+    expect(store.get(dnsEnabledAtom)).toBe(true);
+    expect(store.get(dnsStatusAtom)).not.toBeNull();
+    expect(store.get(dnsErrorAtom)).toBeNull();
+    // 只有探测那部分降级。
+    expect(store.get(systemDnsAtom)).toBeNull();
+  });
+});
+
+/**
+ * 回归测试（issue #153，review #231 跟进）：晚到的旧代探测必须被丢弃。
+ *
+ * 竞态形态：启动时的探测 P1 因 wedged configd 卡住；期间用户完成一次
+ * toggle，P2 已经拿到**新**快照并写入 atom；P1 随后返回，若无守卫就会用
+ * **toggle 之前**的旧快照覆盖 P2，横幅短暂指向错误方向。
+ *
+ * 用可控 deferred promise 精确复现这个时序：让 P1 一直 pending，先跑
+ * P2 落地，再让 P1 返回。
+ */
+describe("late-arriving probe is discarded (issue #153)", () => {
+  const store = getDefaultStore();
+
+  /** 一个由测试手动 resolve 的探测 promise。 */
+  function deferred() {
+    let resolve!: (v: SystemDnsSnapshot) => void;
+    let reject!: (e: unknown) => void;
+    const promise = new Promise<SystemDnsSnapshot>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return { promise, resolve, reject };
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    store.set(dnsEnabledAtom, false);
+    store.set(systemDnsAtom, null);
+    store.set(dnsErrorAtom, null);
+    store.set(isDnsLoadingAtom, false);
+    (getDnsMode as unknown as { mockResolvedValue: (v: unknown) => void })
+      .mockResolvedValue(false);
+    (getDnsStatus as unknown as { mockResolvedValue: (v: unknown) => void })
+      .mockResolvedValue(null);
+  });
+
+  it("a slow older probe must not overwrite a newer probe's snapshot", async () => {
+    const P1 = deferred(); // 启动探测：卡住（wedged configd）
+    const P2 = deferred(); // toggle 后的 re-probe
+
+    // 返回类型也要是 mock 本身，否则链式第二次调用过不了 tsc。
+    const asProbeMock = probeSystemDns as unknown as {
+      mockReturnValueOnce: (v: unknown) => { mockReturnValueOnce: (v: unknown) => void };
+    };
+    asProbeMock.mockReturnValueOnce(P1.promise).mockReturnValueOnce(P2.promise);
+
+    // P1 起飞（不 await —— 它还没返回）。
+    const p1Task = store.set(probeSystemDnsAtom);
+    // P2 起飞并先落地：系统 DNS 现在指向 mHost。
+    const p2Task = store.set(probeSystemDnsAtom);
+    P2.resolve({
+      interface: "Wi-Fi",
+      servers: ["127.0.0.1"],
+      points_at_loopback: true,
+    });
+    await p2Task;
+    expect(store.get(systemDnsAtom)).toEqual({
+      interface: "Wi-Fi",
+      servers: ["127.0.0.1"],
+      points_at_loopback: true,
+    });
+
+    // P1 现在才返回，带的是 toggle **之前**的状态：用户把 DNS 关了，
+    // 系统回到公网 DNS。
+    P1.resolve({
+      interface: "Wi-Fi",
+      servers: ["8.8.8.8"],
+      points_at_loopback: false,
+    });
+    await p1Task;
+
+    // 代数守卫必须让 P1 的结果作废 —— 否则这里会变成 8.8.8.8，
+    // 横幅也会短暂指向 not_pointing 这个错误方向。
+    expect(store.get(systemDnsAtom)).toEqual({
+      interface: "Wi-Fi",
+      servers: ["127.0.0.1"],
+      points_at_loopback: true,
+    });
+  });
+
+  it("a late *failure* must not wipe a newer probe's snapshot either", async () => {
+    const P1 = deferred();
+    const P2 = deferred();
+    // 返回类型也要是 mock 本身，否则链式第二次调用过不了 tsc。
+    const asProbeMock = probeSystemDns as unknown as {
+      mockReturnValueOnce: (v: unknown) => { mockReturnValueOnce: (v: unknown) => void };
+    };
+    asProbeMock.mockReturnValueOnce(P1.promise).mockReturnValueOnce(P2.promise);
+
+    const p1Task = store.set(probeSystemDnsAtom);
+    const p2Task = store.set(probeSystemDnsAtom);
+    P2.resolve({
+      interface: "Wi-Fi",
+      servers: ["127.0.0.1"],
+      points_at_loopback: true,
+    });
+    await p2Task;
+
+    // P1 失败（比如它启动时用户还没联网，probe 耗了几秒才返回错误）。
+    // 无守卫的话这里走 catch 分支把 P2 的快照擦成 null，横幅无缘无故消失。
+    P1.reject(new Error("route: no default route"));
+    await p1Task;
+
+    expect(store.get(systemDnsAtom)).toEqual({
+      interface: "Wi-Fi",
+      servers: ["127.0.0.1"],
+      points_at_loopback: true,
+    });
+    expect(store.get(dnsErrorAtom)).toBeNull();
   });
 });

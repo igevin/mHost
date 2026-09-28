@@ -7,6 +7,7 @@ import type {
   ExportFormat,
   SnapshotMeta,
   DnsStatus,
+  SystemDnsSnapshot,
   ProfileMode,
   AdBlockState,
   AdBlockLimits,
@@ -250,6 +251,22 @@ export async function reloadDnsRules(): Promise<void> {
 
 export async function getDnsStatus(): Promise<DnsStatus> {
   return invoke("get_dns_status");
+}
+
+/**
+ * Issue #153: 读出系统 DNS 的**实际**配置（独立于 Rust 内存态）。
+ *
+ * 与 `getDnsMode` 互补而非重复：`getDnsMode` 只返回 `state.dns_enabled`
+ * 这个 AtomicBool（"mHost 认为自己开着"），本函数直接问 `networksetup`
+ * （"系统实际上指向哪里"）。#152 之所以让用户无计可施，就是因为当时
+ * 前端只有前一个数据源。
+ *
+ * 纯只读、无副作用、不需要 sudo，因此可以在启动 / 每次 toggle /
+ * 窗口重新聚焦时放心调用。非 macOS 会被后端拒掉（DNS mode 目前
+ * macOS-only，见 #67），调用方应把 reject 当作「探测不可用」静默处理。
+ */
+export async function probeSystemDns(): Promise<SystemDnsSnapshot> {
+  return invoke("probe_system_dns");
 }
 
 export async function listDnsProfiles(): Promise<Profile[]> {

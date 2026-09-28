@@ -23,6 +23,36 @@ describe("extractErrorMessage", () => {
     );
   });
 
+  /**
+   * Issue #153: `probe_system_dns` 在非 macOS 返回 `Unsupported`。
+   *
+   * 关键断言是「不读成 invalid input」—— 平台限制和用户输入错误是两件事，
+   * 一旦被归错类，将来任何把这个 message 显示给用户的代码都会告诉用户
+   * 「你输入无效」，而他根本没有输入任何东西。
+   */
+  it("renders MhostError::Unsupported as a platform limitation, not invalid input", () => {
+    const msg = extractErrorMessage({
+      Unsupported: "system DNS probe is only supported on macOS",
+    });
+    expect(msg).toBe(
+      "unsupported on this platform: system DNS probe is only supported on macOS",
+    );
+    expect(msg).not.toMatch(/invalid input/i);
+  });
+
+  /** Issue #153: 探测的读 OS 失败走 `Io { kind: "system-dns-probe" }`。 */
+  it("renders the system-dns-probe Io kind", () => {
+    const msg = extractErrorMessage({
+      Io: {
+        kind: "system-dns-probe",
+        message: "failed to detect active network interface: route failed",
+      },
+    });
+    expect(msg).toBe(
+      "failed to detect active network interface: route failed (system-dns-probe)",
+    );
+  });
+
   it("returns string-payload Network variant (no raw JSON)", () => {
     const result = extractErrorMessage({ Network: "connection refused" });
     expect(result).not.toContain("{");

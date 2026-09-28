@@ -2,6 +2,8 @@ import { atom } from "jotai";
 import type {
   Profile,
   DnsStatus,
+  DnsDiscrepancy,
+  SystemDnsSnapshot,
   AdBlockState,
   ApplyOutcome,
 } from "../../types";
@@ -52,6 +54,38 @@ export const dnsRuleCountAtom = atom((get) =>
     0,
   ),
 );
+
+/**
+ * Issue #153: 系统 DNS 的**实际**配置（`probe_system_dns` IPC 的返回值）。
+ *
+ * `null` 表示「探测不可用」—— 后端拒绝（非 macOS）、`route` 失败
+ * （用户根本没联网）、或 IPC 报错。**探测失败不产生错误提示**，只让
+ * `dnsDiscrepancyAtom` 回到 null（不显示横幅）：这是建议性功能，为一个
+ * 明显无网络的场景弹 toast 只会制造噪音。
+ */
+export const systemDnsAtom = atom<SystemDnsSnapshot | null>(null);
+
+/**
+ * Issue #153: `dnsEnabledAtom`（mHost 内存态）与系统实际状态的分歧。
+ *
+ * | dnsEnabled | points_at_loopback | 分歧              |
+ * |------------|---------------------|-------------------|
+ * | true       | true                | null（一致）      |
+ * | true       | false               | `not_pointing`    |
+ * | false      | true                | `stuck_at_loopback` |
+ * | false      | false               | null（一致）      |
+ *
+ * 纯派生，不发 IPC。`systemDnsAtom` 为 null 时返回 null（探测不可用
+ * 不等于一致，但也不该报警 —— 无从判断就不报警）。
+ */
+export const dnsDiscrepancyAtom = atom<DnsDiscrepancy | null>((get) => {
+  const probe = get(systemDnsAtom);
+  if (!probe) return null;
+  const enabled = get(dnsEnabledAtom);
+  if (enabled && !probe.points_at_loopback) return "not_pointing";
+  if (!enabled && probe.points_at_loopback) return "stuck_at_loopback";
+  return null;
+});
 
 // ---- Apply confirm dialog atoms ----
 

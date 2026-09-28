@@ -159,6 +159,8 @@ pub fn run() {
             get_dns_mode,
             reload_dns_rules,
             get_dns_status,
+            // issue #153: OS 侧系统 DNS 独立探测（不依赖内存态）
+            probe_system_dns,
             list_dns_profiles,
             cancel_dns_mode,
             // 广告屏蔽（issue #130）

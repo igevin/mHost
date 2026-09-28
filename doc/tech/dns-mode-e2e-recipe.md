@@ -210,6 +210,113 @@ cp /tmp/manifest-backup.json "$MANIFEST"
 
 ---
 
+## 5.6 Scenario F — 系统 DNS 被外部改动（issue #153 不一致探测）
+
+`probe_system_dns` 是前端**独立于 Rust 内存态**的第二个数据源。`get_dns_mode`
+只返回 `state.dns_enabled` 这个 `AtomicBool`（"mHost 认为自己是开是关"），
+而本场景验证的是 OS 侧的实际配置（"系统实际上指向哪里"）。两者分歧时
+Settings 页 DNS 卡片顶部出现 `data-testid="dns-discrepancy-banner"` 横幅。
+
+### 5.6.1 not_pointing 方向（显示 Running，系统没指向 mHost）
+
+```bash
+# 1. UI 启用 DNS 模式，确认 Status = Running
+# 2. UI 切到别的 app（或直接改 DNS 再切回 mHost 触发 window focus 探测）
+#    切回 mHost 窗口本身就会触发探测（App.tsx focus listener，1s 冷却）
+
+# 3. 外部把系统 DNS 改成 8.8.8.8（模拟用户/别的工具动了网络配置）
+IFACE=$(networksetup -listnetworkserviceorder | grep -A2 "Hardware Port: Wi-Fi" | grep "Device" | awk '{print $2}')
+sudo networksetup -setdnsservers "Wi-Fi" 8.8.8.8
+
+# 4. 切回 mHost 窗口 → focus 触发探测
+```
+
+期望：
+
+- Settings 页 DNS 卡片出现横幅，`data-discrepancy="not_pointing"`
+- 标题 `System DNS does not point at mHost`
+- 正文显示实际读到的 servers（`8.8.8.8`）和接口名（`Wi-Fi`）
+- **没有** Restore 按钮 —— 这个方向不危险（DNS 还能用），修它要重启
+  enable 流程（两次 sudo + 重建 DnsServer）
+- 此时 mHost 的 DNS 规则**确实不生效**（`dig` 打到 8.8.8.8 而不是 1053）
+
+```bash
+# 5. 验证规则确实没生效（用一个被 hosts profile 覆盖的域名）
+dig +short <被覆盖的域名> @8.8.8.8
+# 期望: 上游返回的真实 IP，不是 profile 里配的 IP
+```
+
+**恢复方式（UI）**：关闭再开启 DNS 模式。横幅应在 toggle 完成后自动消失
+（`toggleDnsModeAtom` 成功分支会重新探测）。
+
+### 5.6.2 stuck_at_loopback 方向（显示 Stopped，系统卡在 127.0.0.1）
+
+这是 **#152 那个 bug 的样子** —— 用户完全无计可施的原因，当时前端只有内存态
+这一个数据源。**危险**：DNS 指向一个没人监听的地址，解析直接失败。
+
+```bash
+# 1. UI 禁用 DNS 模式，确认 Status = Stopped
+
+# 2. 外部把系统 DNS 指向 127.0.0.1（模拟 disable 部分失败 / proxy 崩溃残留）
+sudo networksetup -setdnsservers "Wi-Fi" 127.0.0.1
+
+# 3. 切走再切回 mHost 窗口 → focus 触发探测
+#    （也可以重启 mHost，启动时的 truth-fetch 会并行探测）
+```
+
+期望：
+
+- 横幅出现，`data-discrepancy="stuck_at_loopback"`
+- 标题 `System DNS still points at mHost`（标题不写死 127.0.0.1：IPv6-only 环境正文会显示 `::1`）
+- 正文提示 `Domain resolution may be broken right now`
+- **有** `data-testid="dns-restore-button"`（`Restore system DNS`）
+- 此时 `dig any-domain` 应该失败/超时
+
+```bash
+# 4. 验证网络解析确实坏了
+dig +short example.com
+# 期望: 超时 / SERVFAIL（127.0.0.1:53 上没有监听者）
+
+# 5. 点「Restore system DNS」→ 弹 sudo（走既有的 disable 事务）
+```
+
+期望：
+
+- 系统 DNS 被还原（DhcpEmpty 场景写 `Empty`，Manual 场景写回原始 servers）
+- 横幅自动消失
+- `dig example.com` 恢复正常
+
+```bash
+# 6. 验证还原结果
+networksetup -getdnsservers "Wi-Fi"
+# 期望: "There aren't any DNS Servers set on Wi-Fi"（或用户原始手动配置）
+```
+
+**关键点**：此时 Rust 内存态 `dns_enabled` 已经是 `false`，但
+`set_dns_mode_disable` **没有**「已禁用就短路」的分支 —— 它会真的执行
+`disable_dns_mode()` 走完整个还原事务。这正是这条恢复路径成立的前提，
+**不要**给它加短路优化。
+
+### 5.6.3 探测不可用（不应显示横幅）
+
+```bash
+# 断开 Wi-Fi / 拔网线，然后切回 mHost 窗口
+```
+
+期望：
+
+- `route -n get default` 失败 → 后端返回 `Err`
+- 前端**静默**吞掉（不弹 toast、不写 `dnsErrorAtom`），`systemDnsAtom` 置 null
+- **不显示横幅** —— 无从判断就不报警
+
+日志里可见（`tracing::debug`，需 RUST_LOG=debug）：
+
+```
+probe_system_dns: interface=Wi-Fi servers=["127.0.0.1"] points_at_loopback=true
+```
+
+---
+
 ## 6. 日志 grep 一览表
 
 | 期望日志 | 含义 |
@@ -226,6 +333,7 @@ cp /tmp/manifest-backup.json "$MANIFEST"
 | `try_recover_dns: disable recovery marker found at ...` | 下次启动兜底命中 |
 | `force restore failed` | sudo 兜底也失败 |
 | `recovery marker left at ...` | marker 保留，下次启动 retry |
+| `probe_system_dns: interface=... points_at_loopback=...` | issue #153 探测结果（需 `RUST_LOG=debug`） |
 
 | 不期望日志 | 含义 |
 |------------|------|
@@ -233,6 +341,7 @@ cp /tmp/manifest-backup.json "$MANIFEST"
 | `Failed to enable DNS mode` | enable 失败（一般配合 osascript 超时） |
 | `dns-proxy failed to become ready within 5s` | ready 文件超时（proxy 启动失败） |
 | `recovery marker found` 在 successful disable 后 | 误报（说明 marker 没被清） |
+| `probe system dns failed` 的前端错误提示 | issue #153 的探测失败应该静默，出现说明契约被破坏 |
 
 ---
 
@@ -260,6 +369,7 @@ ls -la "$(find . -path '*/MacOS/mhost-dns-proxy' -type f | head -1)"
 - **Wi-Fi 切换**: Scenario A 假设用户稳定连接 Wi-Fi；如果中途断网 / 切到有线，networksetup 输出会改变，建议在稳定的 home Wi-Fi 环境下测。
 - **macOS 版本差异**: 早期 macOS（< 12）的 networksetup 输出格式略有差异，但只要是 DHCP-empty 状态，输出都是 `There aren't any DNS Servers set on Wi-Fi`。
 - **TCC 缓存**: 第一次跑 Scenario A 之前用户可能需要授权一次 mhost（系统弹窗）。授权后 5 分钟内不再弹（macOS 默认缓存策略）。
+- **Scenario F 的 focus 触发**: 探测依赖 `window` 的 `focus` 事件（1s 冷却）。如果用自动化手段（AppleScript / XCTest）切窗口，事件可能不触发 —— 此时改用重启 mHost 验证，启动时的 truth-fetch 会并行探测。
 
 ---
 
@@ -271,3 +381,5 @@ ls -la "$(find . -path '*/MacOS/mhost-dns-proxy' -type f | head -1)"
 - Issue #152 讨论历史 — 完整 regression diff + 候选 root cause 分析
 - `src-tauri/crates/mhost-dns/src/platform.rs` — `verify_dns_restored_against_loopback` 实现 + tests
 - `src-tauri/crates/mhost-core/src/models.rs` — `OriginalDns::restore_argv` 防御层 + tests
+- Issue #153 — 系统 DNS 不一致探测（`probe_system_dns` IPC + Settings 横幅）
+- `src-tauri/crates/mhost-dns/src/platform.rs` — `probe_system_dns_state` / `probe_snapshot_from`（注意与 `networksetup_get_dns` 的过滤语义**故意相反**）

@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use mhost_core::OriginalDns;
+use mhost_core::{OriginalDns, SystemDnsSnapshot};
 
 // ---------------------------------------------------------------------------
 // Runtime directory + signal/state file paths
@@ -122,6 +122,11 @@ pub enum PlatformError {
     TempScript(String),
     #[error("interface name is empty")]
     EmptyInterfaceName,
+    /// **issue #153**：该平台没有对应的系统 DNS 原语（DNS mode 目前
+    /// macOS-only）。消息直接面向用户，会经 `probe_system_dns` IPC
+    /// 冒泡到 Settings 页的错误路径。
+    #[error("unsupported platform: {0}")]
+    UnsupportedPlatform(&'static str),
 }
 
 /// 接口名白名单：只允许字母、数字、空格、点、下划线、连字符、斜杠。
@@ -619,6 +624,111 @@ fn networksetup_get_dns(port: &str) -> Result<Vec<String>, PlatformError> {
     // (issue #103 fix) for the same reason. Reuse here.
     let filtered: Vec<String> = raw.into_iter().filter(|s| !is_local_resolver(s)).collect();
     Ok(filtered)
+}
+
+// ---------------------------------------------------------------------------
+// System DNS probe (issue #153)
+// ---------------------------------------------------------------------------
+//
+// **不要把下面这条读数路径和 `networksetup_get_dns` 合并。** 两者对
+// `127.0.0.1` 的处理**故意相反**：
+//
+// - `networksetup_get_dns`（#152 root cause 2）—— **过滤掉** loopback。
+//   它服务 `capture_dns_state()`，即「用户的原始 DNS 是什么」。若把
+//   mHost 自己注入的 `127.0.0.1` 读回来当原始值持久化到
+//   `mhost-dns-original.txt`，后续每次 restore 都会把用户系统 DNS 写成
+//   127.0.0.1 —— 永久污染。
+// - `networksetup_get_dns_stdout`（本函数，#153）—— **保留** loopback。
+//   它服务「OS 现在到底指向哪」的探测，答案**必须**能表达
+//   「指向 127.0.0.1」。过滤掉之后 `points_at_loopback` 恒为 false，
+//   issue #153 静默退化成 no-op，而且不会有任何测试失败。
+
+/// `networksetup -getdnsservers <port>` 的 **raw stdout**，不过滤任何条目。
+///
+/// 刻意返回原始字符串而不是 `Vec<String>`：解析只发生在纯函数
+/// [`probe_snapshot_from`] 里一处，让「IO 与判定分离」，issue #153 的
+/// parsing 单测才能在 CI 上跑（不需要 macOS 实机）。
+///
+/// `port` 必须已通过 [`validate_interface_name`]（调用方
+/// `get_active_network_interface` 在返回前会校验，安全边界自动继承）。
+#[cfg(target_os = "macos")]
+fn networksetup_get_dns_stdout(port: &str) -> Result<String, PlatformError> {
+    let output = Command::new("networksetup")
+        .args(["-getdnsservers", port])
+        .output()
+        .map_err(|e| PlatformError::GetDns(format!("networksetup command failed: {}", e)))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(PlatformError::GetDns(format!(
+            "networksetup failed: {}",
+            stderr
+        )));
+    }
+    // 关键：**不过滤**。raw stdout 直接交给 probe_snapshot_from 解析。
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// 从 `networksetup -getdnsservers` 的 **raw stdout** 组装
+/// [`SystemDnsSnapshot`]。
+///
+/// 纯函数（不 spawn 任何进程），所以 issue #153 的验收标准「parsing +
+/// loopback detection 有单测覆盖」可以完全跑在 CI 上，不需要 macOS 实机。
+#[cfg(target_os = "macos")]
+pub(crate) fn probe_snapshot_from(
+    interface: &str,
+    raw_stdout: &str,
+) -> Result<SystemDnsSnapshot, PlatformError> {
+    let servers = parse_dns_servers(raw_stdout)?;
+    Ok(SystemDnsSnapshot::new(interface, servers))
+}
+
+/// **issue #153**：从 OS 读出系统 DNS 的当前实际状态。
+///
+/// 这是前端**唯一独立于 Rust 内存态**的数据源 —— `get_dns_mode` 只返回
+/// `state.dns_enabled` 这个 `AtomicBool`，当内存态和现实分歧时
+/// （#152：`disable` 声称成功但系统 DNS 卡在 127.0.0.1）前端无从发现。
+///
+/// 纯只读：不写任何文件、不调 `networksetup -setdnsservers`、不弹 sudo。
+/// 因此可以在任意时机（启动 / 每次 toggle / 窗口重新聚焦）放心调用。
+///
+/// 非 macOS 直接返回 [`PlatformError::UnsupportedPlatform`] —— DNS mode
+/// 本身目前是 macOS-only（#67 跟踪 Windows / Linux）。IPC 仍然注册，
+/// 这样前端 TS 类型在所有平台保持一致。
+#[cfg(target_os = "macos")]
+pub fn probe_system_dns_state() -> Result<SystemDnsSnapshot, PlatformError> {
+    probe_system_dns_state_with(get_active_network_interface, networksetup_get_dns_stdout)
+}
+
+/// 组合层核心，两个 IO 步骤都注入 —— 纯逻辑（除了注入的 IO 本身），
+/// 所以组合层也能在 CI 上单测。
+///
+/// **review #231 跟进**：上一版 `probe_system_dns_state` 把
+/// `get_active_network_interface` → 读数 → `probe_snapshot_from` 三步
+/// 写死在函数体里，护栏测试只覆盖了 `probe_snapshot_from`（纯函数层）。
+/// 于是「有人把组合层改成直接调**带过滤**的 `networksetup_get_dns`
+/// 再拼 snapshot」这条最现实的破坏路径**能让所有测试全绿** ——
+/// 它绕开的就是唯一被测的那一层。
+///
+/// 现在 IO 可注入，组合层本身有测试。
+///
+/// 注意这**不能**替代 `test_probe_read_path_wires_unfiltered_reader`：
+/// 注入的 reader 是测试自己给的，测不到真实 wiring 指向哪个 reader。
+/// 那条 source-grep 护栏才是钉死真实组合关系的，两条一起才完整。
+#[cfg(target_os = "macos")]
+fn probe_system_dns_state_with(
+    resolve_interface: impl Fn() -> Result<String, PlatformError>,
+    read_dns: impl Fn(&str) -> Result<String, PlatformError>,
+) -> Result<SystemDnsSnapshot, PlatformError> {
+    let interface = resolve_interface()?;
+    let raw_stdout = read_dns(&interface)?;
+    probe_snapshot_from(&interface, &raw_stdout)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn probe_system_dns_state() -> Result<SystemDnsSnapshot, PlatformError> {
+    Err(PlatformError::UnsupportedPlatform(
+        "system DNS probe is only supported on macOS",
+    ))
 }
 
 /// `ipconfig getoption <device> domain_name_server` —— DHCP 推的 DNS。
@@ -2799,6 +2909,242 @@ Ethernet Address: aa:bb:cc:dd:ee:ff
         let raw = parse_dns_servers("8.8.8.8\n1.1.1.1\n").unwrap();
         let filtered: Vec<String> = raw.into_iter().filter(|s| !is_local_resolver(s)).collect();
         assert_eq!(filtered, vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()]);
+    }
+
+    // -----------------------------------------------------------------------
+    // System DNS probe tests (issue #153)
+    // -----------------------------------------------------------------------
+
+    /// `probe_snapshot_from` 是纯函数，覆盖 issue #153 要求的
+    /// 「parsing + loopback detection」两半。
+    ///
+    /// 关键用例是 `dhcp_empty`（networksetup 对「没手动配 DNS」的固定
+    /// 输出）和 `single_loopback_is_NOT_filtered` —— 后者是整个特性的
+    /// 地基：如果这里把 `127.0.0.1` 过滤掉，`points_at_loopback` 恒为
+    /// false，探测退化成永远「一致」，横幅永不出现，且不会有别的测试
+    /// 失败。
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_probe_snapshot_from_parsing_and_loopback_detection() {
+        struct Case {
+            name: &'static str,
+            raw: &'static str,
+            expected_servers: Vec<&'static str>,
+            expected_loopback: bool,
+        }
+        let cases = vec![
+            Case {
+                name: "dhcp_empty",
+                raw: "There aren't any DNS Servers set on Wi-Fi.\n",
+                expected_servers: vec![],
+                expected_loopback: false,
+            },
+            Case {
+                name: "single_loopback_is_NOT_filtered",
+                raw: "127.0.0.1\n",
+                expected_servers: vec!["127.0.0.1"],
+                expected_loopback: true,
+            },
+            Case {
+                name: "ipv6_loopback",
+                raw: "::1\n",
+                expected_servers: vec!["::1"],
+                expected_loopback: true,
+            },
+            Case {
+                name: "public_resolvers",
+                raw: "8.8.8.8\n1.1.1.1\n",
+                expected_servers: vec!["8.8.8.8", "1.1.1.1"],
+                expected_loopback: false,
+            },
+            Case {
+                // 用户手动配了上游，但 mHost 的 127.0.0.1 也还在列表里
+                // （半完成状态）。any 语义 → 判定为接管。
+                name: "mixed_any_semantics",
+                raw: "127.0.0.1\n8.8.8.8\n",
+                expected_servers: vec!["127.0.0.1", "8.8.8.8"],
+                expected_loopback: true,
+            },
+            Case {
+                name: "extra_whitespace_and_crlf",
+                raw: "  127.0.0.1  \r\n",
+                expected_servers: vec!["127.0.0.1"],
+                expected_loopback: true,
+            },
+            Case {
+                name: "malformed_entry_is_preserved_verbatim",
+                raw: "not-an-ip\n",
+                expected_servers: vec!["not-an-ip"],
+                expected_loopback: false,
+            },
+            Case {
+                name: "empty_output",
+                raw: "",
+                expected_servers: vec![],
+                expected_loopback: false,
+            },
+        ];
+
+        for c in cases {
+            let snapshot = probe_snapshot_from("Wi-Fi", c.raw)
+                .unwrap_or_else(|e| panic!("case {}: unexpected err {}", c.name, e));
+            assert_eq!(
+                snapshot.servers, c.expected_servers,
+                "case {}: servers must be the RAW unfiltered read",
+                c.name
+            );
+            assert_eq!(
+                snapshot.points_at_loopback, c.expected_loopback,
+                "case {}",
+                c.name
+            );
+            assert_eq!(snapshot.interface, "Wi-Fi", "case: {}", c.name);
+        }
+    }
+
+    /// **组合层护栏（issue #153，review #231 跟进）**：真实的
+    /// `probe_system_dns_state` 必须把 IO 接到**不过滤**的
+    /// `networksetup_get_dns_stdout` 上。
+    ///
+    /// 上一版护栏（`..._is_not_merged_with_capture_read_path`）只钉住了
+    /// 纯函数层，于是「组合层直接改调带过滤的 `networksetup_get_dns`」
+    /// 这条最现实的破坏路径能让全部测试全绿。注入式测试也测不到这一点
+    /// —— 注入的 reader 是测试自己给的。
+    ///
+    /// 所以这里用 source-grep 把真实 wiring 钉死（本仓库同类问题的既有
+    /// 手法，见 `test_try_recover_dns_reads_canonical_marker_path`）：
+    /// 匹配 `networksetup_get_dns(`（带左括号）而不是
+    /// `networksetup_get_dns`（不带）—— 后者是前者的前缀，会误伤
+    /// `networksetup_get_dns_stdout(`。
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_probe_read_path_wires_unfiltered_reader() {
+        let src = include_str!("platform.rs");
+
+        // 只看 probe_system_dns_state 的函数体（到下一个独立的 `}` 为止）。
+        let start = src
+            .find("pub fn probe_system_dns_state()")
+            .expect("probe_system_dns_state must exist");
+        let body_end = src[start..].find("\n}").expect("function must have a body");
+        let body = &src[start..start + body_end];
+
+        assert!(
+            body.contains("networksetup_get_dns_stdout"),
+            "probe_system_dns_state must wire the UNFILTERED reader \
+             (networksetup_get_dns_stdout). Wiring it to the capture-path \
+             reader silently disables issue #153 — points_at_loopback would \
+             be permanently false. body: {}",
+            body
+        );
+        assert!(
+            !body.contains("networksetup_get_dns("),
+            "probe_system_dns_state must NOT use the capture-path reader \
+             `networksetup_get_dns(` — it filters loopback (issue #152 root \
+             cause 2) and would make points_at_loopback permanently false. \
+             body: {}",
+            body
+        );
+    }
+
+    /// **组合层行为测试（issue #153，review #231 跟进）**：注入假的接口
+    /// 解析 + 假的读数函数，验证 `probe_system_dns_state_with` 的三步
+    /// 编排 —— 尤其是**读数函数收到的是解析出来的接口名**（而不是
+    /// 硬编码的 "Wi-Fi"），以及 raw stdout 原样透传给解析层（未被过滤）。
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_probe_system_dns_state_with_composition() {
+        // 1. happy path：假 reader 返回 127.0.0.1，必须原样到达判定层。
+        let snapshot = probe_system_dns_state_with(
+            || Ok("USB 10/100/1000 LAN".to_string()),
+            |iface| {
+                assert_eq!(
+                    iface, "USB 10/100/1000 LAN",
+                    "reader must receive the resolved interface"
+                );
+                Ok("127.0.0.1
+"
+                .to_string())
+            },
+        )
+        .expect("probe should succeed");
+        assert_eq!(snapshot.interface, "USB 10/100/1000 LAN");
+        assert_eq!(snapshot.servers, vec!["127.0.0.1".to_string()]);
+        assert!(
+            snapshot.points_at_loopback,
+            "127.0.0.1 must survive the composition layer"
+        );
+
+        // 2. 读数是公网 DNS → 不判定为接管。
+        let snapshot = probe_system_dns_state_with(
+            || Ok("Wi-Fi".to_string()),
+            |_| Ok("8.8.8.8\n1.1.1.1\n".to_string()),
+        )
+        .unwrap();
+        assert!(!snapshot.points_at_loopback);
+
+        // 3. 接口解析失败 → 短路，**不**调用读数函数。
+        //    用 Cell 而不是 `mut bool`：闭包是 `Fn`，不能改捕获的可变变量。
+        let reader_called = std::cell::Cell::new(false);
+        let err = probe_system_dns_state_with(
+            || Err(PlatformError::DetectInterface("no default route".into())),
+            |_| {
+                reader_called.set(true);
+                Ok("127.0.0.1\n".to_string())
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, PlatformError::DetectInterface(_)));
+        assert!(
+            !reader_called.get(),
+            "reader must not run when the interface is unknown"
+        );
+
+        // 4. 读数失败 → 向上传播。
+        let err = probe_system_dns_state_with(
+            || Ok("Wi-Fi".to_string()),
+            |_| Err(PlatformError::GetDns("networksetup exploded".into())),
+        )
+        .unwrap_err();
+        assert!(matches!(err, PlatformError::GetDns(_)));
+    }
+
+    /// **回归护栏（issue #153）**：`networksetup_get_dns_stdout`（探测用，
+    /// 不过滤）与 `networksetup_get_dns`（capture 用，过滤 loopback）
+    /// 对同一份 stdout **必须**给出相反结果。
+    ///
+    /// 这两个函数同在一个文件、几乎逐行相同，未来极容易被「顺手统一」
+    /// 成一个。而那个统一**不会让任何现存测试变红** —— 它只会让 #153
+    /// 的探测静默失效（`points_at_loopback` 恒 false）。
+    /// 本测试把这个分界线钉死：谁把两条路径合并，这里立刻失败。
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_probe_read_path_is_not_merged_with_capture_read_path() {
+        let raw = "127.0.0.1\n1.1.1.1\n";
+
+        // capture 路径（#152）：loopback 被过滤掉。
+        let capture_raw = parse_dns_servers(raw).unwrap();
+        let capture_filtered: Vec<String> = capture_raw
+            .into_iter()
+            .filter(|s| !is_local_resolver(s))
+            .collect();
+        assert_eq!(
+            capture_filtered,
+            vec!["1.1.1.1".to_string()],
+            "capture path must keep filtering loopback (#152 root cause 2)"
+        );
+
+        // probe 路径（#153）：loopback 保留。
+        let probe = probe_snapshot_from("Wi-Fi", raw).unwrap();
+        assert_eq!(
+            probe.servers,
+            vec!["127.0.0.1".to_string(), "1.1.1.1".to_string()],
+            "probe path must NOT filter — merging it with the capture path silently \
+             disables issue #153"
+        );
+        assert!(
+            probe.points_at_loopback,
+            "issue #153 depends on this being true when system DNS is 127.0.0.1"
+        );
     }
 
     /// **fix (issue #152, root cause 1)**: `try_recover_dns` must read the
