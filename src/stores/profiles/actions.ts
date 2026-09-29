@@ -243,7 +243,7 @@ export const closeApplyConfirmAtom = atom(null, (_get, set) => {
 //    preview/apply TOCTOU while keeping the common path a single write.
 //
 // Surface state mirrors `executeApplyAtom` so the existing
-// ApplyConfirmDialog / ApplyStatus wiring still lights up.
+// ApplyConfirmDialog wiring still lights up.
 export const quickApplyToggleAtom = atom(
   null,
   async (
