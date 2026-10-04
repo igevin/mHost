@@ -6,10 +6,13 @@
 //! changes go through [`persist_and_reload`] which keeps file + memory +
 //! `DnsServer.ad_block_engine` in sync atomically.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
+use std::path::Path;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -20,6 +23,7 @@ use mhost_hosts::Parser;
 use mhost_storage::adblock as adblock_store;
 use serde::{Deserialize, Serialize};
 use tauri::State;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::state::{lock_or_recover, AppState};
@@ -305,6 +309,7 @@ pub(crate) async fn persist_and_reload(state: &AppState) -> Result<(), MhostErro
     let root = state.storage.root().to_path_buf();
     let dns_enabled = state.dns_enabled.load(Ordering::Relaxed);
     let dns_server = Arc::clone(&state.dns_server);
+    let gate = Arc::clone(&state.ad_block_reload_gate);
     // Clone the token out from its Mutex slot before crossing the
     // spawn_blocking boundary. Issue #138 follow-up: the field is a
     // `Mutex<CancellationToken>` (not a bare token) so the refresh
@@ -316,24 +321,13 @@ pub(crate) async fn persist_and_reload(state: &AppState) -> Result<(), MhostErro
         adblock_store::write_state(&root, &snapshot)
             .map_err(|e| MhostError::InvalidInput(format!("write_state: {}", e)))?;
         if dns_enabled && !cancel.is_cancelled() {
-            // We deliberately run classify_rules even if the pre-check
-            // just succeeded: it's the long sync step (100k+ domain
-            // parsing) and is exactly where cancel is most likely to
-            // land. The post-classify check below is the only
-            // authoritative one for the reload decision; the pre-check
-            // exists only to skip the work entirely when we know up
-            // front that we'll bail.
-            let (zero_addr, nxdomain, whitelist) = classify_rules(&snapshot, &root);
-            // Re-check after classify_rules: it's the long sync step and
-            // is exactly where cancel is most likely to have landed.
-            // (See issue #138: spawn_blocking cannot be aborted.)
-            if !cancel.is_cancelled() {
-                if let Some(server) = lock_or_recover(&dns_server).as_ref() {
-                    // Issue #199 sub-task B: pass the master
-                    // switch to the engine so `check()` can
-                    // decide whether misses should accumulate.
-                    server.reload_ad_block_rules(snapshot.enabled, zero_addr, nxdomain, whitelist);
-                }
+            if let Some(server) = lock_or_recover(&dns_server).as_ref() {
+                // 指纹门（issue #224）：规则输入未变的 mutation（reorder /
+                // interval / auto_refresh / rules_limit_override / 拉到
+                // 未变更内容的刷新）在这里被整段跳过 —— 不重解析、不重建
+                // trie、不清 DNS LRU。force=false；cancel 由
+                // classify_and_reload 在 classify 之后、reload 之前自查。
+                classify_and_reload(&snapshot, &root, &gate, server, false, Some(&cancel));
             }
         }
         Ok(())
@@ -342,44 +336,259 @@ pub(crate) async fn persist_and_reload(state: &AppState) -> Result<(), MhostErro
     .map_err(|e| MhostError::InvalidInput(format!("persist task failed: {}", e)))?
 }
 
-/// Reduce `AdBlockState` into the three rule sets consumed by the engine.
-/// Reads each enabled source's cache file synchronously — only invoked from
-/// `persist_and_reload`, which is in turn called from a tokio task; the IO
-/// is fast (small files, no parsing needed here).
-pub(crate) fn classify_rules(
-    state: &AdBlockState,
-    root: &std::path::Path,
+/// Per-source parsed-domain cache + reload fingerprint gate (issue #224).
+///
+/// 修复前的失效链是「任何 mutator → 全量重读盘 + 重解析全部 enabled
+/// source → 全量重建 3 棵 trie → 清空整个 DNS LRU」。其中 reorder /
+/// interval / auto_refresh / rules_limit_override 根本不改变规则集，
+/// 单源刷新（内容未变）也不改变。现在：
+///
+/// * **指纹门**：指纹 = `enabled` + 每个 enabled source 的
+///   `(source_id, response, 缓存内容 hash)`（按 source_id 排序，与
+///   source 顺序无关——引擎语义本就与顺序无关：zero_addr 全部是
+///   `0.0.0.0` 常量、nxdomain 是集合、`check()` 的优先级是结构性的
+///   whitelist → nxdomain → zero_addr）+ 白名单集合。指纹未变 →
+///   整段失效链（含 LRU 清空）被跳过。
+/// * **解析缓存**：`source_id → (内容 hash, Arc<Vec<String>>)`。内容
+///   hash 不变的 source 复用上次的解析结果，真实变更时只重解析脏
+///   source。
+// `pub`（非 pub(crate)）：AppState 的公开字段持有 `Arc<Self>`，
+// crate 私有类型出现在公开字段上会触发 private_interfaces lint。
+pub struct AdBlockReloadGate {
+    /// 上次成功 reload 进引擎的规则输入指纹。`None` = 引擎还没装过规则
+    /// （冷启动后、或 seed 路径尚未跑）。
+    ///
+    /// 这把锁同时充当 reload 串行化锁：指纹比较 → merge → reload →
+    /// 记录在同一把临界区内完成。若把「比较」和「记录」拆开，两个并发
+    /// persist（用户快速连点两个 mutator）的 spawn_blocking 完成顺序
+    /// 不定——旧状态的任务可能在新状态之后记录指纹，把引擎实际持有的
+    /// 新规则错标成旧指纹，下一次同旧输入的 mutation 会被错误跳过。
+    /// 串行化的代价（reload 期间并发 persist 排队）正是想要的合并效果。
+    fingerprint: Mutex<Option<u64>>,
+    /// source_id → 解析缓存。与 fingerprint 分锁：解析缓存的读写是
+    /// 短临界区，不应被 reload 串行阻塞。
+    parsed: Mutex<HashMap<SourceId, ParsedSource>>,
+}
+
+#[derive(Clone)]
+struct ParsedSource {
+    content_hash: u64,
+    domains: Arc<Vec<String>>,
+}
+
+impl Default for AdBlockReloadGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AdBlockReloadGate {
+    pub fn new() -> Self {
+        Self {
+            fingerprint: Mutex::new(None),
+            parsed: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// 内容 hash 一致才命中解析缓存。
+    fn cached_domains(&self, source_id: &SourceId, content_hash: u64) -> Option<Arc<Vec<String>>> {
+        let parsed = lock_or_recover(&self.parsed);
+        parsed
+            .get(source_id)
+            .filter(|p| p.content_hash == content_hash)
+            .map(|p| Arc::clone(&p.domains))
+    }
+
+    fn store_parsed(&self, source_id: SourceId, content_hash: u64, domains: Arc<Vec<String>>) {
+        lock_or_recover(&self.parsed).insert(
+            source_id,
+            ParsedSource {
+                content_hash,
+                domains,
+            },
+        );
+    }
+
+    /// 只保留仍在规则集里的 source。disabled / 已删除 source 的解析缓存
+    /// 不释放会白白占住内存（单源可达几十 MB）。
+    fn retain_sources(&self, keep: &HashSet<SourceId>) {
+        lock_or_recover(&self.parsed).retain(|id, _| keep.contains(id));
+    }
+
+    #[cfg(test)]
+    fn parsed_len(&self) -> usize {
+        lock_or_recover(&self.parsed).len()
+    }
+}
+
+/// [`load_classify_inputs`] 的产物：合并前的规则输入。
+pub(crate) struct ClassifyInputs {
+    fingerprint: u64,
+    enabled: bool,
+    /// 每个 enabled source 的 `(source, 缓存内容 hash, 解析出的域名)`，
+    /// 已按 source_id 排序（指纹与 source 顺序无关的前提）。
+    sources: Vec<(AdBlockSource, u64, Arc<Vec<String>>)>,
+    whitelist: HashSet<String>,
+}
+
+/// 读取每个 enabled source 的缓存内容（算 hash 供指纹用），命中解析
+/// 缓存则复用，未命中才解析并写回缓存。
+fn load_classify_inputs(
+    snap: &AdBlockState,
+    root: &Path,
+    gate: &AdBlockReloadGate,
+) -> ClassifyInputs {
+    let mut sources: Vec<(AdBlockSource, u64, Arc<Vec<String>>)> = Vec::new();
+    let mut enabled_ids: HashSet<SourceId> = HashSet::new();
+
+    if snap.enabled {
+        // 仅 master switch 开启时才下发规则到引擎；关闭时引擎收到空集，
+        // 自然 fallback 到原始规则 / 上游（与旧 classify_rules 一致）。
+        for source in &snap.sources {
+            if !source.enabled {
+                continue;
+            }
+            enabled_ids.insert(source.source_id.clone());
+            let content = match adblock_store::read_cache(root, &source.source_id) {
+                Ok(Some(content)) => content,
+                Ok(None) => String::new(),
+                Err(e) => {
+                    eprintln!(
+                        "[adblock] failed to read cache for source {}: {}",
+                        source.name, e
+                    );
+                    String::new()
+                }
+            };
+            let content_hash = {
+                let mut h = DefaultHasher::new();
+                content.as_bytes().hash(&mut h);
+                h.finish()
+            };
+            let domains = match gate.cached_domains(&source.source_id, content_hash) {
+                Some(domains) => domains,
+                None => {
+                    let domains = Arc::new(parse_blocklist_domains(&content).domains);
+                    gate.store_parsed(source.source_id.clone(), content_hash, Arc::clone(&domains));
+                    domains
+                }
+            };
+            sources.push((source.clone(), content_hash, domains));
+        }
+    }
+    gate.retain_sources(&enabled_ids);
+
+    // SourceId 自身只 derive 了 Eq/Hash；排序用内部的 Uuid（有 Ord）。
+    sources.sort_by_key(|s| s.0.source_id.0);
+    let fingerprint = compute_fingerprint(snap.enabled, &sources, &snap.whitelist);
+    let whitelist: HashSet<String> = snap.whitelist.iter().cloned().collect();
+
+    ClassifyInputs {
+        fingerprint,
+        enabled: snap.enabled,
+        sources,
+        whitelist,
+    }
+}
+
+/// 规则输入指纹。除缓存内容 hash 外全部是低成本输入；内容 hash 需要
+/// 读文件，但读 + hash 比解析（逐域名 to_lowercase 分配）便宜一个量级，
+/// 且读文件本来就是旧路径必经的一步。
+fn compute_fingerprint(
+    enabled: bool,
+    sources: &[(AdBlockSource, u64, Arc<Vec<String>>)],
+    whitelist: &[String],
+) -> u64 {
+    let mut h = DefaultHasher::new();
+    enabled.hash(&mut h);
+    sources.len().hash(&mut h);
+    // sources 已按 source_id 排序（load_classify_inputs）。
+    for (source, content_hash, _domains) in sources {
+        source.source_id.hash(&mut h);
+        h.write_u8(match source.response {
+            AdBlockResponse::ZeroAddress => 0,
+            AdBlockResponse::NxDomain => 1,
+        });
+        content_hash.hash(&mut h);
+    }
+    whitelist.len().hash(&mut h);
+    // 条目 canonical（validate_whitelist_domain 出口），排序只为防御
+    // 非常规写入路径破坏顺序稳定性。
+    let mut wl: Vec<&String> = whitelist.iter().collect();
+    wl.sort();
+    for w in wl {
+        w.hash(&mut h);
+    }
+    h.finish()
+}
+
+/// 把规则输入合并成引擎要的三件套。与旧 `classify_rules` 语义一致：
+/// zero_addr 是「domain → 0.0.0.0」的映射（所有 ZeroAddress source 共享
+/// 同一个 IP，映射里没有信息量），nxdomain 是集合；同域名同时出现在
+/// 两类 source 时由引擎的结构性优先级（nxdomain 先查）裁决。
+fn merge_inputs(
+    inputs: ClassifyInputs,
 ) -> (HashMap<String, IpAddr>, HashSet<String>, HashSet<String>) {
     let mut zero_addr: HashMap<String, IpAddr> = HashMap::new();
     let mut nxdomain: HashSet<String> = HashSet::new();
 
-    if state.enabled {
-        // 仅 master switch 开启时才下发规则到引擎；关闭时引擎收到空集，
-        // 自然 fallback 到原始规则 / 上游。
-        for source in &state.sources {
-            if !source.enabled {
-                continue;
-            }
-            let domains = domains_for_source(root, source);
+    if inputs.enabled {
+        for (source, _content_hash, domains) in &inputs.sources {
             match source.response {
                 AdBlockResponse::ZeroAddress => {
                     let ip = IpAddr::from([0, 0, 0, 0]);
-                    for d in domains {
-                        zero_addr.entry(d).or_insert(ip);
+                    for d in domains.iter() {
+                        zero_addr.entry(d.clone()).or_insert(ip);
                     }
                 }
                 AdBlockResponse::NxDomain => {
-                    for d in domains {
-                        nxdomain.insert(d);
+                    for d in domains.iter() {
+                        nxdomain.insert(d.clone());
                     }
                 }
             }
         }
     }
 
-    let whitelist: HashSet<String> = state.whitelist.iter().cloned().collect();
+    (zero_addr, nxdomain, inputs.whitelist)
+}
 
-    (zero_addr, nxdomain, whitelist)
+/// 指纹决策 + merge + reload + 记录，一个函数走完整个失效链。
+///
+/// `force=true` 用于「引擎刚构造 / 刚重建，必须装规则」的 seed 路径
+/// （冷启动、DNS enable）；`force=false` 用于增量路径（persist /
+/// 自动刷新 tick），指纹未变时整段跳过。`cancel` 保留 issue #138 的
+/// post-classify 自查：classify 期间 token 落地则放弃 reload。
+///
+/// 返回是否实际 reload。
+pub(crate) fn classify_and_reload(
+    snap: &AdBlockState,
+    root: &Path,
+    gate: &AdBlockReloadGate,
+    server: &mhost_dns::DnsServer,
+    force: bool,
+    cancel: Option<&CancellationToken>,
+) -> bool {
+    // 解析缓存读取在指纹锁之外：并发任务的 load 可以并行，只在决策处
+    // 串行。
+    let inputs = load_classify_inputs(snap, root, gate);
+
+    let mut fingerprint = lock_or_recover(&gate.fingerprint);
+    if !force && *fingerprint == Some(inputs.fingerprint) {
+        return false;
+    }
+    if let Some(cancel) = cancel {
+        if cancel.is_cancelled() {
+            return false;
+        }
+    }
+    let fingerprint_value = inputs.fingerprint;
+    let (zero_addr, nxdomain, whitelist) = merge_inputs(inputs);
+    // Issue #199 sub-task B: pass the master switch to the engine so
+    // `check()` can decide whether misses should accumulate.
+    server.reload_ad_block_rules(snap.enabled, zero_addr, nxdomain, whitelist);
+    *fingerprint = Some(fingerprint_value);
+    true
 }
 
 /// Load cached parsed domains for a single source. Returns an empty Vec if
@@ -1941,6 +2150,409 @@ pub(crate) async fn remove_whitelist_impl(
 mod tests {
     use super::*;
 
+    /// 测试替身：等价于旧的无缓存 `classify_rules` 直通路径，让既有
+    /// 分区/顺序测试继续验证新管线（issue #224）的 load → merge 语义。
+    fn classify_rules(
+        state: &AdBlockState,
+        root: &Path,
+    ) -> (HashMap<String, IpAddr>, HashSet<String>, HashSet<String>) {
+        let gate = AdBlockReloadGate::new();
+        merge_inputs(load_classify_inputs(state, root, &gate))
+    }
+
+    fn mk_gate_source(name: &str, response: AdBlockResponse) -> AdBlockSource {
+        AdBlockSource {
+            source_id: SourceId(Uuid::new_v4()),
+            name: name.into(),
+            url: "https://x".into(),
+            enabled: true,
+            response,
+            format: BlocklistFormat::Hosts,
+            last_fetched_at: None,
+            last_error: None,
+            rule_count: 0,
+            etag: None,
+            rules_limit_override: None,
+            last_refresh_duration_ms: None,
+            last_refresh_failed_at: None,
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // 指纹门（issue #224）
+    // -------------------------------------------------------------------
+
+    /// 头号场景：拖拽排序改变 `sources` 的 Vec 顺序，但规则集输入完全
+    /// 不变 → 指纹必须相同（否则每次拖拽都触发全量重解析 + trie 重建 +
+    /// DNS LRU 清空）。
+    #[test]
+    fn reload_gate_fingerprint_ignores_source_reorder() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let gate = AdBlockReloadGate::new();
+        let a = mk_gate_source("a", AdBlockResponse::ZeroAddress);
+        let b = mk_gate_source("b", AdBlockResponse::NxDomain);
+        mhost_storage::adblock::write_cache(
+            temp.path(),
+            &a.source_id,
+            b"0.0.0.0 ads.example.com\n",
+        )
+        .unwrap();
+        mhost_storage::adblock::write_cache(
+            temp.path(),
+            &b.source_id,
+            b"0.0.0.0 blocked.example.com\n",
+        )
+        .unwrap();
+
+        let state_ab = AdBlockState {
+            enabled: true,
+            sources: vec![a.clone(), b.clone()],
+            ..Default::default()
+        };
+        let state_ba = AdBlockState {
+            enabled: true,
+            sources: vec![b, a],
+            ..Default::default()
+        };
+
+        let fp_ab = load_classify_inputs(&state_ab, temp.path(), &gate).fingerprint;
+        let fp_ba = load_classify_inputs(&state_ba, temp.path(), &gate).fingerprint;
+        assert_eq!(
+            fp_ab, fp_ba,
+            "reorder must not change the rule-input fingerprint"
+        );
+    }
+
+    /// 纯设置类变更（interval / auto_refresh / per-source limit override）
+    /// 不改变规则输入 → 指纹相同。
+    #[test]
+    fn reload_gate_fingerprint_ignores_settings_only_mutations() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let gate = AdBlockReloadGate::new();
+        let mut source = mk_gate_source("a", AdBlockResponse::ZeroAddress);
+        mhost_storage::adblock::write_cache(
+            temp.path(),
+            &source.source_id,
+            b"0.0.0.0 ads.example.com\n",
+        )
+        .unwrap();
+
+        let base = AdBlockState {
+            enabled: true,
+            sources: vec![source.clone()],
+            auto_refresh_enabled: true,
+            refresh_interval_hours: 24,
+            ..Default::default()
+        };
+
+        // interval + auto_refresh 变更
+        let mut settings = base.clone();
+        settings.refresh_interval_hours = 72;
+        settings.auto_refresh_enabled = false;
+
+        // per-source limit override 变更（生效点在 fetch 时截断缓存内容，
+        // 不影响当前缓存 → 规则集不变）
+        let mut limit = base.clone();
+        source.rules_limit_override = Some(123);
+        limit.sources = vec![source];
+
+        let fp_base = load_classify_inputs(&base, temp.path(), &gate).fingerprint;
+        let fp_settings = load_classify_inputs(&settings, temp.path(), &gate).fingerprint;
+        let fp_limit = load_classify_inputs(&limit, temp.path(), &gate).fingerprint;
+        assert_eq!(
+            fp_base, fp_settings,
+            "interval/auto_refresh must not change the fingerprint"
+        );
+        assert_eq!(
+            fp_base, fp_limit,
+            "rules_limit_override must not change the fingerprint"
+        );
+    }
+
+    /// 反向针：真正改变规则集的输入必须改变指纹。
+    #[test]
+    fn reload_gate_fingerprint_tracks_rule_inputs() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let gate = AdBlockReloadGate::new();
+        let source = mk_gate_source("a", AdBlockResponse::ZeroAddress);
+        mhost_storage::adblock::write_cache(
+            temp.path(),
+            &source.source_id,
+            b"0.0.0.0 ads.example.com\n",
+        )
+        .unwrap();
+        let base = AdBlockState {
+            enabled: true,
+            sources: vec![source.clone()],
+            whitelist: vec!["trusted.example.com".to_string()],
+            ..Default::default()
+        };
+        let fp_base = load_classify_inputs(&base, temp.path(), &gate).fingerprint;
+
+        // 白名单增删
+        let mut wl = base.clone();
+        wl.whitelist.push("extra.example.com".to_string());
+        // master 开关
+        let mut off = base.clone();
+        off.enabled = false;
+        // source 启停
+        let mut src_off = base.clone();
+        src_off.sources[0].enabled = false;
+        // response 策略
+        let mut resp = base.clone();
+        resp.sources[0].response = AdBlockResponse::NxDomain;
+        // 缓存内容变更
+        mhost_storage::adblock::write_cache(
+            temp.path(),
+            &source.source_id,
+            b"0.0.0.0 ads.example.com\n0.0.0.0 tracker.example.com\n",
+        )
+        .unwrap();
+        let mut content = base.clone();
+        content.sources = vec![source];
+
+        let fp_wl = load_classify_inputs(&wl, temp.path(), &gate).fingerprint;
+        let fp_off = load_classify_inputs(&off, temp.path(), &gate).fingerprint;
+        let fp_src_off = load_classify_inputs(&src_off, temp.path(), &gate).fingerprint;
+        let fp_resp = load_classify_inputs(&resp, temp.path(), &gate).fingerprint;
+        let fp_content = load_classify_inputs(&content, temp.path(), &gate).fingerprint;
+
+        assert_ne!(
+            fp_base, fp_wl,
+            "whitelist change must change the fingerprint"
+        );
+        assert_ne!(fp_base, fp_off, "master toggle must change the fingerprint");
+        assert_ne!(
+            fp_base, fp_src_off,
+            "source enable toggle must change the fingerprint"
+        );
+        assert_ne!(
+            fp_base, fp_resp,
+            "response change must change the fingerprint"
+        );
+        assert_ne!(
+            fp_base, fp_content,
+            "cache content change must change the fingerprint"
+        );
+    }
+
+    /// 解析缓存：内容 hash 不变时复用同一个 Arc（不重解析）；内容变化
+    /// 后失效并重解析。
+    #[test]
+    fn reload_gate_parse_cache_reuses_and_invalidates() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let gate = AdBlockReloadGate::new();
+        let source = mk_gate_source("a", AdBlockResponse::ZeroAddress);
+        mhost_storage::adblock::write_cache(
+            temp.path(),
+            &source.source_id,
+            b"0.0.0.0 ads.example.com\n",
+        )
+        .unwrap();
+        let state = AdBlockState {
+            enabled: true,
+            sources: vec![source],
+            ..Default::default()
+        };
+
+        let first = load_classify_inputs(&state, temp.path(), &gate);
+        let second = load_classify_inputs(&state, temp.path(), &gate);
+        let d1 = &first.sources[0].2;
+        let d2 = &second.sources[0].2;
+        assert!(
+            Arc::ptr_eq(d1, d2),
+            "unchanged cache content must reuse the parsed domains (no re-parse)"
+        );
+        assert_eq!(d1.len(), 1);
+
+        mhost_storage::adblock::write_cache(
+            temp.path(),
+            &state.sources[0].source_id,
+            b"0.0.0.0 ads.example.com\n0.0.0.0 tracker.example.com\n",
+        )
+        .unwrap();
+        let third = load_classify_inputs(&state, temp.path(), &gate);
+        let d3 = &third.sources[0].2;
+        assert!(
+            !Arc::ptr_eq(d1, d3),
+            "changed cache content must invalidate the parse cache"
+        );
+        assert_eq!(d3.len(), 2, "re-parse must observe the new content");
+    }
+
+    /// disabled / 删除的 source 的解析缓存必须被清理（单源可达几十 MB，
+    /// 不清理是常驻泄漏）。
+    #[test]
+    fn reload_gate_parse_cache_prunes_disabled_sources() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let gate = AdBlockReloadGate::new();
+        let mut a = mk_gate_source("a", AdBlockResponse::ZeroAddress);
+        let b = mk_gate_source("b", AdBlockResponse::ZeroAddress);
+        mhost_storage::adblock::write_cache(temp.path(), &a.source_id, b"0.0.0.0 a.example.com\n")
+            .unwrap();
+        mhost_storage::adblock::write_cache(temp.path(), &b.source_id, b"0.0.0.0 b.example.com\n")
+            .unwrap();
+        let state = AdBlockState {
+            enabled: true,
+            sources: vec![a.clone(), b.clone()],
+            ..Default::default()
+        };
+        load_classify_inputs(&state, temp.path(), &gate);
+        assert_eq!(gate.parsed_len(), 2);
+
+        a.enabled = false;
+        let state_a_off = AdBlockState {
+            enabled: true,
+            sources: vec![a, b],
+            ..Default::default()
+        };
+        load_classify_inputs(&state_a_off, temp.path(), &gate);
+        assert_eq!(
+            gate.parsed_len(),
+            1,
+            "disabled source's parse cache must be pruned"
+        );
+    }
+
+    /// 端到端：真实 DnsServer 上，指纹未变跳过 reload（返回 false），
+    /// 规则变化时 reload（返回 true）且引擎规则数随之更新。
+    #[test]
+    fn classify_and_reload_skips_unchanged_and_reloads_changed() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let gate = AdBlockReloadGate::new();
+        let server =
+            mhost_dns::DnsServer::new(mhost_dns::DnsConfig::default()).expect("dns server");
+        let source = mk_gate_source("a", AdBlockResponse::ZeroAddress);
+        mhost_storage::adblock::write_cache(
+            temp.path(),
+            &source.source_id,
+            b"0.0.0.0 ads.example.com\n",
+        )
+        .unwrap();
+        let state = AdBlockState {
+            enabled: true,
+            sources: vec![source],
+            ..Default::default()
+        };
+
+        // 首次：指纹 None → reload
+        assert!(classify_and_reload(
+            &state,
+            temp.path(),
+            &gate,
+            &server,
+            false,
+            None
+        ));
+        assert_eq!(server.ad_block_rule_count(), 1);
+
+        // 同一状态：跳过
+        assert!(!classify_and_reload(
+            &state,
+            temp.path(),
+            &gate,
+            &server,
+            false,
+            None
+        ));
+        assert_eq!(server.ad_block_rule_count(), 1);
+
+        // 缓存内容变化：reload，规则数更新
+        mhost_storage::adblock::write_cache(
+            temp.path(),
+            &state.sources[0].source_id,
+            b"0.0.0.0 ads.example.com\n0.0.0.0 tracker.example.com\n",
+        )
+        .unwrap();
+        assert!(classify_and_reload(
+            &state,
+            temp.path(),
+            &gate,
+            &server,
+            false,
+            None
+        ));
+        assert_eq!(server.ad_block_rule_count(), 2);
+    }
+
+    /// force（seed 路径）无视指纹：即使指纹相同也必须把规则装进引擎。
+    #[test]
+    fn classify_and_reload_force_reseeds_engine() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let gate = AdBlockReloadGate::new();
+        let server =
+            mhost_dns::DnsServer::new(mhost_dns::DnsConfig::default()).expect("dns server");
+        let source = mk_gate_source("a", AdBlockResponse::ZeroAddress);
+        mhost_storage::adblock::write_cache(
+            temp.path(),
+            &source.source_id,
+            b"0.0.0.0 ads.example.com\n",
+        )
+        .unwrap();
+        let state = AdBlockState {
+            enabled: true,
+            sources: vec![source],
+            ..Default::default()
+        };
+
+        assert!(classify_and_reload(
+            &state,
+            temp.path(),
+            &gate,
+            &server,
+            true,
+            None
+        ));
+        // 同状态再 force：依然 reload（DNS enable / 冷启动 seed 的语义）。
+        assert!(classify_and_reload(
+            &state,
+            temp.path(),
+            &gate,
+            &server,
+            true,
+            None
+        ));
+        assert_eq!(server.ad_block_rule_count(), 1);
+    }
+
+    /// issue #138 的 post-classify 自查契约：cancel 在 classify 之后落地
+    /// 时放弃 reload（引擎保持空集）。
+    #[test]
+    fn classify_and_reload_honors_cancelled_token() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let gate = AdBlockReloadGate::new();
+        let server =
+            mhost_dns::DnsServer::new(mhost_dns::DnsConfig::default()).expect("dns server");
+        let source = mk_gate_source("a", AdBlockResponse::ZeroAddress);
+        mhost_storage::adblock::write_cache(
+            temp.path(),
+            &source.source_id,
+            b"0.0.0.0 ads.example.com\n",
+        )
+        .unwrap();
+        let state = AdBlockState {
+            enabled: true,
+            sources: vec![source],
+            ..Default::default()
+        };
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert!(!classify_and_reload(
+            &state,
+            temp.path(),
+            &gate,
+            &server,
+            false,
+            Some(&cancel)
+        ));
+        assert_eq!(
+            server.ad_block_rule_count(),
+            0,
+            "cancelled reload must leave the engine empty"
+        );
+    }
+
     #[test]
     fn classify_rules_disabled_master_yields_empty() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -3247,6 +3859,9 @@ another-bare.example.com
                 tokio_util::sync::CancellationToken::new(),
             ),
             ad_block_refresh_wake: std::sync::Arc::new(tokio::sync::Notify::new()),
+            ad_block_reload_gate: std::sync::Arc::new(
+                crate::commands::adblock::AdBlockReloadGate::new(),
+            ),
         };
         (state, storage)
     }
