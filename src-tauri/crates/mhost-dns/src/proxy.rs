@@ -876,6 +876,22 @@ pub(crate) mod tests {
         std::fs::write(&signal_path, "  shutdown  \n").unwrap();
         assert!(shutdown_signal_file_contains_shutdown());
 
+        // 5. 非 UTF-8 字节 → false。#229-3 栈缓冲读用 from_utf8（失败按无
+        //    信号处理）；旧 read_to_string 同样 Err → false，语义一致。
+        std::fs::write(&signal_path, [0xFF, 0xFE]).unwrap();
+        assert!(!shutdown_signal_file_contains_shutdown());
+
+        // 6. 超过 32 字节栈缓冲、但前 32 字节 trim 后恰为 "shutdown" → true。
+        //    这是 #229-3 的有意边界（只读前 32 字节）：真实 writer 只写
+        //    7-8 字节字面量（platform.rs / proxy.rs 的 write_signal_file
+        //    调用点），这里把放宽钉死为已文档化行为。
+        std::fs::write(&signal_path, format!("shutdown{}", " ".repeat(40))).unwrap();
+        assert!(shutdown_signal_file_contains_shutdown());
+
+        // 7. 超过 32 字节且前 32 字节不是 "shutdown" → false
+        std::fs::write(&signal_path, format!("running{}", "x".repeat(40))).unwrap();
+        assert!(!shutdown_signal_file_contains_shutdown());
+
         // 清理
         let _ = std::fs::remove_file(&signal_path);
         clear_test_runtime_dir();

@@ -648,11 +648,11 @@ async fn handle_dns_request(
             // **fix (P-R2, issue #90)**: `*record.clone()` 之前是 `clone Box + deref`
             // （两次 alloc：Box 本身 + Box 内的 Record）。`record.as_ref().clone()`
             // 只 alloc 一次（Record 本身），更高效。
-            // **fix（issue #223）**：之前是 `answer.clone()` 再传进
-            // `build_answer_response(... answer: Record)`，miss 路径每查询多一次
-            // Record 分配。改成传 `&Record` 后，函数内部 `add_answer` 需要 owned
-            // 时的 clone 是唯一一次，省掉调用方提前备的那一份。
-            let answer = record.as_ref().clone();
+            // **fix（issue #229 review）**：miss 路径之前对 Record 做了两次深拷贝
+            // （`record.as_ref().clone()` 备缓存一份 + `add_answer` 内部为响应
+            // clone 一份）。改为直接 move 出 `Box<Record>`：原件免费成为缓存的
+            // 那一份，`add_answer` 的内部 clone 成为每次 miss 唯一的深拷贝。
+            let answer = *record;
             let response_bytes = build_answer_response(&request, &query, &answer);
 
             // TTL=0 是合法 DNS 值（"不要缓存"），跳过 put 避免
