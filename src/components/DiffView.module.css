@@ -57,6 +57,19 @@
   color: var(--color-text);
 }
 
+/* Non-interactive sibling of .diffUnchangedCollapsed — the "…N more"
+ * truncated-lines note (issue #230 item 8). Same visual weight, but no
+ * pointer cursor or hover affordance since it is not clickable. */
+.diffUnchangedNote {
+  composes: diffUnchangedCollapsed;
+  cursor: default;
+}
+
+.diffUnchangedNote:hover {
+  background: transparent;
+  color: var(--color-text-muted, #888);
+}
+
 .diffEmpty {
   font-family: var(--font-mono, ui-monospace, "SF Mono", Menlo, monospace);
   font-size: 12px;

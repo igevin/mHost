@@ -177,6 +177,14 @@ function Layout() {
     setShowManagement(true);
   }, []);
 
+  // Issue #230 item 5: keep the onClose prop stable. It feeds the
+  // drawer's Escape-key effect (`[open, onClose]` deps) — an inline arrow
+  // here re-created it on every Layout render, tearing down and re-adding
+  // the document listener each time while the drawer was open.
+  const handleCloseManagement = useCallback(() => {
+    setShowManagement(false);
+  }, []);
+
   return (
     <div className={styles.mhostLayout}>
       <Sidebar
@@ -202,7 +210,7 @@ function Layout() {
 
       <ManagementDrawer
         open={showManagement}
-        onClose={() => setShowManagement(false)}
+        onClose={handleCloseManagement}
       />
 
       <ApplyConfirmDialog

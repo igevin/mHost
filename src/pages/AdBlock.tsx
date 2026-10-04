@@ -1,4 +1,4 @@
-import { useCallback, useState, useEffect, useRef } from "react";
+import { useCallback, useState, useEffect, useRef, useMemo, memo } from "react";
 import { useAtomValue, useSetAtom } from "jotai";
 import { confirm as confirmDialog } from "@tauri-apps/plugin-dialog";
 import {
@@ -32,7 +32,13 @@ import {
 } from "../stores/profiles";
 import { useNavigate } from "react-router-dom";
 import { useWebKitPointerDown } from "../hooks/useWebKitPointerDown";
-import type { AdBlockResponse, BlocklistFormat } from "../types";
+import type {
+  AdBlockLimits,
+  AdBlockResponse,
+  AdBlockSource,
+  BlocklistFormat,
+  OverlapSummary,
+} from "../types";
 import styles from "./AdBlock.module.css";
 
 // Issue #207: parse "source produced N rules (limit: M)" out of
@@ -48,6 +54,281 @@ function parseOverLimitError(lastError: string): { actual: number } | null {
   if (Number.isNaN(actual) || actual <= 0) return null;
   return { actual };
 }
+
+/* ---------------------------------------------------------------------------
+ * Issue #230 A1/A2: the source cards and the whitelist list are extracted
+ * into memo'd components so unrelated renders of the page root (keystrokes
+ * in the add-source form, error toasts, the isLoading flip at the start and
+ * end of every mutation) don't re-render every card and whitelist entry.
+ * Each leaf subscribes to `isAdBlockLoadingAtom` itself; the parent passes
+ * only data whose identity actually changes (src object, overlap summary,
+ * limits). All jotai setters are stable references, so memo holds.
+ * ------------------------------------------------------------------------- */
+
+interface SourceCardProps {
+  src: AdBlockSource;
+  index: number;
+  isLast: boolean;
+  overlapSummary: OverlapSummary | undefined;
+  limits: AdBlockLimits | null;
+  onShowOverlap: (sourceId: string) => void;
+}
+
+const SourceCard = memo(function SourceCard({
+  src,
+  index,
+  isLast,
+  overlapSummary,
+  limits,
+  onShowOverlap,
+}: SourceCardProps) {
+  const isLoading = useAtomValue(isAdBlockLoadingAtom);
+  const setSourceEnabled = useSetAtom(setAdBlockSourceEnabledAtom);
+  const setSourceResponse = useSetAtom(setAdBlockSourceResponseAtom);
+  const overrideSourceLimit = useSetAtom(overrideAdBlockSourceRulesLimitAtom);
+  const resetSourceLimit = useSetAtom(setAdBlockSourceRulesLimitOverrideAtom);
+  const refreshSource = useSetAtom(refreshAdBlockSourceAtom);
+  const reorderSource = useSetAtom(reorderAdBlockSourceAtom);
+  const removeSource = useSetAtom(removeAdBlockSourceAtom);
+  const { onPointerDown } = useWebKitPointerDown();
+
+  return (
+    <div className={`${styles.sourceCard} ${!src.enabled ? styles.dimmed : ""}`}>
+      <div className={styles.sourceHeader}>
+        <div className={styles.flexGrow}>
+          <div className={styles.sourceTitle}>
+            <span>{src.name}</span>
+            {src.last_error && (
+              <span className={styles.errorBadge} title={src.last_error}>
+                fetch failed
+              </span>
+            )}
+          </div>
+          <div className={styles.sourceMeta}>{src.url}</div>
+          <div className={styles.sourceMeta}>
+            {src.rule_count.toLocaleString()} rules
+            {` · ${src.format} format`}
+            {src.rules_limit_override != null &&
+              ` · limit ${src.rules_limit_override.toLocaleString()} (manually raised)`}
+            {src.last_fetched_at &&
+              ` · fetched ${new Date(src.last_fetched_at).toLocaleString()}`}
+            {src.last_error && (
+              <>
+                {" · "}
+                <span className={styles.dangerText}>{src.last_error}</span>
+              </>
+            )}
+          </div>
+
+          {/* Issue #215 §1: overlap chip — visible only when this source
+              shares at least one domain with another enabled source.
+              Clicking opens the drill-down drawer at the bottom of the
+              page. The chip is intentionally outside the existing
+              `sourceMeta` line so it doesn't clutter the status text for
+              sources with zero overlaps. */}
+          {overlapSummary && overlapSummary.overlapping_domain_count > 0 && (
+            <button
+              type="button"
+              className={styles.overlapChip}
+              onClick={() => onShowOverlap(src.source_id)}
+              aria-label={`Show ${overlapSummary.overlapping_domain_count} overlapping domains for ${src.name}`}
+              onPointerDown={onPointerDown(() => {})}
+            >
+              {overlapSummary.overlapping_domain_count.toLocaleString()}{" "}
+              domains also covered by other sources
+            </button>
+          )}
+          {/* Issue #207: one-click way out for legitimately huge lists. The
+              backend stays fail-closed (no truncation); this raises the
+              per-source cap to the actual parsed count and retries through
+              the normal refresh path. Issue #211-3: the absolute-cap gate
+              uses the backend-delivered limits; while limits are unknown
+              the entry stays available — the backend remains the authority
+              and rejects over-cap overrides itself. */}
+          {(() => {
+            const over =
+              src.last_error != null ? parseOverLimitError(src.last_error) : null;
+            if (!over) return null;
+            if (
+              limits != null &&
+              over.actual > limits.rules_per_source_absolute_max
+            ) {
+              return null;
+            }
+            return (
+              <div className={styles.limitOverrideRow}>
+                <span className={styles.muted}>
+                  This list has {over.actual.toLocaleString()} rules — above
+                  the default cap.
+                </span>
+                <button
+                  className="btn btn-sm btn-primary"
+                  onClick={() =>
+                    overrideSourceLimit({
+                      sourceId: src.source_id,
+                      limit: over.actual,
+                    }).catch(() => {})
+                  }
+                  disabled={isLoading}
+                  onPointerDown={onPointerDown(() => {})}
+                >
+                  Allow {over.actual.toLocaleString()} rules &amp; retry
+                </button>
+              </div>
+            );
+          })()}
+
+          {src.rules_limit_override != null && (
+            <div className={styles.limitOverrideRow}>
+              <button
+                className={`btn btn-sm btn-ghost ${styles.limitResetBtn}`}
+                onClick={() =>
+                  resetSourceLimit({
+                    sourceId: src.source_id,
+                    limit: null,
+                  }).catch(() => {})
+                }
+                disabled={isLoading}
+                onPointerDown={onPointerDown(() => {})}
+              >
+                Reset rule limit to default
+              </button>
+            </div>
+          )}
+        </div>
+
+        <div className={styles.sourceActions}>
+          <label className="toggle">
+            <input
+              type="checkbox"
+              checked={src.enabled}
+              onChange={(e) =>
+                setSourceEnabled({
+                  sourceId: src.source_id,
+                  enabled: e.target.checked,
+                }).catch(() => {})
+              }
+              disabled={isLoading}
+            />
+            <span className="toggle-slider" />
+          </label>
+
+          <select
+            className={`input ${styles.badgeSm}`}
+            value={src.response}
+            onChange={(e) =>
+              setSourceResponse({
+                sourceId: src.source_id,
+                response: e.target.value as AdBlockResponse,
+              }).catch(() => {})
+            }
+            disabled={isLoading}
+          >
+            <option value="zero_address">0.0.0.0</option>
+            <option value="nx_domain">NXDOMAIN</option>
+          </select>
+
+          {/* Issue #215: source reorder. Two ↑/↓ buttons (no dnd — see
+              AGENTS.md / spec; the project has no draggable primitive).
+              The Up button is disabled at the head and the Down button at
+              the tail, so the boundary no-op case on the server can't be
+              reached from the UI. Order is purely a presentation concern —
+              never affects interception (covered by the backend regression
+              tests in `commands::adblock::tests`). */}
+          <button
+            type="button"
+            className="btn btn-sm btn-ghost"
+            onClick={() =>
+              reorderSource({
+                sourceId: src.source_id,
+                direction: "up",
+              }).catch(() => {})
+            }
+            disabled={isLoading || index === 0}
+            aria-label={`Move source ${src.name} up`}
+            title="Move up"
+            onPointerDown={onPointerDown(() => {})}
+          >
+            ↑
+          </button>
+          <button
+            type="button"
+            className="btn btn-sm btn-ghost"
+            onClick={() =>
+              reorderSource({
+                sourceId: src.source_id,
+                direction: "down",
+              }).catch(() => {})
+            }
+            disabled={isLoading || isLast}
+            aria-label={`Move source ${src.name} down`}
+            title="Move down"
+            onPointerDown={onPointerDown(() => {})}
+          >
+            ↓
+          </button>
+          <button
+            className="btn btn-sm btn-ghost"
+            onClick={() => refreshSource(src.source_id).catch(() => {})}
+            disabled={isLoading}
+            onPointerDown={onPointerDown(() => {})}
+          >
+            Refresh
+          </button>
+          <button
+            className="btn btn-sm btn-danger"
+            onClick={() => {
+              confirmDialog(`Remove source "${src.name}"?`, {
+                title: "Remove Source",
+                kind: "warning",
+              })
+                .then((ok) => {
+                  if (ok) removeSource(src.source_id).catch(() => {});
+                })
+                .catch(() => {});
+            }}
+            disabled={isLoading}
+            onPointerDown={onPointerDown(() => {})}
+          >
+            Delete
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+});
+
+/**
+ * Issue #230 A2: the whitelist entries are memo'd as a block. A paste of
+ * hundreds of domains (issue #196) otherwise re-renders every span+button
+ * pair on unrelated page renders; now only a change to `items` itself
+ * (a mutation's state refetch) does.
+ */
+const WhitelistList = memo(function WhitelistList({ items }: { items: string[] }) {
+  const isLoading = useAtomValue(isAdBlockLoadingAtom);
+  const removeWhitelist = useSetAtom(removeAdBlockWhitelistAtom);
+
+  if (items.length === 0) {
+    return <div className={styles.empty}>No whitelist entries.</div>;
+  }
+  return (
+    <div className={styles.whitelistList}>
+      {items.map((d) => (
+        <span key={d} className={styles.whitelistItem}>
+          {d}
+          <button
+            className={styles.removeBtn}
+            onClick={() => removeWhitelist(d).catch(() => {})}
+            aria-label={`Remove ${d}`}
+            disabled={isLoading}
+          >
+            ×
+          </button>
+        </span>
+      ))}
+    </div>
+  );
+});
 
 function AdBlock() {
   const state = useAtomValue(adBlockStateAtom);
@@ -69,16 +350,8 @@ function AdBlock() {
   const setInterval = useSetAtom(setAdBlockIntervalAtom);
   const setAutoRefresh = useSetAtom(setAdBlockAutoRefreshEnabledAtom);
   const addSource = useSetAtom(addAdBlockSourceAtom);
-  const removeSource = useSetAtom(removeAdBlockSourceAtom);
-  const setSourceEnabled = useSetAtom(setAdBlockSourceEnabledAtom);
-  const setSourceResponse = useSetAtom(setAdBlockSourceResponseAtom);
-  const overrideSourceLimit = useSetAtom(overrideAdBlockSourceRulesLimitAtom);
-  const resetSourceLimit = useSetAtom(setAdBlockSourceRulesLimitOverrideAtom);
-  const refreshSource = useSetAtom(refreshAdBlockSourceAtom);
-  const reorderSource = useSetAtom(reorderAdBlockSourceAtom);
   const refreshAll = useSetAtom(refreshAllAdBlockSourcesAtom);
   const addWhitelistMany = useSetAtom(addAdBlockWhitelistManyAtom);
-  const removeWhitelist = useSetAtom(removeAdBlockWhitelistAtom);
 
   const { onPointerDown } = useWebKitPointerDown();
   const navigate = useNavigate();
@@ -118,6 +391,19 @@ function AdBlock() {
     // trip when the user opens the drawer.
     fetchOverlaps().catch(() => {});
   }, [fetchState, fetchLimits, fetchStats, fetchOverlaps]);
+
+  // Issue #230 A3: the per-source overlap summary was looked up with
+  // `per_source.find` inside the sources map — O(sources × report rows)
+  // on every render. Prebuild the Map once per report.
+  const overlapBySource = useMemo(
+    () => new Map(overlapReport?.per_source.map((s) => [s.source_id, s]) ?? []),
+    [overlapReport],
+  );
+
+  const handleShowOverlap = useCallback(
+    (sourceId: string) => setOverlapDrawerSrcId(sourceId),
+    [],
+  );
 
   const handleAddSource = useCallback(() => {
     if (!newName.trim() || !newUrl.trim()) return;
@@ -467,237 +753,17 @@ function AdBlock() {
             <div className={styles.empty}>No sources yet.</div>
           ) : (
             <div className={styles.columnGap}>
-              {state.sources.map((src, index) => {
-                const overlapSummary = overlapReport?.per_source.find(
-                  (s) => s.source_id === src.source_id,
-                );
-                return (
-                <div
+              {state.sources.map((src, index) => (
+                <SourceCard
                   key={src.source_id}
-                  className={`${styles.sourceCard} ${!src.enabled ? styles.dimmed : ""}`}
-                >
-                  <div className={styles.sourceHeader}>
-                    <div className={styles.flexGrow}>
-                      <div className={styles.sourceTitle}>
-                        <span>{src.name}</span>
-                        {src.last_error && (
-                          <span
-                            className={styles.errorBadge}
-                            title={src.last_error}
-                          >
-                            fetch failed
-                          </span>
-                        )}
-                      </div>
-                      <div className={styles.sourceMeta}>{src.url}</div>
-                      <div className={styles.sourceMeta}>
-                        {src.rule_count.toLocaleString()} rules
-                        {` · ${src.format} format`}
-                        {src.rules_limit_override != null &&
-                          ` · limit ${src.rules_limit_override.toLocaleString()} (manually raised)`}
-                        {src.last_fetched_at &&
-                          ` · fetched ${new Date(src.last_fetched_at).toLocaleString()}`}
-                        {src.last_error && (
-                          <>
-                            {" · "}
-                            <span className={styles.dangerText}>
-                              {src.last_error}
-                            </span>
-                          </>
-                        )}
-                      </div>
-
-
-                      {/* Issue #215 §1: overlap chip — visible only when
-                          this source shares at least one domain with
-                          another enabled source. Clicking opens the
-                          drill-down drawer at the bottom of the page.
-                          The chip is intentionally outside the existing
-                          `sourceMeta` line so it doesn't clutter the
-                          status text for sources with zero overlaps. */}
-                      {overlapSummary &&
-                        overlapSummary.overlapping_domain_count > 0 && (
-                          <button
-                            type="button"
-                            className={styles.overlapChip}
-                            onClick={() =>
-                              setOverlapDrawerSrcId(src.source_id)
-                            }
-                            aria-label={`Show ${overlapSummary.overlapping_domain_count} overlapping domains for ${src.name}`}
-                            onPointerDown={onPointerDown(() => {})}
-                          >
-                            {overlapSummary.overlapping_domain_count.toLocaleString()}{" "}
-                            domains also covered by other sources
-                          </button>
-                        )}
-                      {/* Issue #207: one-click way out for legitimately huge
-                          lists. The backend stays fail-closed (no truncation);
-                          this raises the per-source cap to the actual parsed
-                          count and retries through the normal refresh path.
-                          Issue #211-3: the absolute-cap gate uses the
-                          backend-delivered limits; while limits are unknown
-                          the entry stays available — the backend remains the
-                          authority and rejects over-cap overrides itself. */}
-                      {(() => {
-                        const over =
-                          src.last_error != null
-                            ? parseOverLimitError(src.last_error)
-                            : null;
-                        if (!over) return null;
-                        if (
-                          limits != null &&
-                          over.actual > limits.rules_per_source_absolute_max
-                        ) {
-                          return null;
-                        }
-                        return (
-                          <div className={styles.limitOverrideRow}>
-                            <span className={styles.muted}>
-                              This list has {over.actual.toLocaleString()}{" "}
-                              rules — above the default cap.
-                            </span>
-                            <button
-                              className="btn btn-sm btn-primary"
-                              onClick={() =>
-                                overrideSourceLimit({
-                                  sourceId: src.source_id,
-                                  limit: over.actual,
-                                }).catch(() => {})
-                              }
-                              disabled={isLoading}
-                              onPointerDown={onPointerDown(() => {})}
-                            >
-                              Allow {over.actual.toLocaleString()} rules &amp;
-                              retry
-                            </button>
-                          </div>
-                        );
-                      })()}
-
-                      {src.rules_limit_override != null && (
-                        <div className={styles.limitOverrideRow}>
-                          <button
-                            className={`btn btn-sm btn-ghost ${styles.limitResetBtn}`}
-                            onClick={() =>
-                              resetSourceLimit({
-                                sourceId: src.source_id,
-                                limit: null,
-                              }).catch(() => {})
-                            }
-                            disabled={isLoading}
-                            onPointerDown={onPointerDown(() => {})}
-                          >
-                            Reset rule limit to default
-                          </button>
-                        </div>
-                      )}
-                    </div>
-
-                    <div className={styles.sourceActions}>
-                      <label className="toggle">
-                        <input
-                          type="checkbox"
-                          checked={src.enabled}
-                          onChange={(e) =>
-                            setSourceEnabled({
-                              sourceId: src.source_id,
-                              enabled: e.target.checked,
-                            }).catch(() => {})
-                          }
-                          disabled={isLoading}
-                        />
-                        <span className="toggle-slider" />
-                      </label>
-
-                      <select
-                        className={`input ${styles.badgeSm}`}
-                        value={src.response}
-                        onChange={(e) =>
-                          setSourceResponse({
-                            sourceId: src.source_id,
-                            response: e.target.value as AdBlockResponse,
-                          }).catch(() => {})
-                        }
-                        disabled={isLoading}
-                      >
-                        <option value="zero_address">0.0.0.0</option>
-                        <option value="nx_domain">NXDOMAIN</option>
-                      </select>
-
-
-                      {/* Issue #215: source reorder. Two ↑/↓ buttons
-                          (no dnd — see AGENTS.md / spec; the project
-                          has no draggable primitive). The Up button
-                          is disabled at the head and the Down
-                          button at the tail, so the boundary no-op
-                          case on the server can't be reached from
-                          the UI. Order is purely a presentation
-                          concern — never affects interception
-                          (covered by the backend regression tests
-                          in `commands::adblock::tests`). */}
-                      <button
-                        type="button"
-                        className="btn btn-sm btn-ghost"
-                        onClick={() =>
-                          reorderSource({
-                            sourceId: src.source_id,
-                            direction: "up",
-                          }).catch(() => {})
-                        }
-                        disabled={isLoading || index === 0}
-                        aria-label={`Move source ${src.name} up`}
-                        title="Move up"
-                        onPointerDown={onPointerDown(() => {})}
-                      >
-                        ↑
-                      </button>
-                      <button
-                        type="button"
-                        className="btn btn-sm btn-ghost"
-                        onClick={() =>
-                          reorderSource({
-                            sourceId: src.source_id,
-                            direction: "down",
-                          }).catch(() => {})
-                        }
-                        disabled={
-                          isLoading || index === state.sources.length - 1
-                        }
-                        aria-label={`Move source ${src.name} down`}
-                        title="Move down"
-                        onPointerDown={onPointerDown(() => {})}
-                      >
-                        ↓
-                      </button>
-                      <button
-                        className="btn btn-sm btn-ghost"
-                        onClick={() =>
-                          refreshSource(src.source_id).catch(() => {})
-                        }
-                        disabled={isLoading}
-                        onPointerDown={onPointerDown(() => {})}
-                      >
-                        Refresh
-                      </button>
-                      <button
-                        className="btn btn-sm btn-danger"
-                        onClick={() => {
-                          confirmDialog(
-                            `Remove source "${src.name}"?`,
-                            { title: "Remove Source", kind: "warning" },
-                          ).then((ok) => {
-                            if (ok) removeSource(src.source_id).catch(() => {});
-                          }).catch(() => {});
-                        }}
-                        disabled={isLoading}
-                        onPointerDown={onPointerDown(() => {})}
-                      >
-                        Delete
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              );})}
+                  src={src}
+                  index={index}
+                  isLast={index === state.sources.length - 1}
+                  overlapSummary={overlapBySource.get(src.source_id)}
+                  limits={limits}
+                  onShowOverlap={handleShowOverlap}
+                />
+              ))}
             </div>
           )}
         </div>
@@ -753,25 +819,7 @@ function AdBlock() {
             </button>
           </div>
 
-          {state.whitelist.length === 0 ? (
-            <div className={styles.empty}>No whitelist entries.</div>
-          ) : (
-            <div className={styles.whitelistList}>
-              {state.whitelist.map((d) => (
-                <span key={d} className={styles.whitelistItem}>
-                  {d}
-                  <button
-                    className={styles.removeBtn}
-                    onClick={() => removeWhitelist(d).catch(() => {})}
-                    aria-label={`Remove ${d}`}
-                    disabled={isLoading}
-                  >
-                    ×
-                  </button>
-                </span>
-              ))}
-            </div>
-          )}
+          <WhitelistList items={state.whitelist} />
         </div>
 
         {/* Auto-refresh toggle + interval */}
@@ -1007,7 +1055,8 @@ function AdBlock() {
 // Issue #199 sub-task B: small counter tile for the stats panel.
 // Kept inline (not exported) because the layout is bespoke to this
 // page; promoting it later is fine but premature now.
-function StatCounter({
+// Issue #230 A1: memo'd — the counters only change when `stats` does.
+const StatCounter = memo(function StatCounter({
   label,
   value,
 }: {
@@ -1020,6 +1069,6 @@ function StatCounter({
       <div className={styles.statLabel}>{label}</div>
     </div>
   );
-}
+});
 
 export default AdBlock;
