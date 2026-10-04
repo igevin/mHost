@@ -364,8 +364,8 @@ async fn set_dns_mode_enable(
     //    所以这里显式做一次 classify + reload，与 AppState::new 冷启动
     //    路径一致。
     //
-    //    9b. 这里复用了 commands::adblock 的 `classify_rules` + 重载路径
-    //    的等价逻辑（避免循环依赖和 IPC 边界），不经过 IPC handler。
+    //    9b. 这里复用了 commands::adblock 的 `classify_and_reload`（force
+    //    seed，必装规则并记录指纹），不经过 IPC handler。
     let snap = state.ad_block_state.read().await.clone();
     // force=true：新 server 必须装规则；指纹门只负责记录指纹供后续
     // 增量路径比较（issue #224）。
@@ -1325,7 +1325,7 @@ fn cancel_ad_block_refresh_task(slot: &Mutex<CancellationToken>) {
 /// `JoinHandle::abort()` reaching a yield point. The `spawn_blocking`
 /// closure inside the loop also checks `token.is_cancelled()` immediately
 /// before calling `reload_ad_block_rules` — that's the layer that protects
-/// against an in-flight `classify_rules` that started before cancel
+/// against an in-flight `classify_and_reload` that started before cancel
 /// landed. `spawn_blocking` work cannot be interrupted by `JoinHandle::
 /// abort()` (tokio explicitly documents this), so the self-check is the
 /// only reliable way to avoid a `reload_ad_block_rules` call landing on
@@ -1485,7 +1485,8 @@ pub(crate) fn spawn_ad_block_refresh_task(
                 let dns_server_clone = Arc::clone(&dns_server);
                 let gate_for_tick = Arc::clone(&reload_gate);
                 let cancel_in_closure = cancel.clone();
-                // Issue #133: classify_rules reads + parses each source's
+                // Issue #133: classify_and_reload (via load_classify_inputs)
+                // reads + parses each source's
                 // cache file synchronously — 100k+ domains can block a
                 // tokio worker for seconds. Move it off the async runtime.
                 let _ = tokio::task::spawn_blocking(move || {

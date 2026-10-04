@@ -36,7 +36,8 @@ use crate::state::{lock_or_recover, AppState};
 /// predates DNS-mode ad-block: issue #130 introduced it to stop 100k+ hosts
 /// entries from being written into `/etc/hosts`. Ad-block rules never touch
 /// the hosts apply path, though — they live only in the DNS engine's
-/// in-memory sets (`classify_rules` → `reload_ad_block_rules`). What this
+/// in-memory sets (`load_classify_inputs` → `merge_inputs` →
+/// `reload_ad_block_rules`). What this
 /// value guards today is process memory: ~500k rules ≈ 35–50 MB resident in
 /// the engine's HashMap/HashSet plus a transient parse buffer, which is
 /// acceptable for a desktop app. It is sized as headroom for real-world
@@ -290,7 +291,7 @@ fn fetch_source_sync(
 /// **Issue #138:** the `spawn_blocking` closure below self-checks
 /// the cancel token immediately before calling `reload_ad_block_rules`.
 /// This protects against the race where the disable path runs
-/// mid-`classify_rules` (which is sync, not cancellable): the closure
+/// mid-`load_classify_inputs` (which is sync, not cancellable): the closure
 /// finishes classifying, sees the token is set, and bails before
 /// mutating a `DnsServer` that's already been stopped. `write_state` is
 /// intentionally NOT gated on the token — persisting in-memory state to
@@ -302,7 +303,7 @@ pub(crate) async fn persist_and_reload(state: &AppState) -> Result<(), MhostErro
         guard.clone()
     };
 
-    // Wrap write_state + classify_rules + reload in a single
+    // Wrap write_state + classify_and_reload in a single
     // spawn_blocking so none of the sync file IO or parsing blocks a
     // tokio worker thread (issue #133 — parsing 100k+ domain blocklists
     // on the reload path starved concurrent DNS queries).
@@ -439,7 +440,17 @@ fn load_classify_inputs(
     gate: &AdBlockReloadGate,
 ) -> ClassifyInputs {
     let mut sources: Vec<(AdBlockSource, u64, Arc<Vec<String>>)> = Vec::new();
-    let mut enabled_ids: HashSet<SourceId> = HashSet::new();
+
+    // enabled source 的集合与 master 开关无关：master off 时 load 仍会
+    // 跑到 retain，如果这里收集成空集，就会把全部解析缓存清掉——用户
+    // 「临时关再开 ad-block」这个常见操作将付出一次全量重解析（issue
+    // #224 review）。retain 照常清掉 disabled / 已删除的 source。
+    let enabled_ids: HashSet<SourceId> = snap
+        .sources
+        .iter()
+        .filter(|s| s.enabled)
+        .map(|s| s.source_id.clone())
+        .collect();
 
     if snap.enabled {
         // 仅 master switch 开启时才下发规则到引擎；关闭时引擎收到空集，
@@ -448,7 +459,6 @@ fn load_classify_inputs(
             if !source.enabled {
                 continue;
             }
-            enabled_ids.insert(source.source_id.clone());
             let content = match adblock_store::read_cache(root, &source.source_id) {
                 Ok(Some(content)) => content,
                 Ok(None) => String::new(),
@@ -1248,7 +1258,7 @@ pub struct OverlapSourceRef {
 /// Sources without a cache file (never fetched, or last fetch
 /// failed) are skipped — they can't contribute to any overlap.
 /// Sources whose `enabled` is false are also skipped, matching
-/// `classify_rules`'s behaviour (they don't contribute to the
+/// `load_classify_inputs`'s behaviour (they don't contribute to the
 /// engine either, so showing their overlaps would be misleading).
 pub(crate) fn compute_overlap_report(
     state: &AdBlockState,
@@ -2336,6 +2346,38 @@ mod tests {
         );
     }
 
+    /// 删除一个 enabled source → 指纹必变（否则删源后引擎还留着它的
+    /// 规则，下一次 reload 却被指纹门跳过）。
+    #[test]
+    fn reload_gate_fingerprint_tracks_source_removal() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let gate = AdBlockReloadGate::new();
+        let a = mk_gate_source("a", AdBlockResponse::ZeroAddress);
+        let b = mk_gate_source("b", AdBlockResponse::NxDomain);
+        mhost_storage::adblock::write_cache(temp.path(), &a.source_id, b"0.0.0.0 a.example.com\n")
+            .unwrap();
+        mhost_storage::adblock::write_cache(temp.path(), &b.source_id, b"0.0.0.0 b.example.com\n")
+            .unwrap();
+
+        let with_both = AdBlockState {
+            enabled: true,
+            sources: vec![a.clone(), b],
+            ..Default::default()
+        };
+        let without_b = AdBlockState {
+            enabled: true,
+            sources: vec![a],
+            ..Default::default()
+        };
+
+        let fp_with = load_classify_inputs(&with_both, temp.path(), &gate).fingerprint;
+        let fp_without = load_classify_inputs(&without_b, temp.path(), &gate).fingerprint;
+        assert_ne!(
+            fp_with, fp_without,
+            "removing an enabled source must change the fingerprint"
+        );
+    }
+
     /// 解析缓存：内容 hash 不变时复用同一个 Arc（不重解析）；内容变化
     /// 后失效并重解析。
     #[test]
@@ -2411,6 +2453,37 @@ mod tests {
             gate.parsed_len(),
             1,
             "disabled source's parse cache must be pruned"
+        );
+    }
+
+    /// master 开关关闭不得清空解析缓存（issue #224 review should-fix）：
+    /// 「临时关再开」是常见操作，关的瞬间 retain 若拿到空集会把全部
+    /// source 的解析结果清掉，重开时付出一次全量重解析。
+    #[test]
+    fn reload_gate_parse_cache_survives_master_off() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let gate = AdBlockReloadGate::new();
+        let a = mk_gate_source("a", AdBlockResponse::ZeroAddress);
+        let b = mk_gate_source("b", AdBlockResponse::NxDomain);
+        mhost_storage::adblock::write_cache(temp.path(), &a.source_id, b"0.0.0.0 a.example.com\n")
+            .unwrap();
+        mhost_storage::adblock::write_cache(temp.path(), &b.source_id, b"0.0.0.0 b.example.com\n")
+            .unwrap();
+        let on = AdBlockState {
+            enabled: true,
+            sources: vec![a, b],
+            ..Default::default()
+        };
+        load_classify_inputs(&on, temp.path(), &gate);
+        assert_eq!(gate.parsed_len(), 2);
+
+        let mut off = on.clone();
+        off.enabled = false;
+        load_classify_inputs(&off, temp.path(), &gate);
+        assert_eq!(
+            gate.parsed_len(),
+            2,
+            "master off must not wipe the per-source parse cache"
         );
     }
 
