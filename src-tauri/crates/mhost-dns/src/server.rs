@@ -50,7 +50,7 @@ const UDP_BUF_SIZE: usize = 4096;
 pub const MAX_CONCURRENT_CLIENT_QUERIES: usize = 1024;
 
 /// DNS 响应缓存条目：记录列表 + 过期时间。
-type CacheEntry = (Vec<Record>, Instant);
+type CacheEntry = (Arc<Vec<Record>>, Instant);
 
 /// 后台上游刷新任务的间隔。
 ///
@@ -602,30 +602,29 @@ async fn handle_dns_request(
 
     // **fix (P-R2, issue #90)**: 缓存命中路径在持锁状态下直接组装响应，
     // 跳过 `records.clone()`（Vec<Record> 一次 alloc + memcpy）。
-    // - `peek` 返回 `&(Vec<Record>, Instant)`，guard 持有期间可直接遍历
-    // - 每个 record 由 `add_answer` 通过 `.clone()` 拿 owned（仍需 alloc，
-    //   但比整个 Vec clone 省 N-1 次 alloc + Vec 容器本身的开销）
-    let cached_response: Option<Vec<u8>> = {
+    //
+    // **Issue #229-1**: 持锁区间缩小到一次 `Arc::clone`（纯引用计数 bump）。
+    // P-R2 的实现把 `build_cached_response`（query.clone() + N 条 record
+    // clone + `Message::to_bytes()` 编码）全部留在了 `parking_lot::Mutex`
+    // 持锁区间内，高 QPS 下所有缓存命中被全局串行化，互斥锁成为吞吐上界。
+    // 现在 records 以 `Arc<Vec<Record>>` 存储：锁内只 bump 引用计数，
+    // 编码在锁外并行进行。编码时的 per-record clone 依然存在（hickory 的
+    // `add_answer` 需要 owned），但已不持锁。
+    let cached_records: Option<Arc<Vec<Record>>> = {
         let mut guard = cache.lock();
-        if let Some((records, expires_at)) = guard.peek(&cache_key) {
-            if *expires_at > now {
-                let response_bytes = build_cached_response(&request, &query, records);
-                drop(guard);
-                response_bytes
-            } else {
+        match guard.peek(&cache_key) {
+            Some((records, expires_at)) if *expires_at > now => Some(Arc::clone(records)),
+            Some((_records, _expires_at)) => {
                 // 已过期 —— 取出丢弃
                 guard.pop(&cache_key);
-                drop(guard);
                 None
             }
-        } else {
-            drop(guard);
-            None
+            None => None,
         }
     };
 
-    if let Some(bytes) = cached_response {
-        return Some(bytes);
+    if let Some(records) = cached_records {
+        return build_cached_response(&request, &query, &records);
     }
 
     // 缓存未命中分支：从规则引擎 + 上游查询
@@ -660,7 +659,10 @@ async fn handle_dns_request(
             // 浪费 LRU slot 且下次 peek 立刻过期被 pop。
             if ttl > 0 {
                 let expires_at = now + std::time::Duration::from_secs(ttl as u64);
-                cache.lock().put(cache_key, (vec![answer], expires_at));
+                // Issue #229-1: cache 值改为 Arc 包装，命中路径锁外编码。
+                cache
+                    .lock()
+                    .put(cache_key, (Arc::new(vec![answer]), expires_at));
             }
             response_bytes
         }

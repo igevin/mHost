@@ -39,15 +39,29 @@ const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// 之前用 `content.trim() != "running"` 在 mhost 写入时（truncate → write_all
 /// 之间）读到空字符串会误触发 shutdown。原子写入修了这问题；这里再加固
 /// 一层：「空文件 = mhost 还没写完，不当作 shutdown 信号」。
+///
+/// **Issue #229-3**：改为定长栈缓冲读取。这个函数在 proxy 存活期内每秒
+/// 被调用一次，旧实现 `fs::read_to_string` 每秒付出 1 次堆 String 分配 +
+/// free，而信号的合法内容只有 "running" / "shutdown" 几个字节。syscall
+/// 次数不变，常驻分配归零；超出缓冲的内容不可能是合法信号值。
 fn shutdown_signal_file_contains_shutdown() -> bool {
-    let Ok(content) = std::fs::read_to_string(crate::platform::shutdown_signal_file()) else {
+    use std::io::Read;
+    let mut file = match std::fs::File::open(crate::platform::shutdown_signal_file()) {
+        Ok(f) => f,
         // 文件不在 = mhost 没在管（手动启 proxy 的情况）
-        return false;
+        Err(_) => return false,
     };
-    if content.trim().is_empty() {
+    let mut buf = [0u8; 32];
+    let n = match file.read(&mut buf) {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    let content = std::str::from_utf8(&buf[..n]).unwrap_or("");
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
         return false;
     }
-    content.trim() == "shutdown"
+    trimmed == "shutdown"
 }
 
 /// 从文件读出原始 DNS（每行一个）。失败或文件不存在返回空 vec。
