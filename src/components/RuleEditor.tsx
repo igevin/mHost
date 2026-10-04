@@ -193,14 +193,23 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEd
     //
     // (1) `rules` reference unchanged → this run was triggered by the
     //     `text` dep (our own keystroke), not by new rules. Previously
-    //     every keystroke paid a full `rulesToText` join here.
-    // (2) mid-edit → the incoming rules are the validation round-trip of
-    //     our own text; never overwrite. Old code ran the same
-    //     reset-flag-and-return sequence in BOTH the `newText === text`
-    //     branch and the `isEditing` branch, so checking `isEditing`
-    //     first is a pure reordering: it skips the convergence
-    //     comparison's `rulesToText` without changing any outcome.
+    //     every keystroke paid a full `rulesToText` join here. This run
+    //     MUST still consume `isEditingRef` (set by handleChange): the
+    //     pre-#226 code reset it on every text-triggered run, and letting
+    //     it outlive the keystroke would swallow external rules changes
+    //     arriving while the flag is still up — e.g. a profile switch
+    //     while onChange is blocked by validation errors, which would
+    //     leave this profile's draft in the other profile's editor.
+    //     (PR #239 review finding 1.)
+    // (2) mid-edit → never overwrite the textarea. Reachable for genuine
+    //     external changes too (profile switch landing in the same
+    //     interleaving as a keystroke); the pre-#226 code refused the
+    //     overwrite in that case as well. Placing this before the
+    //     convergence comparison only skips its O(N) `rulesToText` —
+    //     the old `newText === text` branch performed the identical
+    //     reset-flag-and-return sequence.
     if (rules === prevRulesRef.current) {
+      isEditingRef.current = false;
       return;
     }
     if (isEditingRef.current) {
@@ -349,7 +358,12 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEd
     // `matches` derives from `deferredText` (may lag the live text by one
     // frame during typing); slicing the live text with stale offsets would
     // replace at the wrong position. Recomputing here is O(N+M) (see
-    // search.ts) — negligible for a single click (issue #226).
+    // search.ts) — negligible for a single click. When there is no lag,
+    // `fresh` is byte-identical to `matches`, so the pre-#226 behavior is
+    // preserved (PR #239 review finding 4-ii). The index clamp differs
+    // from the old out-of-range no-op only in that same one-frame lag
+    // case, and lands on the value the old clamp effect would have
+    // converged to — deliberate (finding 3).
     const fresh = findMatches(text, searchQuery);
     if (fresh.length === 0) return;
     const index = Math.min(Math.max(currentMatchIndex, 0), fresh.length - 1);

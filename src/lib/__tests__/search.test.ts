@@ -94,4 +94,30 @@ describe("findMatches", () => {
     const matches = findMatches(text, "example.com");
     expect(matches.map((m) => m.lineIndex)).toEqual([0, 1]);
   });
+
+  it("finds a match that ends at the end of text without a trailing newline", () => {
+    const matches = findMatches("prefix host", "host");
+    expect(matches).toHaveLength(1);
+    expect(matches[0].start).toBe(7);
+    expect(matches[0].lineIndex).toBe(0);
+  });
+
+  it("handles all-newline text without crashing", () => {
+    expect(findMatches("\n\n\n", "host")).toEqual([]);
+  });
+
+  it("reports the starting line for a multi-line literal query", () => {
+    // The contract is "line where the match starts" — a literal query may
+    // itself contain "\n" (PR #239 review finding 4-iii).
+    const text = "line1\nline2";
+    const matches = findMatches(text, "1\nline2");
+    expect(matches).toHaveLength(1);
+    expect(matches[0].start).toBe(4);
+    expect(matches[0].end).toBe(11);
+    expect(matches[0].lineIndex).toBe(0);
+  });
+
+  it("returns an empty array when the query is longer than the text", () => {
+    expect(findMatches("ab", "abcdef")).toEqual([]);
+  });
 });
