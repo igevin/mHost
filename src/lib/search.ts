@@ -23,16 +23,31 @@ export interface MatchInfo {
  * regex pattern.
  *
  * Returns an empty array if either argument is empty.
+ *
+ * Perf (P-F9, issue #226): the previous implementation derived
+ * `lineIndex` per match via `text.slice(0, match.index).split("\n")` —
+ * for every match it copied the entire prefix and allocated one string
+ * per line, O(M×N) overall (a single-character query hitting every line
+ * of a 10k-line profile did ~10⁸ char operations per keystroke). Now a
+ * single `indexOf` walk advances a line cursor alongside the regex scan:
+ * match offsets are strictly increasing, so the walk is O(N + M) with no
+ * per-match allocation.
  */
 export function findMatches(text: string, query: string): MatchInfo[] {
   if (!query || !text) return [];
   const matches: MatchInfo[] = [];
   const escaped = query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const regex = new RegExp(escaped, "gi");
+  let line = 0;
+  let nextNewline = text.indexOf("\n");
   let match: RegExpExecArray | null;
   while ((match = regex.exec(text)) !== null) {
-    const lineIndex = text.slice(0, match.index).split("\n").length - 1;
-    matches.push({ start: match.index, end: match.index + match[0].length, lineIndex });
+    const start = match.index;
+    while (nextNewline !== -1 && nextNewline < start) {
+      line++;
+      nextNewline = text.indexOf("\n", nextNewline + 1);
+    }
+    matches.push({ start, end: start + match[0].length, lineIndex: line });
   }
   return matches;
 }
