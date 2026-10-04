@@ -32,10 +32,12 @@ import {
 } from "../stores/profiles";
 import { useNavigate } from "react-router-dom";
 import { useWebKitPointerDown } from "../hooks/useWebKitPointerDown";
+import { getAdBlockOverlapDetails } from "../lib/tauri";
 import type {
   AdBlockLimits,
   AdBlockResponse,
   AdBlockSource,
+  AdBlockOverlapDetails,
   BlocklistFormat,
   OverlapSummary,
 } from "../types";
@@ -367,6 +369,11 @@ function AdBlock() {
   // Issue #215 §1: id of the source whose overlap drawer is
   // open, or null. The drawer reads from `overlapReport`.
   const [overlapDrawerSrcId, setOverlapDrawerSrcId] = useState<string | null>(null);
+  // Issue #225: the drawer's drill-down is fetched per source when the
+  // drawer opens (the mount-time report carries only the counts), so
+  // the payload is bounded and the data is fresh at open time.
+  const [overlapDetails, setOverlapDetails] = useState<AdBlockOverlapDetails | null>(null);
+  const [overlapDetailsLoading, setOverlapDetailsLoading] = useState(false);
   const [newWhitelistDomain, setNewWhitelistDomain] = useState("");
   // Issue #196: ref so the bulk-add source button can read its value
   // without the previousElementSibling hack.
@@ -404,6 +411,35 @@ function AdBlock() {
     (sourceId: string) => setOverlapDrawerSrcId(sourceId),
     [],
   );
+
+  // Issue #225: fetch the drill-down whenever the drawer opens (and
+  // clear it when it closes). One bounded IPC per open — reorders and
+  // source mutations are reflected without a manual reload, and the
+  // payload can no longer scale with the total overlap size.
+  useEffect(() => {
+    if (overlapDrawerSrcId === null) {
+      setOverlapDetails(null);
+      setOverlapDetailsLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setOverlapDetailsLoading(true);
+    setOverlapDetails(null);
+    getAdBlockOverlapDetails(overlapDrawerSrcId)
+      .then((details) => {
+        if (!cancelled) setOverlapDetails(details);
+      })
+      .catch((err) => {
+        console.warn("failed to load overlap details", err);
+        // Keep `overlapDetails` null — the drawer's empty state covers it.
+      })
+      .finally(() => {
+        if (!cancelled) setOverlapDetailsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [overlapDrawerSrcId]);
 
   const handleAddSource = useCallback(() => {
     if (!newName.trim() || !newUrl.trim()) return;
@@ -967,14 +1003,12 @@ function AdBlock() {
           </div>
         </details>
 
-      {/* Issue #215 §1: overlap drill-down drawer. The drawer reads
-          `overlapDrawerSrcId` and the cached `overlapReport.details`
-          for that source. Closing clears the id; opening re-fetches
-          the report so reorders / source mutations are reflected
-          without a manual reload. The "No overlapping domains" empty
-          state handles the case where the chip was clicked after a
-          mutation cleared the overlap (rare race — `fetchOverlaps`
-          is fired on every mutation but is async). */}
+      {/* Issue #215 §1: overlap drill-down drawer. Closing clears the
+          id; opening fetches the drill-down for that one source (issue
+          #225 — bounded payload, fresh at open time). The "No
+          overlapping domains" empty state covers a fetch failure and
+          the case where the chip was clicked while a mutation was in
+          flight. */}
       {overlapDrawerSrcId !== null && (
         <>
           <div
@@ -1004,7 +1038,10 @@ function AdBlock() {
               </button>
             </div>
             {(() => {
-              const entries = overlapReport?.details[overlapDrawerSrcId] ?? [];
+              if (overlapDetailsLoading) {
+                return <div className={styles.muted}>Loading…</div>;
+              }
+              const entries = overlapDetails?.entries ?? [];
               if (entries.length === 0) {
                 return (
                   <div className={styles.muted}>
@@ -1017,11 +1054,18 @@ function AdBlock() {
               return (
                 <div>
                   <div className={`${styles.muted} ${styles.mutedGap}`}>
-                    {entries.length.toLocaleString()} domains are also
-                    covered by at least one other enabled source. The
-                    "effective" badge shows what the engine will return
-                    for each — derived from the priority chain whitelist
-                    &gt; NXDOMAIN &gt; 0.0.0.0.
+                    {(overlapDetails?.total ?? entries.length).toLocaleString()}{" "}
+                    domains are also covered by at least one other enabled
+                    source. The "effective" badge shows what the engine
+                    will return for each — derived from the priority chain
+                    whitelist &gt; NXDOMAIN &gt; 0.0.0.0.
+                    {overlapDetails?.truncated && (
+                      <>
+                        {" "}
+                        Showing the first {entries.length.toLocaleString()}{" "}
+                        (sorted by domain).
+                      </>
+                    )}
                   </div>
                   {entries.map((entry) => (
                     <div key={entry.domain} className={styles.overlapEntry}>

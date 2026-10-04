@@ -196,7 +196,18 @@ export interface OverlapSourceRef {
 
 export interface AdBlockOverlapReport {
   per_source: OverlapSummary[];
-  details: Record<string, OverlapEntry[]>;
+}
+
+/** Issue #225: per-source overlap drill-down, fetched only when the
+ * drawer opens (the mount-time report carries just the counts).
+ * `entries` is capped at the backend's per-source cap, sorted by
+ * domain; `total` is the uncapped count and `truncated` says whether
+ * the cap bit. */
+export interface AdBlockOverlapDetails {
+  source_id: string;
+  total: number;
+  truncated: boolean;
+  entries: OverlapEntry[];
 }
 
 export interface ApplyPlan {

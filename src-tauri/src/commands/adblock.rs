@@ -601,22 +601,6 @@ pub(crate) fn classify_and_reload(
     true
 }
 
-/// Load cached parsed domains for a single source. Returns an empty Vec if
-/// the cache file is missing or fails to parse (caller logs and continues).
-pub(crate) fn domains_for_source(root: &std::path::Path, source: &AdBlockSource) -> Vec<String> {
-    match adblock_store::read_cache(root, &source.source_id) {
-        Ok(Some(content)) => parse_blocklist_domains(&content).domains,
-        Ok(None) => Vec::new(),
-        Err(e) => {
-            eprintln!(
-                "[adblock] failed to read cache for source {}: {}",
-                source.name, e
-            );
-            Vec::new()
-        }
-    }
-}
-
 /// Validate a whitelist entry. Returns the canonical form (trimmed +
 /// lowercased) on success, or an error message describing why the
 /// input is invalid.
@@ -924,7 +908,7 @@ pub(crate) async fn fetch_and_cache_source(
         // branch deliberately leaves the on-disk cache untouched, but the
         // cache file is not guaranteed to be there — the directory can be
         // cleared out-of-band while the ETag persists in the state. In that
-        // case a 304 would keep "succeeding" while `domains_for_source`
+        // case a 304 would keep "succeeding" while the reload path
         // silently yields an empty rule set with a clean `last_error`.
         // Downgrade to an unconditional GET so the body is re-fetched.
         //
@@ -1196,13 +1180,12 @@ pub async fn get_ad_block_limits() -> Result<AdBlockLimits, MhostError> {
 /// of those sources is configured for that response type".
 ///
 /// **Cost** — O(N · K) where N = enabled sources, K = avg domains
-/// per source. The whole report runs once per `get_ad_block_overlaps`
-/// IPC call. For a typical 5-source / 100 k-domain configuration
-/// the computation is well under 100 ms on macOS, comfortably
-/// inside the budget for "user clicked the drawer open" (the only
-/// trigger — see `pages/AdBlock.tsx`). A summary view alone (just
-/// `per_source`) is what the source card uses to render the chip;
-/// `details` is what the drawer needs.
+/// per source. Split per issue #225: the report IPC carries only the
+/// `per_source` summaries (the chips' counts); the per-source
+/// drill-down moved to [`compute_overlap_details`], fetched only when
+/// the drawer opens and capped there. Both run in `spawn_blocking`
+/// and share the reload gate's parse cache, so the cache files are
+/// read (for hashing) but not re-parsed after the first classify.
 #[derive(Debug, Clone, Serialize)]
 pub struct AdBlockOverlapReport {
     /// Per-source counts — one entry per enabled source with a
@@ -1210,11 +1193,29 @@ pub struct AdBlockOverlapReport {
     /// with zero overlaps is included with `overlapping_domain_count: 0`
     /// so the frontend doesn't have to look it up in two places.
     pub per_source: Vec<OverlapSummary>,
-    /// Drill-down: for each source, the list of overlapping
-    /// domains and the other sources that also cover them. Empty
-    /// for sources with no overlaps.
-    pub details: std::collections::HashMap<SourceId, Vec<OverlapEntry>>,
 }
+
+/// Per-source overlap drill-down (issue #225): fetched by
+/// `get_ad_block_overlap_details` only when the user opens the drawer,
+/// one source at a time. `entries` is capped at
+/// [`MAX_OVERLAP_DETAILS_PER_SOURCE`] (sorted by domain, so the cap is
+/// deterministic); `total` is the uncapped count and `truncated` says
+/// whether the cap bit.
+#[derive(Debug, Clone, Serialize)]
+pub struct AdBlockOverlapDetails {
+    pub source_id: SourceId,
+    /// Uncapped number of overlapping domains for this source.
+    pub total: usize,
+    /// `true` when `entries` was capped at [`MAX_OVERLAP_DETAILS_PER_SOURCE`].
+    pub truncated: bool,
+    pub entries: Vec<OverlapEntry>,
+}
+
+/// Cap on the entries a single [`AdBlockOverlapDetails`] carries. 500
+/// rows ≈ a few hundred KB of JSON and renders fine without
+/// virtualization; the count chip and `total` still reflect the full
+/// number.
+const MAX_OVERLAP_DETAILS_PER_SOURCE: usize = 500;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct OverlapSummary {
@@ -1250,129 +1251,116 @@ pub struct OverlapSourceRef {
     pub response: AdBlockResponse,
 }
 
-/// Compute the overlap report. Reads each enabled source's parsed
-/// domains via `domains_for_source` (already in-memory — no extra
-/// IO during the call beyond the existing `adblock_store::read_cache`),
-/// then folds them into the cross-source map.
+/// Whitelist suffix matcher. Same semantics as the engine's
+/// `RulesSnapshot::whitelist.find_longest_suffix_match` — reuse the
+/// actual trie instead of the previous O(K · |whitelist|) linear walk
+/// (issue #225 item 5). Built fresh per call: whitelists are
+/// user-curated (tens of entries), so trie construction is trivial.
+fn build_whitelist_matcher(state: &AdBlockState) -> mhost_dns::trie::Trie<()> {
+    let mut trie = mhost_dns::trie::Trie::new();
+    for entry in &state.whitelist {
+        trie.insert(entry, ());
+    }
+    trie
+}
+
+/// Load the parsed domains of every enabled source as
+/// `(index into state.sources, domains)`. Reads each cache (for the
+/// content hash) but reuses the reload gate's parsed domains when the
+/// content hash is unchanged — the same cache `classify_and_reload`
+/// warms, so after any reload this is hash + read only (issue #225
+/// item 4: previously every report call re-parsed every source,
+/// `to_lowercase` per domain).
 ///
-/// Sources without a cache file (never fetched, or last fetch
-/// failed) are skipped — they can't contribute to any overlap.
-/// Sources whose `enabled` is false are also skipped, matching
+/// Sources without a cache file (never fetched, or last fetch failed)
+/// parse to an empty set — they can't contribute to any overlap.
+/// Disabled sources are skipped entirely, matching
 /// `load_classify_inputs`'s behaviour (they don't contribute to the
 /// engine either, so showing their overlaps would be misleading).
-pub(crate) fn compute_overlap_report(
+fn load_enabled_source_domains(
     state: &AdBlockState,
-    root: &std::path::Path,
-) -> AdBlockOverlapReport {
-    use std::collections::{HashMap, HashSet};
-
-    // domain -> [(source_id, response)]
-    let mut by_domain: HashMap<String, Vec<(SourceId, AdBlockResponse)>> = HashMap::new();
-
-    for source in &state.sources {
+    root: &Path,
+    gate: &AdBlockReloadGate,
+) -> Vec<(usize, Arc<Vec<String>>)> {
+    let mut loaded: Vec<(usize, Arc<Vec<String>>)> = Vec::new();
+    for (idx, source) in state.sources.iter().enumerate() {
         if !source.enabled {
             continue;
         }
-        let domains = domains_for_source(root, source);
-        for d in &domains {
-            by_domain
-                .entry(d.clone())
-                .or_default()
-                .push((source.source_id.clone(), source.response));
-        }
+        let content = match adblock_store::read_cache(root, &source.source_id) {
+            Ok(Some(content)) => content,
+            Ok(None) => String::new(),
+            Err(e) => {
+                eprintln!(
+                    "[adblock] failed to read cache for source {}: {}",
+                    source.name, e
+                );
+                String::new()
+            }
+        };
+        let content_hash = {
+            let mut h = DefaultHasher::new();
+            content.as_bytes().hash(&mut h);
+            h.finish()
+        };
+        let domains = match gate.cached_domains(&source.source_id, content_hash) {
+            Some(domains) => domains,
+            None => {
+                let domains = Arc::new(parse_blocklist_domains(&content).domains);
+                gate.store_parsed(source.source_id.clone(), content_hash, Arc::clone(&domains));
+                domains
+            }
+        };
+        loaded.push((idx, domains));
     }
+    loaded
+}
 
-    // Whitelist lookups via suffix-match (same semantics as
-    // `RulesSnapshot::whitelist.find_longest_suffix_match`). For a
-    // single report we don't have a trie, but for a low-frequency
-    // call it's cheap enough to do the O(K · |whitelist|) walk.
-    let whitelist: HashSet<String> = state.whitelist.iter().cloned().collect();
-    let whitelisted = |domain: &str| -> bool {
-        if whitelist.contains(domain) {
-            return true;
-        }
-        // Suffix walk: try parent.com, then parent.parent.com, etc.
-        let mut cursor: Option<&str> = Some(domain);
-        while let Some(d) = cursor {
-            if let Some(idx) = d.find('.') {
-                let parent = &d[idx + 1..];
-                if whitelist.contains(parent) {
-                    return true;
-                }
-                cursor = Some(parent);
-            } else {
-                return false;
+/// Compute the overlap report — the per-source counts only (issue #225).
+/// The drill-down lists live in [`compute_overlap_details`], fetched
+/// per source when the drawer opens.
+///
+/// The count for each source includes whitelisted overlapping domains —
+/// the whitelist only relabels `effective` in the details, it does not
+/// change which sources cover a domain (same contract as before the
+/// split).
+pub(crate) fn compute_overlap_report(
+    state: &AdBlockState,
+    root: &Path,
+    gate: &AdBlockReloadGate,
+) -> AdBlockOverlapReport {
+    let loaded = load_enabled_source_domains(state, root, gate);
+
+    // domain → covering source indices. Values index into `state.sources`
+    // (via `loaded`'s first element), so building the map costs no
+    // per-pair allocation: keys borrow from the parse-cached
+    // `Arc<Vec<String>>` held by `loaded`, and single-source domains
+    // never grow their `Vec` beyond one element. The pre-#225 map cloned
+    // the domain String and the `SourceId` for every (domain × source)
+    // pair.
+    let mut by_domain: HashMap<&str, Vec<u32>> = HashMap::new();
+    for (source_idx, domains) in loaded.iter() {
+        let idx32 = *source_idx as u32;
+        for d in domains.iter() {
+            let bucket = by_domain.entry(d.as_str()).or_default();
+            // Duplicate domains within one source's cache are coalesced
+            // (the pre-#225 map pushed a pair per occurrence,
+            // double-counting that source in `overlapping_domain_count`
+            // and rendering the same "Also in:" source twice).
+            if !bucket.contains(&idx32) {
+                bucket.push(idx32);
             }
         }
-        false
-    };
-
-    // Per-source accumulator.
-    let mut details: HashMap<SourceId, Vec<OverlapEntry>> = HashMap::new();
-    let mut per_source_counts: HashMap<SourceId, (String, usize)> = HashMap::new();
-    for source in &state.sources {
-        if source.enabled {
-            per_source_counts.insert(source.source_id.clone(), (source.name.clone(), 0));
-            details.insert(source.source_id.clone(), Vec::new());
-        }
     }
 
-    for (domain, sources) in &by_domain {
-        if sources.len() < 2 {
+    let mut counts: Vec<usize> = vec![0; state.sources.len()];
+    for covering in by_domain.values() {
+        if covering.len() < 2 {
             // Single-source coverage isn't an overlap; skip.
             continue;
         }
-        // Effective action for this domain, derived from the same
-        // priority chain `check()` uses. We can't reuse the engine's
-        // `check()` directly because we don't have a RulesSnapshot;
-        // but the logic is short and stable enough to inline here.
-        let effective = if whitelisted(domain) {
-            "Whitelisted".to_string()
-        } else if sources
-            .iter()
-            .any(|(_, r)| matches!(r, AdBlockResponse::NxDomain))
-        {
-            "NxDomain".to_string()
-        } else if sources
-            .iter()
-            .any(|(_, r)| matches!(r, AdBlockResponse::ZeroAddress))
-        {
-            "ZeroAddress".to_string()
-        } else {
-            continue; // shouldn't happen — at least one source must have a block response
-        };
-
-        // For each source that covers this domain, record the
-        // domain in its details (unless the source itself is
-        // whitelisted, in which case the user's intent is to
-        // exclude it — we still note the OTHER sources that would
-        // have blocked it).
-        for (sid, _response) in sources {
-            let covered_by: Vec<OverlapSourceRef> = sources
-                .iter()
-                .filter(|(other_sid, _)| other_sid != sid)
-                .map(|(other_sid, r)| OverlapSourceRef {
-                    source_id: other_sid.clone(),
-                    name: state
-                        .sources
-                        .iter()
-                        .find(|s| &s.source_id == other_sid)
-                        .map(|s| s.name.clone())
-                        .unwrap_or_default(),
-                    response: *r,
-                })
-                .collect();
-            let entry = OverlapEntry {
-                domain: (*domain).to_string(),
-                covered_by,
-                effective: effective.clone(),
-            };
-            if let Some(bucket) = details.get_mut(sid) {
-                bucket.push(entry);
-                if let Some((_, count)) = per_source_counts.get_mut(sid) {
-                    *count += 1;
-                }
-            }
+        for &idx in covering {
+            counts[idx as usize] += 1;
         }
     }
 
@@ -1381,21 +1369,113 @@ pub(crate) fn compute_overlap_report(
     let per_source: Vec<OverlapSummary> = state
         .sources
         .iter()
-        .filter(|s| s.enabled)
-        .filter_map(|s| {
-            per_source_counts
-                .get(&s.source_id)
-                .map(|(name, count)| OverlapSummary {
-                    source_id: s.source_id.clone(),
-                    source_name: name.clone(),
-                    overlapping_domain_count: *count,
-                })
+        .enumerate()
+        .filter(|(_, s)| s.enabled)
+        .map(|(idx, s)| OverlapSummary {
+            source_id: s.source_id.clone(),
+            source_name: s.name.clone(),
+            overlapping_domain_count: counts[idx],
         })
         .collect();
 
-    AdBlockOverlapReport {
-        per_source,
-        details,
+    AdBlockOverlapReport { per_source }
+}
+
+/// Compute the per-source overlap drill-down for the drawer (issue
+/// #225). Entries are sorted by domain (the pre-split iteration order
+/// over the HashMap was arbitrary, so the drawer's order changed from
+/// open to open) and capped at [`MAX_OVERLAP_DETAILS_PER_SOURCE`];
+/// `total` carries the uncapped count either way.
+///
+/// `effective` is derived from the same priority chain `check()` uses —
+/// we can't reuse the engine's `check()` directly because we don't have
+/// a `RulesSnapshot`, but the chain (whitelist > nxdomain > zero_addr)
+/// is short and mirrored here.
+pub(crate) fn compute_overlap_details(
+    state: &AdBlockState,
+    root: &Path,
+    gate: &AdBlockReloadGate,
+    source_id: &SourceId,
+) -> AdBlockOverlapDetails {
+    let empty = AdBlockOverlapDetails {
+        source_id: source_id.clone(),
+        total: 0,
+        truncated: false,
+        entries: Vec::new(),
+    };
+    let idx = state
+        .sources
+        .iter()
+        .position(|s| s.enabled && &s.source_id == source_id);
+    let Some(idx) = idx else {
+        // Unknown / disabled source: the drawer's empty state handles it
+        // (same as the pre-split `details` map missing the key).
+        return empty;
+    };
+    let idx32 = idx as u32;
+
+    let loaded = load_enabled_source_domains(state, root, gate);
+    let mut by_domain: HashMap<&str, Vec<u32>> = HashMap::new();
+    for (source_idx, domains) in loaded.iter() {
+        let idx32 = *source_idx as u32;
+        for d in domains.iter() {
+            let bucket = by_domain.entry(d.as_str()).or_default();
+            if !bucket.contains(&idx32) {
+                bucket.push(idx32);
+            }
+        }
+    }
+
+    let whitelist = build_whitelist_matcher(state);
+
+    let mut matching: Vec<(&str, &Vec<u32>)> = by_domain
+        .iter()
+        .filter(|(_, covering)| covering.len() >= 2 && covering.contains(&idx32))
+        .map(|(domain, covering)| (*domain, covering))
+        .collect();
+    matching.sort_unstable_by_key(|(domain, _)| *domain);
+
+    let total = matching.len();
+    let entries: Vec<OverlapEntry> = matching
+        .into_iter()
+        .take(MAX_OVERLAP_DETAILS_PER_SOURCE)
+        .map(|(domain, covering)| {
+            let effective = if whitelist.find_longest_suffix_match(domain).is_some() {
+                "Whitelisted"
+            } else if covering.iter().any(|&i| {
+                matches!(
+                    state.sources[i as usize].response,
+                    AdBlockResponse::NxDomain
+                )
+            }) {
+                "NxDomain"
+            } else {
+                // covering.len() >= 2 and no covering source is NxDomain —
+                // every covering source must be ZeroAddress.
+                "ZeroAddress"
+            };
+            let covered_by: Vec<OverlapSourceRef> = covering
+                .iter()
+                .filter(|&&i| i != idx32)
+                .map(|&i| OverlapSourceRef {
+                    source_id: state.sources[i as usize].source_id.clone(),
+                    name: state.sources[i as usize].name.clone(),
+                    response: state.sources[i as usize].response,
+                })
+                .collect();
+            OverlapEntry {
+                domain: domain.to_string(),
+                covered_by,
+                effective: effective.to_string(),
+            }
+        })
+        .collect();
+
+    AdBlockOverlapDetails {
+        source_id: source_id.clone(),
+        total,
+        truncated: total > MAX_OVERLAP_DETAILS_PER_SOURCE,
+        entries,
     }
 }
 
@@ -1404,7 +1484,32 @@ pub async fn get_ad_block_overlaps(
     state: State<'_, AppState>,
 ) -> Result<AdBlockOverlapReport, MhostError> {
     let snap = state.ad_block_state.read().await.clone();
-    Ok(compute_overlap_report(&snap, state.storage.root()))
+    let root = state.storage.root().to_path_buf();
+    let gate = Arc::clone(&state.ad_block_reload_gate);
+    // Issue #133-class: the report reads every source's cache file and
+    // builds a full domain map — keep that off the async runtime
+    // (issue #225; the pre-split code ran it on the IPC thread).
+    tokio::task::spawn_blocking(move || Ok(compute_overlap_report(&snap, &root, &gate)))
+        .await
+        .map_err(|e| MhostError::InvalidInput(format!("overlap task failed: {}", e)))?
+}
+
+/// Per-source overlap drill-down for the drawer (issue #225): one
+/// source per call, entries capped — the payload is bounded regardless
+/// of how heavily the enabled sources overlap.
+#[tauri::command]
+pub async fn get_ad_block_overlap_details(
+    source_id: SourceId,
+    state: State<'_, AppState>,
+) -> Result<AdBlockOverlapDetails, MhostError> {
+    let snap = state.ad_block_state.read().await.clone();
+    let root = state.storage.root().to_path_buf();
+    let gate = Arc::clone(&state.ad_block_reload_gate);
+    tokio::task::spawn_blocking(move || {
+        Ok(compute_overlap_details(&snap, &root, &gate, &source_id))
+    })
+    .await
+    .map_err(|e| MhostError::InvalidInput(format!("overlap details task failed: {}", e)))?
 }
 
 /// Return the full ad block state (sources + whitelist + meta).
@@ -2972,7 +3077,8 @@ mod tests {
             ..Default::default()
         };
 
-        let report = compute_overlap_report(&state, temp.path());
+        let gate = AdBlockReloadGate::new();
+        let report = compute_overlap_report(&state, temp.path(), &gate);
 
         // Each source has exactly one domain overlapped with the
         // other ("shared.example.com"). za-only and nx-only are
@@ -2991,23 +3097,22 @@ mod tests {
         assert_eq!(nx_summary.overlapping_domain_count, 1);
 
         // Effective is NxDomain for the shared domain, derived from
-        // the priority rule.
-        let za_details = report
-            .details
-            .get(&s_za.source_id)
-            .expect("za details present");
-        assert_eq!(za_details.len(), 1);
-        assert_eq!(za_details[0].domain, "shared.example.com");
-        assert_eq!(za_details[0].effective, "NxDomain");
-        assert_eq!(za_details[0].covered_by.len(), 1);
-        assert_eq!(za_details[0].covered_by[0].source_id, s_nx.source_id);
+        // the priority rule. Details are per-source now (issue #225).
+        let za_details = compute_overlap_details(&state, temp.path(), &gate, &s_za.source_id);
+        assert_eq!(za_details.total, 1);
+        assert!(!za_details.truncated);
+        assert_eq!(za_details.entries.len(), 1);
+        assert_eq!(za_details.entries[0].domain, "shared.example.com");
+        assert_eq!(za_details.entries[0].effective, "NxDomain");
+        assert_eq!(za_details.entries[0].covered_by.len(), 1);
+        assert_eq!(
+            za_details.entries[0].covered_by[0].source_id,
+            s_nx.source_id
+        );
 
-        let nx_details = report
-            .details
-            .get(&s_nx.source_id)
-            .expect("nx details present");
-        assert_eq!(nx_details.len(), 1);
-        assert_eq!(nx_details[0].effective, "NxDomain");
+        let nx_details = compute_overlap_details(&state, temp.path(), &gate, &s_nx.source_id);
+        assert_eq!(nx_details.entries.len(), 1);
+        assert_eq!(nx_details.entries[0].effective, "NxDomain");
     }
 
     #[test]
@@ -3066,7 +3171,8 @@ mod tests {
             ..Default::default()
         };
 
-        let report = compute_overlap_report(&state, temp.path());
+        let gate = AdBlockReloadGate::new();
+        let report = compute_overlap_report(&state, temp.path(), &gate);
 
         // Only the enabled source appears in per_source.
         assert_eq!(report.per_source.len(), 1);
@@ -3074,7 +3180,10 @@ mod tests {
         // And its overlap count is 0 because the only other source
         // covering "shared.example.com" is disabled.
         assert_eq!(report.per_source[0].overlapping_domain_count, 0);
-        assert!(report.details.get(&s_on.source_id).unwrap().is_empty());
+        assert_eq!(
+            compute_overlap_details(&state, temp.path(), &gate, &s_on.source_id).total,
+            0
+        );
     }
 
     #[test]
@@ -3111,12 +3220,13 @@ mod tests {
             ..Default::default()
         };
 
-        let report = compute_overlap_report(&state, temp.path());
+        let gate = AdBlockReloadGate::new();
+        let report = compute_overlap_report(&state, temp.path(), &gate);
 
         // Single source — no overlap, but the report must still
         // include the source (so the frontend doesn't have to look
         // it up in two places) and the effective field, if it ever
-        // appears in the details map for this source, must be
+        // appears in the details for this source, must be
         // "Whitelisted". For this test there's no overlap detail
         // because there's only one source, so just verify the
         // summary.
@@ -3190,7 +3300,8 @@ mod tests {
             ..Default::default()
         };
 
-        let report = compute_overlap_report(&state, temp.path());
+        let gate = AdBlockReloadGate::new();
+        let report = compute_overlap_report(&state, temp.path(), &gate);
 
         // Both sources see the same overlap (1 domain each).
         assert_eq!(report.per_source.len(), 2);
@@ -3208,25 +3319,19 @@ mod tests {
         // "Whitelisted" — this is the contract `check()` enforces
         // (whitelist > nxdomain > zero_addr), and it's what the
         // drawer's `effective` badge shows the user.
-        let za_details = report
-            .details
-            .get(&s_za.source_id)
-            .expect("za details present");
-        assert_eq!(za_details.len(), 1);
-        assert_eq!(za_details[0].domain, "trusted.example.com");
+        let za_details = compute_overlap_details(&state, temp.path(), &gate, &s_za.source_id);
+        assert_eq!(za_details.entries.len(), 1);
+        assert_eq!(za_details.entries[0].domain, "trusted.example.com");
         assert_eq!(
-            za_details[0].effective, "Whitelisted",
+            za_details.entries[0].effective, "Whitelisted",
             "whitelist must beat zero_addr for an overlapping domain"
         );
 
-        let nx_details = report
-            .details
-            .get(&s_nx.source_id)
-            .expect("nx details present");
-        assert_eq!(nx_details.len(), 1);
-        assert_eq!(nx_details[0].domain, "trusted.example.com");
+        let nx_details = compute_overlap_details(&state, temp.path(), &gate, &s_nx.source_id);
+        assert_eq!(nx_details.entries.len(), 1);
+        assert_eq!(nx_details.entries[0].domain, "trusted.example.com");
         assert_eq!(
-            nx_details[0].effective, "Whitelisted",
+            nx_details.entries[0].effective, "Whitelisted",
             "whitelist must beat nxdomain for an overlapping domain"
         );
     }
@@ -3234,10 +3339,142 @@ mod tests {
     #[test]
     fn overlap_report_is_empty_when_no_sources() {
         let temp = tempfile::TempDir::new().unwrap();
+        let gate = AdBlockReloadGate::new();
         let state = AdBlockState::default();
-        let report = compute_overlap_report(&state, temp.path());
+        let report = compute_overlap_report(&state, temp.path(), &gate);
         assert!(report.per_source.is_empty());
-        assert!(report.details.is_empty());
+        // Details for any (unknown) source are the empty drill-down.
+        let details =
+            compute_overlap_details(&state, temp.path(), &gate, &SourceId(Uuid::new_v4()));
+        assert_eq!(details.total, 0);
+        assert!(details.entries.is_empty());
+        assert!(!details.truncated);
+    }
+
+    /// issue #225: the drill-down is capped at
+    /// `MAX_OVERLAP_DETAILS_PER_SOURCE` entries (sorted by domain),
+    /// while `total` carries the uncapped count and `truncated` says
+    /// whether the cap bit.
+    #[test]
+    fn overlap_details_caps_entries_and_reports_total() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let gate = AdBlockReloadGate::new();
+        let mk = |name: &str| AdBlockSource {
+            source_id: SourceId(Uuid::new_v4()),
+            name: name.into(),
+            url: "https://x".into(),
+            enabled: true,
+            response: AdBlockResponse::ZeroAddress,
+            format: BlocklistFormat::Hosts,
+            last_fetched_at: None,
+            last_error: None,
+            rule_count: 0,
+            etag: None,
+            rules_limit_override: None,
+            last_refresh_duration_ms: None,
+            last_refresh_failed_at: None,
+        };
+        let a = mk("a");
+        let b = mk("b");
+        // 501 shared domains — one past the cap.
+        let total_domains = MAX_OVERLAP_DETAILS_PER_SOURCE + 1;
+        let mut body = String::new();
+        for i in 0..total_domains {
+            body.push_str(&format!("0.0.0.0 shared{i:05}.example.com\n"));
+        }
+        mhost_storage::adblock::write_cache(temp.path(), &a.source_id, body.as_bytes()).unwrap();
+        mhost_storage::adblock::write_cache(temp.path(), &b.source_id, body.as_bytes()).unwrap();
+        let state = AdBlockState {
+            enabled: true,
+            sources: vec![a, b],
+            ..Default::default()
+        };
+
+        let details =
+            compute_overlap_details(&state, temp.path(), &gate, &state.sources[0].source_id);
+        assert_eq!(details.total, total_domains);
+        assert!(details.truncated);
+        assert_eq!(details.entries.len(), MAX_OVERLAP_DETAILS_PER_SOURCE);
+        // Sorted by domain, so the cap keeps the FIRST 500.
+        assert_eq!(details.entries[0].domain, "shared00000.example.com");
+        assert_eq!(
+            details.entries[MAX_OVERLAP_DETAILS_PER_SOURCE - 1].domain,
+            format!(
+                "shared{:05}.example.com",
+                MAX_OVERLAP_DETAILS_PER_SOURCE - 1
+            )
+        );
+
+        // The summary count is uncapped — the chip shows the real 501.
+        let report = compute_overlap_report(&state, temp.path(), &gate);
+        assert!(report
+            .per_source
+            .iter()
+            .all(|s| s.overlapping_domain_count == total_domains));
+    }
+
+    /// Duplicate domains within one source's cache are coalesced — the
+    /// pre-#225 map pushed a pair per occurrence, double-counting the
+    /// source's own overlap and rendering the same "Also in:" source
+    /// twice in the drawer.
+    #[test]
+    fn overlap_report_dedupes_duplicate_domains_within_a_source() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let gate = AdBlockReloadGate::new();
+        let mk = |name: &str| AdBlockSource {
+            source_id: SourceId(Uuid::new_v4()),
+            name: name.into(),
+            url: "https://x".into(),
+            enabled: true,
+            response: AdBlockResponse::ZeroAddress,
+            format: BlocklistFormat::Hosts,
+            last_fetched_at: None,
+            last_error: None,
+            rule_count: 0,
+            etag: None,
+            rules_limit_override: None,
+            last_refresh_duration_ms: None,
+            last_refresh_failed_at: None,
+        };
+        let a = mk("a");
+        let b = mk("b");
+        mhost_storage::adblock::write_cache(
+            temp.path(),
+            &a.source_id,
+            b"0.0.0.0 dup.example.com\n0.0.0.0 dup.example.com\n",
+        )
+        .unwrap();
+        mhost_storage::adblock::write_cache(
+            temp.path(),
+            &b.source_id,
+            b"0.0.0.0 dup.example.com\n",
+        )
+        .unwrap();
+        let state = AdBlockState {
+            enabled: true,
+            sources: vec![a.clone(), b.clone()],
+            ..Default::default()
+        };
+
+        let report = compute_overlap_report(&state, temp.path(), &gate);
+        let a_summary = report
+            .per_source
+            .iter()
+            .find(|s| s.source_id == a.source_id)
+            .expect("a summary present");
+        assert_eq!(
+            a_summary.overlapping_domain_count, 1,
+            "duplicate cache lines must count the domain once"
+        );
+
+        let details = compute_overlap_details(&state, temp.path(), &gate, &b.source_id);
+        assert_eq!(details.entries.len(), 1);
+        assert_eq!(
+            details.entries[0].covered_by.len(),
+            1,
+            "one covering source, once"
+        );
+        assert_eq!(details.entries[0].covered_by[0].source_id, a.source_id);
     }
 
     #[test]
@@ -3273,7 +3510,8 @@ mod tests {
             ],
             ..Default::default()
         };
-        let report = compute_overlap_report(&state, temp.path());
+        let gate = AdBlockReloadGate::new();
+        let report = compute_overlap_report(&state, temp.path(), &gate);
         let order: Vec<_> = report
             .per_source
             .iter()
@@ -6220,7 +6458,7 @@ trailing-dot.example.com.
 
     /// Issue #213 acceptance 1: a domains-format source parses bare
     /// domains end-to-end — rule_count is correct and the on-disk cache
-    /// is canonical hosts text (so `domains_for_source` / the DNS engine
+    /// is canonical hosts text (so the classify/overlap loaders and the DNS engine
     /// path needs no format awareness).
     #[tokio::test]
     async fn fetch_and_cache_source_domains_format_parses_bare_domains() {
