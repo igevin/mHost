@@ -139,10 +139,18 @@ impl<T> Trie<T> {
     /// `root → com → example → c → b → a`, creating missing nodes
     /// along the way. The leaf node (`a`) holds the value.
     pub fn insert(&mut self, domain: &str, value: T) {
-        // Collect right-to-left labels. An empty domain is a no-op
-        // (matches the prior `HashMap::insert("", _, _)` which
-        // silently dropped it).
-        let mut labels: Vec<&str> = Vec::new();
+        // Collect right-to-left labels into stack storage for the common
+        // case (real-world domains carry a handful of labels), so the
+        // per-domain `Vec<&str>` heap allocation is gone (issue #227-1).
+        // Domains longer than the inline capacity spill into a `Vec`,
+        // preserving the old behavior exactly.
+        const MAX_INLINE_LABELS: usize = 16;
+        let mut inline: [&str; MAX_INLINE_LABELS] = [""; MAX_INLINE_LABELS];
+        let mut inline_len = 0usize;
+        let mut spilled: Vec<&str> = Vec::new();
+
+        // An empty domain is a no-op (matches the prior
+        // `HashMap::insert("", _, _)` which silently dropped it).
         let mut rest = domain;
         loop {
             let (label, new_rest) = match rest.rfind('.') {
@@ -152,12 +160,26 @@ impl<T> Trie<T> {
             if label.is_empty() {
                 break;
             }
-            labels.push(label);
+            if inline_len < MAX_INLINE_LABELS {
+                inline[inline_len] = label;
+                inline_len += 1;
+            } else {
+                // First spill: carry over the labels already collected.
+                if spilled.is_empty() {
+                    spilled.extend_from_slice(&inline);
+                }
+                spilled.push(label);
+            }
             rest = new_rest;
             if rest.is_empty() {
                 break;
             }
         }
+        let labels: &[&str] = if spilled.is_empty() {
+            &inline[..inline_len]
+        } else {
+            &spilled
+        };
         if labels.is_empty() {
             return;
         }
@@ -169,14 +191,25 @@ impl<T> Trie<T> {
         // multiple inserts. (`labels.iter().rev()` was a bug — it
         // built the tree inverted, defeating the whole shared-prefix
         // optimization.)
+        //
+        // Issue #227-1: only pay the `String` allocation when the node
+        // is actually missing. The previous unconditional
+        // `entry(label.to_string())` allocated a String for every label
+        // of every domain even when the node already existed and the
+        // key was immediately dropped — roughly one wasted allocation
+        // per label per domain per rebuild (~300k at 100k domains ×
+        // ~3 labels, ×3 rule sets). `contains_key` + `get_mut` costs
+        // one extra hash probe on the existing-node path, far cheaper
+        // than the allocation it replaces. (The borrow checker rejects
+        // the single-probe `get_mut`/`entry` combination — the classic
+        // NLL limitation — so the two-probe form is the stable-Rust
+        // optimum.)
         let mut node = &mut self.root;
         for label in labels.iter() {
-            // `entry().or_insert_with` is one allocation per missing
-            // node — exactly what we want.
-            node = node
-                .children
-                .entry(label.to_string())
-                .or_insert_with(TrieNode::new);
+            if !node.children.contains_key(*label) {
+                node.children.insert(label.to_string(), TrieNode::new());
+            }
+            node = node.children.get_mut(*label).unwrap();
         }
         node.data = Some(value);
     }

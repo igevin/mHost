@@ -229,9 +229,10 @@ impl AdBlockEngine {
     /// without touching any counter — there is nothing meaningful
     /// to record.
     pub fn check(&self, domain: &str) -> Option<AdBlockAction> {
-        let snap = self.snapshot();
-
-        // Master switch off → no counters, no work. The whitelist
+        // Master switch off → no counters, no work. Hoisted above the
+        // snapshot read (issue #227-4): ad-block off is the common
+        // state, and the old order paid one RwLock read + Arc refcount
+        // bump per query for a snapshot it never used. The whitelist
         // walk is skipped because the caller always falls through on
         // `None`, and `classify_rules` only feeds block rules to the
         // engine when master is on, so a whitelist hit while master
@@ -239,6 +240,8 @@ impl AdBlockEngine {
         if !self.enabled.load(Ordering::Relaxed) {
             return None;
         }
+
+        let snap = self.snapshot();
 
         // Whitelist first — wins over both block-rule sets
         // (whitelist collected regardless of master switch). A

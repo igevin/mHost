@@ -23,11 +23,16 @@ pub fn generate_plan(profiles: &[Profile], current_hosts: &str) -> Result<ApplyP
     let merge_result = Merger::merge(profiles);
     let diff = diff::calculate_diff(current_hosts, &merge_result.rules);
 
+    // Issue #228-2: derive the flag from the diff before moving it into
+    // the plan — the previous `diff: diff.clone()` deep-copied all three
+    // HostsDiff vecs only to read their lengths.
+    let backup_required = !diff.added.is_empty() || !diff.removed.is_empty();
+
     Ok(ApplyPlan {
         rules: merge_result.rules,
         conflicts: merge_result.conflicts,
-        diff: diff.clone(),
-        backup_required: !diff.added.is_empty() || !diff.removed.is_empty(),
+        diff,
+        backup_required,
     })
 }
 
