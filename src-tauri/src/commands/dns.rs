@@ -364,15 +364,20 @@ async fn set_dns_mode_enable(
     //    所以这里显式做一次 classify + reload，与 AppState::new 冷启动
     //    路径一致。
     //
-    //    9b. 这里复用了 commands::adblock 的 `classify_rules` + 重载路径
-    //    的等价逻辑（避免循环依赖和 IPC 边界），不经过 IPC handler。
+    //    9b. 这里复用了 commands::adblock 的 `classify_and_reload`（force
+    //    seed，必装规则并记录指纹），不经过 IPC handler。
     let snap = state.ad_block_state.read().await.clone();
-    let (za, nx, wl) = crate::commands::adblock::classify_rules(&snap, state.storage.root());
+    // force=true：新 server 必须装规则；指纹门只负责记录指纹供后续
+    // 增量路径比较（issue #224）。
     if let Some(server) = lock_or_recover(&state.dns_server).as_ref() {
-        // Issue #199 sub-task B: pass the master switch to the
-        // engine so `check()` can decide whether misses should
-        // accumulate. We snapshot it from the cloned state above.
-        server.reload_ad_block_rules(snap.enabled, za, nx, wl);
+        crate::commands::adblock::classify_and_reload(
+            &snap,
+            state.storage.root(),
+            &state.ad_block_reload_gate,
+            server,
+            true,
+            None,
+        );
     }
     spawn_ad_block_refresh_task(
         &state.ad_block_refresh_task,
@@ -381,6 +386,7 @@ async fn set_dns_mode_enable(
         &state.storage,
         &state.ad_block_refresh_cancel,
         &state.ad_block_refresh_wake,
+        &state.ad_block_reload_gate,
     );
 
     Ok(())
@@ -602,6 +608,7 @@ mod tests {
             ad_block_refresh_task: Mutex::new(None),
             ad_block_refresh_cancel: Mutex::new(CancellationToken::new()),
             ad_block_refresh_wake: Arc::new(tokio::sync::Notify::new()),
+            ad_block_reload_gate: Arc::new(crate::commands::adblock::AdBlockReloadGate::new()),
         };
 
         assert!(!token.is_cancelled(), "pre-condition: token uncancelled");
@@ -644,6 +651,7 @@ mod tests {
             ad_block_refresh_task: Mutex::new(None),
             ad_block_refresh_cancel: Mutex::new(CancellationToken::new()),
             ad_block_refresh_wake: Arc::new(tokio::sync::Notify::new()),
+            ad_block_reload_gate: Arc::new(crate::commands::adblock::AdBlockReloadGate::new()),
         };
 
         let slot = lock_or_recover(&state.dns_cancel);
@@ -685,6 +693,7 @@ mod tests {
             ad_block_refresh_task: Mutex::new(None),
             ad_block_refresh_cancel: Mutex::new(CancellationToken::new()),
             ad_block_refresh_wake: Arc::new(tokio::sync::Notify::new()),
+            ad_block_reload_gate: Arc::new(crate::commands::adblock::AdBlockReloadGate::new()),
         };
 
         // Simulate the swap pattern at the top of `set_dns_mode`:
@@ -732,6 +741,7 @@ mod tests {
             ad_block_refresh_task: Mutex::new(None),
             ad_block_refresh_cancel: Mutex::new(tokio_util::sync::CancellationToken::new()),
             ad_block_refresh_wake: Arc::new(tokio::sync::Notify::new()),
+            ad_block_reload_gate: Arc::new(crate::commands::adblock::AdBlockReloadGate::new()),
         };
         // dns_enabled = false → cleanup 应直接返回 Ok
         let result = cleanup_dns_on_exit(&state, false).await;
@@ -776,6 +786,7 @@ mod tests {
             ad_block_refresh_task: Mutex::new(None),
             ad_block_refresh_cancel: Mutex::new(tokio_util::sync::CancellationToken::new()),
             ad_block_refresh_wake: Arc::new(tokio::sync::Notify::new()),
+            ad_block_reload_gate: Arc::new(crate::commands::adblock::AdBlockReloadGate::new()),
         };
         // cleanup_dns_on_exit → set_dns_mode_disable(interactive=false)
         //   - original 是 DhcpEmpty → 只打印 warning（不返回 Err，bug 1 修复）
@@ -833,6 +844,7 @@ mod tests {
             ad_block_refresh_task: Mutex::new(None),
             ad_block_refresh_cancel: Mutex::new(tokio_util::sync::CancellationToken::new()),
             ad_block_refresh_wake: Arc::new(tokio::sync::Notify::new()),
+            ad_block_reload_gate: Arc::new(crate::commands::adblock::AdBlockReloadGate::new()),
         };
 
         // 第一次 cleanup：跑 disable 路径。注意必须用 interactive=false
@@ -895,6 +907,7 @@ mod tests {
         task_slot: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
         cancel_slot: Mutex<CancellationToken>,
         wake: Arc<tokio::sync::Notify>,
+        reload_gate: Arc<crate::commands::adblock::AdBlockReloadGate>,
     }
 
     fn refresh_task_env(auto: bool, interval_hours: u32) -> RefreshTaskEnv {
@@ -931,6 +944,7 @@ mod tests {
             task_slot: Mutex::new(None),
             cancel_slot: Mutex::new(CancellationToken::new()),
             wake: Arc::new(tokio::sync::Notify::new()),
+            reload_gate: Arc::new(crate::commands::adblock::AdBlockReloadGate::new()),
         }
     }
 
@@ -943,6 +957,7 @@ mod tests {
                 &self.storage,
                 &self.cancel_slot,
                 &self.wake,
+                &self.reload_gate,
             );
         }
 
@@ -1310,7 +1325,7 @@ fn cancel_ad_block_refresh_task(slot: &Mutex<CancellationToken>) {
 /// `JoinHandle::abort()` reaching a yield point. The `spawn_blocking`
 /// closure inside the loop also checks `token.is_cancelled()` immediately
 /// before calling `reload_ad_block_rules` — that's the layer that protects
-/// against an in-flight `classify_rules` that started before cancel
+/// against an in-flight `classify_and_reload` that started before cancel
 /// landed. `spawn_blocking` work cannot be interrupted by `JoinHandle::
 /// abort()` (tokio explicitly documents this), so the self-check is the
 /// only reliable way to avoid a `reload_ad_block_rules` call landing on
@@ -1325,6 +1340,7 @@ pub(crate) fn spawn_ad_block_refresh_task(
     storage: &Arc<dyn mhost_storage::storage::Storage + Send + Sync>,
     cancel_slot: &Mutex<CancellationToken>,
     wake: &Arc<tokio::sync::Notify>,
+    reload_gate: &Arc<crate::commands::adblock::AdBlockReloadGate>,
 ) {
     // Issue #138 follow-up (re-enable): swap the cancel slot for a fresh
     // token so this task is unaffected by a previous disable's `cancel()`.
@@ -1343,6 +1359,7 @@ pub(crate) fn spawn_ad_block_refresh_task(
     let ad_block_state = ad_block_state.clone();
     let dns_server = dns_server.clone();
     let wake = wake.clone();
+    let reload_gate = reload_gate.clone();
 
     let handle = tokio::spawn(async move {
         loop {
@@ -1466,8 +1483,10 @@ pub(crate) fn spawn_ad_block_refresh_task(
                 let snap = ad_block_state.read().await.clone();
                 let root = storage.root().to_path_buf();
                 let dns_server_clone = Arc::clone(&dns_server);
+                let gate_for_tick = Arc::clone(&reload_gate);
                 let cancel_in_closure = cancel.clone();
-                // Issue #133: classify_rules reads + parses each source's
+                // Issue #133: classify_and_reload (via load_classify_inputs)
+                // reads + parses each source's
                 // cache file synchronously — 100k+ domains can block a
                 // tokio worker for seconds. Move it off the async runtime.
                 let _ = tokio::task::spawn_blocking(move || {
@@ -1475,15 +1494,17 @@ pub(crate) fn spawn_ad_block_refresh_task(
                     if cancel_in_closure.is_cancelled() {
                         return;
                     }
-                    let (za, nx, wl) = crate::commands::adblock::classify_rules(&snap, &root);
-                    if cancel_in_closure.is_cancelled() {
-                        return;
-                    }
+                    // 指纹门（issue #224）：本轮 tick 刷到的源内容都没变时，
+                    // 跳过 merge + trie 重建 + LRU 清空（force=false）。
                     if let Some(server) = lock_or_recover(&dns_server_clone).as_ref() {
-                        // Issue #199 sub-task B: pass the master
-                        // switch to the engine. Read from the
-                        // snapshot cloned at the top of this tick.
-                        server.reload_ad_block_rules(snap.enabled, za, nx, wl);
+                        crate::commands::adblock::classify_and_reload(
+                            &snap,
+                            &root,
+                            &gate_for_tick,
+                            server,
+                            false,
+                            Some(&cancel_in_closure),
+                        );
                     }
                 })
                 .await;

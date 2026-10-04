@@ -161,6 +161,11 @@ pub struct AppState {
     /// 在无等待者时保留一个 permit，IPC 与 task 循环之间的任意交错都
     /// 不会丢唤醒。
     pub ad_block_refresh_wake: Arc<tokio::sync::Notify>,
+    /// ad block reload 指纹门 + per-source 解析缓存（issue #224）。
+    /// 规则输入未变的 mutation（reorder / interval / auto_refresh /
+    /// rules_limit_override / 内容未变的刷新）经此跳过 classify、trie
+    /// 重建与 DNS LRU 清空。
+    pub ad_block_reload_gate: Arc<crate::commands::adblock::AdBlockReloadGate>,
 }
 
 impl AppState {
@@ -268,6 +273,7 @@ impl AppState {
             ad_block_refresh_task: Mutex::new(None),
             ad_block_refresh_cancel: Mutex::new(tokio_util::sync::CancellationToken::new()),
             ad_block_refresh_wake: Arc::new(tokio::sync::Notify::new()),
+            ad_block_reload_gate: Arc::new(crate::commands::adblock::AdBlockReloadGate::new()),
         };
 
         // Issue #206 design note 2: startup orphan-cache sweep. The
@@ -306,13 +312,19 @@ impl AppState {
             let snap = state.ad_block_state.read().await.clone();
             let storage_root = state.storage.root().to_path_buf();
             let dns_server = Arc::clone(&state.dns_server);
+            let gate = Arc::clone(&state.ad_block_reload_gate);
             let result = tokio::task::spawn_blocking(move || {
-                let (za, nx, wl) = crate::commands::adblock::classify_rules(&snap, &storage_root);
+                // force=true：引擎刚构造，必须装规则，指纹门只负责记录
+                // 指纹供后续增量路径比较（issue #224）。
                 if let Some(server) = crate::state::lock_or_recover(&dns_server).as_ref() {
-                    // Issue #199 sub-task B: pass the master switch
-                    // to the engine. Read from the snapshot cloned
-                    // just above the spawn_blocking boundary.
-                    server.reload_ad_block_rules(snap.enabled, za, nx, wl);
+                    crate::commands::adblock::classify_and_reload(
+                        &snap,
+                        &storage_root,
+                        &gate,
+                        server,
+                        true,
+                        None,
+                    );
                 }
             })
             .await;
@@ -329,6 +341,7 @@ impl AppState {
                 &state.storage,
                 &state.ad_block_refresh_cancel,
                 &state.ad_block_refresh_wake,
+                &state.ad_block_reload_gate,
             );
         }
 
@@ -653,6 +666,9 @@ mod tests {
                 tokio_util::sync::CancellationToken::new(),
             ),
             ad_block_refresh_wake: std::sync::Arc::new(tokio::sync::Notify::new()),
+            ad_block_reload_gate: std::sync::Arc::new(
+                crate::commands::adblock::AdBlockReloadGate::new(),
+            ),
         };
         (temp_dir, std::sync::Arc::new(state))
     }
