@@ -763,12 +763,25 @@ pub(crate) async fn fetch_and_cache_source(
                 // Re-serialize as canonical hosts text so the cache is
                 // always valid hosts format (drops comments the original
                 // may have). Skipped entirely on 304 — see issue #193.
-                let canon = parsed
-                    .domains
-                    .iter()
-                    .map(|d| format!("0.0.0.0 {}", d))
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                //
+                // Issue #227-2: build the canonical text into one
+                // pre-sized buffer — the previous `format!` per domain +
+                // `Vec<String>` + `join` transiently materialized the
+                // list three times (≈2× body size at 500k rules).
+                use std::fmt::Write as _;
+                let mut canon = String::with_capacity(
+                    parsed.domains.iter().map(|d| d.len() + 9).sum::<usize>(),
+                );
+                for (i, d) in parsed.domains.iter().enumerate() {
+                    // Byte-identical to the old `map(format!) + join("\n")`:
+                    // separators between entries, no trailing newline
+                    // (tests pin the exact cache bytes).
+                    if i > 0 {
+                        canon.push('\n');
+                    }
+                    // write! into a String never fails.
+                    write!(canon, "0.0.0.0 {}", d).unwrap();
+                }
                 adblock_store::write_cache(&root, &id_owned, canon.as_bytes())?;
                 Ok(Parsed::Fresh {
                     rule_count: parsed.domains.len(),

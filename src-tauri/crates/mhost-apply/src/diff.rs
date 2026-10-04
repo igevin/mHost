@@ -17,15 +17,20 @@ pub fn calculate_diff(current_hosts: &str, resolved_rules: &[ResolvedRule]) -> H
     // Extract existing rules from current hosts (outside managed block)
     let existing_lines = extract_existing_lines(current_hosts);
 
-    // Build target lines from resolved rules
-    let target_lines: Vec<String> = resolved_rules
-        .iter()
-        .map(|r| format!("{} {}", r.ip, r.domain))
-        .collect();
+    // Build target lines into one pre-sized buffer and let the set borrow
+    // slices of it — the previous `format!` per rule allocated one String
+    // per resolved rule (issue #228-1: P-R9 fixed this class in
+    // verification.rs but left diff.rs behind).
+    use std::fmt::Write as _;
+    let mut target_buf = String::with_capacity(resolved_rules.len() * 32);
+    for r in resolved_rules {
+        // writeln! into a String never fails.
+        writeln!(target_buf, "{} {}", r.ip, r.domain).unwrap();
+    }
+    let target_set: BTreeSet<&str> = target_buf.lines().collect();
 
     // Compute diff using set operations (BTreeSet for deterministic ordering)
     let existing_set: BTreeSet<&str> = existing_lines.iter().map(|s| s.as_str()).collect();
-    let target_set: BTreeSet<&str> = target_lines.iter().map(|s| s.as_str()).collect();
 
     let added: Vec<String> = target_set
         .difference(&existing_set)
@@ -57,20 +62,36 @@ pub fn calculate_diff(current_hosts: &str, resolved_rules: &[ResolvedRule]) -> H
 fn extract_existing_lines(current_hosts: &str) -> Vec<String> {
     let managed_range = Parser::extract_managed_block(current_hosts);
 
-    let content_to_parse = match managed_range {
-        Some((start, end)) => {
-            let lines: Vec<&str> = current_hosts.lines().collect();
-            // Validate indices: start+1 must be < end and within bounds
-            if start + 1 < end && end <= lines.len() {
-                lines[start + 1..end].join("\n")
-            } else {
-                String::new()
+    // Slice the managed-block interior directly by byte offset — the
+    // previous `lines().collect()` + `join("\n")` walked every line of
+    // the file and copied the entire managed block just to hand the
+    // parser a `&str` (issue #228-1: P-R6 fixed this class in
+    // writer/content.rs but left diff.rs behind).
+    let content_to_parse: &str = match managed_range {
+        Some((start, end)) if start + 1 < end => {
+            let mut line_start = 0usize;
+            let mut begin: Option<usize> = None;
+            let mut interior = "";
+            for (i, line) in current_hosts.lines().enumerate() {
+                if i == start + 1 {
+                    begin = Some(line_start);
+                }
+                if i == end - 1 {
+                    if let Some(begin) = begin {
+                        interior = &current_hosts[begin..line_start + line.len()];
+                    }
+                    break;
+                }
+                line_start += line.len() + 1;
             }
+            interior
         }
-        None => String::new(),
+        // `end` beyond the last line (or a degenerate range) → empty,
+        // matching the old bounds-checked `lines[start + 1..end]` slice.
+        _ => "",
     };
 
-    let parse_result = Parser::parse(&content_to_parse);
+    let parse_result = Parser::parse(content_to_parse);
 
     // Log parse errors so they are not silently discarded
     for err in &parse_result.errors {

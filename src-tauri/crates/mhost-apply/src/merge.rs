@@ -64,19 +64,28 @@ impl Merger {
         let mut domain_to_ips: HashMap<String, HashSet<IpAddr>> = HashMap::new();
 
         for rule in all_rules {
-            let domain = rule.domain.clone();
-            let key = (domain.clone(), rule.ip);
-
-            by_domain_ip.entry(key).or_insert_with(|| ResolvedRule {
-                ip: rule.ip,
-                domain: domain.clone(),
-                source_profile_id: rule.source_profile_id,
-                source_profile_name: rule.source_profile_name,
-            });
-
-            // P-R11: insert IpAddr directly, no to_string() alloc. HashSet
-            // auto-dedupes the IPs for "is conflict?" check.
-            domain_to_ips.entry(domain).or_default().insert(rule.ip);
+            // Issue #228-4: the domain is cloned exactly ONCE per rule
+            // (the `domain_to_ips` key). The `by_domain_ip` key takes the
+            // original String, and the stored ResolvedRule carries an
+            // empty placeholder — the key's String is moved into the
+            // rule before either is returned (both loops below), so the
+            // placeholder never escapes this function. The previous code
+            // cloned the domain three times per rule.
+            let ResolvedRule {
+                ip,
+                domain,
+                source_profile_id,
+                source_profile_name,
+            } = rule;
+            domain_to_ips.entry(domain.clone()).or_default().insert(ip);
+            by_domain_ip
+                .entry((domain, ip))
+                .or_insert_with(|| ResolvedRule {
+                    ip,
+                    domain: String::new(),
+                    source_profile_id,
+                    source_profile_name,
+                });
         }
 
         // Build conflicts: same domain with different IPs
@@ -96,7 +105,12 @@ impl Merger {
             let mut conflict_rules: Vec<ResolvedRule> = Vec::new();
             // P-R11: iterate HashSet<IpAddr> directly, no String clones
             for &ip in &domain_to_ips[domain] {
-                if let Some(rule) = by_domain_ip.remove(&(domain.clone(), ip)) {
+                // Issue #228-4: the removed rule's domain is a placeholder
+                // (see the insert loop) — patch it by moving the removed
+                // key's String, no extra clone.
+                let key = (domain.clone(), ip);
+                if let Some(mut rule) = by_domain_ip.remove(&key) {
+                    rule.domain = key.0;
                     conflict_rules.push(rule);
                 }
             }
@@ -114,10 +128,14 @@ impl Merger {
         let mut rules: Vec<ResolvedRule> = Vec::new();
         let conflict_domain_set: HashSet<&String> = conflict_domains.iter().collect();
 
-        for ((domain, _ip), rule) in by_domain_ip {
-            if !conflict_domain_set.contains(&domain) {
-                rules.push(rule);
+        for ((domain, _ip), mut rule) in by_domain_ip {
+            if conflict_domain_set.contains(&domain) {
+                continue;
             }
+            // Issue #228-4: move the map key's String into the rule,
+            // replacing the empty placeholder — zero clones.
+            rule.domain = domain;
+            rules.push(rule);
         }
 
         // P-R10: sort by (domain, IpAddr) — both Ord, zero alloc.
