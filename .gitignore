@@ -86,3 +86,6 @@ dist/
 # Claude Code agent worktrees (created by subagents in isolated worktrees;
 # these are scratch directories, not source).
 .claude/worktrees/
+
+# ZCode workspace config
+.zcodeignore
