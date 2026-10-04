@@ -39,15 +39,29 @@ const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// 之前用 `content.trim() != "running"` 在 mhost 写入时（truncate → write_all
 /// 之间）读到空字符串会误触发 shutdown。原子写入修了这问题；这里再加固
 /// 一层：「空文件 = mhost 还没写完，不当作 shutdown 信号」。
+///
+/// **Issue #229-3**：改为定长栈缓冲读取。这个函数在 proxy 存活期内每秒
+/// 被调用一次，旧实现 `fs::read_to_string` 每秒付出 1 次堆 String 分配 +
+/// free，而信号的合法内容只有 "running" / "shutdown" 几个字节。syscall
+/// 次数不变，常驻分配归零；超出缓冲的内容不可能是合法信号值。
 fn shutdown_signal_file_contains_shutdown() -> bool {
-    let Ok(content) = std::fs::read_to_string(crate::platform::shutdown_signal_file()) else {
+    use std::io::Read;
+    let mut file = match std::fs::File::open(crate::platform::shutdown_signal_file()) {
+        Ok(f) => f,
         // 文件不在 = mhost 没在管（手动启 proxy 的情况）
-        return false;
+        Err(_) => return false,
     };
-    if content.trim().is_empty() {
+    let mut buf = [0u8; 32];
+    let n = match file.read(&mut buf) {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    let content = std::str::from_utf8(&buf[..n]).unwrap_or("");
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
         return false;
     }
-    content.trim() == "shutdown"
+    trimmed == "shutdown"
 }
 
 /// 从文件读出原始 DNS（每行一个）。失败或文件不存在返回空 vec。
@@ -861,6 +875,22 @@ pub(crate) mod tests {
         // 4. 文件内容 = 其他（truncated / 加换行）→ trim 后 = "shutdown" → true
         std::fs::write(&signal_path, "  shutdown  \n").unwrap();
         assert!(shutdown_signal_file_contains_shutdown());
+
+        // 5. 非 UTF-8 字节 → false。#229-3 栈缓冲读用 from_utf8（失败按无
+        //    信号处理）；旧 read_to_string 同样 Err → false，语义一致。
+        std::fs::write(&signal_path, [0xFF, 0xFE]).unwrap();
+        assert!(!shutdown_signal_file_contains_shutdown());
+
+        // 6. 超过 32 字节栈缓冲、但前 32 字节 trim 后恰为 "shutdown" → true。
+        //    这是 #229-3 的有意边界（只读前 32 字节）：真实 writer 只写
+        //    7-8 字节字面量（platform.rs / proxy.rs 的 write_signal_file
+        //    调用点），这里把放宽钉死为已文档化行为。
+        std::fs::write(&signal_path, format!("shutdown{}", " ".repeat(40))).unwrap();
+        assert!(shutdown_signal_file_contains_shutdown());
+
+        // 7. 超过 32 字节且前 32 字节不是 "shutdown" → false
+        std::fs::write(&signal_path, format!("running{}", "x".repeat(40))).unwrap();
+        assert!(!shutdown_signal_file_contains_shutdown());
 
         // 清理
         let _ = std::fs::remove_file(&signal_path);
