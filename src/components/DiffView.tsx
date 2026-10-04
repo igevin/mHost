@@ -75,10 +75,7 @@ function DiffView({ plan, compact = false }: DiffViewProps) {
                       </div>
                     ))}
                   {plan.diff.unchanged.length > MAX_RENDERED_UNCHANGED && (
-                    <div
-                      className={styles.diffUnchangedCollapsed}
-                      role="note"
-                    >
+                    <div className={styles.diffUnchangedNote} role="note">
                       …{(
                         plan.diff.unchanged.length - MAX_RENDERED_UNCHANGED
                       ).toLocaleString()}{" "}
