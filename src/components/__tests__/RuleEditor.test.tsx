@@ -126,6 +126,40 @@ describe("RuleEditor", () => {
     expect(onChange).not.toHaveBeenCalled();
   });
 
+  it("rolls back the textarea when external rules change while onChange is blocked", async () => {
+    // Regression (PR #239 review finding 1): typing must consume
+    // `isEditingRef` on the keystroke-triggered effect run — the
+    // pre-#226 code reset it there too. If the flag outlives the
+    // keystroke, an external rules change arriving while onChange stays
+    // blocked (validation errors) hits the mid-edit early-out and is
+    // swallowed: the stale draft survives a profile switch instead of
+    // being rolled back.
+    mockValidateHostsText.mockResolvedValue({
+      rules: [],
+      errors: [{ line_number: 1, error: "parse error" }],
+      duplicates: [],
+    });
+    const onChange = vi.fn();
+    const otherProfileRules: HostRule[] = [
+      makeRule({ id: "r9", ip: "10.0.0.1", domains: ["other.example.com"] }),
+    ];
+    const { rerender } = render(<RuleEditor rules={sampleRules} onChange={onChange} />);
+    const textarea = screen.getByRole("textbox");
+
+    fireEvent.change(textarea, { target: { value: "bad input" } });
+    act(() => {
+      vi.advanceTimersByTime(350);
+    });
+    await act(async () => {
+      await vi.runAllTimersAsync();
+    });
+    expect(onChange).not.toHaveBeenCalled();
+
+    // Profile switch while the draft is stuck — must roll back.
+    rerender(<RuleEditor rules={otherProfileRules} onChange={onChange} />);
+    expect(textarea).toHaveValue("10.0.0.1 other.example.com");
+  });
+
   it("handles empty input", async () => {
     mockValidateHostsText.mockResolvedValue({
       rules: [],

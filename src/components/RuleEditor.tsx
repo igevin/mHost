@@ -163,7 +163,19 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEd
   const [searchBarVisible, setSearchBarVisible] = useState(false);
   const [currentMatchIndex, setCurrentMatchIndex] = useState(0);
 
-  const matches = useMemo(() => findMatches(text, searchQuery), [text, searchQuery]);
+  // Perf (P-F9, issue #226): search runs off the *deferred* text so the
+  // urgent keystroke render never pays for it. The memo used to depend on
+  // `[text, searchQuery]` — re-running O(N) match scan on every keystroke
+  // while a query was active — while the highlight layer one block below
+  // already used `useDeferredValue`. Display-level consumers (highlight,
+  // match count, prev/next navigation) are fine with the one-frame lag;
+  // the replace handlers recompute against the live text instead (see
+  // handleReplace).
+  const deferredText = useDeferredValue(text);
+  const matches = useMemo(
+    () => findMatches(deferredText, searchQuery),
+    [deferredText, searchQuery],
+  );
 
   // Clamp currentMatchIndex when matches change
   useEffect(() => {
@@ -177,19 +189,41 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEd
   // Sync text when rules prop changes externally (not from our own onChange)
   const prevRulesRef = useRef<HostRule[]>([]);
   useEffect(() => {
+    // Perf (P-F15, issue #226): two early-outs before any O(N) work.
+    //
+    // (1) `rules` reference unchanged → this run was triggered by the
+    //     `text` dep (our own keystroke), not by new rules. Previously
+    //     every keystroke paid a full `rulesToText` join here. This run
+    //     MUST still consume `isEditingRef` (set by handleChange): the
+    //     pre-#226 code reset it on every text-triggered run, and letting
+    //     it outlive the keystroke would swallow external rules changes
+    //     arriving while the flag is still up — e.g. a profile switch
+    //     while onChange is blocked by validation errors, which would
+    //     leave this profile's draft in the other profile's editor.
+    //     (PR #239 review finding 1.)
+    // (2) mid-edit → never overwrite the textarea. Reachable for genuine
+    //     external changes too (profile switch landing in the same
+    //     interleaving as a keystroke); the pre-#226 code refused the
+    //     overwrite in that case as well. Placing this before the
+    //     convergence comparison only skips its O(N) `rulesToText` —
+    //     the old `newText === text` branch performed the identical
+    //     reset-flag-and-return sequence.
+    if (rules === prevRulesRef.current) {
+      isEditingRef.current = false;
+      return;
+    }
+    if (isEditingRef.current) {
+      isEditingRef.current = false;
+      prevRulesRef.current = rules;
+      return;
+    }
+
     const newText = rulesToText(rules);
 
     // If the generated text matches current text, just update the ref
     // and skip overwriting (preserves cursor position).
     // Also reset editing flag — user has converged on the validated state.
     if (newText === text) {
-      isEditingRef.current = false;
-      prevRulesRef.current = rules;
-      return;
-    }
-
-    // Skip text overwrite if the change originated from our own editing.
-    if (isEditingRef.current) {
       isEditingRef.current = false;
       prevRulesRef.current = rules;
       return;
@@ -320,26 +354,42 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEd
 
   // Replace handlers
   const handleReplace = useCallback(() => {
-    if (matches.length === 0 || currentMatchIndex < 0 || currentMatchIndex >= matches.length) return;
-    const match = matches[currentMatchIndex];
+    if (!searchQuery) return;
+    // `matches` derives from `deferredText` (may lag the live text by one
+    // frame during typing); slicing the live text with stale offsets would
+    // replace at the wrong position. Recomputing here is O(N+M) (see
+    // search.ts) — negligible for a single click. When there is no lag,
+    // `fresh` is byte-identical to `matches`, so the pre-#226 behavior is
+    // preserved (PR #239 review finding 4-ii). The index clamp differs
+    // from the old out-of-range no-op only in that same one-frame lag
+    // case, and lands on the value the old clamp effect would have
+    // converged to — deliberate (finding 3).
+    const fresh = findMatches(text, searchQuery);
+    if (fresh.length === 0) return;
+    const index = Math.min(Math.max(currentMatchIndex, 0), fresh.length - 1);
+    const match = fresh[index];
     const newText = text.slice(0, match.start) + replaceText + text.slice(match.end);
     isEditingRef.current = true;
     setText(newText);
     debouncedValidate(newText);
-  }, [text, matches, currentMatchIndex, replaceText, debouncedValidate]);
+  }, [text, searchQuery, currentMatchIndex, replaceText, debouncedValidate]);
 
   const handleReplaceAll = useCallback(() => {
-    if (matches.length === 0) return;
+    if (!searchQuery) return;
+    // Same freshness guard as handleReplace: offsets must match the live
+    // text, not the deferred snapshot the highlight layer renders.
+    const fresh = findMatches(text, searchQuery);
+    if (fresh.length === 0) return;
     let newText = text;
-    for (let i = matches.length - 1; i >= 0; i--) {
-      const match = matches[i];
+    for (let i = fresh.length - 1; i >= 0; i--) {
+      const match = fresh[i];
       newText = newText.slice(0, match.start) + replaceText + newText.slice(match.end);
     }
     isEditingRef.current = true;
     setText(newText);
     debouncedValidate(newText);
     setCurrentMatchIndex(0);
-  }, [text, matches, replaceText, debouncedValidate]);
+  }, [text, searchQuery, replaceText, debouncedValidate]);
 
   // Keyboard shortcuts for search
   useEffect(() => {
@@ -369,7 +419,6 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEd
   }, [searchBarVisible]);
 
   // Generate highlighted content — Perf fix (#30): use deferred value to avoid blocking on every keystroke
-  const deferredText = useDeferredValue(text);
   const highlightedHtml = useMemo(
     () => highlightText(deferredText, matches, currentMatchIndex),
     [deferredText, matches, currentMatchIndex],
@@ -384,7 +433,17 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEd
   // is stable → `lineNumbers` returns the same array (React sees identity
   // equality). For typing across a newline, `lineCount` changes by ±1
   // → array is rebuilt, but only by the delta size.
-  const lineCount = useMemo(() => text.split("\n").length, [text]);
+  //
+  // **fix (P-F8 residue, issue #226)**: counting via `text.split("\n").length`
+  // allocated N substrings per keystroke just to arrive at a number. An
+  // `indexOf` walk scans the same bytes natively with zero allocation.
+  const lineCount = useMemo(() => {
+    let count = 1;
+    for (let idx = text.indexOf("\n"); idx !== -1; idx = text.indexOf("\n", idx + 1)) {
+      count++;
+    }
+    return count;
+  }, [text]);
   const lineNumbers = useMemo(
     () => Array.from({ length: lineCount }, (_, i) => i + 1),
     [lineCount],
