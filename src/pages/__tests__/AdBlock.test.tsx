@@ -837,8 +837,10 @@ describe("AdBlock", () => {
   // Issue #215 §1: cross-source overlap UI. Two tests:
   //  1. The chip renders only on sources with overlapping_domain_count > 0
   //     and opens the drawer when clicked.
-  //  2. The drawer shows the per-domain entries from
-  //     `overlapReport.details[source_id]` with the `effective` badge.
+  //  2. The drawer shows the per-domain entries fetched via
+  //     `getAdBlockOverlapDetails` for the clicked source (issue #225
+  //     split the counts report from the per-source drill-down) with
+  //     the `effective` badge.
   //
   // Like the reorder tests, each test sets `mockGetAdBlockState` so
   // the page's `useEffect` `fetchState()` doesn't overwrite the
@@ -960,7 +962,9 @@ describe("AdBlock", () => {
       expect(screen.getByText("shared.example.com").nextElementSibling).toHaveTextContent("NxDomain");
       // The covered_by line lists the other source + its response.
       expect(screen.getByText(/B \(nx_domain\)/)).toBeInTheDocument();
-      // The drill-down IPC was issued for the clicked source only.
+      // The drill-down IPC was issued for the clicked source only —
+      // exactly once, not once per summary row (issue #225 review).
+      expect(mockGetAdBlockOverlapDetails).toHaveBeenCalledTimes(1);
       expect(mockGetAdBlockOverlapDetails).toHaveBeenCalledWith("src-a");
     });
   });
