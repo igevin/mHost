@@ -67,22 +67,32 @@ fn extract_existing_lines(current_hosts: &str) -> Vec<String> {
     // the file and copied the entire managed block just to hand the
     // parser a `&str` (issue #228-1: P-R6 fixed this class in
     // writer/content.rs but left diff.rs behind).
+    //
+    // Offsets come from a `split_inclusive('\n')` walk — the same
+    // pattern `Parser::extract_managed_block_bytes` uses. Chunk lengths
+    // include the full `\r\n`, so the arithmetic stays CRLF-exact.
+    // (`str::lines()` strips the `\r` from each line while a naive
+    // `+1` accumulator counts both bytes — the two disagree by one byte
+    // per CRLF line, which silently corrupted the interior on CRLF
+    // hosts files.) The raw slice is safe to hand to the parser as-is:
+    // `parse_line` trims every line, so `\r` endings parse identically
+    // to the old join-normalized text.
     let content_to_parse: &str = match managed_range {
         Some((start, end)) if start + 1 < end => {
-            let mut line_start = 0usize;
+            let mut pos = 0usize;
             let mut begin: Option<usize> = None;
             let mut interior = "";
-            for (i, line) in current_hosts.lines().enumerate() {
+            for (i, line) in current_hosts.split_inclusive('\n').enumerate() {
                 if i == start + 1 {
-                    begin = Some(line_start);
+                    begin = Some(pos);
                 }
                 if i == end - 1 {
                     if let Some(begin) = begin {
-                        interior = &current_hosts[begin..line_start + line.len()];
+                        interior = &current_hosts[begin..pos + line.len()];
                     }
                     break;
                 }
-                line_start += line.len() + 1;
+                pos += line.len();
             }
             interior
         }
@@ -312,6 +322,42 @@ mod tests {
         assert_eq!(diff.removed[0], "127.0.0.1 b.com");
         assert_eq!(diff.unchanged.len(), 1);
         assert_eq!(diff.unchanged[0], "127.0.0.1 a.com");
+    }
+
+    /// PR #236 review finding 1: the byte-offset slicing must stay
+    /// correct on CRLF hosts files. `str::lines()` strips the `\r` from
+    /// each line, so an offset accumulator built on `lines()` lengths
+    /// drifts by one byte per line — the interior slice came out shifted
+    /// and truncated (a domain silently renamed). `split_inclusive('\n')`
+    /// chunk lengths are CRLF-exact; this pins the fix.
+    #[test]
+    fn test_diff_crlf_managed_block() {
+        let current = "# ---- mHost start ----\r\n127.0.0.1 a.com\r\n::1 localhost\r\n# ---- mHost end ----\r\n";
+        let rules = vec![
+            make_rule("127.0.0.1", "a.com", "p1"),
+            make_rule("::1", "localhost", "p1"),
+        ];
+
+        let diff = calculate_diff(current, &rules);
+        assert!(diff.added.is_empty(), "added: {:?}", diff.added);
+        assert!(diff.removed.is_empty(), "removed: {:?}", diff.removed);
+        assert_eq!(diff.unchanged.len(), 2);
+        assert!(diff.unchanged.contains(&"127.0.0.1 a.com".to_string()));
+        assert!(diff.unchanged.contains(&"::1 localhost".to_string()));
+    }
+
+    /// Same as `test_diff_crlf_managed_block` but with the managed block
+    /// at the very end of the file and no trailing newline after the end
+    /// marker — the interior's last line has no `\n` to include.
+    #[test]
+    fn test_diff_crlf_managed_block_no_trailing_newline() {
+        let current = "# ---- mHost start ----\r\n127.0.0.1 a.com\r\n# ---- mHost end ----";
+        let rules = vec![make_rule("127.0.0.1", "a.com", "p1")];
+
+        let diff = calculate_diff(current, &rules);
+        assert!(diff.added.is_empty(), "added: {:?}", diff.added);
+        assert!(diff.removed.is_empty(), "removed: {:?}", diff.removed);
+        assert_eq!(diff.unchanged, vec!["127.0.0.1 a.com".to_string()]);
     }
 
     #[test]
