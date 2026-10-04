@@ -2,6 +2,16 @@ import { useState } from "react";
 import type { ApplyPlan } from "../types";
 import styles from "./DiffView.module.css";
 
+/**
+ * Issue #230 item 8: hard cap on how many unchanged lines are rendered
+ * when the block is expanded. A large profile diff can carry tens of
+ * thousands of unchanged lines; without a cap, one click on
+ * "unchanged lines" mounts all of them as DOM nodes and freezes the
+ * dialog. The lines remain in `plan.diff.unchanged` — only the DOM
+ * window is truncated, and the trailing note says by how much.
+ */
+const MAX_RENDERED_UNCHANGED = 500;
+
 interface DiffViewProps {
   plan: ApplyPlan;
   /** When true, render only the added/removed diff (no conflicts block).
@@ -54,14 +64,27 @@ function DiffView({ plan, compact = false }: DiffViewProps) {
                 </button>
               ) : (
                 <>
-                  {plan.diff.unchanged.map((line) => (
+                  {plan.diff.unchanged
+                    .slice(0, MAX_RENDERED_UNCHANGED)
+                    .map((line) => (
+                      <div
+                        key={`u${line}`}
+                        className={`${styles.diffLine} ${styles.diffUnchanged}`}
+                      >
+                        {`  ${line}`}
+                      </div>
+                    ))}
+                  {plan.diff.unchanged.length > MAX_RENDERED_UNCHANGED && (
                     <div
-                      key={`u${line}`}
-                      className={`${styles.diffLine} ${styles.diffUnchanged}`}
+                      className={styles.diffUnchangedCollapsed}
+                      role="note"
                     >
-                      {`  ${line}`}
+                      …{(
+                        plan.diff.unchanged.length - MAX_RENDERED_UNCHANGED
+                      ).toLocaleString()}{" "}
+                      more unchanged lines not rendered
                     </div>
-                  ))}
+                  )}
                   <button
                     className={styles.diffUnchangedCollapsed}
                     onClick={() => setShowUnchanged(false)}

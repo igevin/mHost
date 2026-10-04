@@ -311,7 +311,13 @@ export const fetchSnapshotsAtom = atom(null, async (_get, set) => {
   set(snapshotErrorAtom, null);
   try {
     const snapshots = await listSnapshots();
-    set(snapshotsAtom, snapshots);
+    // Issue #230 item 6 (P-F5 residue): the full-refetch path was the
+    // only one without the cap — every mutation elsewhere refetches the
+    // whole list, so an install with hundreds of on-disk snapshots would
+    // still blow past the save path's cap on the next page visit. The
+    // list is newest-first (mirrors saveSnapshotAtom's prepend), so the
+    // head is what we keep. On-disk files are untouched.
+    set(snapshotsAtom, snapshots.slice(0, MAX_SNAPSHOTS));
   } catch (err) {
     set(snapshotErrorAtom, extractErrorMessage(err));
   } finally {
