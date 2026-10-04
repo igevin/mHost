@@ -16,6 +16,7 @@ import type {
   BlocklistFormat,
   AdBlockStats,
   AdBlockOverlapReport,
+  AdBlockOverlapDetails,
 } from "../types";
 
 // ---- Profile commands ----
@@ -311,12 +312,26 @@ export async function listAdBlockSources(): Promise<AdBlockSource[]> {
  * Issue #215 §1: cross-source overlap report. Computed
  * lazily on the server (only when this IPC is called) —
  * not part of `getAdBlockState()` so the page-load IPC
- * stays cheap. The UI calls this when the overlap chip
- * is clicked (drawer open) and on first mount with a
- * small refresh strategy if needed.
+ * stays cheap. Issue #225: this carries the per-source
+ * COUNTS only (the chips); the drill-down lists moved to
+ * `getAdBlockOverlapDetails`, fetched per source when the
+ * drawer opens.
  */
 export async function getAdBlockOverlaps(): Promise<AdBlockOverlapReport> {
   return invoke<AdBlockOverlapReport>("get_ad_block_overlaps");
+}
+
+/**
+ * Issue #225: per-source overlap drill-down for the drawer — one
+ * source per call, entries capped server-side, so the payload is
+ * bounded regardless of how heavily the enabled sources overlap.
+ */
+export async function getAdBlockOverlapDetails(
+  sourceId: string,
+): Promise<AdBlockOverlapDetails> {
+  return invoke<AdBlockOverlapDetails>("get_ad_block_overlap_details", {
+    sourceId,
+  });
 }
 
 export async function addAdBlockSource(

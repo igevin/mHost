@@ -23,7 +23,13 @@ const mockSetAdBlockSourceEnabled = vi.fn().mockResolvedValue({});
 const mockSetAdBlockSourceResponse = vi.fn().mockResolvedValue({});
 const mockRefreshAdBlockSource = vi.fn().mockResolvedValue({});
 const mockReorderAdBlockSources = vi.fn().mockResolvedValue([]);
-const mockGetAdBlockOverlaps = vi.fn().mockResolvedValue({ per_source: [], details: {} });
+const mockGetAdBlockOverlaps = vi.fn().mockResolvedValue({ per_source: [] });
+const mockGetAdBlockOverlapDetails = vi.fn().mockResolvedValue({
+  source_id: "",
+  total: 0,
+  truncated: false,
+  entries: [],
+});
 const mockRefreshAllAdBlockSources = vi.fn().mockResolvedValue([]);
 const mockAddAdBlockWhitelist = vi.fn().mockResolvedValue([]);
 const mockAddAdBlockWhitelistMany = vi
@@ -53,6 +59,8 @@ vi.mock("../../lib/tauri", async (importOriginal) => {
     refreshAdBlockSource: (...args: unknown[]) => mockRefreshAdBlockSource(...args),
     reorderAdBlockSources: (...args: unknown[]) => mockReorderAdBlockSources(...args),
     getAdBlockOverlaps: (...args: unknown[]) => mockGetAdBlockOverlaps(...args),
+    getAdBlockOverlapDetails: (...args: unknown[]) =>
+      mockGetAdBlockOverlapDetails(...args),
     refreshAllAdBlockSources: (...args: unknown[]) => mockRefreshAllAdBlockSources(...args),
     addAdBlockWhitelist: (...args: unknown[]) => mockAddAdBlockWhitelist(...args),
     addAdBlockWhitelistMany: (...args: unknown[]) =>
@@ -840,7 +848,13 @@ describe("AdBlock", () => {
       mockGetAdBlockOverlaps.mockReset();
       mockGetAdBlockOverlaps.mockResolvedValue({
         per_source: [],
-        details: {},
+      });
+      mockGetAdBlockOverlapDetails.mockReset();
+      mockGetAdBlockOverlapDetails.mockResolvedValue({
+        source_id: "",
+        total: 0,
+        truncated: false,
+        entries: [],
       });
     });
 
@@ -905,21 +919,26 @@ describe("AdBlock", () => {
             overlapping_domain_count: 1,
           },
         ],
-        details: {
-          "src-a": [
-            {
-              domain: "shared.example.com",
-              covered_by: [
-                {
-                  source_id: "src-b",
-                  name: "B",
-                  response: "nx_domain",
-                },
-              ],
-              effective: "NxDomain",
-            },
-          ],
-        },
+      });
+      // Issue #225: the drill-down is fetched per source when the
+      // drawer opens — a separate IPC from the counts report.
+      mockGetAdBlockOverlapDetails.mockResolvedValue({
+        source_id: "src-a",
+        total: 1,
+        truncated: false,
+        entries: [
+          {
+            domain: "shared.example.com",
+            covered_by: [
+              {
+                source_id: "src-b",
+                name: "B",
+                response: "nx_domain",
+              },
+            ],
+            effective: "NxDomain",
+          },
+        ],
       });
       renderWithProviders(<AdBlock />);
 
@@ -941,6 +960,8 @@ describe("AdBlock", () => {
       expect(screen.getByText("shared.example.com").nextElementSibling).toHaveTextContent("NxDomain");
       // The covered_by line lists the other source + its response.
       expect(screen.getByText(/B \(nx_domain\)/)).toBeInTheDocument();
+      // The drill-down IPC was issued for the clicked source only.
+      expect(mockGetAdBlockOverlapDetails).toHaveBeenCalledWith("src-a");
     });
   });
 });
