@@ -42,7 +42,7 @@ jobs:
     # 用 == false 而非 != true：head.repo 异常为 null 时整体为假，fail-closed
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.fork == false }}
     runs-on: ubuntu-latest
-    # job 级余量要盖过内层 timeout 480s + 检出/安装，否则 claude 跑满内层
+    # job 级余量要盖过内层 timeout 600s + 检出/安装，否则 claude 跑满内层
     # 超时会连"Post failure notice"一起被拦腰截断，PR 拿不到失败说明
     timeout-minutes: 15
     # 模型密钥（ZHIPU_API_KEY）挂在 LLM environment 上；该环境无保护规则，
@@ -197,7 +197,7 @@ jobs:
           ANTHROPIC_MODEL: ${{ env.AI_REVIEW_MODEL }}
         run: |
           set +e
-          timeout 480 claude -p "$(cat ai-review-prompt.md)" \
+          timeout 600 claude -p "$(cat ai-review-prompt.md)" \
             --allowedTools "Read,Grep,Glob" \
             --strict-mcp-config \
             --settings "$RUNNER_TEMP/ai-review-guard.json" \
