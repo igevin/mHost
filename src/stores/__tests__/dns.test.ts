@@ -396,6 +396,14 @@ describe("toggleDnsModeAtom drops a mid-toggle probe (issue #232)", () => {
       .mockReturnValue(new Promise(() => {}));
     (getDnsStatus as unknown as { mockResolvedValue: (v: unknown) => void })
       .mockResolvedValue(null);
+    // 本 describe 必须自持。cancel 用例会触发 abort 监听器里的
+    // `cancelDnsMode().catch(...)`；`vi.clearAllMocks()` 只清调用记录、
+    // **不清实现**，所以此前是靠上面 #149 describe 的
+    // `mockResolvedValue(undefined)` 漏过来才通过的。一旦那个 describe
+    // 被删改或执行顺序变化，这里就会拿到 undefined，`.catch` 抛
+    // TypeError。显式建一次，不依赖邻居。
+    (cancelDnsMode as unknown as { mockResolvedValue: (v: unknown) => void })
+      .mockResolvedValue(undefined);
   });
 
   it("a focus probe landing mid-toggle does not resurrect a false stuck_at_loopback", async () => {

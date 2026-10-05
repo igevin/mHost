@@ -596,15 +596,14 @@ export const toggleDnsModeAtom = atom(null, async (_get, set, enabled: boolean) 
     // `set(isDnsLoadingAtom, false)` 在 `void runProbe()` **发起**时就跑，
     // 不是落地时，所以它盖不住探测延迟。
     //
-    // 修法与 toggle 开头的置 null 同一条原则：快照已知过时就宣布「不知道」，
-    // 而 `dnsDiscrepancyAtom` 对 null 不报警。顺带把 Settings 页横幅的
-    // 同款隐患一起关掉（#153 遗留，本 PR 只是让它变显眼）。
+    // 修法与 toggle 开头的作废同一条原则：快照已知过时就宣布「不知道」，
+    // 而 `dnsDiscrepancyAtom` 对 null 不报警。
     //
     // 必须用 `invalidateProbeSnapshot`（含代数递增）而不是裸置 null：
     // 下面 `await getDnsStatus()` 是一个 yield 点，在这段窗口里回来的
     // 在途探测若代数仍匹配，`applyProbe` 会把已知过时的快照写回来 ——
-    // 裸置 null 只是把假警报压缩，没关死。顺带把 Settings 页横幅的同款
-    // 隐患一起关掉（#153 遗留，本 PR 只是让它变显眼）。
+    // 裸置 null 只是把假警报压缩，没关死。这一并关掉了 Settings 页
+    // 横幅的同款隐患（#153 遗留，本 PR 只是让它变显眼）。
     invalidateProbeSnapshot(set);
     set(dnsEnabledAtom, enabled);
     const status = await getDnsStatus();
