@@ -434,6 +434,30 @@ interface ProbeResult {
 type ProbeSetter = (atom: typeof systemDnsAtom, value: SystemDnsSnapshot | null) => void;
 
 /**
+ * Issue #232：**作废**当前探测快照 —— 置 null **并**递增代数。
+ *
+ * 两步都必要，缺一不可：
+ *
+ * 1. `set(systemDnsAtom, null)` —— 宣布「不知道」。`dnsDiscrepancyAtom`
+ *    对 null 返回 null，所以此刻不报警。这与 {@link applyProbe} 的代数
+ *    语义是相反的方向（见 toggle 开头那段注释），所以**不能**走守卫。
+ *
+ * 2. `probeGeneration++` —— 让**已经在飞**的探测落地时作废。这一步是
+ *    issue #232 第二轮修的关键：只置 null 的话，一个在 toggle 之前发起、
+ *    在「置 null 之后 / 下一次 runProbe() 之前」返回的探测，代数仍然匹配
+ *    （代数只在**发起**时递增），`applyProbe` 会把这份**已知过时**的快照
+ *    照写不误 —— 假警报只是被压缩到 `await getDnsStatus()` 那个窗口，
+ *    没有关死。递增之后，任何早于本次作废的探测都会被守卫丢掉。
+ *
+ * 递增不影响「主动宣布失效」这个语义：清空仍然是直接 `set`，不经过
+ * `applyProbe`；守卫只拦**在途**探测的晚到结果。
+ */
+function invalidateProbeSnapshot(set: ProbeSetter): void {
+  probeGeneration++;
+  set(systemDnsAtom, null);
+}
+
+/**
  * Issue #153: 探测系统 DNS 的实际状态，写入 `systemDnsAtom`。
  *
  * **失败静默**：见 {@link runProbe}。绝不 reject —— 调用方都是
@@ -526,7 +550,10 @@ export const toggleDnsModeAtom = atom(null, async (_get, set, enabled: boolean) 
   // 而是「主动宣布现有结论失效」。代数守卫的语义是「新探测比旧探测新，
   // 别被旧结果覆盖」；这里恰恰相反 —— 我们要在新探测回来之前先把结论
   // 清空。若改成走守卫，一次更早的探测结果就会把它挡回来，假警报重现。
-  set(systemDnsAtom, null);
+  //
+  // 但**在途**的探测必须一并作废，所以走 `invalidateProbeSnapshot`
+  // （issue #232）：它会递增代数，让早于此刻发起的探测回来时写不进来。
+  invalidateProbeSnapshot(set);
 
   const ctrl = new AbortController();
   activeDnsToggleController = ctrl;
@@ -550,6 +577,34 @@ export const toggleDnsModeAtom = atom(null, async (_get, set, enabled: boolean) 
 
   try {
     await setDnsMode(enabled, { signal: ctrl.signal });
+    // Issue #232（AI review 指出）：在翻 `dnsEnabledAtom` **之前**再清一次
+    // 探测快照。
+    //
+    // 上面的 `set(systemDnsAtom, null)` 只护住了 toggle **开始前**已有的
+    // 快照。中间还有一个洞：toggle 进行中（等 sudo 授权时用户切走再切回很
+    // 常见）窗口 focus 会发一次探测，它在 disable 真正生效前落地，带回
+    // `points_at_loopback=true` —— 那一刻它**确实**是真的（DNS 还没还原），
+    // 但对即将结束的这个 toggle 来说已经过时了。
+    //
+    // 于是 `set(dnsEnabledAtom, false)` 一执行，派生 atom 立刻算出
+    // `stuck_at_loopback`：系统说「刚成功恢复了 DNS」，侧栏却红字「DNS
+    // broken」并把用户指向 Restore 按钮。这个假警报要等到下面
+    // `void runProbe()` 回来才消失，而探测在 configd 卡住时能挂几秒
+    // （见本文件 probeGeneration 的注释）。
+    //
+    // 为什么不能靠 `isDnsLoadingAtom` 门控 UI：`finally` 里的
+    // `set(isDnsLoadingAtom, false)` 在 `void runProbe()` **发起**时就跑，
+    // 不是落地时，所以它盖不住探测延迟。
+    //
+    // 修法与 toggle 开头的作废同一条原则：快照已知过时就宣布「不知道」，
+    // 而 `dnsDiscrepancyAtom` 对 null 不报警。
+    //
+    // 必须用 `invalidateProbeSnapshot`（含代数递增）而不是裸置 null：
+    // 下面 `await getDnsStatus()` 是一个 yield 点，在这段窗口里回来的
+    // 在途探测若代数仍匹配，`applyProbe` 会把已知过时的快照写回来 ——
+    // 裸置 null 只是把假警报压缩，没关死。这一并关掉了 Settings 页
+    // 横幅的同款隐患（#153 遗留，本 PR 只是让它变显眼）。
+    invalidateProbeSnapshot(set);
     set(dnsEnabledAtom, enabled);
     const status = await getDnsStatus();
     set(dnsStatusAtom, status);
@@ -569,6 +624,15 @@ export const toggleDnsModeAtom = atom(null, async (_get, set, enabled: boolean) 
       set(dnsErrorAtom, null);
       try {
         const truth = await getDnsMode();
+        // Issue #232: 同款作废，位置在翻 `dnsEnabledAtom` **之前**。
+        //
+        // cancel 路径的窗口比成功路径**更大** —— `await getDnsMode()` 和
+        // 随后的 `await getDnsStatus()` 两次 IPC 都在翻转之前，而 rollback
+        // 期间系统 DNS 恰恰最可能停在 127.0.0.1（#152 同款）。若此时
+        // atom 里还留着一份 `points_at_loopback=true` 的旧快照，
+        // `truth=false` 一落地就派生出假的 `stuck_at_loopback`，要等到
+        // 下面那次 re-probe 才消失。
+        invalidateProbeSnapshot(set);
         set(dnsEnabledAtom, truth);
         const status = await getDnsStatus();
         set(dnsStatusAtom, status);
