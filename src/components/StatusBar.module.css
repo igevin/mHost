@@ -61,6 +61,14 @@
   background: var(--color-text-muted);
 }
 
+/* issue #232: `stuck_at_loopback` 警示色。
+   与上面的 .statusDotOn / .statusDotOff 一样，CSS Modules 编译后都是
+   单类选择器、优先级相同，靠**源码顺序**覆盖 .statusDot 的 background。
+   所以这个变体必须声明在 .statusDot 之后 —— 挪到前面会静默失效。 */
+.statusDotDanger {
+  background: var(--color-danger);
+}
+
 .statusProfile {
   font-size: 12px;
   color: var(--color-text);
@@ -68,6 +76,14 @@
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* issue #232: 必须声明在 .statusProfile **之后**（同为单类选择器，
+   靠源码顺序取胜）。使用处两个 class 都挂：
+   `${styles.statusProfile} ${styles.statusProfileDanger}`。 */
+.statusProfileDanger {
+  color: var(--color-danger);
+  font-weight: 600;
 }
 
 .statusApplying {

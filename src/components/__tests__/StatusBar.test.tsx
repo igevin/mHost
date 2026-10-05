@@ -1,8 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, fireEvent, act } from "@testing-library/react";
 import { Provider as JotaiProvider } from "jotai";
 import { getDefaultStore } from "jotai";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import type { Profile } from "../../types";
 import {
   profilesAtom,
@@ -11,6 +11,7 @@ import {
   dnsProfilesAtom,
   enabledDnsProfilesAtom,
   dnsRuleCountAtom,
+  systemDnsAtom,
 } from "../../stores/profiles";
 
 // Mock tauri invoke
@@ -60,6 +61,22 @@ function Wrapper({ children }: { children: React.ReactNode }) {
   );
 }
 
+/** issue #232: 让断言能看见路由落点。仓库里此前没有导航断言的先例，
+ *  所以这里用最小探针而不是 mock `useNavigate` —— mock 掉之后
+ *  `handleDnsClick` 里的分支就测不到了。 */
+function LocationProbe() {
+  const location = useLocation();
+  return <div data-testid="location">{location.pathname}</div>;
+}
+
+function makeProbe(pointsAtLoopback: boolean) {
+  return {
+    interface: "Wi-Fi",
+    servers: pointsAtLoopback ? ["127.0.0.1"] : ["192.168.1.1"],
+    points_at_loopback: pointsAtLoopback,
+  };
+}
+
 describe("StatusBar", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -68,6 +85,10 @@ describe("StatusBar", () => {
     store.set(isApplyingAtom, false);
     store.set(dnsEnabledAtom, false);
     store.set(dnsProfilesAtom, []);
+    // issue #232: 必须显式清空 —— 否则上一个用例留下的探测快照会漏进
+    // 下一个用例，让 `dnsDiscrepancyAtom` 凭空变成 stuck，白底失败或
+    // 更糟：假绿。
+    store.set(systemDnsAtom, null);
   });
 
   // ---- Hosts column (v0.3 behavior) ----
@@ -270,5 +291,173 @@ describe("StatusBar", () => {
     );
 
     expect(screen.getByText("1/1 enabled · 0 rules")).toBeInTheDocument();
+  });
+});
+
+/**
+ * Issue #232 —— `stuck_at_loopback` 的常驻警示入口。
+ *
+ * 背景：这个状态意味着用户的系统 DNS 仍指向 127.0.0.1，域名解析已经坏了。
+ * 原来的警示只在 Settings 页（`Settings.test.tsx` 的
+ * `dns-discrepancy-banner`），而用户在 mHost 里乱点时不会想到去 Settings。
+ * 侧栏底栏在所有路由下常驻，所以警示搬到这里。
+ *
+ * 注意本组用例**不复用** Settings 的断言路径：侧栏只负责「让用户注意到」，
+ * 解释与一键 Restore 仍然只在 Settings（issue #232「不在范围内」）。
+ */
+describe("StatusBar — stuck_at_loopback warning (issue #232)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    const store = getDefaultStore();
+    store.set(profilesAtom, []);
+    store.set(isApplyingAtom, false);
+    // 每个用例都显式 set 了 dnsEnabledAtom，但仍在 beforeEach 复位：
+    // `dnsDiscrepancyAtom` 的判定同时依赖它和 systemDnsAtom，谁漏写一个
+    // 就会让「警示没出现」变成一条**永远通过**的空断言。
+    store.set(dnsEnabledAtom, false);
+    store.set(dnsProfilesAtom, []);
+    store.set(systemDnsAtom, null);
+  });
+
+  it("shows the 'DNS broken' warning when DNS is off but system points at loopback", () => {
+    const store = getDefaultStore();
+    store.set(dnsEnabledAtom, false);
+    store.set(systemDnsAtom, makeProbe(true));
+
+    render(
+      <Wrapper>
+        <StatusBar />
+      </Wrapper>,
+    );
+
+    const warning = screen.getByTestId("dns-stuck-warning");
+    expect(warning).toHaveTextContent("DNS broken");
+    // 不能只显示 "Off"：那正是这个 bug 的伪装形态，用户看不出异常。
+    expect(screen.queryByText("Off")).not.toBeInTheDocument();
+    expect(screen.getByTestId("dns-status-card")).toHaveAttribute(
+      "data-dns-stuck",
+      "true",
+    );
+  });
+
+  it("replaces the 'Off' summary with a tooltip that names the actual failure", () => {
+    const store = getDefaultStore();
+    store.set(dnsEnabledAtom, false);
+    store.set(systemDnsAtom, makeProbe(true));
+
+    render(
+      <Wrapper>
+        <StatusBar />
+      </Wrapper>,
+    );
+
+    const title = screen.getByTestId("dns-status-card").getAttribute("title");
+    expect(title).toMatch(/127\.0\.0\.1/);
+    expect(title).toMatch(/resolution is likely broken/i);
+    // 警示必须指向修复路径，否则只是制造焦虑。
+    expect(title).toMatch(/Settings/i);
+  });
+
+  it("does not warn when the probe is unavailable (no data source = no alarm)", () => {
+    const store = getDefaultStore();
+    store.set(dnsEnabledAtom, false);
+    store.set(systemDnsAtom, null);
+
+    render(
+      <Wrapper>
+        <StatusBar />
+      </Wrapper>,
+    );
+
+    expect(screen.queryByTestId("dns-stuck-warning")).not.toBeInTheDocument();
+    expect(screen.getByText("Off")).toBeInTheDocument();
+  });
+
+  it("does not warn for not_pointing (DNS still works — out of scope per #232)", () => {
+    const store = getDefaultStore();
+    store.set(dnsEnabledAtom, true);
+    store.set(systemDnsAtom, makeProbe(false));
+
+    render(
+      <Wrapper>
+        <StatusBar />
+      </Wrapper>,
+    );
+
+    expect(screen.queryByTestId("dns-stuck-warning")).not.toBeInTheDocument();
+    // not_pointing 时侧栏维持既有的 DNS 摘要，不做任何升级。
+    expect(screen.getByText("0/0 enabled · 0 rules")).toBeInTheDocument();
+  });
+
+  it("does not warn when mHost is off and the system is not at loopback", () => {
+    const store = getDefaultStore();
+    store.set(dnsEnabledAtom, false);
+    store.set(systemDnsAtom, makeProbe(false));
+
+    render(
+      <Wrapper>
+        <StatusBar />
+      </Wrapper>,
+    );
+
+    expect(screen.queryByTestId("dns-stuck-warning")).not.toBeInTheDocument();
+    expect(screen.getByText("Off")).toBeInTheDocument();
+  });
+
+  it("clicking the warning lands on /settings, where the Restore button lives", () => {
+    const store = getDefaultStore();
+    store.set(dnsEnabledAtom, false);
+    store.set(systemDnsAtom, makeProbe(true));
+
+    render(
+      <Wrapper>
+        <StatusBar />
+        <LocationProbe />
+      </Wrapper>,
+    );
+
+    expect(screen.getByTestId("location")).toHaveTextContent("/");
+    fireEvent.click(screen.getByTestId("dns-status-card"));
+    expect(screen.getByTestId("location")).toHaveTextContent("/settings");
+  });
+
+  it("Enter key on the warning also lands on /settings", () => {
+    const store = getDefaultStore();
+    store.set(dnsEnabledAtom, false);
+    store.set(systemDnsAtom, makeProbe(true));
+
+    render(
+      <Wrapper>
+        <StatusBar />
+        <LocationProbe />
+      </Wrapper>,
+    );
+
+    fireEvent.keyDown(screen.getByTestId("dns-status-card"), { key: "Enter" });
+    expect(screen.getByTestId("location")).toHaveTextContent("/settings");
+  });
+
+  it("clears the warning once a later probe reports a consistent state", () => {
+    const store = getDefaultStore();
+    store.set(dnsEnabledAtom, false);
+    store.set(systemDnsAtom, makeProbe(true));
+
+    render(
+      <Wrapper>
+        <StatusBar />
+      </Wrapper>,
+    );
+    expect(screen.getByTestId("dns-stuck-warning")).toBeInTheDocument();
+
+    // 用户点了 Settings 的 Restore（或自己在系统设置里改回）后，
+    // focus 触发的 re-probe 落地 —— 警示必须随之消失。
+    // 必须包在 act() 里：atom 写发生在 render 之后，裸 store.set 不会
+    // 同步刷新订阅者，断言会读到上一次渲染的旧 DOM。
+    act(() => {
+      store.set(systemDnsAtom, makeProbe(false));
+    });
+
+    expect(screen.queryByTestId("dns-stuck-warning")).not.toBeInTheDocument();
+    expect(screen.getByText("Off")).toBeInTheDocument();
   });
 });
