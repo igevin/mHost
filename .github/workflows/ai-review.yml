@@ -1,0 +1,304 @@
+# AI Code Review —— PR 创建/更新时用 Claude Code (Headless) 审查，结论评论到 PR。
+#
+# 前置配置（仓库 Settings → Secrets and variables → Actions）：
+#   Secrets（挂在 LLM environment 上，运行时经 step env 注入 claude 进程，不落盘）：
+#     ZHIPU_API_KEY              智谱 API Key（必填，未配置时审查失败）
+#   Variables（可选，用于覆盖默认值）:
+#     AI_REVIEW_MAX_DIFF_LINES   diff 上限（行数），默认 2000
+#     AI_REVIEW_MODEL            审查模型，默认 glm-5.3-flash
+#
+# 定位是 advisory：评论非阻塞，不作为合并门禁；审查失败时 PR 留"AI 审查失败"说明。
+# 评审标准在 .github/ai-review-prompt.md，改 prompt 不用动本文件。
+
+name: AI Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 要复审的 PR 编号
+        required: true
+        type: number
+
+# 同一 PR 只保留最新一次审查：连续 push 时取消在途运行，避免评论刷屏
+concurrency:
+  group: ai-review-${{ github.event.pull_request.number || github.event.inputs.pr_number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  issues: write
+  # gh pr comment 走 GraphQL addComment，实测需要 pull-requests: write
+  # （issues: write 不够；降到 read 会让审查成功但评论 403）
+  pull-requests: write
+
+env:
+  MAX_DIFF_LINES: ${{ vars.AI_REVIEW_MAX_DIFF_LINES || 2000 }}
+  AI_REVIEW_MODEL: ${{ vars.AI_REVIEW_MODEL || 'glm-5.3-flash' }}
+
+jobs:
+  ai-review:
+    # fork PR 在 pull_request 触发下拿不到 secrets——这是 GitHub 平台按 PR
+    # 的 fork 属性在服务端扣住的，本行跳过是第二层（少跑一次注定无果的
+    # job）；手动触发不受限。
+    # 判空必须显式：GitHub 表达式做宽松相等，比较时 null 归一为数字 0，
+    # 因此 null == false 与 null != true 都判真——head.repo 为 null（如
+    # fork 被删除后的后续事件）时会放行，需先判 head.repo != null。
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event.pull_request.head.repo != null && github.event.pull_request.head.repo.fork == false) }}
+    runs-on: ubuntu-latest
+    # job 级余量要盖过内层 timeout 900s + 检出/安装；审查耗时随 PR 复杂度
+    # 和端点延迟波动（实测 2~10 分钟），超时只会打断"Post failure notice"
+    timeout-minutes: 20
+    # 模型密钥（ZHIPU_API_KEY）挂在 LLM environment 上；该环境无保护规则，
+    # fork PR 已在上方 if 跳过，不受环境密钥对 fork 不可用的限制
+    environment: LLM
+    steps:
+      - name: Resolve PR number
+        id: pr
+        env:
+          # workflow_dispatch 输入不经校验直接进 API，先当不可信字符串处理
+          PR_INPUT: ${{ github.event.inputs.pr_number }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            case "$PR_INPUT" in
+              ''|*[!0-9]*) echo "::error::pr_number must be a positive integer"; exit 1 ;;
+            esac
+            echo "number=$PR_INPUT" >> "$GITHUB_OUTPUT"
+          else
+            echo "number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # 统一检出 PR head：手动复审时拿到的也是 PR 代码而非 master。
+          # fetch-depth 0 会带走全部分支，后面的 merge-base 无需再走网络。
+          ref: refs/pull/${{ steps.pr.outputs.number }}/head
+          fetch-depth: 0
+          # 不把 GITHUB_TOKEN 留在 .git/config——Read 工具可达即是外泄面
+          persist-credentials: false
+
+      - name: Resolve base/head revisions
+        id: refs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EVENT_BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            head=$(gh pr view "$PR_NUMBER" --json headRefOid -q .headRefOid)
+            base_ref=$(gh pr view "$PR_NUMBER" --json baseRefName -q .baseRefName)
+          else
+            head="$EVENT_HEAD_SHA"
+            base_ref="$EVENT_BASE_REF"
+          fi
+          # 工作树钉住触发事件的 head，运行期间新 push 不会改变检出内容
+          git checkout -q "$head"
+          base=$(git merge-base "refs/remotes/origin/${base_ref}" "$head")
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "head=$head" >> "$GITHUB_OUTPUT"
+
+      - name: Sanitize untrusted PR files
+        env:
+          BASE: ${{ steps.refs.outputs.base }}
+        run: |
+          # PR 检出树是不可信输入：项目级 .claude/（hooks、permissions.allow）
+          # 与 .mcp.json 会在 -p 模式下被自动执行/加载且无审批门，而
+          # workflow_dispatch 复审 fork PR 是设计内场景——fork 作者可以
+          # 在 PR 里植入它们，故运行前一律清除。
+          # CLAUDE.md/CLAUDE.local.md/AGENTS.md（含子目录级，读取对应目录
+          # 文件时自动加载）会被 claude 吸收进上下文，全部清除后仅恢复
+          # base 版的根文件，PR 作者无法借此改写审查口径。
+          rm -rf .claude .mcp.json
+          find . -not -path './.git/*' \( -name 'CLAUDE.md' -o -name 'CLAUDE.local.md' -o -name 'AGENTS.md' \) -delete
+          git show "$BASE:CLAUDE.md" > CLAUDE.md 2>/dev/null || true
+          git show "$BASE:AGENTS.md" > AGENTS.md 2>/dev/null || true
+          # 密钥经进程环境注入后 /proc/self/environ 仍是 Read 可达的文件，
+          # 用 deny 规则封禁内核伪文件系统。注意只需 Read 规则：claude-code
+          # 的文件权限校验对读文件类工具统一走 Read 规则（Grep/Glob 自动
+          # 被覆盖，官方校验警告与实测均确认）；deny 优先于 allowedTools，
+          # // 前缀为绝对路径规则，已在 claude-code 2.1.x 上实测生效。
+          cat > "$RUNNER_TEMP/ai-review-guard.json" <<'EOF'
+          {
+            "permissions": {
+              "deny": [
+                "Read(//proc/**)",
+                "Read(//sys/**)",
+                "Read(//dev/**)"
+              ]
+            }
+          }
+          EOF
+          # 防线自校验：JSON 若损坏会被 claude 静默忽略，/proc 封禁随之
+          # 失效；校验不过就拒绝运行审查，走"AI 审查失败"路径
+          jq -e '.permissions.deny | index("Read(//proc/**)")' "$RUNNER_TEMP/ai-review-guard.json" > /dev/null || {
+            echo "::error::ai-review-guard.json invalid — refusing to run review without the /proc deny rule"
+            exit 1
+          }
+
+      - name: Build diff with size guard
+        id: diff
+        env:
+          BASE: ${{ steps.refs.outputs.base }}
+          HEAD: ${{ steps.refs.outputs.head }}
+        run: |
+          # 上限变量仅管理员可控，但仍防手滑配成非数字让 -gt 直接报错
+          case "$MAX_DIFF_LINES" in
+            ''|*[!0-9]*)
+              echo "::warning::AI_REVIEW_MAX_DIFF_LINES='$MAX_DIFF_LINES' is not a number, falling back to 2000"
+              MAX_DIFF_LINES=2000
+              ;;
+          esac
+          git diff "$BASE" "$HEAD" > pr.diff
+          total=$(wc -l < pr.diff | tr -d ' ')
+          mode=full
+          if [ "$total" -gt "$MAX_DIFF_LINES" ]; then
+            # 超限降级：核心目录 + 安全敏感配置（capability manifest / CSP）
+            # + CI 工作流与依赖清单——对审查器而言这是最该覆盖的
+            # 供应链面，超限 PR 不能靠凑行数躲开对它们的改动
+            mode=core-only
+            git diff "$BASE" "$HEAD" -- src-tauri/src src-tauri/crates src src-tauri/tauri.conf.json src-tauri/capabilities .github/workflows src-tauri/Cargo.toml src-tauri/Cargo.lock package.json pnpm-lock.yaml > pr.diff || true
+            total=$(wc -l < pr.diff | tr -d ' ')
+            if [ "$total" -eq 0 ]; then
+              # PR 完全不碰核心目录时退回全量 diff 截断
+              mode=truncated
+              git diff "$BASE" "$HEAD" > pr.diff
+            fi
+          fi
+          if [ "$(wc -l < pr.diff | tr -d ' ')" -gt "$MAX_DIFF_LINES" ]; then
+            mode=truncated
+            head -n "$MAX_DIFF_LINES" pr.diff > pr.diff.part
+            mv pr.diff.part pr.diff
+          fi
+          # 评审标准两级兜底：base 版本 → 内嵌最小版。不回退到检出版本：
+          # base 尚无此文件时（仅引入本工作流的 PR 会遇到），作者在 PR 里
+          # 自带的审查口径不可信，宁缺毋滥；内嵌版保证 master 误删 prompt
+          # 文件时审查降级而非硬失败无说明。
+          git show "$BASE:.github/ai-review-prompt.md" > ai-review-prompt.md 2>/dev/null || true
+          if [ ! -s ai-review-prompt.md ]; then
+            cat > ai-review-prompt.md <<'EOF'
+          你是代码审查助手。审查经标准输入提供的 diff：找出安全漏洞、正确性 bug、并发与错误处理问题，用 Markdown 按严重程度分组输出发现（每条注明 文件:行号 和一句话理由）；没有发现就明确说没有。
+          EOF
+          fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "lines=$(wc -l < pr.diff | tr -d ' ')" >> "$GITHUB_OUTPUT"
+
+      - name: Skip when diff is empty
+        id: gate
+        run: |
+          if [ -s pr.diff ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Empty diff, nothing to review."
+          fi
+
+      - name: Setup Node
+        if: steps.gate.outputs.skip == 'false'
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+
+      - name: Install Claude Code
+        if: steps.gate.outputs.skip == 'false'
+        # 钉精确版本：Read deny 规则覆盖 Grep/Glob 是 2.1.x 的实测行为，
+        # 只锁主版本仍可能被小版本无声漂移破坏这条防线
+        run: npm install -g @anthropic-ai/claude-code@2.1.289
+
+      - name: Run AI review
+        id: review
+        if: steps.gate.outputs.skip == 'false'
+        env:
+          # 密钥只经进程环境注入 claude，不写入 settings.json；/proc、/sys、
+          # /dev 的读取面由 sanitize 步骤写出的 deny 规则封禁
+          ANTHROPIC_BASE_URL: https://open.bigmodel.cn/api/anthropic
+          ANTHROPIC_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.ZHIPU_API_KEY }}
+          ANTHROPIC_MODEL: ${{ env.AI_REVIEW_MODEL }}
+        run: |
+          set +e
+          timeout 900 claude -p "$(cat ai-review-prompt.md)" \
+            --allowedTools "Read,Grep,Glob" \
+            --strict-mcp-config \
+            --settings "$RUNNER_TEMP/ai-review-guard.json" \
+            --max-turns 40 \
+            --output-format json \
+            < pr.diff > review.json
+          code=$?
+          set -e
+          status=failed
+          if [ "$code" -eq 0 ] && [ -s review.json ] \
+             && [ "$(jq -r '.subtype // ""' review.json)" = "success" ] \
+             && jq -e '.result | type == "string" and length > 0' review.json > /dev/null; then
+            jq -r '.result' review.json > report.md
+            # GitHub 评论上限 64KB：超长截断，避免"审查成功但发评论失败"
+            # 导致整个 job 报错、PR 一条评论都没有。iconv -c 丢弃截断点
+            # 可能劈开的半个多字节字符，保证输出仍是合法 UTF-8
+            if [ "$(wc -c < report.md)" -gt 60000 ]; then
+              head -c 60000 report.md | iconv -c -f UTF-8 -t UTF-8 > report.trunc && mv report.trunc report.md
+              printf '\n\n> ⚠️ 报告超过 60KB，已截断。\n' >> report.md
+            fi
+            status=ok
+          fi
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+
+      - name: Post review comment
+        # 残余风险声明：report 是模型输出、原样发布——被审 diff 中的注入
+        # 指令仍可能诱导报告措辞（缓解：只读工具、上下文清洗、/proc deny；
+        # advisory 定位下接受该残余风险），评论头带 head SHA 便于归因
+        if: steps.review.outputs.status == 'ok'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          MODE: ${{ steps.diff.outputs.mode }}
+          REVIEWED_SHA: ${{ steps.refs.outputs.head }}
+        run: |
+          {
+            echo "## 🤖 AI Review（advisory，非阻塞）"
+            echo
+            echo "> 被审查的 head：\`$REVIEWED_SHA\`"
+            echo
+            if [ "$MODE" = "core-only" ]; then
+              echo "> ⚠️ diff 超过 ${MAX_DIFF_LINES} 行，本次仅审查核心目录（src-tauri、src/、.github/workflows 及依赖/安全配置），其余变更未覆盖。"
+              echo
+            elif [ "$MODE" = "truncated" ]; then
+              echo "> ⚠️ diff 超过 ${MAX_DIFF_LINES} 行，超出部分被截断，审查可能不完整。"
+              echo
+            fi
+            cat report.md
+          } > comment.md
+          gh pr comment "$PR_NUMBER" --body-file comment.md
+
+      - name: Post failure notice
+        if: steps.review.outputs.status == 'failed'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: gh pr comment "$PR_NUMBER" --body "AI 审查失败"
+
+      - name: Post failure notice for unexpected errors
+        # 覆盖 review 步骤之外的失败（检出、merge-base、护栏等基础设施
+        # 错误），否则只留红叉、PR 侧无任何说明。排除并发取消：
+        # 连续 push 时被取消的在途运行不得发评论刷屏；job 级超时若表现
+        # 为取消则维持现状（无评论，可在 Actions 里看日志）
+        if: failure() && !cancelled() && steps.review.outputs.status != 'failed'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          REVIEW_STATUS: ${{ steps.review.outputs.status }}
+        run: |
+          # 区分措辞：审查成功但发布瞬时失败 ≠ 审查本身失败，避免误导
+          if [ "$REVIEW_STATUS" = "ok" ]; then
+            gh pr comment "$PR_NUMBER" --body "AI 审查已完成，但结果发布失败；可在 Actions 对本次运行点 Re-run 重试发布。"
+          else
+            gh pr comment "$PR_NUMBER" --body "AI 审查失败"
+          fi
+
+      - name: Mark job failed
+        if: steps.review.outputs.status == 'failed'
+        run: |
+          echo "::error::AI review did not complete (timeout or non-success result), see steps above."
+          exit 1
