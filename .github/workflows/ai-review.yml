@@ -1,7 +1,7 @@
 # AI Code Review —— PR 创建/更新时用 Claude Code (Headless) 审查，结论评论到 PR。
 #
 # 前置配置（仓库 Settings → Secrets and variables → Actions）：
-#   Secrets:
+#   Secrets（挂在 LLM environment 上，由 job 声明 environment: LLM 注入）：
 #     ZHIPU_API_KEY              智谱 API Key（必填，未配置时审查失败）
 #   Variables（可选，用于覆盖默认值）:
 #     AI_REVIEW_MAX_DIFF_LINES   diff 上限（行数），默认 2000
@@ -42,6 +42,9 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.fork != true }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # 模型密钥（ZHIPU_API_KEY）挂在 LLM environment 上；该环境无保护规则，
+    # fork PR 已在上方 if 跳过，不受环境密钥对 fork 不可用的限制
+    environment: LLM
     steps:
       - name: Checkout
         uses: actions/checkout@v4
