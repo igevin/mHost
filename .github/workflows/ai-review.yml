@@ -5,7 +5,7 @@
 #     ZHIPU_API_KEY              智谱 API Key（必填，未配置时审查失败）
 #   Variables（可选，用于覆盖默认值）:
 #     AI_REVIEW_MAX_DIFF_LINES   diff 上限（行数），默认 2000
-#     AI_REVIEW_MODEL            审查模型，默认 glm-4.6
+#     AI_REVIEW_MODEL            审查模型，默认 glm-5.3-flash
 #
 # 定位是 advisory：评论非阻塞，不作为合并门禁；审查失败时 PR 留"AI 审查失败"说明。
 # 评审标准在 .github/ai-review-prompt.md，改 prompt 不用动本文件。
@@ -36,7 +36,7 @@ permissions:
 
 env:
   MAX_DIFF_LINES: ${{ vars.AI_REVIEW_MAX_DIFF_LINES || 2000 }}
-  AI_REVIEW_MODEL: ${{ vars.AI_REVIEW_MODEL || 'glm-4.6' }}
+  AI_REVIEW_MODEL: ${{ vars.AI_REVIEW_MODEL || 'glm-5.3-flash' }}
 
 jobs:
   ai-review:
