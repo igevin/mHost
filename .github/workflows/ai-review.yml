@@ -65,7 +65,7 @@ jobs:
           fi
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           # 统一检出 PR head：手动复审时拿到的也是 PR 代码而非 master。
           # fetch-depth 0 会带走全部分支，后面的 merge-base 无需再走网络。
@@ -111,8 +111,10 @@ jobs:
           git show "$BASE:CLAUDE.md" > CLAUDE.md 2>/dev/null || true
           git show "$BASE:AGENTS.md" > AGENTS.md 2>/dev/null || true
           # 密钥经进程环境注入后 /proc/self/environ 仍是 Read 可达的文件，
-          # 用 deny 规则封禁内核伪文件系统（deny 优先于 allowedTools；
-          # // 前缀为绝对路径规则，已在 claude-code 2.1.x 上实测生效）
+          # 用 deny 规则封禁内核伪文件系统。注意只需 Read 规则：claude-code
+          # 的文件权限校验对读文件类工具统一走 Read 规则（Grep/Glob 自动
+          # 被覆盖，官方校验警告与实测均确认）；deny 优先于 allowedTools，
+          # // 前缀为绝对路径规则，已在 claude-code 2.1.x 上实测生效。
           cat > "$RUNNER_TEMP/ai-review-guard.json" <<'EOF'
           {
             "permissions": {
@@ -150,9 +152,15 @@ jobs:
             head -n "$MAX_DIFF_LINES" pr.diff > pr.diff.part
             mv pr.diff.part pr.diff
           fi
-          # 评审标准取 base 分支版本，PR 作者无法借本 PR 改写审查规则；
-          # base 上还没有该文件时（如引入本工作流的 PR）回退到检出版本
-          git show "$BASE:.github/ai-review-prompt.md" > ai-review-prompt.md 2>/dev/null || cp .github/ai-review-prompt.md ai-review-prompt.md
+          # 评审标准三级兜底：base 版本 → 检出版本（引入本工作流的 PR 上
+          # base 尚无此文件）→ 内嵌最小版（防 master 误删 prompt 文件后
+          # 所有 PR 硬失败且没有失败说明）
+          git show "$BASE:.github/ai-review-prompt.md" > ai-review-prompt.md 2>/dev/null || cp .github/ai-review-prompt.md ai-review-prompt.md || true
+          if [ ! -s ai-review-prompt.md ]; then
+            cat > ai-review-prompt.md <<'EOF'
+          你是代码审查助手。审查经标准输入提供的 diff：找出安全漏洞、正确性 bug、并发与错误处理问题，用 Markdown 按严重程度分组输出发现（每条注明 文件:行号 和一句话理由）；没有发现就明确说没有。
+          EOF
+          fi
           echo "mode=$mode" >> "$GITHUB_OUTPUT"
           echo "lines=$(wc -l < pr.diff | tr -d ' ')" >> "$GITHUB_OUTPUT"
 
@@ -168,7 +176,7 @@ jobs:
 
       - name: Setup Node
         if: steps.gate.outputs.skip == 'false'
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
 
