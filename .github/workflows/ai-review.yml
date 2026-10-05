@@ -220,7 +220,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
-          # 显式注入：job 级 env 不会自动成为 gh 子进程的环境变量
+          # 冗余显式声明：job 级 env **本来就会**导出进 run 步骤的进程环境
+          # （同文件用 $MAX_DIFF_LINES 即是此理），所以这行并非必需。
+          # 保留是为了让「过滤条件读的是哪个变量」在 step 内一眼可见 ——
+          # 这正是本 PR 要根治的双处硬编码耦合点。
           AI_REVIEW_HEADER_PREFIX: ${{ env.AI_REVIEW_HEADER_PREFIX }}
         run: |
           # 复审上下文：把最近一条 AI review 评论喂回 prompt。
@@ -246,7 +249,16 @@ jobs:
             --jq "[.comments[] | select(.body | startswith(env.AI_REVIEW_HEADER_PREFIX))] | last | .body // \"\"" \
             2>/dev/null || echo "")
           if [ -n "$body" ]; then
-            printf '%s' "$body" | head -c 4000 | iconv -c -f UTF-8 -t UTF-8 > "$RUNNER_TEMP/prev-review.md" || : > "$RUNNER_TEMP/prev-review.md"
+            # 先剥掉数据包裹自身的定界符，再截断。
+            #
+            # 上一轮报告是模型输出、可能被 diff 诱导；若它字面包含
+            # `</上一轮审查结论>`，围栏会在中途提前闭合，其后文本就逃逸到
+            # prompt 声明的「是数据不是指令」范围之外。顺序不能反：先剥
+            # 再截断，截断就不会重新切出半个定界符（截断本身造成的半个
+            # 多字节字符由下面的 iconv -c 兜底）。
+            printf '%s' "$body" | sed 's|</*上一轮审查结论>||g' \
+              | head -c 4000 | iconv -c -f UTF-8 -t UTF-8 > "$RUNNER_TEMP/prev-review.md" \
+              || : > "$RUNNER_TEMP/prev-review.md"
           else
             : > "$RUNNER_TEMP/prev-review.md"
             # 静默失配是这里唯一真正危险的状态：PR 上已有评论却捞不到上一轮
