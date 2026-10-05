@@ -44,11 +44,12 @@ function StatusBar() {
   const dnsProfiles = useAtomValue(dnsProfilesAtom);
   const enabledDnsProfiles = useAtomValue(enabledDnsProfilesAtom);
   const dnsRuleCount = useAtomValue(dnsRuleCountAtom);
-  // issue #232: 与 `dnsEnabledAtom` 的分歧。**新增的订阅是纯探测派生的
-  // 读**，只在 `systemDnsAtom` 变化时（启动 / 窗口 focus / DNS toggle）
-  // 才可能重渲染 StatusBar —— 与 apply 对话框状态无关，所以不构成 #90
-  // 点过的「sidebar atom 订阅」那类问题（那个问题的根因是 Layout 重渲染
-  // 拖垮整棵侧栏树，已由 P-F1 的 React.memo 拆分修掉）。
+  // issue #232: 与 `dnsEnabledAtom` 的分歧。**新增的订阅是纯派生的读**，
+  // 不发任何 IPC；它只在 `dnsEnabledAtom` 或 `systemDnsAtom` 变化时才可能
+  // 触发本组件重渲染 —— 后者只在启动 / 窗口 focus / DNS toggle 时写。
+  // 两个都不是 apply 对话框的状态，所以不构成 #90 点过的「sidebar atom
+  // 订阅」那类问题（那个的根因是 Layout 重渲染拖垮整棵侧栏树，已由 P-F1
+  // 的 React.memo 拆分修掉）。
   const dnsDiscrepancy = useAtomValue(dnsDiscrepancyAtom);
 
   const navigate = useNavigate();

@@ -365,6 +365,78 @@ describe("toggleDnsModeAtom clears stale probe (issue #153)", () => {
 });
 
 /**
+ * Issue #232（AI review 发现）：toggle **收尾**窗口的假 `stuck_at_loopback`。
+ *
+ * `toggleDnsModeAtom` 开头那次置 null 只护住「toggle 开始前」的快照。等
+ * sudo 授权期间用户切走再切回，窗口 focus 会发一次探测，在 disable 真正
+ * 生效前落地，带回 `points_at_loopback=true` —— 那一刻它是真的，但对即将
+ * 结束的 toggle 已经过时。
+ *
+ * 于是 `set(dnsEnabledAtom, false)` 一落地就派生出 `stuck_at_loopback`：
+ * 后端刚成功还原了系统 DNS，UI 却报「DNS broken」并指向 Restore 按钮。
+ * 假警报要等收尾那次 `void runProbe()` 回来才消失。
+ *
+ * 修法：翻内存态之前再清一次快照（宣布「不知道」= 不报警）。
+ *
+ * 注意**不能**用 `isDnsLoadingAtom` 门控 —— `finally` 里的
+ * `set(isDnsLoadingAtom, false)` 在 probe **发起**时就跑，不是落地时，
+ * 盖不住探测延迟（configd 卡住时能挂几秒）。
+ */
+describe("toggleDnsModeAtom drops a mid-toggle probe (issue #232)", () => {
+  const store = getDefaultStore();
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    store.set(dnsEnabledAtom, true);
+    store.set(dnsStatusAtom, null);
+    store.set(dnsErrorAtom, null);
+    store.set(isDnsLoadingAtom, false);
+    // 收尾那次探测永远 pending：只断言「过时快照被作废」，不受新值干扰。
+    (probeSystemDns as unknown as { mockReturnValue: (v: unknown) => void })
+      .mockReturnValue(new Promise(() => {}));
+    (getDnsStatus as unknown as { mockResolvedValue: (v: unknown) => void })
+      .mockResolvedValue(null);
+  });
+
+  it("a focus probe landing mid-toggle does not resurrect a false stuck_at_loopback", async () => {
+    // toggle 前的合法快照：DNS 开着 + 系统指向 127.0.0.1 → 一致。
+    store.set(systemDnsAtom, {
+      interface: "Wi-Fi",
+      servers: ["127.0.0.1"],
+      points_at_loopback: true,
+    });
+    expect(store.get(dnsDiscrepancyAtom)).toBeNull();
+
+    // setDnsMode 挂起，模拟 sudo 授权还没完成。
+    let resolveSetDnsMode!: (v: unknown) => void;
+    (setDnsMode as unknown as { mockReturnValue: (v: unknown) => void })
+      .mockReturnValue(new Promise((r) => {
+        resolveSetDnsMode = r;
+      }));
+
+    const toggle = store.set(toggleDnsModeAtom, false);
+
+    // toggle 还在飞：窗口 focus 的探测落地。它带回的
+    // points_at_loopback=true 在此刻**是真的**（disable 还没生效），
+    // 但对这个即将结束的 toggle 已经过时。
+    store.set(systemDnsAtom, {
+      interface: "Wi-Fi",
+      servers: ["127.0.0.1"],
+      points_at_loopback: true,
+    });
+
+    // 后端 disable 成功返回。
+    resolveSetDnsMode(undefined);
+    await toggle;
+
+    expect(store.get(dnsEnabledAtom)).toBe(false);
+    // 契约：内存态翻成 false 的同一刻，过时快照必须已被作废。
+    expect(store.get(systemDnsAtom)).toBeNull();
+    expect(store.get(dnsDiscrepancyAtom)).toBeNull();
+  });
+});
+
+/**
  * `fetchDnsModeAtom` 现在并行跑三件事：内存态 truth-fetch + status +
  * 系统 DNS 探测。探测失败**不能**污染主路径。
  */

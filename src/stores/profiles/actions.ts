@@ -550,6 +550,29 @@ export const toggleDnsModeAtom = atom(null, async (_get, set, enabled: boolean) 
 
   try {
     await setDnsMode(enabled, { signal: ctrl.signal });
+    // Issue #232（AI review 指出）：在翻 `dnsEnabledAtom` **之前**再清一次
+    // 探测快照。
+    //
+    // 上面的 `set(systemDnsAtom, null)` 只护住了 toggle **开始前**已有的
+    // 快照。中间还有一个洞：toggle 进行中（等 sudo 授权时用户切走再切回很
+    // 常见）窗口 focus 会发一次探测，它在 disable 真正生效前落地，带回
+    // `points_at_loopback=true` —— 那一刻它**确实**是真的（DNS 还没还原），
+    // 但对即将结束的这个 toggle 来说已经过时了。
+    //
+    // 于是 `set(dnsEnabledAtom, false)` 一执行，派生 atom 立刻算出
+    // `stuck_at_loopback`：系统说「刚成功恢复了 DNS」，侧栏却红字「DNS
+    // broken」并把用户指向 Restore 按钮。这个假警报要等到下面
+    // `void runProbe()` 回来才消失，而探测在 configd 卡住时能挂几秒
+    // （见本文件 probeGeneration 的注释）。
+    //
+    // 为什么不能靠 `isDnsLoadingAtom` 门控 UI：`finally` 里的
+    // `set(isDnsLoadingAtom, false)` 在 `void runProbe()` **发起**时就跑，
+    // 不是落地时，所以它盖不住探测延迟。
+    //
+    // 修法与 toggle 开头的置 null 同一条原则：快照已知过时就宣布「不知道」，
+    // 而 `dnsDiscrepancyAtom` 对 null 不报警。顺带把 Settings 页横幅的
+    // 同款隐患一起关掉（#153 遗留，本 PR 只是让它变显眼）。
+    set(systemDnsAtom, null);
     set(dnsEnabledAtom, enabled);
     const status = await getDnsStatus();
     set(dnsStatusAtom, status);
