@@ -1,7 +1,7 @@
 # AI Code Review —— PR 创建/更新时用 Claude Code (Headless) 审查，结论评论到 PR。
 #
 # 前置配置（仓库 Settings → Secrets and variables → Actions）：
-#   Secrets（挂在 LLM environment 上，由 job 声明 environment: LLM 注入）：
+#   Secrets（挂在 LLM environment 上，运行时经 step env 注入 claude 进程，不落盘）：
 #     ZHIPU_API_KEY              智谱 API Key（必填，未配置时审查失败）
 #   Variables（可选，用于覆盖默认值）:
 #     AI_REVIEW_MAX_DIFF_LINES   diff 上限（行数），默认 2000
@@ -46,11 +46,6 @@ jobs:
     # fork PR 已在上方 if 跳过，不受环境密钥对 fork 不可用的限制
     environment: LLM
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
       - name: Resolve PR number
         id: pr
         run: |
@@ -60,6 +55,16 @@ jobs:
             echo "number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # 统一检出 PR head：手动复审时拿到的也是 PR 代码而非 master。
+          # fetch-depth 0 会带走全部分支，后面的 merge-base 无需再走网络。
+          ref: refs/pull/${{ steps.pr.outputs.number }}/head
+          fetch-depth: 0
+          # 不把 GITHUB_TOKEN 留在 .git/config——Read 工具可达即是外泄面
+          persist-credentials: false
+
       - name: Resolve base/head revisions
         id: refs
         env:
@@ -67,13 +72,14 @@ jobs:
           PR_NUMBER: ${{ steps.pr.outputs.number }}
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            git fetch --no-tags origin "pull/${PR_NUMBER}/head"
             head=$(gh pr view "$PR_NUMBER" --json headRefOid -q .headRefOid)
+            base_ref=$(gh pr view "$PR_NUMBER" --json baseRefName -q .baseRefName)
           else
             head="${{ github.event.pull_request.head.sha }}"
+            base_ref="${{ github.event.pull_request.base.ref }}"
           fi
-          base_ref=$(gh pr view "$PR_NUMBER" --json baseRefName -q .baseRefName)
-          git fetch --no-tags origin "+refs/heads/${base_ref}:refs/remotes/origin/${base_ref}"
+          # 工作树钉住触发事件的 head，运行期间新 push 不会改变检出内容
+          git checkout -q "$head"
           base=$(git merge-base "refs/remotes/origin/${base_ref}" "$head")
           echo "base=$base" >> "$GITHUB_OUTPUT"
           echo "head=$head" >> "$GITHUB_OUTPUT"
@@ -88,9 +94,9 @@ jobs:
           total=$(wc -l < pr.diff | tr -d ' ')
           mode=full
           if [ "$total" -gt "$MAX_DIFF_LINES" ]; then
-            # 超限降级：只保留核心目录（Rust 后端 + 前端源码）
+            # 超限降级：核心目录 + 安全敏感配置（capability manifest / CSP）
             mode=core-only
-            git diff "$BASE" "$HEAD" -- src-tauri/src src-tauri/crates src > pr.diff || true
+            git diff "$BASE" "$HEAD" -- src-tauri/src src-tauri/crates src src-tauri/tauri.conf.json src-tauri/capabilities > pr.diff || true
             total=$(wc -l < pr.diff | tr -d ' ')
             if [ "$total" -eq 0 ]; then
               # PR 完全不碰核心目录时退回全量 diff 截断
@@ -103,6 +109,9 @@ jobs:
             head -n "$MAX_DIFF_LINES" pr.diff > pr.diff.part
             mv pr.diff.part pr.diff
           fi
+          # 评审标准取 base 分支版本，PR 作者无法借本 PR 改写审查规则；
+          # base 上还没有该文件时（如引入本工作流的 PR）回退到检出版本
+          git show "$BASE:.github/ai-review-prompt.md" > ai-review-prompt.md 2>/dev/null || cp .github/ai-review-prompt.md ai-review-prompt.md
           echo "mode=$mode" >> "$GITHUB_OUTPUT"
           echo "lines=$(wc -l < pr.diff | tr -d ' ')" >> "$GITHUB_OUTPUT"
 
@@ -126,29 +135,19 @@ jobs:
         if: steps.gate.outputs.skip == 'false'
         run: npm install -g @anthropic-ai/claude-code
 
-      - name: Configure model provider
-        if: steps.gate.outputs.skip == 'false'
-        env:
-          ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
-        run: |
-          mkdir -p ~/.claude
-          cat > ~/.claude/settings.json <<EOF
-          {
-            "env": {
-              "ANTHROPIC_BASE_URL": "https://open.bigmodel.cn/api/anthropic",
-              "ANTHROPIC_API_KEY": "${ZHIPU_API_KEY}",
-              "ANTHROPIC_AUTH_TOKEN": "${ZHIPU_API_KEY}",
-              "ANTHROPIC_MODEL": "${AI_REVIEW_MODEL}"
-            }
-          }
-          EOF
-
       - name: Run AI review
         id: review
         if: steps.gate.outputs.skip == 'false'
+        env:
+          # 密钥只经进程环境注入 claude，不写入 settings.json——
+          # 环境变量对 Read/Grep 工具不可见，diff 里的注入指令拿不到它
+          ANTHROPIC_BASE_URL: https://open.bigmodel.cn/api/anthropic
+          ANTHROPIC_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.ZHIPU_API_KEY }}
+          ANTHROPIC_MODEL: ${{ env.AI_REVIEW_MODEL }}
         run: |
           set +e
-          timeout 480 claude -p "$(cat .github/ai-review-prompt.md)" \
+          timeout 480 claude -p "$(cat ai-review-prompt.md)" \
             --allowedTools "Read,Grep,Glob" \
             --max-turns 40 \
             --output-format json \
@@ -175,7 +174,7 @@ jobs:
             echo "## 🤖 AI Review（advisory，非阻塞）"
             echo
             if [ "$MODE" = "core-only" ]; then
-              echo "> ⚠️ diff 超过 ${MAX_DIFF_LINES} 行，本次仅审查核心目录（src-tauri、src/），其余变更未覆盖。"
+              echo "> ⚠️ diff 超过 ${MAX_DIFF_LINES} 行，本次仅审查核心目录（src-tauri、src/ 及安全配置），其余变更未覆盖。"
               echo
             elif [ "$MODE" = "truncated" ]; then
               echo "> ⚠️ diff 超过 ${MAX_DIFF_LINES} 行，超出部分被截断，审查可能不完整。"
