@@ -40,9 +40,13 @@ env:
 
 jobs:
   ai-review:
-    # fork PR 在 pull_request 触发下拿不到 secrets，直接跳过；手动触发不受限。
-    # 用 == false 而非 != true：head.repo 异常为 null 时整体为假，fail-closed
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.fork == false }}
+    # fork PR 在 pull_request 触发下拿不到 secrets——这是 GitHub 平台按 PR
+    # 的 fork 属性在服务端扣住的，本行跳过是第二层（少跑一次注定无果的
+    # job）；手动触发不受限。
+    # 判空必须显式：GitHub 表达式做宽松相等，比较时 null 归一为数字 0，
+    # 因此 null == false 与 null != true 都判真——head.repo 为 null（如
+    # fork 被删除后的后续事件）时会放行，需先判 head.repo != null。
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event.pull_request.head.repo != null && github.event.pull_request.head.repo.fork == false) }}
     runs-on: ubuntu-latest
     # job 级余量要盖过内层 timeout 900s + 检出/安装；审查耗时随 PR 复杂度
     # 和端点延迟波动（实测 2~10 分钟），超时只会打断"Post failure notice"
@@ -156,7 +160,7 @@ jobs:
             # + CI 工作流与依赖清单——对审查器而言这是最该覆盖的
             # 供应链面，超限 PR 不能靠凑行数躲开对它们的改动
             mode=core-only
-            git diff "$BASE" "$HEAD" -- src-tauri/src src-tauri/crates src src-tauri/tauri.conf.json src-tauri/capabilities .github/workflows src-tauri/Cargo.toml src-tauri/Cargo.lock > pr.diff || true
+            git diff "$BASE" "$HEAD" -- src-tauri/src src-tauri/crates src src-tauri/tauri.conf.json src-tauri/capabilities .github/workflows src-tauri/Cargo.toml src-tauri/Cargo.lock package.json pnpm-lock.yaml > pr.diff || true
             total=$(wc -l < pr.diff | tr -d ' ')
             if [ "$total" -eq 0 ]; then
               # PR 完全不碰核心目录时退回全量 diff 截断
