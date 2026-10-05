@@ -128,6 +128,12 @@ jobs:
             }
           }
           EOF
+          # 防线自校验：JSON 若损坏会被 claude 静默忽略，/proc 封禁随之
+          # 失效；校验不过就拒绝运行审查，走"AI 审查失败"路径
+          jq -e '.permissions.deny | index("Read(//proc/**)")' "$RUNNER_TEMP/ai-review-guard.json" > /dev/null || {
+            echo "::error::ai-review-guard.json invalid — refusing to run review without the /proc deny rule"
+            exit 1
+          }
 
       - name: Build diff with size guard
         id: diff
@@ -135,6 +141,13 @@ jobs:
           BASE: ${{ steps.refs.outputs.base }}
           HEAD: ${{ steps.refs.outputs.head }}
         run: |
+          # 上限变量仅管理员可控，但仍防手滑配成非数字让 -gt 直接报错
+          case "$MAX_DIFF_LINES" in
+            ''|*[!0-9]*)
+              echo "::warning::AI_REVIEW_MAX_DIFF_LINES='$MAX_DIFF_LINES' is not a number, falling back to 2000"
+              MAX_DIFF_LINES=2000
+              ;;
+          esac
           git diff "$BASE" "$HEAD" > pr.diff
           total=$(wc -l < pr.diff | tr -d ' ')
           mode=full
@@ -215,11 +228,20 @@ jobs:
              && [ "$(jq -r '.subtype // ""' review.json)" = "success" ] \
              && jq -e '.result | type == "string" and length > 0' review.json > /dev/null; then
             jq -r '.result' review.json > report.md
+            # GitHub 评论上限 64KB：超长截断，避免"审查成功但发评论失败"
+            # 导致整个 job 报错、PR 一条评论都没有
+            if [ "$(wc -c < report.md)" -gt 60000 ]; then
+              head -c 60000 report.md > report.trunc && mv report.trunc report.md
+              printf '\n\n> ⚠️ 报告超过 60KB，已截断。\n' >> report.md
+            fi
             status=ok
           fi
           echo "status=$status" >> "$GITHUB_OUTPUT"
 
       - name: Post review comment
+        # 残余风险声明：report 是模型输出、原样发布——被审 diff 中的注入
+        # 指令仍可能诱导报告措辞（缓解：只读工具、上下文清洗、/proc deny；
+        # advisory 定位下接受该残余风险），评论头带 head SHA 便于归因
         if: steps.review.outputs.status == 'ok'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -245,6 +267,17 @@ jobs:
 
       - name: Post failure notice
         if: steps.review.outputs.status == 'failed'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: gh pr comment "$PR_NUMBER" --body "AI 审查失败"
+
+      - name: Post failure notice for unexpected errors
+        # 覆盖 review 步骤之外的失败（检出、merge-base、护栏等基础设施
+        # 错误），否则只留红叉、PR 侧无任何说明。排除并发取消：
+        # 连续 push 时被取消的在途运行不得发评论刷屏；job 级超时若表现
+        # 为取消则维持现状（无评论，可在 Actions 里看日志）
+        if: failure() && !cancelled() && steps.review.outputs.status != 'failed'
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
