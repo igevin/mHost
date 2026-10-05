@@ -48,9 +48,15 @@ jobs:
     steps:
       - name: Resolve PR number
         id: pr
+        env:
+          # workflow_dispatch 输入不经校验直接进 API，先当不可信字符串处理
+          PR_INPUT: ${{ github.event.inputs.pr_number }}
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "number=${{ github.event.inputs.pr_number }}" >> "$GITHUB_OUTPUT"
+            case "$PR_INPUT" in
+              ''|*[!0-9]*) echo "::error::pr_number must be a positive integer"; exit 1 ;;
+            esac
+            echo "number=$PR_INPUT" >> "$GITHUB_OUTPUT"
           else
             echo "number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
           fi
@@ -83,6 +89,21 @@ jobs:
           base=$(git merge-base "refs/remotes/origin/${base_ref}" "$head")
           echo "base=$base" >> "$GITHUB_OUTPUT"
           echo "head=$head" >> "$GITHUB_OUTPUT"
+
+      - name: Sanitize untrusted PR files
+        env:
+          BASE: ${{ steps.refs.outputs.base }}
+        run: |
+          # PR 检出树是不可信输入：项目级 .claude/（hooks、permissions.allow）
+          # 与 .mcp.json 会在 -p 模式下被自动执行/加载且无审批门，而
+          # workflow_dispatch 复审 fork PR 是设计内场景——fork 作者可以
+          # 在 PR 里植入它们，故运行前一律清除。
+          # CLAUDE.md/AGENTS.md 会被 claude 自动加载，取 base 分支版本，
+          # 防止 PR 作者改写审查标准；base 上没有就删掉。
+          rm -rf .claude .mcp.json
+          for f in CLAUDE.md AGENTS.md; do
+            git show "$BASE:$f" > "$f" 2>/dev/null || rm -f "$f"
+          done
 
       - name: Build diff with size guard
         id: diff
@@ -133,7 +154,8 @@ jobs:
 
       - name: Install Claude Code
         if: steps.gate.outputs.skip == 'false'
-        run: npm install -g @anthropic-ai/claude-code
+        # 锁大版本：advisory job 也不要被 latest 无声改变审查行为
+        run: npm install -g @anthropic-ai/claude-code@2
 
       - name: Run AI review
         id: review
@@ -149,6 +171,7 @@ jobs:
           set +e
           timeout 480 claude -p "$(cat ai-review-prompt.md)" \
             --allowedTools "Read,Grep,Glob" \
+            --strict-mcp-config \
             --max-turns 40 \
             --output-format json \
             < pr.diff > review.json
