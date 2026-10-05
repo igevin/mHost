@@ -434,6 +434,188 @@ describe("toggleDnsModeAtom drops a mid-toggle probe (issue #232)", () => {
     expect(store.get(systemDnsAtom)).toBeNull();
     expect(store.get(dnsDiscrepancyAtom)).toBeNull();
   });
+
+  /**
+   * 上一条只覆盖了「置 null」。这一条覆盖**代数递增**那半步：光置 null
+   * 的话，一个在置空之前发起、在 `await getDnsStatus()` 窗口里返回的
+   * 探测，代数仍然匹配，`applyProbe` 会把已知过时的快照写回去 ——
+   * 假警报被压缩而没有关死。
+   *
+   * 这里刻意走 `probeSystemDnsAtom` 真实发起一次探测（而不是直接
+   * `store.set(systemDnsAtom, ...)`），因为代数守卫只有真跑一遍
+   * `runProbe` / `applyProbe` 才会被验证到。
+   */
+  it("drops an in-flight probe that lands in the post-clear await window", async () => {
+    store.set(dnsEnabledAtom, true);
+    store.set(systemDnsAtom, {
+      interface: "Wi-Fi",
+      servers: ["127.0.0.1"],
+      points_at_loopback: true,
+    });
+
+    // 控制两个异步点：getDnsStatus（toggle 成功路径上那个 yield）
+    // 与在途探测的返回值。
+    let resolveStatus!: (v: unknown) => void;
+    (getDnsStatus as unknown as { mockReturnValue: (v: unknown) => void })
+      .mockReturnValue(new Promise((r) => {
+        resolveStatus = r;
+      }));
+    let resolveInFlight!: (v: unknown) => void;
+    (probeSystemDns as unknown as { mockImplementationOnce: (fn: unknown) => void })
+      .mockImplementationOnce(
+        () => new Promise((r) => {
+          resolveInFlight = r;
+        }),
+      );
+    let resolveSetDnsMode!: (v: unknown) => void;
+    (setDnsMode as unknown as { mockReturnValue: (v: unknown) => void })
+      .mockReturnValue(new Promise((r) => {
+        resolveSetDnsMode = r;
+      }));
+
+    // 第一次 probeSystemDns 调用 = 模拟窗口 focus 发起的探测（在途）。
+    const focusProbe = store.set(probeSystemDnsAtom);
+    // 第二次 = toggle 收尾那次 re-probe，让它永远 pending，不干扰断言。
+    (probeSystemDns as unknown as { mockReturnValue: (v: unknown) => void })
+      .mockReturnValue(new Promise(() => {}));
+
+    const toggle = store.set(toggleDnsModeAtom, false);
+
+    // 后端 disable 成功 → toggle 走到 invalidate + 翻转内存态，
+    // 然后停在 `await getDnsStatus()`。
+    resolveSetDnsMode(undefined);
+    await vi.waitFor(() =>
+      expect(store.get(dnsEnabledAtom)).toBe(false),
+    );
+
+    // 此刻在途探测才返回，带回过时结论。代数若被递增过，它写不进来。
+    resolveInFlight({
+      interface: "Wi-Fi",
+      servers: ["127.0.0.1"],
+      points_at_loopback: true,
+    });
+    await focusProbe;
+
+    expect(store.get(systemDnsAtom)).toBeNull();
+    expect(store.get(dnsDiscrepancyAtom)).toBeNull();
+
+    // 放行 toggle 收尾。
+    resolveStatus(null);
+    await toggle;
+  });
+
+  /**
+   * cancel 路径的同形状假警报（issue #232 第二轮）。
+   *
+   * 窗口比成功路径**更大**：`await getDnsMode()` 和随后的
+   * `await getDnsStatus()` 两次 IPC 都在翻转 `dnsEnabledAtom` 之前，而
+   * rollback 期间系统 DNS 恰恰最可能停在 127.0.0.1（#152 同款）。
+   * 若 atom 里还留着一份 `points_at_loopback=true` 的旧快照，
+   * `truth=false` 一落地就派生出假的 `stuck_at_loopback`。
+   */
+  it("a cancelled toggle does not flip to a false stuck_at_loopback", async () => {
+    store.set(dnsEnabledAtom, true);
+    // 用户点 Disable 前的合法快照：DNS 开着 + 指向 127.0.0.1 → 一致。
+    store.set(systemDnsAtom, {
+      interface: "Wi-Fi",
+      servers: ["127.0.0.1"],
+      points_at_loopback: true,
+    });
+    // 收尾 re-probe 永远 pending，不干扰断言。
+    (probeSystemDns as unknown as { mockReturnValue: (v: unknown) => void })
+      .mockReturnValue(new Promise(() => {}));
+    // backend truth：cancel 后系统 DNS 已回到「没开」
+    (getDnsMode as unknown as { mockResolvedValue: (v: unknown) => void })
+      .mockResolvedValue(false);
+
+    let rejectSet!: (err: unknown) => void;
+    const setPromise = new Promise<void>((_, reject) => {
+      rejectSet = reject;
+    });
+    setPromise.catch(() => {
+      /* swallowed — 真正的 handler 是 atom 自己的 catch */
+    });
+    (setDnsMode as unknown as { mockImplementation: (fn: unknown) => void })
+      .mockImplementation(() => setPromise);
+
+    const togglePromise = store.set(toggleDnsModeAtom, false);
+    await new Promise((r) => setTimeout(r, 0));
+
+    // cancel → 后端 rollback 完成 → setDnsMode 以 Cancelled 结束。
+    cancelActiveDnsToggle();
+
+    // **关键**：toggle 开头的作废已经清过一次，所以必须在这里重新注入
+    // 一份过时快照，cancel 分支的作废才真的被踩到 —— 否则
+    // `systemDnsAtom` 从头到尾都是 null，撤掉修复也照样通过。
+    //
+    // 这模拟窗口 focus 的探测在 rollback 期间落地：那一刻系统 DNS 的确
+    // 还停在 127.0.0.1，但对即将用 backend truth 拨正内存态的这条路径
+    // 已经过时。
+    store.set(systemDnsAtom, {
+      interface: "Wi-Fi",
+      servers: ["127.0.0.1"],
+      points_at_loopback: true,
+    });
+
+    rejectSet({ Cancelled: null });
+    await togglePromise;
+
+    expect(store.get(dnsEnabledAtom)).toBe(false);
+    // 契约：truth 落地的同一刻，过时快照必须已被作废 → 不报警。
+    expect(store.get(systemDnsAtom)).toBeNull();
+    expect(store.get(dnsDiscrepancyAtom)).toBeNull();
+  });
+
+  /**
+   * toggle **开头**那一次作废的代数递增（issue #232 第二轮）。
+   *
+   * 在 toggle 开始之前就在飞的探测，描述的是「toggle 之前的世界」。
+   * 它必须在 toggle 期间回来时被丢掉，否则它会把一个已经作废的结论
+   * 重新写进 atom —— 正是 issue #232 那条评论指出的「清快照 ≠ 作废在途
+   * 探测」。
+   */
+  it("drops a probe that was already in flight when the toggle started", async () => {
+    store.set(dnsEnabledAtom, true);
+    store.set(systemDnsAtom, {
+      interface: "Wi-Fi",
+      servers: ["127.0.0.1"],
+      points_at_loopback: true,
+    });
+
+    // 在 toggle 之前发起一次探测，让它挂在半空。
+    let resolvePreToggle!: (v: unknown) => void;
+    (probeSystemDns as unknown as { mockImplementationOnce: (fn: unknown) => void })
+      .mockImplementationOnce(
+        () => new Promise((r) => {
+          resolvePreToggle = r;
+        }),
+      );
+    const preToggleProbe = store.set(probeSystemDnsAtom);
+    // toggle 收尾的 re-probe 永远 pending。
+    (probeSystemDns as unknown as { mockReturnValue: (v: unknown) => void })
+      .mockReturnValue(new Promise(() => {}));
+
+    let resolveSetDnsMode!: (v: unknown) => void;
+    (setDnsMode as unknown as { mockReturnValue: (v: unknown) => void })
+      .mockReturnValue(new Promise((r) => {
+        resolveSetDnsMode = r;
+      }));
+
+    const toggle = store.set(toggleDnsModeAtom, false);
+
+    // toggle 开始后，那条在途探测才返回 —— 代数若已递增，它写不进来。
+    resolvePreToggle({
+      interface: "Wi-Fi",
+      servers: ["127.0.0.1"],
+      points_at_loopback: true,
+    });
+    await preToggleProbe;
+
+    expect(store.get(systemDnsAtom)).toBeNull();
+
+    resolveSetDnsMode(undefined);
+    await toggle;
+  });
 });
 
 /**

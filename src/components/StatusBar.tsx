@@ -131,13 +131,20 @@ function StatusBar() {
               刻意用英文：同栏的 "Off" / "Applying..." / "2/3 enabled"
               以及 Settings 页那段横幅全是英文，前端只有
               RuleEditor / ImportDialog 的冲突诊断是中文 —— 状态标签
-              不该是那个唯一的例外。 */}
+              不该是那个唯一的例外。
+
+              `aria-live="polite"`：Settings 横幅有 `role="alert"`，侧栏
+              这张卡没有等价的可达性信号 —— 而 #232 的目标就是「让用户
+              注意到」，非视觉用户没有别的通道。放这里而不是整张卡上，
+              是为了只播报这行状态文字。噪音可控：这一行的内容只随
+              用户主动操作（开关 DNS / 切 profile / 规则重载）变化。*/}
           <div
             className={
               dnsStuck
                 ? `${styles.statusProfile} ${styles.statusProfileDanger}`
                 : styles.statusProfile
             }
+            aria-live="polite"
             data-testid={dnsStuck ? "dns-stuck-warning" : undefined}
           >
             {dnsStuck
