@@ -29,8 +29,10 @@ concurrency:
 
 permissions:
   contents: read
-  issues: write # PR 评论走 issues API
-  pull-requests: read # gh pr view 只需要读
+  issues: write
+  # gh pr comment 走 GraphQL addComment，实测需要 pull-requests: write
+  # （issues: write 不够；降到 read 会让审查成功但评论 403）
+  pull-requests: write
 
 env:
   MAX_DIFF_LINES: ${{ vars.AI_REVIEW_MAX_DIFF_LINES || 2000 }}
