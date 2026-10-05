@@ -1,0 +1,196 @@
+# AI Code Review —— PR 创建/更新时用 Claude Code (Headless) 审查，结论评论到 PR。
+#
+# 前置配置（仓库 Settings → Secrets and variables → Actions）：
+#   Secrets:
+#     ZHIPU_API_KEY              智谱 API Key（必填，未配置时审查失败）
+#   Variables（可选，用于覆盖默认值）:
+#     AI_REVIEW_MAX_DIFF_LINES   diff 上限（行数），默认 2000
+#     AI_REVIEW_MODEL            审查模型，默认 glm-4.6
+#
+# 定位是 advisory：评论非阻塞，不作为合并门禁；审查失败时 PR 留"AI 审查失败"说明。
+# 评审标准在 .github/ai-review-prompt.md，改 prompt 不用动本文件。
+
+name: AI Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 要复审的 PR 编号
+        required: true
+        type: number
+
+# 同一 PR 只保留最新一次审查：连续 push 时取消在途运行，避免评论刷屏
+concurrency:
+  group: ai-review-${{ github.event.pull_request.number || github.event.inputs.pr_number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  issues: write # PR 评论走 issues API
+  pull-requests: write
+
+env:
+  MAX_DIFF_LINES: ${{ vars.AI_REVIEW_MAX_DIFF_LINES || 2000 }}
+  AI_REVIEW_MODEL: ${{ vars.AI_REVIEW_MODEL || 'glm-4.6' }}
+
+jobs:
+  ai-review:
+    # fork PR 在 pull_request 触发下拿不到 secrets，直接跳过；手动触发不受限
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.fork != true }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve PR number
+        id: pr
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "number=${{ github.event.inputs.pr_number }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve base/head revisions
+        id: refs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            git fetch --no-tags origin "pull/${PR_NUMBER}/head"
+            head=$(gh pr view "$PR_NUMBER" --json headRefOid -q .headRefOid)
+          else
+            head="${{ github.event.pull_request.head.sha }}"
+          fi
+          base_ref=$(gh pr view "$PR_NUMBER" --json baseRefName -q .baseRefName)
+          git fetch --no-tags origin "+refs/heads/${base_ref}:refs/remotes/origin/${base_ref}"
+          base=$(git merge-base "refs/remotes/origin/${base_ref}" "$head")
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "head=$head" >> "$GITHUB_OUTPUT"
+
+      - name: Build diff with size guard
+        id: diff
+        env:
+          BASE: ${{ steps.refs.outputs.base }}
+          HEAD: ${{ steps.refs.outputs.head }}
+        run: |
+          git diff "$BASE" "$HEAD" > pr.diff
+          total=$(wc -l < pr.diff | tr -d ' ')
+          mode=full
+          if [ "$total" -gt "$MAX_DIFF_LINES" ]; then
+            # 超限降级：只保留核心目录（Rust 后端 + 前端源码）
+            mode=core-only
+            git diff "$BASE" "$HEAD" -- src-tauri/src src-tauri/crates src > pr.diff || true
+            total=$(wc -l < pr.diff | tr -d ' ')
+            if [ "$total" -eq 0 ]; then
+              # PR 完全不碰核心目录时退回全量 diff 截断
+              mode=truncated
+              git diff "$BASE" "$HEAD" > pr.diff
+            fi
+          fi
+          if [ "$(wc -l < pr.diff | tr -d ' ')" -gt "$MAX_DIFF_LINES" ]; then
+            mode=truncated
+            head -n "$MAX_DIFF_LINES" pr.diff > pr.diff.part
+            mv pr.diff.part pr.diff
+          fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "lines=$(wc -l < pr.diff | tr -d ' ')" >> "$GITHUB_OUTPUT"
+
+      - name: Skip when diff is empty
+        id: gate
+        run: |
+          if [ -s pr.diff ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Empty diff, nothing to review."
+          fi
+
+      - name: Setup Node
+        if: steps.gate.outputs.skip == 'false'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Claude Code
+        if: steps.gate.outputs.skip == 'false'
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Configure model provider
+        if: steps.gate.outputs.skip == 'false'
+        env:
+          ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
+        run: |
+          mkdir -p ~/.claude
+          cat > ~/.claude/settings.json <<EOF
+          {
+            "env": {
+              "ANTHROPIC_BASE_URL": "https://open.bigmodel.cn/api/anthropic",
+              "ANTHROPIC_API_KEY": "${ZHIPU_API_KEY}",
+              "ANTHROPIC_AUTH_TOKEN": "${ZHIPU_API_KEY}",
+              "ANTHROPIC_MODEL": "${AI_REVIEW_MODEL}"
+            }
+          }
+          EOF
+
+      - name: Run AI review
+        id: review
+        if: steps.gate.outputs.skip == 'false'
+        run: |
+          set +e
+          timeout 480 claude -p "$(cat .github/ai-review-prompt.md)" \
+            --allowedTools "Read,Grep,Glob" \
+            --max-turns 40 \
+            --output-format json \
+            < pr.diff > review.json
+          code=$?
+          set -e
+          status=failed
+          if [ "$code" -eq 0 ] && [ -s review.json ] \
+             && [ "$(jq -r '.subtype // ""' review.json)" = "success" ] \
+             && jq -e '.result | type == "string" and length > 0' review.json > /dev/null; then
+            jq -r '.result' review.json > report.md
+            status=ok
+          fi
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+
+      - name: Post review comment
+        if: steps.review.outputs.status == 'ok'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          MODE: ${{ steps.diff.outputs.mode }}
+        run: |
+          {
+            echo "## 🤖 AI Review（advisory，非阻塞）"
+            echo
+            if [ "$MODE" = "core-only" ]; then
+              echo "> ⚠️ diff 超过 ${MAX_DIFF_LINES} 行，本次仅审查核心目录（src-tauri、src/），其余变更未覆盖。"
+              echo
+            elif [ "$MODE" = "truncated" ]; then
+              echo "> ⚠️ diff 超过 ${MAX_DIFF_LINES} 行，超出部分被截断，审查可能不完整。"
+              echo
+            fi
+            cat report.md
+          } > comment.md
+          gh pr comment "$PR_NUMBER" --body-file comment.md
+
+      - name: Post failure notice
+        if: steps.review.outputs.status == 'failed'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: gh pr comment "$PR_NUMBER" --body "AI 审查失败"
+
+      - name: Mark job failed
+        if: steps.review.outputs.status == 'failed'
+        run: |
+          echo "::error::AI review did not complete (timeout or non-success result), see steps above."
+          exit 1
