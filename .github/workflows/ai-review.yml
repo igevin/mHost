@@ -30,7 +30,7 @@ concurrency:
 permissions:
   contents: read
   issues: write # PR 评论走 issues API
-  pull-requests: write
+  pull-requests: read # gh pr view 只需要读
 
 env:
   MAX_DIFF_LINES: ${{ vars.AI_REVIEW_MAX_DIFF_LINES || 2000 }}
@@ -152,10 +152,11 @@ jobs:
             head -n "$MAX_DIFF_LINES" pr.diff > pr.diff.part
             mv pr.diff.part pr.diff
           fi
-          # 评审标准三级兜底：base 版本 → 检出版本（引入本工作流的 PR 上
-          # base 尚无此文件）→ 内嵌最小版（防 master 误删 prompt 文件后
-          # 所有 PR 硬失败且没有失败说明）
-          git show "$BASE:.github/ai-review-prompt.md" > ai-review-prompt.md 2>/dev/null || cp .github/ai-review-prompt.md ai-review-prompt.md || true
+          # 评审标准两级兜底：base 版本 → 内嵌最小版。不回退到检出版本：
+          # base 尚无此文件时（仅引入本工作流的 PR 会遇到），作者在 PR 里
+          # 自带的审查口径不可信，宁缺毋滥；内嵌版保证 master 误删 prompt
+          # 文件时审查降级而非硬失败无说明。
+          git show "$BASE:.github/ai-review-prompt.md" > ai-review-prompt.md 2>/dev/null || true
           if [ ! -s ai-review-prompt.md ]; then
             cat > ai-review-prompt.md <<'EOF'
           你是代码审查助手。审查经标准输入提供的 diff：找出安全漏洞、正确性 bug、并发与错误处理问题，用 Markdown 按严重程度分组输出发现（每条注明 文件:行号 和一句话理由）；没有发现就明确说没有。
@@ -182,8 +183,9 @@ jobs:
 
       - name: Install Claude Code
         if: steps.gate.outputs.skip == 'false'
-        # 锁大版本：advisory job 也不要被 latest 无声改变审查行为
-        run: npm install -g @anthropic-ai/claude-code@2
+        # 钉精确版本：Read deny 规则覆盖 Grep/Glob 是 2.1.x 的实测行为，
+        # 只锁主版本仍可能被小版本无声漂移破坏这条防线
+        run: npm install -g @anthropic-ai/claude-code@2.1.289
 
       - name: Run AI review
         id: review
@@ -221,9 +223,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
           MODE: ${{ steps.diff.outputs.mode }}
+          REVIEWED_SHA: ${{ steps.refs.outputs.head }}
         run: |
           {
             echo "## 🤖 AI Review（advisory，非阻塞）"
+            echo
+            echo "> 被审查的 head：\`$REVIEWED_SHA\`"
             echo
             if [ "$MODE" = "core-only" ]; then
               echo "> ⚠️ diff 超过 ${MAX_DIFF_LINES} 行，本次仅审查核心目录（src-tauri、src/ 及安全配置），其余变更未覆盖。"
