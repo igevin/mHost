@@ -153,8 +153,10 @@ jobs:
           mode=full
           if [ "$total" -gt "$MAX_DIFF_LINES" ]; then
             # 超限降级：核心目录 + 安全敏感配置（capability manifest / CSP）
+            # + CI 工作流与依赖清单——对审查器而言这是最该覆盖的
+            # 供应链面，超限 PR 不能靠凑行数躲开对它们的改动
             mode=core-only
-            git diff "$BASE" "$HEAD" -- src-tauri/src src-tauri/crates src src-tauri/tauri.conf.json src-tauri/capabilities > pr.diff || true
+            git diff "$BASE" "$HEAD" -- src-tauri/src src-tauri/crates src src-tauri/tauri.conf.json src-tauri/capabilities .github/workflows src-tauri/Cargo.toml src-tauri/Cargo.lock > pr.diff || true
             total=$(wc -l < pr.diff | tr -d ' ')
             if [ "$total" -eq 0 ]; then
               # PR 完全不碰核心目录时退回全量 diff 截断
@@ -229,9 +231,10 @@ jobs:
              && jq -e '.result | type == "string" and length > 0' review.json > /dev/null; then
             jq -r '.result' review.json > report.md
             # GitHub 评论上限 64KB：超长截断，避免"审查成功但发评论失败"
-            # 导致整个 job 报错、PR 一条评论都没有
+            # 导致整个 job 报错、PR 一条评论都没有。iconv -c 丢弃截断点
+            # 可能劈开的半个多字节字符，保证输出仍是合法 UTF-8
             if [ "$(wc -c < report.md)" -gt 60000 ]; then
-              head -c 60000 report.md > report.trunc && mv report.trunc report.md
+              head -c 60000 report.md | iconv -c -f UTF-8 -t UTF-8 > report.trunc && mv report.trunc report.md
               printf '\n\n> ⚠️ 报告超过 60KB，已截断。\n' >> report.md
             fi
             status=ok
@@ -255,7 +258,7 @@ jobs:
             echo "> 被审查的 head：\`$REVIEWED_SHA\`"
             echo
             if [ "$MODE" = "core-only" ]; then
-              echo "> ⚠️ diff 超过 ${MAX_DIFF_LINES} 行，本次仅审查核心目录（src-tauri、src/ 及安全配置），其余变更未覆盖。"
+              echo "> ⚠️ diff 超过 ${MAX_DIFF_LINES} 行，本次仅审查核心目录（src-tauri、src/、.github/workflows 及依赖/安全配置），其余变更未覆盖。"
               echo
             elif [ "$MODE" = "truncated" ]; then
               echo "> ⚠️ diff 超过 ${MAX_DIFF_LINES} 行，超出部分被截断，审查可能不完整。"
@@ -281,7 +284,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
-        run: gh pr comment "$PR_NUMBER" --body "AI 审查失败"
+          REVIEW_STATUS: ${{ steps.review.outputs.status }}
+        run: |
+          # 区分措辞：审查成功但发布瞬时失败 ≠ 审查本身失败，避免误导
+          if [ "$REVIEW_STATUS" = "ok" ]; then
+            gh pr comment "$PR_NUMBER" --body "AI 审查已完成，但结果发布失败；可在 Actions 对本次运行点 Re-run 重试发布。"
+          else
+            gh pr comment "$PR_NUMBER" --body "AI 审查失败"
+          fi
 
       - name: Mark job failed
         if: steps.review.outputs.status == 'failed'
