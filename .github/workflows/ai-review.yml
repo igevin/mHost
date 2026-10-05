@@ -38,10 +38,13 @@ env:
 
 jobs:
   ai-review:
-    # fork PR 在 pull_request 触发下拿不到 secrets，直接跳过；手动触发不受限
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.fork != true }}
+    # fork PR 在 pull_request 触发下拿不到 secrets，直接跳过；手动触发不受限。
+    # 用 == false 而非 != true：head.repo 异常为 null 时整体为假，fail-closed
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.fork == false }}
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # job 级余量要盖过内层 timeout 480s + 检出/安装，否则 claude 跑满内层
+    # 超时会连"Post failure notice"一起被拦腰截断，PR 拿不到失败说明
+    timeout-minutes: 15
     # 模型密钥（ZHIPU_API_KEY）挂在 LLM environment 上；该环境无保护规则，
     # fork PR 已在上方 if 跳过，不受环境密钥对 fork 不可用的限制
     environment: LLM
@@ -76,13 +79,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EVENT_BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             head=$(gh pr view "$PR_NUMBER" --json headRefOid -q .headRefOid)
             base_ref=$(gh pr view "$PR_NUMBER" --json baseRefName -q .baseRefName)
           else
-            head="${{ github.event.pull_request.head.sha }}"
-            base_ref="${{ github.event.pull_request.base.ref }}"
+            head="$EVENT_HEAD_SHA"
+            base_ref="$EVENT_BASE_REF"
           fi
           # 工作树钉住触发事件的 head，运行期间新 push 不会改变检出内容
           git checkout -q "$head"
@@ -98,12 +103,27 @@ jobs:
           # 与 .mcp.json 会在 -p 模式下被自动执行/加载且无审批门，而
           # workflow_dispatch 复审 fork PR 是设计内场景——fork 作者可以
           # 在 PR 里植入它们，故运行前一律清除。
-          # CLAUDE.md/AGENTS.md 会被 claude 自动加载，取 base 分支版本，
-          # 防止 PR 作者改写审查标准；base 上没有就删掉。
+          # CLAUDE.md/CLAUDE.local.md/AGENTS.md（含子目录级，读取对应目录
+          # 文件时自动加载）会被 claude 吸收进上下文，全部清除后仅恢复
+          # base 版的根文件，PR 作者无法借此改写审查口径。
           rm -rf .claude .mcp.json
-          for f in CLAUDE.md AGENTS.md; do
-            git show "$BASE:$f" > "$f" 2>/dev/null || rm -f "$f"
-          done
+          find . -not -path './.git/*' \( -name 'CLAUDE.md' -o -name 'CLAUDE.local.md' -o -name 'AGENTS.md' \) -delete
+          git show "$BASE:CLAUDE.md" > CLAUDE.md 2>/dev/null || true
+          git show "$BASE:AGENTS.md" > AGENTS.md 2>/dev/null || true
+          # 密钥经进程环境注入后 /proc/self/environ 仍是 Read 可达的文件，
+          # 用 deny 规则封禁内核伪文件系统（deny 优先于 allowedTools；
+          # // 前缀为绝对路径规则，已在 claude-code 2.1.x 上实测生效）
+          cat > "$RUNNER_TEMP/ai-review-guard.json" <<'EOF'
+          {
+            "permissions": {
+              "deny": [
+                "Read(//proc/**)",
+                "Read(//sys/**)",
+                "Read(//dev/**)"
+              ]
+            }
+          }
+          EOF
 
       - name: Build diff with size guard
         id: diff
@@ -161,8 +181,8 @@ jobs:
         id: review
         if: steps.gate.outputs.skip == 'false'
         env:
-          # 密钥只经进程环境注入 claude，不写入 settings.json——
-          # 环境变量对 Read/Grep 工具不可见，diff 里的注入指令拿不到它
+          # 密钥只经进程环境注入 claude，不写入 settings.json；/proc、/sys、
+          # /dev 的读取面由 sanitize 步骤写出的 deny 规则封禁
           ANTHROPIC_BASE_URL: https://open.bigmodel.cn/api/anthropic
           ANTHROPIC_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
           ANTHROPIC_AUTH_TOKEN: ${{ secrets.ZHIPU_API_KEY }}
@@ -172,6 +192,7 @@ jobs:
           timeout 480 claude -p "$(cat ai-review-prompt.md)" \
             --allowedTools "Read,Grep,Glob" \
             --strict-mcp-config \
+            --settings "$RUNNER_TEMP/ai-review-guard.json" \
             --max-turns 40 \
             --output-format json \
             < pr.diff > review.json
