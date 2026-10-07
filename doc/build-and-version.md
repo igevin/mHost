@@ -6,8 +6,8 @@ mHost 有三个地方写着版本号，它们各自影响不同的东西：
 
 | 文件 | 字段 | 当前版本 | 用途 | 影响出包名 | 影响 check_update |
 |-----|------|---------|------|-----------|-------------------|
-| `src-tauri/tauri.conf.json` | `version` | `0.3.2` | Tauri 应用版本（出包文件名） | **是** | 否 |
-| `package.json` | `version` | `0.3.2` | 前端版本，通过 `vite.config.ts` 注入为 `__APP_VERSION__` | 否 | **是** |
+| `src-tauri/tauri.conf.json` | `version` | `0.4.0` | Tauri 应用版本（出包文件名） | **是** | 否 |
+| `package.json` | `version` | `0.4.0` | 前端版本，通过 `vite.config.ts` 注入为 `__APP_VERSION__` | 否 | **是** |
 | `src-tauri/Cargo.toml` | `version` | `0.1.0` | Rust crate 版本 | 否 | 否 |
 
 ### `__APP_VERSION__` 的版本来源
