@@ -180,7 +180,7 @@ mHost 采用 **Tauri 2** 构建：Rust 实现核心逻辑，Web 前端负责界�
 
 ## 项目状态
 
-- 当前版本：v0.3.3（见 [Releases](https://github.com/igevin/mHost/releases)）
+- 当前版本：v0.4.0（见 [Releases](https://github.com/igevin/mHost/releases)）
 - 开源协议：Apache License 2.0
 - Hosts 模式已在 macOS / Windows / Linux 规划内落地推进，DNS 模式已随 v0.2 发布（详见上文平台支持表）
 - 项目持续活跃开发中，采用分阶段交付（`spec/` 目录存档各阶段计划），历史问题审计与性能优化记录公开可查
