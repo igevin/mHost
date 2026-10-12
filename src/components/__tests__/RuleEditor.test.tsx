@@ -216,7 +216,7 @@ describe("RuleEditor", () => {
       await vi.runAllTimersAsync();
     });
 
-    const warningEl = screen.getByText(/冗余.*example.com/);
+    const warningEl = screen.getByText(/Duplicate.*example\.com/);
     expect(warningEl).toBeInTheDocument();
     expect(warningEl.className).toMatch(/warningItem/);
     expect(onErrorChange).toHaveBeenCalledWith(false);
@@ -246,7 +246,7 @@ describe("RuleEditor", () => {
       await vi.runAllTimersAsync();
     });
 
-    const errorEl = screen.getByText(/冲突.*example.com/);
+    const errorEl = screen.getByText(/Conflict.*example\.com/);
     expect(errorEl).toBeInTheDocument();
     expect(errorEl.className).toMatch(/errorItem/);
     expect(onErrorChange).toHaveBeenCalledWith(true);
@@ -274,7 +274,7 @@ describe("RuleEditor", () => {
       await vi.runAllTimersAsync();
     });
 
-    expect(screen.queryByText(/冗余|冲突/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Duplicate|Conflict/)).not.toBeInTheDocument();
   });
 
   describe("Search & Replace", () => {

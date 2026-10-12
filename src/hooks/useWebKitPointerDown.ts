@@ -18,21 +18,34 @@ export const POINTER_DOWN_DEBOUNCE_MS = 50;
  * read modifiers (`metaKey`, `altKey`) — e.g. issue #123's Quick Apply
  * override that holds Cmd/Option to force the Preview dialog.
  *
- * Usage:
- *   const { fire, release, onPointerDown } = useWebKitPointerDown();
+ * Two supported call-site patterns — pick exactly one per button:
  *
- *   <button onPointerDown={onPointerDown((e) => handleCancel(e.metaKey))} />
+ * **A. Wrapper (handler does NOT own a guard).** For plain buttons whose
+ * handler has no `fire()` call of its own:
  *
- *   // Sync toggles guarded from double-fire (issue #123). Both `onClick`
- *   // and `onPointerDown` feed `handleToggle()`, which calls `fire()` +
- *   // `releaseSoon()` itself. The wrapper is **not** used here — that
- *   // would double-consume `firedRef` (the wrapper calls `fire()` before
- *   // dispatching the handler) and drop every gesture on the floor.
+ *   const { onPointerDown } = useWebKitPointerDown();
+ *   <button onClick={handleSave} onPointerDown={onPointerDown(handleSave)} />
+ *
+ * **B. Handler-owned guard (both events feed one handler).** For toggles
+ * and async actions that must dedupe the pointerdown+click pair across a
+ * longer window (issue #123/#149 legacy): the handler calls `fire()` +
+ * `releaseSoon()` itself, and `onPointerDown` is bound with only an inline
+ * `e.button !== 0` filter — NEVER through the wrapper, which would
+ * double-consume `firedRef` and drop every gesture on the floor:
+ *
+ *   const { fire, releaseSoon } = useWebKitPointerDown();
  *   const handleToggle = () => {
  *     if (!fire()) return;
  *     releaseSoon();
  *     doWork();
  *   };
+ *   <button
+ *     onClick={handleToggle}
+ *     onPointerDown={(e) => { if (e.button !== 0) return; handleToggle(); }}
+ *   />
+ *
+ * Use a separate hook instance per independent action (e.g. SnapshotPanel's
+ * save/rollback/delete guards) so one action's latch can't block another's.
  */
 export function useWebKitPointerDown() {
   const firedRef = useRef(false);

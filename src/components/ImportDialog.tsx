@@ -32,6 +32,9 @@ function ImportDialog({ open, onClose, mode = "create", onImported, onRulesParse
   const [importError, setImportError] = useState<string | null>(null);
   const validateTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const { fire, release, onPointerDown } = useWebKitPointerDown();
+  // Separate instance for the source-selector tabs so a tab pointerdown
+  // can't consume the import button's guard within the debounce window.
+  const sourceGuard = useWebKitPointerDown();
 
   // Reset state when dialog opens/closes
   useEffect(() => {
@@ -231,21 +234,21 @@ function ImportDialog({ open, onClose, mode = "create", onImported, onRulesParse
             <button
               className={`btn btn-sm ${source === "text" ? "btn-primary" : "btn-ghost"}`}
               onClick={() => handleSourceChange("text")}
-              onPointerDown={(e) => { if (e.button === 0) handleSourceChange("text"); }}
+              onPointerDown={sourceGuard.onPointerDown(() => handleSourceChange("text"))}
             >
               Paste Text
             </button>
             <button
               className={`btn btn-sm ${source === "file-hosts" ? "btn-primary" : "btn-ghost"}`}
               onClick={() => handleSourceChange("file-hosts")}
-              onPointerDown={(e) => { if (e.button === 0) handleSourceChange("file-hosts"); }}
+              onPointerDown={sourceGuard.onPointerDown(() => handleSourceChange("file-hosts"))}
             >
               Hosts File
             </button>
             <button
               className={`btn btn-sm ${source === "file-json" ? "btn-primary" : "btn-ghost"}`}
               onClick={() => handleSourceChange("file-json")}
-              onPointerDown={(e) => { if (e.button === 0) handleSourceChange("file-json"); }}
+              onPointerDown={sourceGuard.onPointerDown(() => handleSourceChange("file-json"))}
             >
               JSON File
             </button>
@@ -318,8 +321,8 @@ function ImportDialog({ open, onClose, mode = "create", onImported, onRulesParse
                 className={dup.kind === "different_ip" ? styles.errorItem : styles.warningItem}
               >
                 {dup.kind === "different_ip"
-                  ? `冲突: 域名 "${dup.domain}" 映射到不同 IP (行 ${dup.lines.join(", ")})`
-                  : `冗余: 域名 "${dup.domain}" 重复出现 (行 ${dup.lines.join(", ")})`}
+                  ? `Conflict: domain "${dup.domain}" maps to different IPs (lines ${dup.lines.join(", ")})`
+                  : `Duplicate: domain "${dup.domain}" appears more than once (lines ${dup.lines.join(", ")})`}
               </div>
             ))}
           </div>

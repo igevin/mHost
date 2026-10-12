@@ -46,6 +46,7 @@ import {
   addAdBlockWhitelistMany,
   removeAdBlockWhitelist,
   removeAdBlockWhitelistMany,
+  queryDomain,
 } from "../../lib/tauri";
 import { extractErrorMessage, isPreviewRequired } from "../../lib/error";
 import { decideApplyMode } from "../../lib/applyPolicy";
@@ -77,6 +78,9 @@ import {
   adBlockOverlapReportAtom,
   quickApplyOutcomeAtom,
   isQuickApplyToastOpenAtom,
+  paletteQueryAtom,
+  paletteResultsAtom,
+  paletteHistoryAtom,
 } from "./state";
 
 // ---- Async action atoms ----
@@ -1124,4 +1128,40 @@ export const fetchAdBlockWhitelistAtom = atom(null, async () => {
 
 export const fetchAdBlockSourcesAtom = atom(null, async () => {
   return listAdBlockSources();
+});
+
+// ---- Command palette (issue #124) ----
+
+/**
+ * Run a `query_domain` IPC for the palette. Response-order guard: the
+ * palette debounces keystrokes (100ms) but two IPCs can still land out of
+ * order — a late response for a stale query must not overwrite the current
+ * results. Empty query clears results without an IPC.
+ */
+export const queryDomainAtom = atom(null, async (get, set, query: string) => {
+  const trimmed = query.trim();
+  if (!trimmed) {
+    set(paletteResultsAtom, null);
+    return;
+  }
+  try {
+    const result = await queryDomain(trimmed);
+    if (get(paletteQueryAtom).trim() === trimmed) {
+      set(paletteResultsAtom, result);
+    }
+  } catch {
+    // Lookup failure is non-fatal for a palette — degrade to commands only.
+    if (get(paletteQueryAtom).trim() === trimmed) {
+      set(paletteResultsAtom, null);
+    }
+  }
+});
+
+/** Push an executed query onto the persisted history (deduped, cap 5). */
+export const pushPaletteHistoryAtom = atom(null, (_get, set, query: string) => {
+  const trimmed = query.trim();
+  if (!trimmed) return;
+  set(paletteHistoryAtom, (prev) =>
+    [trimmed, ...prev.filter((h) => h !== trimmed)].slice(0, 5),
+  );
 });

@@ -15,8 +15,8 @@
 /* ---- Info Bar (collapsible basic info) ---- */
 
 .infoBar {
-  background: var(--color-surface);
-  border: 1px solid var(--color-border);
+  background: var(--surface);
+  border: 1px solid var(--rule);
   border-radius: var(--radius-md);
   margin-bottom: 16px;
   flex-shrink: 0;
@@ -40,17 +40,17 @@
 }
 
 .infoBarName {
-  font-size: 14px;
+  font-size: var(--font-size-lg);
   font-weight: 600;
-  color: var(--color-text);
+  color: var(--ink);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
 .infoBarDesc {
-  font-size: 13px;
-  color: var(--color-text-secondary);
+  font-size: var(--font-size-md);
+  color: var(--ink-soft);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -69,16 +69,16 @@
   display: inline-block;
   padding: 1px 8px;
   border-radius: 999px;
-  background: var(--color-bg);
-  border: 1px solid var(--color-border);
-  font-size: 11px;
-  color: var(--color-text-secondary);
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  font-size: var(--font-size-xs);
+  color: var(--ink-soft);
 }
 
 .infoBarEditLink {
-  font-size: 12px;
+  font-size: var(--font-size-sm);
   font-weight: 500;
-  color: var(--color-primary);
+  color: var(--accent);
   cursor: pointer;
   flex-shrink: 0;
   background: none;
@@ -88,7 +88,7 @@
 }
 
 .infoBarEditLink:hover {
-  color: var(--color-primary-hover);
+  color: var(--accent-hover);
 }
 
 .infoBarExpanded {
@@ -144,7 +144,7 @@
   font-size: 18px;
   font-weight: 700;
   margin: 0;
-  color: var(--color-text);
+  color: var(--ink);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -163,49 +163,49 @@
   gap: 4px;
   padding: 2px 10px;
   border-radius: 999px;
-  font-size: 11px;
+  font-size: var(--font-size-xs);
   font-weight: 600;
   white-space: nowrap;
 }
 
 .badgeEnabled {
-  background: var(--green-light);
-  color: var(--green);
+  background: var(--success-soft);
+  color: var(--success);
 }
 
 .badgeDisabled {
-  background: var(--color-border-secondary);
-  color: var(--color-text-muted);
+  background: var(--rule-soft);
+  color: var(--ink-muted);
 }
 
 .badgeProtected {
-  background: var(--yellow-light);
-  color: var(--yellow);
+  background: var(--warning-soft);
+  color: var(--warning);
 }
 
 .badgeRules {
-  background: var(--color-bg);
-  color: var(--color-text-secondary);
-  border: 1px solid var(--color-border);
+  background: var(--paper);
+  color: var(--ink-soft);
+  border: 1px solid var(--rule);
 }
 
 .badgeReadOnly {
-  background: var(--color-border-secondary);
-  color: var(--color-text-muted);
+  background: var(--rule-soft);
+  color: var(--ink-muted);
 }
 
 .badgeEditing {
-  background: var(--accent-light);
-  color: var(--color-primary);
+  background: var(--accent-soft);
+  color: var(--accent);
 }
 
 .badgeModeHosts {
-  background: var(--accent-light);
+  background: var(--accent-soft);
   color: var(--accent);
 }
 
 .badgeModeDns {
-  background: var(--purple-light);
+  background: var(--purple-soft);
   color: var(--purple);
 }
 
@@ -244,7 +244,7 @@
 }
 
 .rulesTitle {
-  font-size: 13px;
+  font-size: var(--font-size-md);
   font-weight: 500;
   margin: 0;
   color: var(--ink);

@@ -11,6 +11,7 @@ import {
   dnsProfilesAtom,
   enabledDnsProfilesAtom,
   dnsRuleCountAtom,
+  isDnsLoadingAtom,
   systemDnsAtom,
 } from "../../stores/profiles";
 
@@ -18,6 +19,36 @@ import {
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
 }));
+
+// Phase 2: DNS switch tests drive `toggleDnsModeAtom`, which calls the
+// lib/tauri wrappers (setDnsMode / getDnsStatus / probeSystemDns /
+// cancelDnsMode). Mock them at the lib boundary (same pattern as
+// Settings.test.tsx) so assertions target our mocks, not invoke shapes.
+const mockSetDnsMode = vi.fn().mockResolvedValue(undefined);
+const mockCancelDnsMode = vi.fn().mockResolvedValue(undefined);
+vi.mock("../../lib/tauri", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../lib/tauri")>();
+  return {
+    ...actual,
+    getDnsMode: vi.fn().mockResolvedValue(false),
+    setDnsMode: (...args: unknown[]) => mockSetDnsMode(...args),
+    cancelDnsMode: (...args: unknown[]) => mockCancelDnsMode(...args),
+    getDnsStatus: vi.fn().mockResolvedValue({
+      running: true,
+      port: 53,
+      upstream: ["8.8.8.8"],
+      original_dns: { kind: "manual", servers: ["192.168.1.1"] },
+      rule_count: 0,
+      cache_capacity: 100,
+    }),
+    probeSystemDns: vi.fn().mockResolvedValue({
+      interface: "Wi-Fi",
+      servers: ["192.168.1.1"],
+      points_at_loopback: false,
+    }),
+    reloadDnsRules: vi.fn().mockResolvedValue(undefined),
+  };
+});
 
 import StatusBar from "../../components/StatusBar";
 
@@ -63,10 +94,16 @@ function Wrapper({ children }: { children: React.ReactNode }) {
 
 /** issue #232: 让断言能看见路由落点。仓库里此前没有导航断言的先例，
  *  所以这里用最小探针而不是 mock `useNavigate` —— mock 掉之后
- *  `handleDnsClick` 里的分支就测不到了。 */
+ *  `handleDnsClick` 里的分支就测不到了。
+ *  Phase 2: 附带 location.state（stuck 态跳转带 highlightDnsDiscrepancy）。 */
 function LocationProbe() {
   const location = useLocation();
-  return <div data-testid="location">{location.pathname}</div>;
+  return (
+    <div data-testid="location">
+      {location.pathname}
+      {location.state ? ` ${JSON.stringify(location.state)}` : ""}
+    </div>
+  );
 }
 
 function makeProbe(pointsAtLoopback: boolean) {
@@ -459,5 +496,170 @@ describe("StatusBar — stuck_at_loopback warning (issue #232)", () => {
 
     expect(screen.queryByTestId("dns-stuck-warning")).not.toBeInTheDocument();
     expect(screen.getByText("Off")).toBeInTheDocument();
+  });
+
+  it("stuck navigation carries highlightDnsDiscrepancy in location.state (Phase 2)", () => {
+    const store = getDefaultStore();
+    store.set(dnsEnabledAtom, false);
+    store.set(systemDnsAtom, makeProbe(true));
+
+    render(
+      <Wrapper>
+        <StatusBar />
+        <LocationProbe />
+      </Wrapper>,
+    );
+
+    fireEvent.click(screen.getByTestId("dns-status-card"));
+    expect(screen.getByTestId("location")).toHaveTextContent(
+      '/settings {"highlightDnsDiscrepancy":true}',
+    );
+  });
+
+  it("does not render the DNS mode switch while stuck (restore belongs to Settings)", () => {
+    const store = getDefaultStore();
+    store.set(dnsEnabledAtom, false);
+    store.set(systemDnsAtom, makeProbe(true));
+
+    render(
+      <Wrapper>
+        <StatusBar />
+      </Wrapper>,
+    );
+
+    expect(screen.queryByTestId("dns-mode-switch")).not.toBeInTheDocument();
+  });
+});
+
+/**
+ * Phase 2: DNS 卡内嵌 mini switch —— 直接走 `toggleDnsModeAtom` 开关
+ * DNS 模式，toggle 进行中露出 Cancel（issue #149 的 AbortController
+ * 路径，与 Settings 页同一约定：Cancel 是兄弟节点，不是同位 swap）。
+ */
+describe("StatusBar — DNS mode switch (Phase 2)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    const store = getDefaultStore();
+    store.set(profilesAtom, []);
+    store.set(isApplyingAtom, false);
+    store.set(dnsEnabledAtom, false);
+    store.set(dnsProfilesAtom, []);
+    store.set(isDnsLoadingAtom, false);
+    store.set(systemDnsAtom, null);
+  });
+
+  function switchLabel(): HTMLLabelElement {
+    const input = screen.getByTestId("dns-mode-switch");
+    const label = input.closest("label");
+    if (!label) throw new Error("dns switch label not found");
+    return label as HTMLLabelElement;
+  }
+
+  it("flipping the switch ON calls setDnsMode(true)", async () => {
+    render(
+      <Wrapper>
+        <StatusBar />
+      </Wrapper>,
+    );
+
+    await act(async () => {
+      fireEvent.click(switchLabel());
+    });
+
+    // issue #149: setDnsMode 的第一个参数是 toggle 意图，第二个是
+    // AbortController signal。
+    expect(mockSetDnsMode).toHaveBeenCalledWith(true, expect.anything());
+  });
+
+  it("flipping the switch OFF when enabled calls setDnsMode(false)", async () => {
+    const store = getDefaultStore();
+    store.set(dnsEnabledAtom, true);
+
+    render(
+      <Wrapper>
+        <StatusBar />
+      </Wrapper>,
+    );
+
+    await act(async () => {
+      fireEvent.click(switchLabel());
+    });
+
+    expect(mockSetDnsMode).toHaveBeenCalledWith(false, expect.anything());
+  });
+
+  it("debounces the WebKit pointerdown+click pair (single toggle per gesture)", async () => {
+    render(
+      <Wrapper>
+        <StatusBar />
+      </Wrapper>,
+    );
+
+    await act(async () => {
+      fireEvent.pointerDown(switchLabel(), { button: 0 });
+      fireEvent.click(switchLabel());
+    });
+
+    expect(mockSetDnsMode).toHaveBeenCalledTimes(1);
+  });
+
+  it("clicking the switch does not trigger the card navigation", () => {
+    render(
+      <Wrapper>
+        <StatusBar />
+        <LocationProbe />
+      </Wrapper>,
+    );
+
+    fireEvent.click(switchLabel());
+
+    // stopPropagation：switch 的点击不能冒泡成卡片导航
+    expect(screen.getByTestId("location")).toHaveTextContent("/");
+  });
+
+  it("shows a Cancel sibling and disables the switch while a toggle is in flight", async () => {
+    // 挂起 set_dns_mode，让 toggle 停在 in-flight 状态。
+    mockSetDnsMode.mockImplementation(() => new Promise(() => {}));
+
+    render(
+      <Wrapper>
+        <StatusBar />
+      </Wrapper>,
+    );
+
+    await act(async () => {
+      fireEvent.click(switchLabel());
+    });
+
+    const cancelBtn = screen.getByTestId("dns-cancel-button");
+    expect(cancelBtn).toBeInTheDocument();
+    expect(screen.getByTestId("dns-mode-switch")).toBeDisabled();
+    // issue #149 的关键不变量：Cancel 与 switch 同时存在（兄弟节点），
+    // 而不是同位 swap —— trailing click 不会落到新挂载的 Cancel 上。
+    expect(screen.getByTestId("dns-mode-switch")).toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.click(cancelBtn);
+    });
+
+    // cancelActiveDnsToggle：abort + 后端 cancel_dns_mode IPC。
+    expect(mockCancelDnsMode).toHaveBeenCalled();
+  });
+
+  it("switch is inert while isDnsLoadingAtom is set", async () => {
+    const store = getDefaultStore();
+    store.set(isDnsLoadingAtom, true);
+
+    render(
+      <Wrapper>
+        <StatusBar />
+      </Wrapper>,
+    );
+
+    await act(async () => {
+      fireEvent.click(switchLabel());
+    });
+
+    expect(mockSetDnsMode).not.toHaveBeenCalled();
   });
 });

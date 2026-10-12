@@ -36,7 +36,10 @@ function SearchBar({
   const [replaceExpanded, setReplaceExpanded] = useState(false);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const { onPointerDown } = useWebKitPointerDown();
-  // Separate guard for toggle to prevent double-fire from onClick + onPointerDown
+  // Separate guard for the Replace toggle: it binds BOTH onClick and
+  // onPointerDown, so it owns fire()+releaseSoon() itself (the shared
+  // `onPointerDown` wrapper must not wrap it — that would double-consume
+  // the dedupe ref, see useWebKitPointerDown docs).
   const toggleGuard = useWebKitPointerDown();
 
   useEffect(() => {
@@ -64,8 +67,8 @@ function SearchBar({
 
   const handleToggleReplace = useCallback(() => {
     if (!toggleGuard.fire()) return;
+    toggleGuard.releaseSoon();
     setReplaceExpanded((prev) => !prev);
-    setTimeout(toggleGuard.release, 50);
   }, [toggleGuard]);
 
   const matchDisplay = matchCount > 0 ? `${currentMatchIndex + 1}/${matchCount}` : "0/0";
@@ -107,7 +110,10 @@ function SearchBar({
           <button
             className={`${styles.actionButton} ${replaceExpanded ? styles.actionButtonActive : ""}`}
             onClick={handleToggleReplace}
-            onPointerDown={onPointerDown(handleToggleReplace)}
+            onPointerDown={(e) => {
+              if (e.button !== 0) return;
+              handleToggleReplace();
+            }}
             data-testid="toggle-replace"
           >
             Replace

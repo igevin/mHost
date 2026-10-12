@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { extractErrorMessage } from "../lib/error";
-import styles from "./RollbackButton.module.css";
+import ConfirmDialog from "./ConfirmDialog";
 
 interface RollbackButtonProps {
   onRollback: () => Promise<void>;
@@ -44,38 +44,19 @@ function RollbackButton({ onRollback }: RollbackButtonProps) {
         Rollback
       </button>
 
-      {showConfirm && (
-        <div className={styles.overlay} role="dialog" aria-modal="true">
-          <div className={styles.dialog}>
-            <h3 className={styles.dialogTitle}>Confirm Rollback</h3>
-            <p className={styles.dialogMessage}>
-              Are you sure you want to rollback the hosts file to the previous
-              backup? This will replace the current hosts file.
-            </p>
-
-            {error && (
-              <div className="alert alert-error">{error}</div>
-            )}
-
-            <div className={styles.dialogActions}>
-              <button
-                className="btn btn-ghost"
-                onClick={handleCancel}
-                disabled={isRollingBack}
-              >
-                Cancel
-              </button>
-              <button
-                className="btn btn-danger"
-                onClick={handleConfirm}
-                disabled={isRollingBack}
-              >
-                {isRollingBack ? "Rolling back..." : "Confirm"}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      <ConfirmDialog
+        open={showConfirm}
+        title="Confirm Rollback"
+        message="Are you sure you want to rollback the hosts file to the previous backup? This will replace the current hosts file."
+        confirmLabel="Confirm"
+        loadingLabel="Rolling back..."
+        danger
+        isLoading={isRollingBack}
+        onConfirm={handleConfirm}
+        onCancel={handleCancel}
+      >
+        {error && <div className="alert alert-error">{error}</div>}
+      </ConfirmDialog>
     </>
   );
 }

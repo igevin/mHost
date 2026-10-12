@@ -294,3 +294,26 @@ export interface SnapshotMeta {
   profile_count: number;
   created_at: string;
 }
+
+/* ---- Command palette domain lookup (issue #124) ----
+ * Mirrors the tagged union in src-tauri/src/commands/query.rs. */
+
+export type RuleMatchSource =
+  | { type: "system_hosts"; line: number }
+  | { type: "profile"; id: string; name: string; line: number; enabled: boolean }
+  | { type: "dns_rule"; id: string; name: string; line: number };
+
+export interface RuleMatch {
+  domain: string;
+  ip: string;
+  source: RuleMatchSource;
+  /** false → grayed out; the rule can't win resolution. */
+  effective: boolean;
+  /** Exactly one match — the one that actually wins. */
+  is_winner: boolean;
+}
+
+export interface QueryDomainResult {
+  query: string;
+  matches: RuleMatch[];
+}

@@ -8,7 +8,8 @@ pub mod tray_logic;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 use commands::{
-    adblock::*, apply::*, dns::*, profile::*, profile_io::*, snapshot::*, update::*, validate::*,
+    adblock::*, apply::*, dns::*, profile::*, profile_io::*, query::*, snapshot::*, update::*,
+    validate::*,
 };
 use state::AppState;
 use tauri::{Manager, RunEvent};
@@ -163,6 +164,8 @@ pub fn run() {
             probe_system_dns,
             list_dns_profiles,
             cancel_dns_mode,
+            // issue #124: 命令面板的域名查询（只读聚合）
+            query_domain,
             // 广告屏蔽（issue #130）
             get_ad_block_state,
             get_ad_block_limits,

@@ -4,25 +4,25 @@
   position: fixed;
   inset: 0;
   background: rgba(0, 0, 0, 0.3);
-  z-index: 400; /* above ManagementDrawer (300) */
+  z-index: 200; /* Z_INDEX.CREATE_OVERLAY */
   display: flex;
   align-items: center;
   justify-content: center;
 }
 
 .dialog {
-  background: var(--color-surface);
-  border: 1px solid var(--color-border);
+  background: var(--surface);
+  border: 1px solid var(--rule);
   border-radius: var(--radius-md);
   padding: 16px 20px;
   width: 360px;
   box-shadow: var(--shadow-md);
-  z-index: 410;
+  z-index: 210; /* Z_INDEX.CREATE_CONTENT */
 }
 
 .title {
-  font-size: 14px;
+  font-size: var(--font-size-lg);
   font-weight: 600;
   margin-bottom: 12px;
-  color: var(--color-text);
+  color: var(--ink);
 }

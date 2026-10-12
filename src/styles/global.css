@@ -63,6 +63,12 @@
   --font-sans: 'Geist', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 
+  /* ---- Type scale (UI text; display/heading sizes stay literal) ---- */
+  --font-size-xs: 11px;
+  --font-size-sm: 12px;
+  --font-size-md: 13px;
+  --font-size-lg: 14px;
+
   /* ---- Surfaces (paper) ---- */
   --paper: #FAF7EE;
   --surface: #FCF9F2;
@@ -118,49 +124,9 @@
   --transition-fast: 120ms ease;
   --transition-normal: 180ms ease;
 
-  /* ---- Legacy aliases (kept for backwards compat with .module.css files) ---- */
-  /* These MUST mirror the new token names above so module CSS keeps working. */
-  --color-bg: var(--paper);
-  --color-surface: var(--surface);
-  --color-sidebar: var(--sidebar-bg);
-  --color-sidebar-hover: var(--sidebar-hover);
-  --color-sidebar-active: var(--sidebar-active);
-  --color-text: var(--ink);
-  --color-text-secondary: var(--ink-soft);
-  --color-text-muted: var(--ink-muted);
-  --color-border: var(--rule);
-  --color-border-secondary: var(--rule-soft);
-  --color-primary: var(--accent);
-  --color-primary-hover: var(--accent-hover);
-  --color-primary-contrast: var(--accent-contrast);
-  --color-surface-elevated: var(--surface);
-  --color-danger: var(--danger);
-  --color-danger-hover: var(--danger-hover);
-  --color-success: var(--success);
-  --color-warning: var(--warning);
-  --color-error-bg: var(--danger-soft);
-  --color-error-border: var(--danger-soft);
-  --color-success-bg: var(--success-soft);
-  --color-success-border: var(--success-soft);
-  --color-warning-bg: var(--warning-soft);
-  --color-warning-border: var(--warning-soft);
-  --color-readonly-bg: var(--sidebar-bg);
-  --color-input-bg: var(--input-bg);
-  --color-scrollbar: var(--scrollbar);
-
-  /* Pre-existing alias names that module CSS still references. */
-  --accent-light: var(--accent-soft);
-  --accent-lighter: var(--accent-soft);
-  --green: var(--success);
-  --green-light: var(--success-soft);
-  --red: var(--danger);
-  --red-light: var(--danger-soft);
-  --yellow: var(--warning);
-  --yellow-light: var(--warning-soft);
-  /* (issue #125 review): removed `--orange: var(--accent)` alias. It was
+  /* (issue #125 review): there is deliberately no `--orange` alias. It was
    * never referenced by any module CSS, and mapping "orange" → blue
    * silently broke any future caller that wanted a literal orange. */
-  --purple-light: var(--purple-soft);
 }
 
 @media (prefers-color-scheme: dark) {
@@ -217,7 +183,7 @@ body,
 
 body {
   font-family: var(--font-sans);
-  font-size: 14px;
+  font-size: var(--font-size-lg);
   line-height: 1.5;
   color: var(--ink);
   background: var(--paper);
@@ -279,7 +245,7 @@ body {
 .mhost-page-subtitle {
   margin: 2px 0 0;
   color: var(--ink-soft);
-  font-size: 13px;
+  font-size: var(--font-size-md);
 }
 
 .mhost-page-actions {
@@ -307,7 +273,7 @@ body {
 }
 
 .card-title {
-  font-size: 14px;
+  font-size: var(--font-size-lg);
   font-weight: 600;
   margin: 0 0 14px;
   color: var(--ink);
@@ -329,7 +295,7 @@ body {
   border-radius: var(--radius-sm);
   border: 1px solid transparent;
   font-family: var(--font-mono);
-  font-size: 13px;
+  font-size: var(--font-size-md);
   font-weight: 500;
   cursor: pointer;
   transition: background var(--transition-fast), color var(--transition-fast),
@@ -380,7 +346,7 @@ body {
 
 .btn-sm {
   padding: 4px 10px;
-  font-size: 12px;
+  font-size: var(--font-size-sm);
 }
 
 /* =====================================================================
@@ -394,7 +360,7 @@ body {
 
 .form-label {
   display: block;
-  font-size: 12px;
+  font-size: var(--font-size-sm);
   font-weight: 500;
   margin-bottom: 6px;
   color: var(--ink-soft);
@@ -403,7 +369,7 @@ body {
 }
 
 .form-static {
-  font-size: 14px;
+  font-size: var(--font-size-lg);
   padding: 7px 0;
 }
 
@@ -420,7 +386,7 @@ body {
   border: 1px solid var(--rule);
   border-radius: var(--radius-sm);
   font-family: var(--font-mono);
-  font-size: 13px;
+  font-size: var(--font-size-md);
   background: var(--input-bg);
   color: var(--ink);
   outline: none;
@@ -442,7 +408,7 @@ body {
   border: 1px solid var(--rule);
   border-radius: var(--radius-sm);
   font-family: var(--font-mono);
-  font-size: 13px;
+  font-size: var(--font-size-md);
   line-height: 1.6;
   background: var(--surface);
   color: var(--ink);
@@ -530,7 +496,7 @@ body {
   background: var(--sidebar-bg);
   border: 1px solid var(--rule-soft);
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: var(--font-size-xs);
   color: var(--ink-soft);
   letter-spacing: 0.01em;
 }
@@ -543,7 +509,7 @@ body {
 .alert {
   padding: 10px 14px;
   border-radius: var(--radius-sm);
-  font-size: 13px;
+  font-size: var(--font-size-md);
   margin-bottom: 14px;
   border: 1px solid var(--rule);
 }
@@ -566,7 +532,7 @@ body {
 }
 
 .empty-hint {
-  font-size: 13px;
+  font-size: var(--font-size-md);
   color: var(--ink-muted);
   margin-top: 4px;
 }
@@ -575,7 +541,7 @@ body {
   padding: 20px;
   text-align: center;
   color: var(--ink-muted);
-  font-size: 13px;
+  font-size: var(--font-size-md);
   font-family: var(--font-mono);
 }
 
@@ -592,7 +558,7 @@ body {
   padding: 2px 10px;
   border-radius: 999px;
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: var(--font-size-xs);
   font-weight: 500;
   background: var(--sidebar-bg);
   color: var(--ink-soft);
@@ -635,7 +601,7 @@ body {
   padding: 1px 7px;
   border-radius: var(--radius-sm);
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: var(--font-size-xs);
   font-weight: 500;
   background: var(--sidebar-bg);
   color: var(--ink-muted);

@@ -4,14 +4,14 @@
   right: 16px;
   width: 360px;
   max-width: calc(100vw - 32px);
-  background: var(--color-surface);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-md, 6px);
-  box-shadow: var(--shadow-md, 0 4px 12px rgba(0, 0, 0, 0.15));
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
   padding: 12px 16px;
   z-index: 1100; /* above ApplyConfirmDialog (1000) */
-  font-size: 13px;
-  color: var(--color-text);
+  font-size: var(--font-size-md);
+  color: var(--ink);
 }
 
 .header {
@@ -34,17 +34,17 @@
   cursor: pointer;
   font-size: 18px;
   line-height: 1;
-  color: var(--color-text-muted, #888);
+  color: var(--ink-muted);
   padding: 0 4px;
 }
 
 .closeBtn:hover {
-  color: var(--color-text);
+  color: var(--ink);
 }
 
 .meta {
-  font-size: 12px;
-  color: var(--color-text-muted, #888);
+  font-size: var(--font-size-sm);
+  color: var(--ink-muted);
   margin-bottom: 8px;
 }
 

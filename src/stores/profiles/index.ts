@@ -36,6 +36,10 @@ export {
   quickApplyOnToggleAtom,
   quickApplyOutcomeAtom,
   isQuickApplyToastOpenAtom,
+  paletteOpenAtom,
+  paletteQueryAtom,
+  paletteResultsAtom,
+  paletteHistoryAtom,
 } from "./state";
 
 // ---- Async action atoms ----
@@ -84,4 +88,6 @@ export {
   fetchAdBlockSourcesAtom,
   fetchAdBlockWhitelistAtom,
   quickApplyToggleAtom,
+  queryDomainAtom,
+  pushPaletteHistoryAtom,
 } from "./actions";

@@ -10,8 +10,8 @@
 }
 
 .dialog {
-  background: var(--color-surface);
-  border: 1px solid var(--color-border);
+  background: var(--surface);
+  border: 1px solid var(--rule);
   border-radius: var(--radius-lg);
   padding: 24px;
   width: 90%;
@@ -34,31 +34,31 @@
 }
 
 .diffPreview {
-  background: var(--color-bg);
-  border: 1px solid var(--color-border);
+  background: var(--paper);
+  border: 1px solid var(--rule);
   border-radius: var(--radius-sm);
   padding: 12px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  font-size: 12px;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
   line-height: 1.8;
   overflow: auto;
   max-height: 300px;
 }
 
 .diffAdded {
-  color: var(--color-success);
-  background: var(--color-success-bg);
+  color: var(--success);
+  background: var(--success-soft);
 }
 
 .diffRemoved {
-  color: var(--color-danger);
-  background: var(--color-error-bg);
+  color: var(--danger);
+  background: var(--danger-soft);
   text-decoration: line-through;
 }
 
 .diffUnchanged {
-  color: var(--color-text-muted);
-  background: var(--color-bg);
+  color: var(--ink-muted);
+  background: var(--paper);
 }
 
 .diffLine {
@@ -71,23 +71,23 @@
   width: 100%;
   padding: 4px;
   text-align: center;
-  color: var(--color-text-muted);
+  color: var(--ink-muted);
   background: none;
   border: none;
-  font-size: 12px;
+  font-size: var(--font-size-sm);
   cursor: pointer;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-family: var(--font-mono);
 }
 
 .diffUnchangedCollapsed:hover {
-  color: var(--color-text-secondary);
-  background: var(--color-border-secondary);
+  color: var(--ink-soft);
+  background: var(--rule-soft);
   border-radius: var(--radius-sm);
 }
 
 .diffEmpty {
-  color: var(--color-text-muted);
-  font-size: 13px;
+  color: var(--ink-muted);
+  font-size: var(--font-size-md);
   text-align: center;
   padding: 12px;
 }
@@ -100,11 +100,11 @@
 
 .conflictWarning {
   padding: 8px 12px;
-  background: var(--yellow-light);
-  color: var(--yellow);
-  border: 1px solid var(--yellow);
+  background: var(--warning-soft);
+  color: var(--warning);
+  border: 1px solid var(--warning);
   border-radius: var(--radius-sm);
-  font-size: 13px;
+  font-size: var(--font-size-md);
   font-weight: 600;
   margin-bottom: 8px;
 }
@@ -120,11 +120,11 @@
   align-items: center;
   gap: 6px;
   padding: 8px 12px;
-  background: var(--color-error-bg);
-  border: 1px solid var(--color-error-border);
+  background: var(--danger-soft);
+  border: 1px solid var(--danger-soft);
   border-radius: var(--radius-sm);
-  font-size: 13px;
-  color: var(--color-danger);
+  font-size: var(--font-size-md);
+  color: var(--danger);
 }
 
 .conflictItem:last-child {
@@ -133,14 +133,14 @@
 
 .conflictDomain {
   font-weight: 600;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-family: var(--font-mono);
 }
 
 /* ---- Backup Notice ---- */
 
 .backupNotice {
-  font-size: 13px;
-  color: var(--color-text-secondary);
+  font-size: var(--font-size-md);
+  color: var(--ink-soft);
   margin-bottom: 16px;
 }
 
@@ -154,7 +154,7 @@
 .progressText {
   font-size: 15px;
   font-weight: 500;
-  color: var(--color-primary);
+  color: var(--accent);
 }
 
 /* ---- Result ---- */
@@ -165,21 +165,21 @@
 }
 
 .resultSuccess {
-  color: var(--color-success);
+  color: var(--success);
   font-size: 15px;
   font-weight: 600;
 }
 
 .resultError {
-  color: var(--color-danger);
+  color: var(--danger);
   font-size: 15px;
   font-weight: 600;
   margin-bottom: 8px;
 }
 
 .resultErrorMessage {
-  color: var(--color-text-secondary);
-  font-size: 13px;
+  color: var(--ink-soft);
+  font-size: var(--font-size-md);
   margin-bottom: 12px;
 }
 

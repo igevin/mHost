@@ -50,7 +50,10 @@ CI runs on **macos-latest only** (`.github/workflows/ci.yml`) and requires `carg
 mHost/
 ├── src/                       React/TS frontend
 │   ├── App.tsx, main.tsx      entry + router
-│   ├── components/            Layout, ProfileCard, ManagementDrawer, RuleEditor, ApplyConfirmDialog, SnapshotPanel, ApplyStatus
+│   ├── components/            Layout, Sidebar (the profile management surface — search, ⋯ menu,
+│   │                          toggles; ManagementDrawer/DrawerProfileCard were removed in the Phase 2
+│   │                          UI overhaul), SidebarProfileItem, PopupMenu, ConfirmDialog, RuleEditor,
+│   │                          ApplyConfirmDialog, SnapshotPanel, StatusBar
 │   ├── pages/                 ProfileList, ProfileView, ProfileEdit
 │   ├── stores/                Jotai atoms (profiles, dns, snapshots)
 │   ├── hooks/                 shared hooks

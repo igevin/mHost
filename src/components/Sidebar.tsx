@@ -1,6 +1,7 @@
-import { memo, useCallback, useState } from "react";
+import { memo, useCallback, useMemo, useState } from "react";
 import { NavLink, useNavigate } from "react-router-dom";
 import { useAtomValue, useSetAtom } from "jotai";
+import { save } from "@tauri-apps/plugin-dialog";
 import {
   profilesAtom,
   selectedProfileIdAtom,
@@ -9,14 +10,21 @@ import {
   isLoadingAtom,
   errorAtom,
   createProfileAtom,
+  deleteProfileAtom,
+  fetchProfilesAtom,
   previewApplyAtom,
   applyErrorAtom,
   quickApplyOnToggleAtom,
   quickApplyToggleAtom,
 } from "../stores/profiles";
+import { exportProfileToFile, duplicateProfile } from "../lib/tauri";
 import { extractErrorMessage } from "../lib/error";
 import { useWebKitPointerDown } from "../hooks/useWebKitPointerDown";
+import type { Profile } from "../types";
 import CreateProfileDialog from "./CreateProfileDialog";
+import ConfirmDialog from "./ConfirmDialog";
+import PopupMenu, { type PopupMenuItem } from "./PopupMenu";
+import SidebarProfileItem from "./SidebarProfileItem";
 import StatusBar from "./StatusBar";
 import styles from "./Layout.module.css";
 
@@ -31,12 +39,15 @@ interface NavItem {
 interface SidebarProps {
   /** 工具导航项（模块级常量，引用稳定） */
   toolNavItems: ReadonlyArray<NavItem>;
-  /** Layout 提供的回调：打开 ManagementDrawer */
-  onOpenManagement: () => void;
 }
 
 /**
  * 侧栏组件 —— 自包含 profile 列表 / DNS 状态指示 / 创建对话框。
+ *
+ * **Phase 2: 侧栏即管理面。** ManagementDrawer（及其 DrawerProfileCard）
+ * 已删除；profile 的搜索过滤 / 排序 / ⋯ 菜单（Edit info / Duplicate /
+ * Export / Delete / Enable-Disable）全部收在这里。Delete 走 Phase 1 的
+ * ConfirmDialog。
  *
  * **fix (P-F1, issue #90)**: 之前 sidebar 是 Layout 内联 JSX，订阅 13 个 atoms
  * （含 apply dialog 状态）。apply 操作启动 → applyConfirmOpen / isApplying 变化
@@ -45,10 +56,10 @@ interface SidebarProps {
  * 现在 Sidebar 自订阅需要的 atoms，apply dialog 状态由 Layout 独占订阅，
  * 侧栏对 apply 状态变化**完全不可见**。
  *
- * React.memo + 稳定的 props（toolNavItems 模块级常量 + useCallback'd
- * onOpenManagement）保证 Layout 重渲染时 Sidebar 完全跳过渲染。
+ * React.memo + 稳定的 props（toolNavItems 模块级常量）保证 Layout
+ * 重渲染时 Sidebar 完全跳过渲染。
  */
-function Sidebar({ toolNavItems, onOpenManagement }: SidebarProps) {
+function Sidebar({ toolNavItems }: SidebarProps) {
   const navigate = useNavigate();
   const profiles = useAtomValue(profilesAtom);
   const selectedProfileId = useAtomValue(selectedProfileIdAtom);
@@ -57,6 +68,8 @@ function Sidebar({ toolNavItems, onOpenManagement }: SidebarProps) {
   const isLoading = useAtomValue(isLoadingAtom);
 
   const createProfile = useSetAtom(createProfileAtom);
+  const deleteProfile = useSetAtom(deleteProfileAtom);
+  const fetchProfiles = useSetAtom(fetchProfilesAtom);
   const previewApply = useSetAtom(previewApplyAtom);
   const quickApplyToggle = useSetAtom(quickApplyToggleAtom);
   // issue #123: when ON, Hosts profile toggles skip the preview dialog
@@ -67,6 +80,30 @@ function Sidebar({ toolNavItems, onOpenManagement }: SidebarProps) {
   const { fire, releaseSoon } = useWebKitPointerDown();
 
   const [showCreateDialog, setShowCreateDialog] = useState(false);
+  // 搜索过滤 —— 纯本地 state，不进 atom（Phase 2 brief: no atom）。
+  const [profileQuery, setProfileQuery] = useState("");
+  // ⋯ 菜单：当前打开的行 id + 锚点 rect（PopupMenu 按 fixed 定位）。
+  const [menuState, setMenuState] = useState<{
+    id: string;
+    anchorRect: DOMRect;
+  } | null>(null);
+  // Delete 确认目标（ConfirmDialog，Phase 1）+ 删除中状态。
+  const [deleteTarget, setDeleteTarget] = useState<Profile | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [duplicatingId, setDuplicatingId] = useState<string | null>(null);
+
+  // 排序 + 过滤都在 memoized selector 里做，绝不 mutate profilesAtom：
+  // 启用的在前，其余按名字字母序（localeCompare）。
+  const visibleProfiles = useMemo(() => {
+    const q = profileQuery.trim().toLowerCase();
+    const filtered = q
+      ? profiles.filter((p) => p.name.toLowerCase().includes(q))
+      : profiles;
+    return [...filtered].sort((a, b) => {
+      if (a.enabled !== b.enabled) return a.enabled ? -1 : 1;
+      return a.name.localeCompare(b.name);
+    });
+  }, [profiles, profileQuery]);
 
   const handleProfileClick = useCallback(
     (id: string) => {
@@ -122,6 +159,101 @@ function Sidebar({ toolNavItems, onOpenManagement }: SidebarProps) {
     navigate("/settings");
   }, [navigate]);
 
+  const handleOpenMenu = useCallback((id: string, anchorRect: DOMRect) => {
+    setMenuState({ id, anchorRect });
+  }, []);
+
+  const handleCloseMenu = useCallback(() => {
+    setMenuState(null);
+  }, []);
+
+  const handleDuplicate = useCallback(
+    async (profile: Profile) => {
+      if (duplicatingId) return;
+      setDuplicatingId(profile.id);
+      try {
+        await duplicateProfile(profile.id, `${profile.name} (copy)`);
+        await fetchProfiles();
+      } catch (err: unknown) {
+        setError(extractErrorMessage(err));
+      } finally {
+        setDuplicatingId(null);
+      }
+    },
+    [duplicatingId, setError, fetchProfiles],
+  );
+
+  const handleExport = useCallback(
+    async (profile: Profile) => {
+      try {
+        const path = await save({
+          defaultPath: `${profile.name}.hosts`,
+          filters: [{ name: "Hosts", extensions: ["hosts", "txt"] }],
+        });
+        if (path) {
+          await exportProfileToFile(profile.id, "hosts", path);
+        }
+      } catch (err: unknown) {
+        setError(extractErrorMessage(err));
+      }
+    },
+    [setError],
+  );
+
+  const handleDeleteRequest = useCallback((profile: Profile) => {
+    setDeleteTarget(profile);
+  }, []);
+
+  const handleDeleteConfirm = useCallback(async () => {
+    const target = deleteTarget;
+    setDeleteTarget(null);
+    if (!target) return;
+    setDeletingId(target.id);
+    try {
+      await deleteProfile(target.id);
+    } catch (err: unknown) {
+      setError(extractErrorMessage(err));
+    } finally {
+      setDeletingId(null);
+    }
+  }, [deleteTarget, deleteProfile, setError]);
+
+  const handleDeleteCancel = useCallback(() => {
+    setDeleteTarget(null);
+  }, []);
+
+  const menuProfile = menuState
+    ? (profiles.find((p) => p.id === menuState.id) ?? null)
+    : null;
+
+  const menuItems: PopupMenuItem[] = menuProfile
+    ? [
+        {
+          label: menuProfile.enabled ? "Disable" : "Enable",
+          onSelect: () => handleToggle(menuProfile.id, menuProfile.enabled, false),
+        },
+        {
+          label: "Edit info",
+          onSelect: () => navigate(`/profiles/${menuProfile.id}`),
+        },
+        {
+          label: duplicatingId === menuProfile.id ? "Duplicating..." : "Duplicate",
+          disabled: duplicatingId !== null,
+          onSelect: () => handleDuplicate(menuProfile),
+        },
+        {
+          label: "Export",
+          onSelect: () => handleExport(menuProfile),
+        },
+        {
+          label: "Delete",
+          danger: true,
+          disabled: menuProfile.protected || deletingId !== null,
+          onSelect: () => handleDeleteRequest(menuProfile),
+        },
+      ]
+    : [];
+
   return (
     <aside className={styles.sidebar}>
       <div className={styles.sidebarHeader}>
@@ -142,81 +274,38 @@ function Sidebar({ toolNavItems, onOpenManagement }: SidebarProps) {
       </div>
 
       {/* Profiles Section — flex-grows to fill available sidebar height
-          (issue #125 review); profileList scrolls internally. */}
+          (issue #125 review); profileList scrolls internally, Tools 与
+          StatusBar 始终钉在底部（滚动隔离）。 */}
       <div className={`${styles.sidebarSection} ${styles.profilesSection}`}>
         <div className={styles.sidebarSectionTitleRow}>
           <span className={styles.sidebarSectionTitle}>Profiles</span>
-          <button className={styles.manageLink} onClick={onOpenManagement}>
-            Manage -&gt;
-          </button>
         </div>
+        <input
+          className={styles.profileSearchInput}
+          type="text"
+          placeholder="Filter profiles..."
+          aria-label="Filter profiles"
+          value={profileQuery}
+          onChange={(e) => setProfileQuery(e.target.value)}
+          spellCheck={false}
+        />
         <div className={styles.profileList}>
           {profiles.length === 0 && (
             <div className={styles.profileEmpty}>No profiles yet</div>
           )}
-          {profiles.map((profile) => {
-            const isActive = selectedProfileId === profile.id;
-            return (
-              <div
-                key={profile.id}
-                className={`${styles.profileItem} ${
-                  isActive ? styles.profileItemActive : ""
-                }`}
-                onClick={() => handleProfileClick(profile.id)}
-                role="button"
-                tabIndex={0}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") handleProfileClick(profile.id);
-                }}
-              >
-                <div className={styles.profileItemContent}>
-                  <span
-                    className={`${styles.profileStatusDot} ${
-                      profile.enabled
-                        ? styles.profileStatusDotOn
-                        : styles.profileStatusDotOff
-                    }`}
-                  />
-                  <div className={styles.profileItemInfo}>
-                    <span className={styles.profileItemName}>{profile.name}</span>
-                    {profile.description && (
-                      <span className={styles.profileItemDesc}>
-                        {profile.description}
-                      </span>
-                    )}
-                  </div>
-                </div>
-                <label
-                  className={styles.toggle}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    e.preventDefault();
-                    handleToggle(
-                      profile.id,
-                      profile.enabled,
-                      e.metaKey || e.altKey,
-                    );
-                  }}
-                  onPointerDown={(e) => {
-                    if (e.button !== 0) return;
-                    handleToggle(
-                      profile.id,
-                      profile.enabled,
-                      e.metaKey || e.altKey,
-                    );
-                  }}
-                >
-                  <input
-                    type="checkbox"
-                    role="switch"
-                    checked={profile.enabled}
-                    readOnly
-                  />
-                  <span className={styles.toggleSlider} />
-                </label>
-              </div>
-            );
-          })}
+          {profiles.length > 0 && visibleProfiles.length === 0 && (
+            <div className={styles.profileEmpty}>No matching profiles</div>
+          )}
+          {visibleProfiles.map((profile) => (
+            <SidebarProfileItem
+              key={profile.id}
+              profile={profile}
+              isActive={selectedProfileId === profile.id}
+              onOpen={handleProfileClick}
+              onToggle={handleToggle}
+              onOpenMenu={handleOpenMenu}
+            />
+          ))}
         </div>
         <button className={styles.newProfileBtn} onClick={handleNewProfile}>
           + New Profile
@@ -269,6 +358,28 @@ function Sidebar({ toolNavItems, onOpenManagement }: SidebarProps) {
        */}
       <div className={styles.sidebarSpacer} />
       <StatusBar />
+
+      {menuState && menuProfile && (
+        <PopupMenu
+          anchorRect={menuState.anchorRect}
+          items={menuItems}
+          onClose={handleCloseMenu}
+        />
+      )}
+
+      <ConfirmDialog
+        open={deleteTarget !== null}
+        title="Delete Profile"
+        message={
+          deleteTarget ? `Delete profile "${deleteTarget.name}"?` : ""
+        }
+        confirmLabel="Delete"
+        danger
+        isLoading={deletingId !== null}
+        loadingLabel="Deleting..."
+        onConfirm={handleDeleteConfirm}
+        onCancel={handleDeleteCancel}
+      />
     </aside>
   );
 }

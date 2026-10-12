@@ -526,8 +526,8 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEd
               className={dup.kind === "different_ip" ? styles.errorItem : styles.warningItem}
             >
               {dup.kind === "different_ip"
-                ? `冲突: 域名 "${dup.domain}" 映射到不同 IP (行 ${dup.lines.join(", ")})`
-                : `冗余: 域名 "${dup.domain}" 重复出现 (行 ${dup.lines.join(", ")})`}
+                ? `Conflict: domain "${dup.domain}" maps to different IPs (lines ${dup.lines.join(", ")})`
+                : `Duplicate: domain "${dup.domain}" appears more than once (lines ${dup.lines.join(", ")})`}
             </div>
           ))}
         </div>

@@ -1,7 +1,7 @@
 import { useEffect, useState, useCallback, useMemo, useRef } from "react";
-import { useParams, useNavigate, Navigate } from "react-router-dom";
+import { useParams, useNavigate, Navigate, useLocation } from "react-router-dom";
 import { useAtomValue, useSetAtom } from "jotai";
-import { save, confirm } from "@tauri-apps/plugin-dialog";
+import { save } from "@tauri-apps/plugin-dialog";
 import {
   profilesAtom,
   selectedProfileIdAtom,
@@ -23,6 +23,8 @@ import type { HostRule } from "../types";
 import RuleEditor from "./RuleEditor";
 import ImportDialog from "./ImportDialog";
 import CreateProfileDialog from "./CreateProfileDialog";
+import ConfirmDialog from "./ConfirmDialog";
+import PopupMenu, { type PopupMenuItem } from "./PopupMenu";
 import styles from "../pages/ProfileView.module.css";
 
 /**
@@ -41,6 +43,10 @@ import styles from "../pages/ProfileView.module.css";
 export default function HostsProfileView() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
+  // issue #124: 命令面板的跳转目标行（location.state.focusLine）。
+  const location = useLocation();
+  const focusLine =
+    (location.state as { focusLine?: number } | null)?.focusLine ?? null;
 
   const profiles = useAtomValue(profilesAtom);
   const isLoading = useAtomValue(isLoadingAtom);
@@ -67,8 +73,12 @@ export default function HostsProfileView() {
   const [isSavingInfo, setIsSavingInfo] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
   const isDeletingRef = useRef(false);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [importDialogOpen, setImportDialogOpen] = useState(false);
   const [showCreateDialog, setShowCreateDialog] = useState(false);
+  // Phase 2: 头部 ⋯ 菜单的锚点 rect（PopupMenu 按 fixed 定位）。
+  // Import / Export / Delete / Edit info 都收进这个菜单。
+  const [headerMenuAnchor, setHeaderMenuAnchor] = useState<DOMRect | null>(null);
 
   // Draft state for editing rules
   const [draftRules, setDraftRules] = useState<HostRule[]>([]);
@@ -219,10 +229,14 @@ export default function HostsProfileView() {
     }
   }, [profile, draftRules, ruleErrors, isSaving, updateProfile, setError]);
 
-  const handleDeleteProfile = useCallback(async () => {
+  const handleDeleteProfile = useCallback(() => {
     if (!profile || !id || profile.protected || isDeletingRef.current) return;
-    const confirmed = await confirm(`Delete profile "${profile.name}"?`);
-    if (!confirmed) return;
+    setShowDeleteConfirm(true);
+  }, [profile, id]);
+
+  const handleDeleteConfirm = useCallback(async () => {
+    if (!id || isDeletingRef.current) return;
+    setShowDeleteConfirm(false);
     isDeletingRef.current = true;
     setIsDeleting(true);
     try {
@@ -234,7 +248,7 @@ export default function HostsProfileView() {
       isDeletingRef.current = false;
       setIsDeleting(false);
     }
-  }, [profile, id, deleteProfileAction, navigate, setError]);
+  }, [id, deleteProfileAction, navigate, setError]);
 
   const handleExport = useCallback(async () => {
     if (!profile || !id) return;
@@ -290,6 +304,33 @@ export default function HostsProfileView() {
     setApplyError(null);
     previewApplyAction({ id, enabled: !profile.enabled });
   }, [id, profile, setApplyError, previewApplyAction]);
+
+  // Phase 2 头部 ⋯ 菜单项。顺序与已删除的 ManagementDrawer 卡片一致：
+  // 编辑信息 → 导入/导出 → 删除（danger 收尾）。Edit info 展开与信息栏
+  // 里同一个 inline 表单（handleEditInfo 会同时展开 info bar）。
+  const headerMenuItems: PopupMenuItem[] = profile
+    ? [
+        {
+          label: "Edit info",
+          onSelect: handleEditInfo,
+        },
+        {
+          label: "Import",
+          onSelect: () => setImportDialogOpen(true),
+        },
+        {
+          label: "Export",
+          disabled: isLoading,
+          onSelect: handleExport,
+        },
+        {
+          label: "Delete",
+          danger: true,
+          disabled: profile.protected || isLoading || isDeleting,
+          onSelect: handleDeleteProfile,
+        },
+      ]
+    : [];
 
   if (!id) {
     if (profiles.length > 0) {
@@ -360,15 +401,6 @@ export default function HostsProfileView() {
                 </div>
               )}
             </div>
-            <button
-              className={styles.infoBarEditLink}
-              onClick={(e) => {
-                e.stopPropagation();
-                handleEditInfo();
-              }}
-            >
-              Edit info -&gt;
-            </button>
           </div>
         ) : (
           <div className={styles.infoBarExpanded}>
@@ -510,21 +542,6 @@ export default function HostsProfileView() {
           {!isEditing ? (
             <>
               <button
-                className="btn btn-ghost btn-sm"
-                onClick={() => setImportDialogOpen(true)}
-                onPointerDown={onPointerDown(() => setImportDialogOpen(true))}
-              >
-                Import
-              </button>
-              <button
-                className="btn btn-ghost btn-sm"
-                onClick={handleExport}
-                onPointerDown={onPointerDown(handleExport)}
-                disabled={isLoading}
-              >
-                Export
-              </button>
-              <button
                 className="btn btn-primary btn-sm"
                 onClick={handleEditRules}
                 onPointerDown={onPointerDown(handleEditRules)}
@@ -532,11 +549,17 @@ export default function HostsProfileView() {
                 Edit Rules
               </button>
               <button
-                className="btn btn-danger btn-sm"
-                onClick={handleDeleteProfile}
-                disabled={profile.protected || isLoading || isDeleting}
+                className="btn btn-ghost btn-sm"
+                aria-label="More profile actions"
+                title="More actions"
+                onClick={(e) =>
+                  setHeaderMenuAnchor(e.currentTarget.getBoundingClientRect())
+                }
+                onPointerDown={onPointerDown((e) =>
+                  setHeaderMenuAnchor(e.currentTarget.getBoundingClientRect()),
+                )}
               >
-                Delete
+                ⋯
               </button>
             </>
           ) : (
@@ -587,6 +610,7 @@ export default function HostsProfileView() {
             onChange={handleRulesChange}
             onErrorChange={handleRulesErrorChange}
             readOnly={!isEditing}
+            focusLine={focusLine}
           />
         </div>
       </div>
@@ -604,6 +628,26 @@ export default function HostsProfileView() {
         onCreate={handleCreateProfile}
         isLoading={isLoading}
       />
+
+      <ConfirmDialog
+        open={showDeleteConfirm}
+        title="Delete Profile"
+        message={`Delete profile "${profile.name}"?`}
+        confirmLabel="Delete"
+        danger
+        isLoading={isDeleting}
+        loadingLabel="Deleting..."
+        onConfirm={handleDeleteConfirm}
+        onCancel={() => setShowDeleteConfirm(false)}
+      />
+
+      {headerMenuAnchor && (
+        <PopupMenu
+          anchorRect={headerMenuAnchor}
+          items={headerMenuItems}
+          onClose={() => setHeaderMenuAnchor(null)}
+        />
+      )}
     </div>
   );
 }

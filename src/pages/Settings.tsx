@@ -1,4 +1,5 @@
-import { useCallback, useState, useEffect } from "react";
+import { useCallback, useState, useEffect, useRef } from "react";
+import { useLocation } from "react-router-dom";
 import { useAtomValue, useSetAtom } from "jotai";
 import {
   dnsEnabledAtom,
@@ -40,6 +41,23 @@ function Settings() {
   // TCC prompt can appear. Symptom: Enable click hangs forever with
   // "Enable DNS mode" UI state and no macOS authorization dialog.
   const { fire, releaseSoon } = useWebKitPointerDown();
+
+  // Phase 2: StatusBar 的 "DNS broken" 警示卡导航到 /settings 时带
+  // `location.state.highlightDnsDiscrepancy` —— 分歧横幅滚动进视口并
+  // 加高亮描边，让用户一眼看到修复入口。横幅只在 `dnsDiscrepancy`
+  // 非空时渲染，所以 effect 依赖两者。
+  const location = useLocation();
+  const highlightDnsBanner =
+    (location.state as { highlightDnsDiscrepancy?: boolean } | null)
+      ?.highlightDnsDiscrepancy === true;
+  const dnsBannerRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (highlightDnsBanner && dnsDiscrepancy && dnsBannerRef.current) {
+      // jsdom 没有 scrollIntoView —— 可选调用保护测试环境。
+      dnsBannerRef.current.scrollIntoView?.({ block: "center" });
+    }
+  }, [highlightDnsBanner, dnsDiscrepancy]);
 
   // issue #123: persisted Quick Apply preference (localStorage-backed atom).
   const quickApplyOnToggle = useAtomValue(quickApplyOnToggleAtom);
@@ -231,7 +249,10 @@ function Settings() {
           */}
           {dnsDiscrepancy && (
             <div
-              className={styles.dnsDiscrepancyBanner}
+              ref={dnsBannerRef}
+              className={`${styles.dnsDiscrepancyBanner} ${
+                highlightDnsBanner ? styles.dnsDiscrepancyBannerHighlighted : ""
+              }`}
               data-testid="dns-discrepancy-banner"
               data-discrepancy={dnsDiscrepancy}
               role="alert"

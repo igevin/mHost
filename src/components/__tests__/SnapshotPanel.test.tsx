@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, act, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, act, waitFor, within } from "@testing-library/react";
 import { getDefaultStore, Provider as JotaiProvider } from "jotai";
 import {
   snapshotsAtom,
@@ -7,11 +7,6 @@ import {
   snapshotErrorAtom,
 } from "../../stores/profiles";
 import type { SnapshotMeta } from "../../types";
-
-// Mock tauri dialog
-vi.mock("@tauri-apps/plugin-dialog", () => ({
-  confirm: vi.fn().mockResolvedValue(true),
-}));
 
 // Mock tauri invoke
 vi.mock("@tauri-apps/api/core", () => ({
@@ -135,8 +130,8 @@ describe("SnapshotPanel", () => {
   });
 
   // 5. 回滚确认对话框
-  it("calls confirm dialog on Rollback click", async () => {
-    const { confirm } = await import("@tauri-apps/plugin-dialog");
+  it("shows ConfirmDialog on Rollback click and loads snapshot on confirm", async () => {
+    const { invoke } = await import("@tauri-apps/api/core");
     const store = getDefaultStore();
     store.set(snapshotsAtom, [makeSnapshot({ id: "snap-1", name: "rollback-me" })]);
 
@@ -153,16 +148,32 @@ describe("SnapshotPanel", () => {
       fireEvent.click(rollbackButton);
     });
 
-    await waitFor(() =>
-      expect(confirm).toHaveBeenCalledWith(
+    // ConfirmDialog (not the native plugin-dialog confirm) is shown
+    expect(
+      screen.getByText(
         'Rollback to snapshot "rollback-me"? Current configuration will be overwritten.',
+      ),
+    ).toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.click(
+        within(screen.getByRole("dialog")).getByRole("button", {
+          name: "Rollback",
+        }),
+      );
+    });
+
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith(
+        "load_snapshot",
+        expect.objectContaining({ id: "snap-1" }),
       ),
     );
   });
 
   // 6. 删除确认对话框
-  it("calls confirm dialog on Delete click", async () => {
-    const { confirm } = await import("@tauri-apps/plugin-dialog");
+  it("shows ConfirmDialog on Delete click and deletes snapshot on confirm", async () => {
+    const { invoke } = await import("@tauri-apps/api/core");
     const store = getDefaultStore();
     store.set(snapshotsAtom, [makeSnapshot({ id: "snap-1", name: "delete-me" })]);
 
@@ -179,8 +190,23 @@ describe("SnapshotPanel", () => {
       fireEvent.click(deleteButton);
     });
 
+    expect(
+      screen.getByText('Delete snapshot "delete-me"?'),
+    ).toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.click(
+        within(screen.getByRole("dialog")).getByRole("button", {
+          name: "Delete",
+        }),
+      );
+    });
+
     await waitFor(() =>
-      expect(confirm).toHaveBeenCalledWith('Delete snapshot "delete-me"?'),
+      expect(invoke).toHaveBeenCalledWith(
+        "delete_snapshot",
+        expect.objectContaining({ id: "snap-1" }),
+      ),
     );
   });
 

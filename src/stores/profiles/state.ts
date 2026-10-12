@@ -6,6 +6,7 @@ import type {
   SystemDnsSnapshot,
   AdBlockState,
   ApplyOutcome,
+  QueryDomainResult,
 } from "../../types";
 import { countRealRules } from "../../lib/rules";
 import { atomWithLocalStorage } from "../../lib/atomWithLocalStorage";
@@ -164,3 +165,22 @@ export const quickApplyOutcomeAtom = atom<ApplyOutcome | null>(null);
 /** Visibility gate for QuickApplyToast. Mounted in Layout at all times
  *  but renders `null` when closed. */
 export const isQuickApplyToastOpenAtom = atom(false);
+
+// ---- Command palette (issue #124) ----
+
+/** Cmd+K palette visibility. Toggled by useGlobalKeybindings (Layout). */
+export const paletteOpenAtom = atom(false);
+
+/** Current palette input. Written per keystroke by CommandPalette; the
+ *  only subscriber is the palette itself, so this doesn't fan out. */
+export const paletteQueryAtom = atom("");
+
+/** Latest `query_domain` IPC result for `paletteQueryAtom` (null = none /
+ *  stale response discarded / query empty). */
+export const paletteResultsAtom = atom<QueryDomainResult | null>(null);
+
+/** Last 5 executed lookup queries, persisted (issue #124 history). */
+export const paletteHistoryAtom = atomWithLocalStorage<string[]>(
+  "mhost.paletteHistory",
+  [],
+);

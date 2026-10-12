@@ -1,4 +1,3 @@
-import { useCallback, useState } from "react";
 import { Outlet } from "react-router-dom";
 import { useAtomValue, useSetAtom } from "jotai";
 import {
@@ -12,7 +11,6 @@ import {
   rollbackHostsActionAtom,
   profilesAtom,
 } from "../stores/profiles";
-import ManagementDrawer from "./ManagementDrawer";
 import ApplyConfirmDialog from "./ApplyConfirmDialog";
 import QuickApplyToast from "./QuickApplyToast";
 import Sidebar, { type NavItem } from "./Sidebar";
@@ -155,8 +153,6 @@ const toolNavItems: NavItem[] = [
 ];
 
 function Layout() {
-  const [showManagement, setShowManagement] = useState(false);
-
   const applyConfirmOpen = useAtomValue(applyConfirmOpenAtom);
   const applyPlan = useAtomValue(applyPlanAtom);
   const applyResult = useAtomValue(applyResultAtom);
@@ -170,27 +166,11 @@ function Layout() {
   // Refs #127: profiles needed by QuickApplyToast to resolve disabled IDs to display names.
   const profiles = useAtomValue(profilesAtom);
 
-  // **fix (P-F1, issue #90)**: useCallback 保持 onOpenManagement 引用稳定，
-  // 否则 inline arrow 会让 Sidebar 的 React.memo 失效（每次 Layout 渲染
-  // 都看到新 props）。
-  const handleOpenManagement = useCallback(() => {
-    setShowManagement(true);
-  }, []);
-
-  // Issue #230 item 5: keep the onClose prop stable. It feeds the
-  // drawer's Escape-key effect (`[open, onClose]` deps) — an inline arrow
-  // here re-created it on every Layout render, tearing down and re-adding
-  // the document listener each time while the drawer was open.
-  const handleCloseManagement = useCallback(() => {
-    setShowManagement(false);
-  }, []);
-
   return (
     <div className={styles.mhostLayout}>
-      <Sidebar
-        toolNavItems={toolNavItems}
-        onOpenManagement={handleOpenManagement}
-      />
+      {/* 侧栏即管理面（Phase 2）：ManagementDrawer 已删除，
+          profile 的 toggle / 编辑 / 删除全部收进 Sidebar。 */}
+      <Sidebar toolNavItems={toolNavItems} />
 
       <main className={styles.mhostMain}>
         {applyError && !applyConfirmOpen && (
@@ -208,11 +188,8 @@ function Layout() {
         <Outlet />
       </main>
 
-      <ManagementDrawer
-        open={showManagement}
-        onClose={handleCloseManagement}
-      />
-
+      {/* ApplyConfirmDialog 全局只挂载这一份 —— 之前 ManagementDrawer
+          里还有第二个挂载点，两个 dialog 会同时响应 apply 状态。 */}
       <ApplyConfirmDialog
         open={applyConfirmOpen}
         plan={applyPlan}

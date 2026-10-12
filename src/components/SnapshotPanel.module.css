@@ -11,7 +11,7 @@
 .emptyState {
   text-align: center;
   padding: 48px 24px;
-  color: var(--color-text-secondary);
+  color: var(--ink-soft);
 }
 
 .emptyState p {
@@ -19,8 +19,8 @@
 }
 
 .emptyHint {
-  font-size: 13px;
-  color: var(--color-text-muted);
+  font-size: var(--font-size-md);
+  color: var(--ink-muted);
   margin-top: 8px;
 }
 
@@ -35,8 +35,8 @@
 /* ---- Snapshot Card ---- */
 
 .snapshotCard {
-  background: var(--color-surface);
-  border: 1px solid var(--color-border);
+  background: var(--surface);
+  border: 1px solid var(--rule);
   border-radius: var(--radius-md);
   padding: 16px;
   transition: all var(--transition-normal);
@@ -57,7 +57,7 @@
 .snapshotName {
   font-size: 15px;
   font-weight: 600;
-  color: var(--color-text);
+  color: var(--ink);
   margin: 0;
 }
 
@@ -66,25 +66,25 @@
   align-items: center;
   padding: 2px 10px;
   border-radius: 999px;
-  font-size: 11px;
+  font-size: var(--font-size-xs);
   font-weight: 600;
-  background: var(--color-bg);
-  color: var(--color-text-secondary);
-  border: 1px solid var(--color-border);
+  background: var(--paper);
+  color: var(--ink-soft);
+  border: 1px solid var(--rule);
   white-space: nowrap;
 }
 
 .snapshotDesc {
   margin: 8px 0 0;
-  font-size: 13px;
-  color: var(--color-text-secondary);
+  font-size: var(--font-size-md);
+  color: var(--ink-soft);
   line-height: 1.5;
 }
 
 .snapshotMeta {
   margin-top: 8px;
-  font-size: 12px;
-  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
+  color: var(--ink-muted);
 }
 
 .snapshotActions {
@@ -92,7 +92,7 @@
   gap: 8px;
   margin-top: 12px;
   padding-top: 12px;
-  border-top: 1px solid var(--color-border);
+  border-top: 1px solid var(--rule);
 }
 
 /* ---- Create Snapshot Dialog ---- */
@@ -101,28 +101,28 @@
   position: fixed;
   inset: 0;
   background: rgba(0, 0, 0, 0.3);
-  z-index: 400;
+  z-index: 200; /* Z_INDEX.CREATE_OVERLAY */
   display: flex;
   align-items: center;
   justify-content: center;
 }
 
 .dialog {
-  background: var(--color-surface);
-  border: 1px solid var(--color-border);
+  background: var(--surface);
+  border: 1px solid var(--rule);
   border-radius: var(--radius-md);
   padding: 20px 24px;
   width: 420px;
   max-width: 90vw;
   box-shadow: var(--shadow-md);
-  z-index: 410;
+  z-index: 210; /* Z_INDEX.CREATE_CONTENT */
 }
 
 .dialogTitle {
-  font-size: 15px;
+  font-size: 16px;
   font-weight: 600;
   margin: 0 0 16px;
-  color: var(--color-text);
+  color: var(--ink);
 }
 
 .dialogBody {

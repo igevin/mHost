@@ -137,8 +137,11 @@ describe("Layout", () => {
 
     renderWithProviders(<Layout />);
 
-    // Toggle switches should be rendered as role="switch"
-    const toggles = screen.getAllByRole("switch");
+    // Toggle switches should be rendered as role="switch". Scope to the
+    // profile list — StatusBar's DNS card has its own switch (Phase 2).
+    const toggles = screen
+      .getAllByRole("switch")
+      .filter((el) => el.closest("[class*='profileList']") !== null);
     expect(toggles).toHaveLength(2);
   });
 

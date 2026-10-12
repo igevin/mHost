@@ -18,6 +18,7 @@ import { useWebKitPointerDown } from "../hooks/useWebKitPointerDown";
 import type { HostRule } from "../types";
 import RuleEditor from "./RuleEditor";
 import CreateProfileDialog from "./CreateProfileDialog";
+import ConfirmDialog from "./ConfirmDialog";
 import styles from "../pages/ProfileView.module.css";
 
 /**
@@ -56,6 +57,7 @@ export default function DnsProfileView() {
   const [showCreateDialog, setShowCreateDialog] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
   const isDeletingRef = useRef(false);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
 
   // Rules editing state（镜像 HostsProfileView）
   const [isEditing, setIsEditing] = useState(false);
@@ -146,10 +148,14 @@ export default function DnsProfileView() {
     }
   }, [profile, id]);
 
-  const handleDeleteProfile = useCallback(async () => {
+  const handleDeleteProfile = useCallback(() => {
     if (!profile || !id || profile.protected || isDeletingRef.current) return;
-    const confirmed = window.confirm(`Delete profile "${profile.name}"?`);
-    if (!confirmed) return;
+    setShowDeleteConfirm(true);
+  }, [profile, id]);
+
+  const handleDeleteConfirm = useCallback(async () => {
+    if (!id || isDeletingRef.current) return;
+    setShowDeleteConfirm(false);
     isDeletingRef.current = true;
     setIsDeleting(true);
     try {
@@ -161,7 +167,7 @@ export default function DnsProfileView() {
       isDeletingRef.current = false;
       setIsDeleting(false);
     }
-  }, [profile, id, deleteProfileAction, navigate]);
+  }, [id, deleteProfileAction, navigate]);
 
   const handleCreateProfile = useCallback(
     async (name: string) => {
@@ -515,6 +521,18 @@ export default function DnsProfileView() {
         onClose={() => setShowCreateDialog(false)}
         onCreate={handleCreateProfile}
         isLoading={isLoading}
+      />
+
+      <ConfirmDialog
+        open={showDeleteConfirm}
+        title="Delete Profile"
+        message={`Delete profile "${profile.name}"?`}
+        confirmLabel="Delete"
+        danger
+        isLoading={isDeleting}
+        loadingLabel="Deleting..."
+        onConfirm={handleDeleteConfirm}
+        onCancel={() => setShowDeleteConfirm(false)}
       />
     </div>
   );

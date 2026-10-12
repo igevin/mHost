@@ -267,35 +267,39 @@ describe("ProfileView", () => {
     expect(screen.getByText("Save")).toBeDisabled();
   });
 
-  it("shows Delete confirmation when Delete button is clicked", async () => {
-    const { confirm } = await import("@tauri-apps/plugin-dialog");
+  it("shows Delete confirmation when Delete menu item is clicked", async () => {
     const profile = makeProfile({ id: "p1", protected: false });
     const store = getDefaultStore();
     store.set(profilesAtom, [profile]);
 
     renderWithRouter("/profiles/p1");
 
-    // Click delete button
-    const deleteButton = screen.getByText("Delete");
-    expect(deleteButton).not.toBeDisabled();
+    // Delete lives in the header ⋯ menu (Phase 2)
+    fireEvent.click(
+      screen.getByRole("button", { name: /more profile actions/i }),
+    );
+    const deleteItem = screen.getByRole("menuitem", { name: "Delete" });
+    expect(deleteItem).not.toBeDisabled();
 
     await act(async () => {
-      fireEvent.click(deleteButton);
+      fireEvent.click(deleteItem);
     });
 
-    // The confirm dialog should have been called
-    expect(confirm).toHaveBeenCalled();
+    // The shared ConfirmDialog (not the native plugin-dialog confirm) opens
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    expect(
+      screen.getByText('Delete profile "dev-profile"?'),
+    ).toBeInTheDocument();
   });
 
   // Regression test for issue #100: Delete was double-bound to both
   // `onClick` and `onPointerDown`, so one physical click fired the handler
   // twice — producing two confirmation dialogs and a `ProfileNotFound` error
-  // on the second IPC call. After the fix, a `pointerDown` followed by a
-  // `click` must result in exactly one `confirm` call.
-  it("Delete fires confirm only once when both pointerDown and click are dispatched", async () => {
-    const { confirm } = await import("@tauri-apps/plugin-dialog");
-    vi.mocked(confirm).mockClear();
-    vi.mocked(confirm).mockResolvedValue(true);
+  // on the second IPC call. The entry now lives in the ⋯ menu (items are
+  // click-only, see PopupMenu docs); a `pointerDown` followed by a `click`
+  // must still open exactly one ConfirmDialog and never delete directly.
+  it("Delete menu item opens only one ConfirmDialog when both pointerDown and click are dispatched", async () => {
+    const { invoke } = await import("@tauri-apps/api/core");
 
     const profile = makeProfile({ id: "p1", protected: false });
     const store = getDefaultStore();
@@ -303,17 +307,23 @@ describe("ProfileView", () => {
 
     renderWithRouter("/profiles/p1");
 
-    const deleteButton = screen.getByText("Delete");
+    fireEvent.click(
+      screen.getByRole("button", { name: /more profile actions/i }),
+    );
+    const deleteItem = screen.getByRole("menuitem", { name: "Delete" });
 
     await act(async () => {
-      fireEvent.pointerDown(deleteButton, { button: 0 });
-      fireEvent.click(deleteButton);
-      // Flush microtasks so the first handler's `await confirm(...)` resolves
-      // before any second-invocation effects propagate.
+      fireEvent.pointerDown(deleteItem, { button: 0 });
+      fireEvent.click(deleteItem);
+      // Flush microtasks so any async handler effects propagate.
       await Promise.resolve();
     });
 
-    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(screen.getAllByRole("dialog")).toHaveLength(1);
+    expect(invoke).not.toHaveBeenCalledWith(
+      "delete_profile",
+      expect.anything(),
+    );
   });
 
   // ---- DNS mode tests ----

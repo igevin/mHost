@@ -1,7 +1,7 @@
-import { memo, useCallback, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAtomValue, useSetAtom } from "jotai";
-import { save, confirm } from "@tauri-apps/plugin-dialog";
+import { save } from "@tauri-apps/plugin-dialog";
 import {
   dnsProfilesAtom,
   isDnsLoadingAtom,
@@ -20,6 +20,7 @@ import { extractErrorMessage } from "../lib/error";
 import { useWebKitPointerDown } from "../hooks/useWebKitPointerDown";
 import type { Profile } from "../types";
 import CreateProfileDialog from "./CreateProfileDialog";
+import ConfirmDialog from "./ConfirmDialog";
 import styles from "./DnsProfileList.module.css";
 import viewStyles from "../pages/ProfileView.module.css";
 
@@ -55,11 +56,15 @@ function DnsProfileList() {
   const [showCreateDialog, setShowCreateDialog] = useState(false);
   const [duplicatingId, setDuplicatingId] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  // Delete confirmation target (replaces the native plugin-dialog confirm()).
+  const [deleteTargetId, setDeleteTargetId] = useState<string | null>(null);
 
   // issue #67：单击 label 会触发 pointerdown + click 两个事件，两个事件
   // 都直接调 handleToggle 会让 setProfileEnabled 跑两次（true → false），
-  // 结果 profile 留在 disabled、规则永不生效。用 ref 锁 100ms 防双触发。
-  const toggleLockedRef = useRef(false);
+  // 结果 profile 留在 disabled、规则永不生效。去重守卫统一走
+  // `useWebKitPointerDown`（fire + releaseSoon），与 Sidebar 的 toggle
+  // 路径一致 —— 原来是这里自带的 100ms ref 锁，现已并入共享 hook。
+  const toggleGuard = useWebKitPointerDown();
 
   const stats = useMemo(
     () => ({
@@ -85,14 +90,11 @@ function DnsProfileList() {
 
   const handleToggle = useCallback(
     (id: string, enabled: boolean) => {
-      if (toggleLockedRef.current) return;
-      toggleLockedRef.current = true;
-      setTimeout(() => {
-        toggleLockedRef.current = false;
-      }, 100);
+      if (!toggleGuard.fire()) return;
+      toggleGuard.releaseSoon();
       toggleEnabled({ id, enabled: !enabled });
     },
-    [toggleEnabled],
+    [toggleEnabled, toggleGuard],
   );
 
   const handleEdit = useCallback(
@@ -131,21 +133,30 @@ function DnsProfileList() {
   }, [setError]);
 
   const handleDelete = useCallback(
-    async (id: string) => {
+    (id: string) => {
       if (deletingId) return;
-      const ok = await confirm("Delete this DNS profile?");
-      if (!ok) return;
-      setDeletingId(id);
-      try {
-        await deleteProfile(id);
-      } catch (err: unknown) {
-        setError(extractErrorMessage(err));
-      } finally {
-        setDeletingId(null);
-      }
+      setDeleteTargetId(id);
     },
-    [deletingId, deleteProfile, setError],
+    [deletingId],
   );
+
+  const handleDeleteConfirm = useCallback(async () => {
+    const id = deleteTargetId;
+    setDeleteTargetId(null);
+    if (!id) return;
+    setDeletingId(id);
+    try {
+      await deleteProfile(id);
+    } catch (err: unknown) {
+      setError(extractErrorMessage(err));
+    } finally {
+      setDeletingId(null);
+    }
+  }, [deleteTargetId, deleteProfile, setError]);
+
+  const handleDeleteCancel = useCallback(() => {
+    setDeleteTargetId(null);
+  }, []);
 
   return (
     <div className={viewStyles.viewPage}>
@@ -250,7 +261,6 @@ function DnsProfileList() {
               onDuplicate={handleDuplicate}
               onExport={handleExport}
               onDelete={handleDelete}
-              onPointerDownToggle={onPointerDown}
               formatDate={formatDate}
             />
           ))
@@ -262,6 +272,18 @@ function DnsProfileList() {
         onClose={() => setShowCreateDialog(false)}
         onCreate={handleCreate}
         isLoading={isLoading}
+      />
+
+      <ConfirmDialog
+        open={deleteTargetId !== null}
+        title="Delete DNS Profile"
+        message="Delete this DNS profile?"
+        confirmLabel="Delete"
+        danger
+        isLoading={deletingId !== null}
+        loadingLabel="Deleting..."
+        onConfirm={handleDeleteConfirm}
+        onCancel={handleDeleteCancel}
       />
     </div>
   );
@@ -278,13 +300,17 @@ interface DnsProfileListCardProps {
   onDuplicate: (profile: Profile) => void;
   onExport: (profile: Profile) => void;
   onDelete: (id: string) => void;
-  onPointerDownToggle: (handler: () => void) => (e: React.PointerEvent) => void;
   formatDate: (isoDate: string) => string;
 }
 
 /**
- * 列表卡片 —— 镜像 `DrawerProfileCard` 的密度，但带 inline enable toggle
- * （checkbox switch）。`React.memo` 包裹：handler 引用稳定时跳过重渲染。
+ * 列表卡片 —— 带 inline enable toggle（checkbox switch）。
+ * `React.memo` 包裹：handler 引用稳定时跳过重渲染。
+ *
+ * Toggle 的 pointerdown+click 去重由 `onToggle`（DnsProfileList 的
+ * handleToggle）里的 `useWebKitPointerDown` guard 负责（pattern B，
+ * 见 hook 文档）：两个事件都直接喂 onToggle，pointerdown
+ * 侧只做内联 `e.button !== 0` 过滤。
  */
 function DnsProfileListCard({
   profile,
@@ -295,7 +321,6 @@ function DnsProfileListCard({
   onDuplicate,
   onExport,
   onDelete,
-  onPointerDownToggle,
   formatDate,
 }: DnsProfileListCardProps) {
   const ruleCount = useMemo(
@@ -318,9 +343,10 @@ function DnsProfileListCard({
             e.preventDefault();
             onToggle(profile.id, profile.enabled);
           }}
-          onPointerDown={onPointerDownToggle(() =>
-            onToggle(profile.id, profile.enabled),
-          )}
+          onPointerDown={(e) => {
+            if (e.button !== 0) return;
+            onToggle(profile.id, profile.enabled);
+          }}
           title={profile.enabled ? "Disable profile" : "Enable profile"}
         >
           <input
