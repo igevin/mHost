@@ -50,6 +50,14 @@ CommandPalette (src/components/CommandPalette.tsx, portal → body)
    冲突规则一致）。
 3. system hosts —— 兜底。
 
+> **WIN 语义边界（PR #244 review 结论）**：上述是「mHost 管辖域内的优先级
+> 模型」，不是 OS 解析顺序的完整模拟。mHost 的 managed block **追加**在
+> `/etc/hosts` 末尾，而 `getaddrinfo` 按文件行序取首条匹配 —— 若用户在
+> managed block **之前**手写了同名条目，真实解析以外部条目为准，面板却仍把
+> profile 规则标为 WIN。这与 apply/diff 的既有建模假设一致（同样不处理外部
+> 条目优先级），属已知取舍；如需严格对齐 OS 语义，后续可把管理块之前的
+> 同名外部条目判为更高优先级。
+
 **非有效匹配**（disabled profile、profile 内被注释的 rule、DNS 模式关闭时的
 DNS 规则）一律排在最后、UI 灰显、**永远不能成为 WIN**。排序键：
 `(rank, fuzzy score desc, 源内顺序)`；排序后第一个 effective 匹配即 winner

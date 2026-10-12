@@ -67,7 +67,12 @@ pub struct RuleMatch {
     /// Whether this rule currently participates in resolution.
     /// `false` → grayed out in the UI; can never be the winner.
     pub effective: bool,
-    /// Exactly one match — the one that actually wins resolution.
+    /// Exactly one match — the one that wins within mHost's precedence
+    /// model (DNS > enabled profiles > system hosts). Note this is NOT a
+    /// full simulation of OS resolution order: the managed block is
+    /// appended at the end of `/etc/hosts`, so a same-name entry the user
+    /// hand-wrote *before* the block would actually win `getaddrinfo`.
+    /// This mirrors the apply/diff modeling assumption (PR #244 review).
     pub is_winner: bool,
 }
 
