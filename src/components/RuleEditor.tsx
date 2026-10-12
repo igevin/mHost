@@ -13,6 +13,9 @@ interface RuleEditorProps {
   onChange: (rules: HostRule[]) => void;
   onErrorChange?: (hasErrors: boolean) => void;
   readOnly?: boolean;
+  /** issue #124: 命令面板跳转目标行（1-based）。设置后滚动到该行并高亮
+   *  gutter —— 只读模式同样生效（跳转不做任何编辑）。 */
+  focusLine?: number | null;
 }
 
 /** Convert HostRule[] to hosts file text format */
@@ -144,7 +147,7 @@ function useDebouncedCallback<T extends (...args: Parameters<T>) => void>(
   return debounced;
 }
 
-function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEditorProps) {
+function RuleEditor({ rules, onChange, onErrorChange, readOnly = false, focusLine = null }: RuleEditorProps) {
   const [text, setText] = useState(() => rulesToText(rules));
   const [validateResult, setValidateResult] = useState<ValidateResult | null>(null);
   const errors = validateResult?.errors ?? [];
@@ -337,6 +340,27 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEd
     }
   }, []);
 
+  // issue #124: 命令面板跳转。focusLine 变化时滚动到该行并高亮 gutter。
+  // lastSel/lastLine 增量缓存必须重置到「目标行行首」这个**自洽**基准：
+  // 若只写 lastLine 而 lastSel 停留在旧 caret 位置，两者就是不一致配对，
+  // 下一次 onSelect 的 delta walk 会从错误的起点数换行、算错绝对行号
+  // （handleActiveLineUpdate 的增量缓存契约，见上方注释）。这里的 O(N)
+  // 行首偏移计算每次跳转只跑一次，不在击键热路径上。
+  useEffect(() => {
+    if (focusLine == null) return;
+    const ta = textareaRef.current;
+    if (!ta) return;
+    const lines = ta.value.split("\n");
+    // 越界行号钳到最后一行 —— profile 在跳转后被编辑过也不能滚飞。
+    const lineIdx = Math.min(Math.max(0, focusLine - 1), lines.length - 1);
+    let offset = 0;
+    for (let i = 0; i < lineIdx; i++) offset += lines[i].length + 1;
+    lastSelRef.current = offset;
+    lastLineRef.current = lineIdx;
+    setActiveLineNumber(lineIdx);
+    scrollToMatch(lineIdx);
+  }, [focusLine, scrollToMatch]);
+
   // Navigation handlers
   const handlePrev = useCallback(() => {
     if (matches.length === 0) return;
@@ -475,7 +499,10 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false }: RuleEd
         <div ref={lineNumbersRef} className={styles.lineNumbers}>
           {lineNumbers.map((num) => {
             const lineIdx = num - 1;
-            const isActive = !readOnly && lineIdx === activeLineNumber;
+            // issue #124: 面板跳转（focusLine 非空）时只读模式也要高亮
+            // 目标行 —— 跳转是导航不是编辑，不违反只读语义。
+            const isActive =
+              lineIdx === activeLineNumber && (!readOnly || focusLine != null);
             return (
               <div
                 key={num}

@@ -97,6 +97,22 @@ function renderWithRouter(initialEntry: string) {
   );
 }
 
+/** Variant that carries location.state (issue #124 palette jump). */
+function renderWithRouterState(pathname: string, state: Record<string, unknown>) {
+  return render(
+    <JotaiProvider store={getDefaultStore()}>
+      <MemoryRouter initialEntries={[{ pathname, state }]}>
+        <Routes>
+          <Route path="/profiles" element={<ProfileView />} />
+          <Route path="/profiles/:id" element={<ProfileView />} />
+          <Route path="/dns-profiles" element={<ProfileView mode="dns" />} />
+          <Route path="/dns-profiles/:id" element={<ProfileView mode="dns" />} />
+        </Routes>
+      </MemoryRouter>
+    </JotaiProvider>,
+  );
+}
+
 describe("ProfileView", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -486,5 +502,32 @@ describe("ProfileView", () => {
     expect(screen.queryByText("Editing")).not.toBeInTheDocument();
     expect(screen.getByText("Edit")).toBeInTheDocument();
     expect(screen.getByText("Edit Info")).toBeInTheDocument();
+  });
+
+  // issue #124: 命令面板 dns_rule 跳转 —— DnsProfileView 必须读取
+  // location.state.focusLine 并透传给 RuleEditor（gutter 高亮目标行）。
+  it("forwards location.state.focusLine to the DNS profile's RuleEditor gutter", () => {
+    const profile = makeProfile({ id: "d1", mode: "dns" });
+    const store = getDefaultStore();
+    store.set(dnsProfilesAtom, [profile]);
+
+    renderWithRouterState("/dns-profiles/d1", { focusLine: 2 });
+
+    const active = document.querySelector("[class*='lineNumberActive']");
+    expect(active).not.toBeNull();
+    expect(active!.textContent).toBe("2");
+  });
+
+  // issue #124: hosts 侧同款接线（palette profile 跳转）。
+  it("forwards location.state.focusLine to the hosts profile's RuleEditor gutter", () => {
+    const profile = makeProfile({ id: "p1" });
+    const store = getDefaultStore();
+    store.set(profilesAtom, [profile]);
+
+    renderWithRouterState("/profiles/p1", { focusLine: 2 });
+
+    const active = document.querySelector("[class*='lineNumberActive']");
+    expect(active).not.toBeNull();
+    expect(active!.textContent).toBe("2");
   });
 });

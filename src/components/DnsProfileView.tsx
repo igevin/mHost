@@ -1,5 +1,5 @@
 import { useState, useCallback, useMemo, useRef } from "react";
-import { useParams, useNavigate } from "react-router-dom";
+import { useParams, useNavigate, useLocation } from "react-router-dom";
 import { useAtomValue, useSetAtom } from "jotai";
 import { save } from "@tauri-apps/plugin-dialog";
 import {
@@ -38,6 +38,10 @@ import styles from "../pages/ProfileView.module.css";
 export default function DnsProfileView() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
+  // issue #124: 命令面板的跳转目标行（location.state.focusLine）。
+  const location = useLocation();
+  const focusLine =
+    (location.state as { focusLine?: number } | null)?.focusLine ?? null;
 
   const profiles = useAtomValue(dnsProfilesAtom);
   const isLoading = useAtomValue(isDnsLoadingAtom);
@@ -512,6 +516,7 @@ export default function DnsProfileView() {
             onChange={handleRulesChange}
             onErrorChange={handleRulesErrorChange}
             readOnly={!isEditing}
+            focusLine={focusLine}
           />
         </div>
       </div>

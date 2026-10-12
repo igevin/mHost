@@ -245,4 +245,22 @@ describe("Layout", () => {
     const indicator = document.querySelector("[class*='dnsStatusIndicator']");
     expect(indicator).toBeFalsy();
   });
+
+  it("Cmd+K toggles the command palette (issue #124)", () => {
+    renderWithProviders(<Layout />);
+    expect(screen.queryByRole("dialog", { name: "Command palette" })).not.toBeInTheDocument();
+
+    fireEvent.keyDown(document, { key: "k", metaKey: true });
+    expect(screen.getByRole("dialog", { name: "Command palette" })).toBeInTheDocument();
+
+    // 再按一次关闭（toggle，不劫持面板内部按键）
+    fireEvent.keyDown(document, { key: "k", metaKey: true });
+    expect(screen.queryByRole("dialog", { name: "Command palette" })).not.toBeInTheDocument();
+  });
+
+  it("Ctrl+K also opens the palette (non-macOS modifier)", () => {
+    renderWithProviders(<Layout />);
+    fireEvent.keyDown(document, { key: "k", ctrlKey: true });
+    expect(screen.getByRole("dialog", { name: "Command palette" })).toBeInTheDocument();
+  });
 });

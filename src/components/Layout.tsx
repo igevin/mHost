@@ -13,7 +13,9 @@ import {
 } from "../stores/profiles";
 import ApplyConfirmDialog from "./ApplyConfirmDialog";
 import QuickApplyToast from "./QuickApplyToast";
+import CommandPalette from "./CommandPalette";
 import Sidebar, { type NavItem } from "./Sidebar";
+import { useGlobalKeybindings } from "../hooks/useGlobalKeybindings";
 import styles from "./Layout.module.css";
 
 /* ---- SVG Icons ---- */
@@ -166,6 +168,10 @@ function Layout() {
   // Refs #127: profiles needed by QuickApplyToast to resolve disabled IDs to display names.
   const profiles = useAtomValue(profilesAtom);
 
+  // issue #124: Cmd+K 命令面板全局可用（任意路由）。keybinding 注册与
+  // 面板都挂在最外层 Layout，路由切换不影响。
+  useGlobalKeybindings();
+
   return (
     <div className={styles.mhostLayout}>
       {/* 侧栏即管理面（Phase 2）：ManagementDrawer 已删除，
@@ -202,6 +208,9 @@ function Layout() {
       />
 
       <QuickApplyToast profiles={profiles} />
+
+      {/* issue #124: Cmd+K 命令面板（portal 到 body，open=false 时渲染 null） */}
+      <CommandPalette />
     </div>
   );
 }
