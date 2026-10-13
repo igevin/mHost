@@ -544,9 +544,17 @@ export default function HostsProfileView() {
           </div>
         </div>
         <div className={styles.viewHeaderActions}>
+          {/* review #244 follow-up: keys on both button groups — without
+              them React patches the SAME DOM nodes in place when the header
+              swaps (all <button>, same position), and the gesture's
+              trailing click then hits a node that is still `origin`, which
+              defeats the useWebKitPointerDown retarget guard (clicking
+              "Edit Rules" instantly "clicked" the Cancel that replaced
+              it). Distinct keys force fresh nodes. */}
           {!isEditing ? (
             <>
               <button
+                key="edit-rules"
                 className="btn btn-primary btn-sm"
                 onClick={handleEditRules}
                 onPointerDown={onPointerDown(handleEditRules)}
@@ -554,6 +562,7 @@ export default function HostsProfileView() {
                 Edit Rules
               </button>
               <button
+                key="more-actions"
                 className="btn btn-ghost btn-sm"
                 aria-label="More profile actions"
                 title="More actions"
@@ -570,6 +579,7 @@ export default function HostsProfileView() {
           ) : (
             <>
               <button
+                key="cancel-edit"
                 className="btn btn-ghost btn-sm"
                 onClick={handleCancelEdit}
                 onPointerDown={onPointerDown(handleCancelEdit)}
@@ -577,6 +587,7 @@ export default function HostsProfileView() {
                 Cancel
               </button>
               <button
+                key="save-rules"
                 className="btn btn-primary btn-sm"
                 onClick={handleSave}
                 onPointerDown={onPointerDown(handleSave)}

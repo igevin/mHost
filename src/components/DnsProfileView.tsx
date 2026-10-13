@@ -446,7 +446,10 @@ export default function DnsProfileView() {
           </button>
           {isEditing ? (
             <>
+              {/* keys: same-type sibling swap — see HostsProfileView header
+                  for why the retarget guard needs distinct DOM nodes */}
               <button
+                key="cancel-edit"
                 className="btn btn-ghost btn-sm"
                 onClick={handleCancelEdit}
                 onPointerDown={onPointerDown(handleCancelEdit)}
@@ -454,6 +457,7 @@ export default function DnsProfileView() {
                 Cancel
               </button>
               <button
+                key="save-rules"
                 className="btn btn-primary btn-sm"
                 onClick={handleSave}
                 onPointerDown={onPointerDown(handleSave)}
@@ -465,6 +469,7 @@ export default function DnsProfileView() {
           ) : (
             <>
               <button
+                key="export"
                 className="btn btn-ghost btn-sm"
                 onClick={handleExport}
                 onPointerDown={onPointerDown(handleExport)}
@@ -473,6 +478,7 @@ export default function DnsProfileView() {
                 Export
               </button>
               <button
+                key="edit-rules"
                 className="btn btn-primary btn-sm"
                 onClick={handleEditRules}
                 onPointerDown={onPointerDown(handleEditRules)}
@@ -480,6 +486,7 @@ export default function DnsProfileView() {
                 Edit
               </button>
               <button
+                key="edit-info"
                 className="btn btn-ghost btn-sm"
                 onClick={handleEditInfo}
                 onPointerDown={onPointerDown(handleEditInfo)}
@@ -487,6 +494,7 @@ export default function DnsProfileView() {
                 Edit Info
               </button>
               <button
+                key="delete"
                 className="btn btn-danger btn-sm"
                 onClick={handleDeleteProfile}
                 disabled={profile.protected || isLoading || isDeleting}
