@@ -129,6 +129,18 @@
   letter-spacing: 0.04em;
 }
 
+/* R1: DNS resolver 后缀命中标记（规则域名是查询的父域）。 */
+.suffixBadge {
+  flex-shrink: 0;
+  padding: 0 6px;
+  border-radius: var(--radius-sm);
+  background: var(--warning-soft);
+  color: var(--warning);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  font-weight: 500;
+}
+
 .commandTitle {
   min-width: 0;
   overflow: hidden;

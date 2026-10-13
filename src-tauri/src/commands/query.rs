@@ -10,7 +10,17 @@
 //! 1. **DNS-mode profiles** — `storage.list_profiles_by_mode(Dns)`; the same
 //!    list `DnsServer::reload_rules` consumes, so what we show is what the
 //!    resolver serves. Only matches from *enabled* profiles with *enabled*
-//!    rules are effective, and only while DNS mode is on.
+//!    rules are effective, and only while DNS mode is on. Profiles are
+//!    sorted by name before collection to mirror `RuleEngine::rebuild`'s
+//!    deterministic first-wins order. Matching mirrors `RuleEngine::resolve`
+//!    (fix #79): a rule also hits when its domain is a dot-suffix of the
+//!    query (`ad.example.com` → rule for `example.com`, `via_suffix=true`);
+//!    exact hits outrank suffix hits, longer suffixes outrank shorter ones.
+//!
+//!    Known pre-existing divergence (not fixed here): the live resolver
+//!    compares `Name::to_utf8()` bytes as-is, so a 0x20-case-randomized
+//!    DNS query can miss a lowercase rule; the palette matches
+//!    case-insensitively (the right call for a human-facing lookup).
 //! 2. **Hosts-mode profiles** — `AppState::cached_profiles()` (the #181
 //!    profile cache; all mutation IPCs invalidate it). First enabled
 //!    profile in list order wins per domain (mirrors the apply merger's
@@ -18,7 +28,11 @@
 //! 3. **System hosts** — `/etc/hosts` with the mHost managed block blanked
 //!    out line-for-line before parsing, so `parse_with_lines` reports
 //!    line numbers in the *original file*. Managed-block lines are excluded
-//!    because those rules already show up as profile matches.
+//!    because those rules already show up as profile matches. If the block
+//!    markers are malformed (duplicated/misordered → strict extraction
+//!    fails), a lenient first-start-to-last-end span is masked instead;
+//!    when no sane span exists at all, system-hosts hits duplicating a
+//!    profile match's `(domain, ip)` are dropped as managed-block leaks.
 //!
 //! # Line numbers for profile rules
 //!
@@ -74,6 +88,11 @@ pub struct RuleMatch {
     /// hand-wrote *before* the block would actually win `getaddrinfo`.
     /// This mirrors the apply/diff modeling assumption (PR #244 review).
     pub is_winner: bool,
+    /// `true` when the match came from the DNS resolver's suffix walk
+    /// (fix #79, mirrored — see module doc): the rule's domain is a
+    /// dot-suffix of the query, e.g. query `ad.example.com` hits a rule
+    /// for `example.com`. Always serialized (issue #202 lesson).
+    pub via_suffix: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -122,6 +141,32 @@ fn fuzzy_score(query: &str, text: &str) -> Option<(i32, Vec<usize>)> {
     Some((score, positions))
 }
 
+/// Mirror of `RuleEngine::resolve`'s suffix walk (fix #79): the live DNS
+/// resolver answers `query` with a rule for `domain` iff `domain == query`
+/// or `domain` is a dot-suffix of `query` (`ad.example.com` →
+/// `example.com`). Returns the specificity: `usize::MAX` for an exact
+/// match, otherwise the matched domain's label count (more labels = the
+/// resolver walks into it earlier). `None` = the resolver would NOT hit
+/// this rule for this query.
+///
+/// Case-insensitive. Known pre-existing divergence (do NOT "fix" here):
+/// the live resolver compares `Name::to_utf8()` bytes as-is
+/// (server.rs `resolve` path), so a 0x20-case-randomized query misses a
+/// lowercase rule. The palette is case-insensitive by design — documented
+/// divergence, not a bug to propagate.
+fn resolver_hit_specificity(query: &str, domain: &str) -> Option<usize> {
+    let q = query.to_lowercase();
+    let d = domain.to_lowercase();
+    if q == d {
+        return Some(usize::MAX);
+    }
+    if q.len() > d.len() + 1 && q.ends_with(&d) && q.as_bytes()[q.len() - d.len() - 1] == b'.' {
+        // Label count of the matched suffix — more labels = more specific.
+        return Some(d.matches('.').count() + 1);
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Aggregation
 // ---------------------------------------------------------------------------
@@ -132,12 +177,33 @@ struct Scored {
     /// 0 = DNS rule, 1 = enabled hosts profile, 2 = system hosts,
     /// 3 = anything non-effective (disabled profile / rule / DNS off).
     rank: u8,
+    /// DNS resolver specificity (PR #244 R1): exact > longer suffix > not
+    /// a resolver hit (fuzzy-only). 0 for non-DNS rows and fuzzy-only DNS
+    /// rows — resolver hits always outrank fuzzy-only within rank 0.
+    specificity: usize,
+    /// Winner eligibility. Fuzzy-only DNS matches are shown (lookup is a
+    /// finding aid) but can never be the WIN — the live resolver would not
+    /// answer the query with them. Non-DNS rows keep the pre-existing
+    /// fuzzy-winner semantics (`true` here).
+    resolver_hit: bool,
     score: i32,
-    /// Source-list order (profile index; line order for system hosts).
-    order: usize,
+    /// Source-list order: (profile index, rule index) for profile rows,
+    /// (line, 0) for system hosts rows.
+    order: (usize, usize),
 }
 
 /// Collect matches from one profile list (hosts- or DNS-mode).
+///
+/// PR #244 review (R1): for DNS profiles we ALSO match the query's parent
+/// suffixes, mirroring `RuleEngine::resolve` (fix #79) — a rule for
+/// `example.com` intercepts `ad.example.com`, so it must appear (and be
+/// eligible for WIN) here. Fuzzy-only DNS matches are still shown (lookup
+/// is a *finding* aid) but sort behind resolver hits and cannot outrank
+/// them for the winner badge.
+///
+/// PR #244 review (R2): DNS profiles are sorted by name before iteration,
+/// mirroring `RuleEngine::rebuild`'s deterministic first-wins order
+/// (storage's `read_dir` enumeration order is filesystem-dependent).
 fn collect_profile_matches(
     query: &str,
     profiles: &[Profile],
@@ -145,16 +211,36 @@ fn collect_profile_matches(
     dns_enabled: bool,
     out: &mut Vec<Scored>,
 ) {
-    for (profile_idx, profile) in profiles.iter().enumerate() {
+    let mut ordered: Vec<&Profile> = profiles.iter().collect();
+    if mode == ProfileMode::Dns {
+        ordered.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+
+    for (profile_idx, profile) in ordered.iter().enumerate() {
         for (rule_idx, rule) in profile.rules.iter().enumerate() {
             // Comment-only rules carry no IP and can't match a domain.
             let Some(ip) = rule.ip else { continue };
             // 1-based editor line: RuleEditor renders one line per rule.
             let line = rule_idx + 1;
             for domain in &rule.domains {
-                let Some((score, _positions)) = fuzzy_score(query, domain) else {
-                    continue;
+                let fuzzy = fuzzy_score(query, domain);
+                let resolver_spec = if mode == ProfileMode::Dns {
+                    resolver_hit_specificity(query, domain)
+                } else {
+                    None
                 };
+                if fuzzy.is_none() && resolver_spec.is_none() {
+                    continue;
+                }
+                let (via_suffix, specificity) = match resolver_spec {
+                    Some(usize::MAX) => (false, usize::MAX), // exact
+                    Some(spec) => (true, spec),              // suffix hit
+                    None => (false, 0),                      // fuzzy-only
+                };
+                // Hosts/system rows keep pre-existing fuzzy-winner
+                // semantics; DNS rows need a resolver hit to be eligible.
+                let resolver_hit = mode == ProfileMode::Hosts || resolver_spec.is_some();
+                let score = fuzzy.map(|(s, _)| s).unwrap_or(0);
                 // A rule is effective only when its whole delivery chain is
                 // on: profile enabled AND rule enabled AND (for DNS profiles)
                 // DNS mode running.
@@ -185,40 +271,84 @@ fn collect_profile_matches(
                         source,
                         effective,
                         is_winner: false,
+                        via_suffix,
                     },
                     rank,
+                    specificity,
+                    resolver_hit,
                     score,
-                    order: profile_idx * 1_000_000 + rule_idx,
+                    order: (profile_idx, rule_idx),
                 });
             }
         }
     }
 }
 
+/// Mask the managed block out of a hosts file, line-for-line (blanking
+/// keeps `parse_with_lines` line numbers aligned with the original file).
+///
+/// Returns `(masked_text, mask_applied)`. **PR #244 review (R3)**: the
+/// strict `extract_managed_block` returns `None` on duplicated or
+/// misordered markers, which used to leak managed rules into system-hosts
+/// matches. Fallback: mask from the *first* start marker through the *last*
+/// end marker; if markers are too broken to locate a sane span, return the
+/// input unmasked and let the caller dedupe against profile matches.
+fn mask_managed_block(text: &str) -> (String, bool) {
+    let range = Parser::extract_managed_block(text).or_else(|| {
+        let lines: Vec<&str> = text.lines().collect();
+        let start = lines
+            .iter()
+            .position(|l| l.trim() == mhost_hosts::parser::MANAGED_START);
+        let end = lines
+            .iter()
+            .rposition(|l| l.trim() == mhost_hosts::parser::MANAGED_END);
+        match (start, end) {
+            (Some(s), Some(e)) if s <= e => Some((s, e)),
+            _ => None,
+        }
+    });
+
+    match range {
+        Some((start, end)) => (
+            text.lines()
+                .enumerate()
+                .map(|(i, line)| if (start..=end).contains(&i) { "" } else { line })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            true,
+        ),
+        None => (text.to_string(), false),
+    }
+}
+
 /// Collect matches from `/etc/hosts`, excluding mHost's managed block.
 ///
-/// The managed block is blanked line-for-line (not removed) so that
-/// `parse_with_lines` line numbers stay aligned with the original file.
-fn collect_system_hosts_matches(query: &str, hosts_text: &str, out: &mut Vec<Scored>) {
-    let masked = match Parser::extract_managed_block(hosts_text) {
-        Some((start, end)) => hosts_text
-            .lines()
-            .enumerate()
-            .map(|(i, line)| if (start..=end).contains(&i) { "" } else { line })
-            .collect::<Vec<_>>()
-            .join("\n"),
-        None => hosts_text.to_string(),
-    };
+/// `profile_keys` holds `(domain, ip)` of every profile match; it is only
+/// consulted when the managed block could NOT be masked (markers too broken
+/// to trust) — then any system-hosts hit duplicating a profile match is a
+/// managed-block leak and is dropped (PR #244 R3).
+fn collect_system_hosts_matches(
+    query: &str,
+    hosts_text: &str,
+    profile_keys: &std::collections::HashSet<(String, String)>,
+    out: &mut Vec<Scored>,
+) {
+    let (masked, mask_applied) = mask_managed_block(hosts_text);
 
     let parsed = Parser::parse_with_lines(&masked);
     for rule in &parsed.rules {
         let Some(ip) = rule.ip else { continue };
-        // parse_with_lines always sets line_number; fallback is unreachable.
-        let line = rule.line_number.unwrap_or(0);
+        // Skip rules without a line number instead of inventing line 0.
+        let Some(line) = rule.line_number else {
+            continue;
+        };
         for domain in &rule.domains {
             let Some((score, _positions)) = fuzzy_score(query, domain) else {
                 continue;
             };
+            if !mask_applied && profile_keys.contains(&(domain.clone(), ip.to_string())) {
+                continue;
+            }
             out.push(Scored {
                 m: RuleMatch {
                     domain: domain.clone(),
@@ -226,10 +356,14 @@ fn collect_system_hosts_matches(query: &str, hosts_text: &str, out: &mut Vec<Sco
                     source: MatchSource::SystemHosts { line },
                     effective: true,
                     is_winner: false,
+                    via_suffix: false,
                 },
                 rank: 2,
+                specificity: 0,
+                // System hosts keeps pre-existing fuzzy-winner semantics.
+                resolver_hit: true,
                 score,
-                order: line,
+                order: (line, 0),
             });
         }
     }
@@ -267,11 +401,17 @@ pub(crate) fn aggregate_domain_matches(
         dns_enabled,
         &mut scored,
     );
-    collect_system_hosts_matches(query, system_hosts_text, &mut scored);
+    // R3 fallback: only consulted when the managed block couldn't be masked.
+    let profile_keys: std::collections::HashSet<(String, String)> = scored
+        .iter()
+        .map(|s| (s.m.domain.clone(), s.m.ip.clone()))
+        .collect();
+    collect_system_hosts_matches(query, system_hosts_text, &profile_keys, &mut scored);
 
     scored.sort_by(|a, b| {
         a.rank
             .cmp(&b.rank)
+            .then(b.specificity.cmp(&a.specificity))
             .then(b.score.cmp(&a.score))
             .then(a.order.cmp(&b.order))
     });
@@ -281,7 +421,7 @@ pub(crate) fn aggregate_domain_matches(
         .into_iter()
         .map(|s| {
             let mut m = s.m;
-            if !winner_assigned && m.effective {
+            if !winner_assigned && s.resolver_hit && m.effective {
                 m.is_winner = true;
                 winner_assigned = true;
             }
@@ -311,13 +451,15 @@ pub async fn query_domain(
     }
 
     // Hosts-mode profiles come from the #181 cache (every mutation IPC
-    // invalidates it, so this is fresh). Read before spawn_blocking: the
-    // cache path is a non-blocking RwLock read.
-    let hosts_profiles = state.cached_profiles()?;
-    let dns_enabled = state.dns_enabled.load(Ordering::Relaxed);
+    // invalidates it, so this is fresh). PR #244 review (R4): the read must
+    // happen INSIDE spawn_blocking — on a cache miss it synchronously walks
+    // and parses the profiles dir, which must not block a Tokio worker.
     let storage = state.storage.clone();
+    let profile_cache = state.cached_profiles.clone();
+    let dns_enabled = state.dns_enabled.load(Ordering::Relaxed);
 
     tauri::async_runtime::spawn_blocking(move || {
+        let hosts_profiles = crate::state::cached_profiles_read(&profile_cache, &storage)?;
         let dns_profiles = storage.list_profiles_by_mode(ProfileMode::Dns)?;
         // /etc/hosts unreadable (permissions, missing) is not fatal for a
         // lookup — degrade to profile/DNS matches only.
@@ -334,6 +476,8 @@ pub async fn query_domain(
         })
     })
     .await
+    // JoinError = the blocking task panicked/cancelled; MhostError has no
+    // better-fitting variant, so InvalidInput carries the message.
     .map_err(|e| MhostError::InvalidInput(e.to_string()))?
 }
 
@@ -641,16 +785,20 @@ mod tests {
             },
             effective: true,
             is_winner: true,
+            via_suffix: false,
         };
         let json = serde_json::to_string(&m).unwrap();
         assert!(json.contains("\"type\":\"profile\""), "{}", json);
         assert!(json.contains("\"is_winner\":true"), "{}", json);
+        // via_suffix 永远在线上（issue #202 教训：绝不省略字段）。
+        assert!(json.contains("\"via_suffix\":false"), "{}", json);
         let sys = RuleMatch {
             domain: "x".into(),
             ip: "1.1.1.1".into(),
             source: MatchSource::SystemHosts { line: 7 },
             effective: true,
             is_winner: false,
+            via_suffix: false,
         };
         assert!(serde_json::to_string(&sys)
             .unwrap()
@@ -665,9 +813,217 @@ mod tests {
             },
             effective: true,
             is_winner: false,
+            via_suffix: false,
         };
         assert!(serde_json::to_string(&dns)
             .unwrap()
             .contains("\"type\":\"dns_rule\""));
+    }
+
+    // ---- PR #244 review follow-ups (R1/R2/R3/R5) ----
+
+    #[test]
+    fn resolver_hit_specificity_mirrors_suffix_walk() {
+        assert_eq!(
+            resolver_hit_specificity("example.com", "example.com"),
+            Some(usize::MAX)
+        );
+        assert_eq!(
+            resolver_hit_specificity("ad.example.com", "example.com"),
+            Some(2)
+        );
+        assert_eq!(
+            resolver_hit_specificity("a.b.example.com", "example.com"),
+            Some(2)
+        );
+        assert_eq!(
+            resolver_hit_specificity("a.b.example.com", "b.example.com"),
+            Some(3)
+        );
+        // 兄弟域名 / 父域不是 query 的后缀 → 不命中
+        assert_eq!(
+            resolver_hit_specificity("notexample.com", "example.com"),
+            None
+        );
+        assert_eq!(
+            resolver_hit_specificity("example.com", "ad.example.com"),
+            None
+        );
+        // 大小写不敏感
+        assert!(resolver_hit_specificity("AD.EXAMPLE.COM", "Example.com").is_some());
+    }
+
+    /// R1: 子域名查询命中父域 DNS 规则并压过 hosts 条目拿 WIN。
+    #[test]
+    fn dns_suffix_match_wins_over_hosts_entries() {
+        let dns_profiles = vec![make_profile(
+            "ads",
+            ProfileMode::Dns,
+            true,
+            vec![("0.0.0.0", "example.com")],
+        )];
+        let hosts_profiles = vec![make_profile(
+            "dev",
+            ProfileMode::Hosts,
+            true,
+            vec![("10.0.0.1", "ad.example.com")],
+        )];
+        let matches =
+            aggregate_domain_matches("ad.example.com", &hosts_profiles, &dns_profiles, "", true);
+        let w = winner(&matches).expect("winner exists");
+        match &w.source {
+            MatchSource::DnsRule { name, .. } => assert_eq!(name, "ads"),
+            _ => panic!("suffix-matched DNS rule must win"),
+        }
+        assert!(w.via_suffix);
+        assert_eq!(w.ip, "0.0.0.0");
+        // hosts 那条还在，但只能排在后面且不赢
+        assert!(matches
+            .iter()
+            .any(|m| matches!(m.source, MatchSource::Profile { .. }) && !m.is_winner));
+    }
+
+    /// R1: 更具体的规则先赢（resolver 从完整域名向上走）。
+    #[test]
+    fn dns_suffix_more_specific_rule_wins() {
+        let dns_profiles = vec![make_profile(
+            "ads",
+            ProfileMode::Dns,
+            true,
+            vec![("0.0.0.0", "example.com"), ("127.0.0.1", "sub.example.com")],
+        )];
+        let matches = aggregate_domain_matches("a.sub.example.com", &[], &dns_profiles, "", true);
+        let w = winner(&matches).unwrap();
+        assert_eq!(w.ip, "127.0.0.1");
+        assert!(w.via_suffix);
+        // 排序：更具体的 suffix 排前面
+        assert_eq!(matches[0].domain, "sub.example.com");
+        assert_eq!(matches[1].domain, "example.com");
+    }
+
+    /// R1: fuzzy-only 的 DNS 匹配仍然展示（查找是「找规则」场景），但
+    /// 排在 resolver hit 之后，且永远不能成为 WIN —— 真实 resolver 不会
+    /// 用它应答这个 query。
+    #[test]
+    fn fuzzy_only_dns_match_ranks_behind_resolver_hits_and_cannot_win() {
+        let dns_profiles = vec![
+            // suffix hit：query 的 dot-suffix
+            make_profile(
+                "a-suffix",
+                ProfileMode::Dns,
+                true,
+                vec![("0.0.0.0", "api.local")],
+            ),
+            // fuzzy-only：query 的字符是它的子序列，但 resolver 不会命中
+            make_profile(
+                "b-fuzzy",
+                ProfileMode::Dns,
+                true,
+                vec![("0.0.0.2", "subzero.api.local")],
+            ),
+        ];
+        let matches = aggregate_domain_matches("sub.api.local", &[], &dns_profiles, "", true);
+        assert_eq!(matches.len(), 2);
+        // resolver hit 排第一且赢
+        assert_eq!(matches[0].domain, "api.local");
+        assert!(matches[0].via_suffix);
+        assert!(matches[0].is_winner);
+        // fuzzy-only 排第二、不赢
+        assert_eq!(matches[1].domain, "subzero.api.local");
+        assert!(!matches[1].is_winner);
+
+        // 只剩 fuzzy-only DNS 匹配时，winner 让给 hosts/system 的精确匹配
+        let hosts_profiles = vec![make_profile(
+            "dev",
+            ProfileMode::Hosts,
+            true,
+            vec![("10.0.0.1", "sub.api.local")],
+        )];
+        let matches = aggregate_domain_matches(
+            "sub.api.local",
+            &hosts_profiles,
+            &dns_profiles[1..],
+            "",
+            true,
+        );
+        let w = winner(&matches).unwrap();
+        assert!(matches!(w.source, MatchSource::Profile { .. }));
+    }
+
+    /// R2: 同一域名出现在两个启用的 DNS profile —— winner 与 resolver
+    /// 的 by-name first-wins 一致，与输入顺序无关。
+    #[test]
+    fn dns_winner_follows_resolver_name_order() {
+        let zeta = make_profile(
+            "zeta",
+            ProfileMode::Dns,
+            true,
+            vec![("10.0.0.1", "shared.com")],
+        );
+        let alpha = make_profile(
+            "alpha",
+            ProfileMode::Dns,
+            true,
+            vec![("10.0.0.2", "shared.com")],
+        );
+        // 输入顺序 zeta 在前（模拟 read_dir 的任意顺序）
+        let matches = aggregate_domain_matches("shared.com", &[], &[zeta, alpha], "", true);
+        let w = winner(&matches).unwrap();
+        match &w.source {
+            MatchSource::DnsRule { name, .. } => assert_eq!(name, "alpha"),
+            _ => unreachable!(),
+        }
+        assert_eq!(w.ip, "10.0.0.2");
+    }
+
+    /// R3: 标记损坏（重复 start marker）→ 严格提取失败 → lenient 区间
+    /// mask 兜底，managed 规则不会作为 system_hosts 重复出现。
+    #[test]
+    fn malformed_managed_block_falls_back_to_lenient_mask() {
+        let system = "127.0.0.1 localhost\n# ---- mHost start ----\n10.0.0.1 api.local\n# ---- mHost start ----\n10.0.0.2 other.local\n# ---- mHost end ----\n";
+        let matches = aggregate_domain_matches("api.local", &[], &[], system, false);
+        assert!(matches.is_empty(), "managed leak despite broken markers");
+    }
+
+    /// R3: 标记完全不可用（只有 start 没有 end）→ 不做 mask，改为按
+    /// (domain, ip) 去重 profile 已有匹配 —— managed 泄漏被去重拦截，
+    /// 但同域名不同 IP 的**用户手写**条目（块外）仍保留。
+    #[test]
+    fn unmaskable_managed_block_dedupes_profile_duplicates() {
+        let hosts_profiles = vec![make_profile(
+            "dev",
+            ProfileMode::Hosts,
+            true,
+            vec![("10.0.0.1", "api.local")],
+        )];
+        // 只有一个 start marker → 无有效区间 → dedupe 路径
+        let system = "# ---- mHost start ----\n10.0.0.1 api.local\n";
+        let matches = aggregate_domain_matches("api.local", &hosts_profiles, &[], system, false);
+        assert_eq!(matches.len(), 1, "profile 一条 + system 去重后零条");
+        assert!(matches!(matches[0].source, MatchSource::Profile { .. }));
+    }
+
+    /// R5: 多域名规则 —— 每个域名独立匹配、各自成行。
+    #[test]
+    fn multi_domain_rule_matches_each_domain() {
+        let mut p = Profile::new("dev");
+        p.enabled = true;
+        p.rules.push(HostRule::new(
+            "10.0.0.1".parse::<IpAddr>().unwrap(),
+            vec!["a.local".to_string(), "b.local".to_string()],
+        ));
+        let a = aggregate_domain_matches("a.local", &[p.clone()], &[], "", false);
+        let b = aggregate_domain_matches("b.local", &[p], &[], "", false);
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].domain, "a.local");
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].domain, "b.local");
+        // 同一条规则 → 同一编辑器行号
+        match (&a[0].source, &b[0].source) {
+            (MatchSource::Profile { line: la, .. }, MatchSource::Profile { line: lb, .. }) => {
+                assert_eq!(la, lb);
+            }
+            _ => unreachable!(),
+        }
     }
 }

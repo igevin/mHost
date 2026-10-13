@@ -93,7 +93,6 @@
 
   /* ---- Status ---- */
   --danger: #DC2626;
-  --danger-hover: #B91C1C;
   --danger-soft: rgba(220, 38, 38, 0.08);
   --success: #22C55E;
   --success-soft: rgba(34, 197, 94, 0.08);
@@ -117,8 +116,6 @@
 
   /* ---- Layout ---- */
   --sidebar-width: 260px;
-  --titlebar-height: 38px;
-  --statusbar-height: 28px;
 
   /* ---- Transitions ---- */
   --transition-fast: 120ms ease;
@@ -608,3 +605,19 @@ body {
   margin-left: auto;
   letter-spacing: 0.02em;
 }
+/* =====================================================================
+ * Z-index layer registry
+ * (replaces the deleted src/styles/zindex.ts — that module had zero TS
+ * imports; only CSS comments referenced it, so the registry lives here
+ * next to the tokens instead)
+ * =====================================================================
+ *   100/110   ImportDialog overlay / content
+ *   200/210   create dialogs (CreateProfileDialog, SnapshotPanel create)
+ *   1100      QuickApplyToast
+ *   1140/1150 PopupMenu click-catcher / menu
+ *   1200      ConfirmDialog
+ *   1250      ApplyConfirmDialog (must sit above ConfirmDialog — PR #244
+ *             review F8: a palette-triggered Enable preview opens while a
+ *             delete ConfirmDialog is still mounted)
+ *   1300      CommandPalette (topmost)
+ */

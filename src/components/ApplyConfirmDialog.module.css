@@ -6,7 +6,10 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  z-index: 1000;
+  /* review F8: 必须在 ConfirmDialog (1200) 之上 —— 侧栏删除确认框开着
+   * 时用面板触发 Enable 会走到这里的 preview dialog。Palette (1300) 仍
+   * 是顶层。 */
+  z-index: 1250;
 }
 
 .dialog {

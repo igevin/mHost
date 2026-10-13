@@ -311,6 +311,10 @@ export interface RuleMatch {
   effective: boolean;
   /** Exactly one match — the one that actually wins. */
   is_winner: boolean;
+  /** DNS resolver suffix hit (fix #79 mirrored): the rule's domain is a
+   *  parent suffix of the query, e.g. query `ad.example.com` hits a rule
+   *  for `example.com`. */
+  via_suffix: boolean;
 }
 
 export interface QueryDomainResult {

@@ -144,9 +144,11 @@ function SystemHosts() {
   // issue #124: 命令面板跳转到 system hosts 匹配时带
   // `location.state.focusLine`（原文件物理行号）—— 没有搜索激活时
   // 用它驱动 gutter 高亮。
+  // review F6: jumpId nonce —— 同一行的重复跳转也要重滚。
   const location = useLocation();
-  const focusLine =
-    (location.state as { focusLine?: number } | null)?.focusLine ?? null;
+  const locationState = location.state as { focusLine?: number; jumpId?: number } | null;
+  const focusLine = locationState?.focusLine ?? null;
+  const jumpId = locationState?.jumpId ?? 0;
   const activeLineNumber =
     searchBarVisible &&
     matches.length > 0 &&
@@ -199,13 +201,13 @@ function SystemHosts() {
 
   // issue #124: 命令面板跳转 —— focusLine 变化且内容加载完成后，把
   // pre 滚到目标行（12px × 1.6 = 19.2px 行高，与 gutter 的
-  // min-height 一致），gutter 同步滚动。
+  // min-height 一致），gutter 同步滚动。jumpId 是重复跳转的 nonce（F6）。
   useEffect(() => {
     if (focusLine == null || hostsContent === null) return;
     const top = (focusLine - 1) * 19.2;
     if (previewRef.current) previewRef.current.scrollTop = top;
     if (gutterRef.current) gutterRef.current.scrollTop = top;
-  }, [focusLine, hostsContent]);
+  }, [focusLine, jumpId, hostsContent]);
 
   // Keyboard shortcuts: Cmd+F / Ctrl+F opens search bar; Esc outside the
   // search input closes it and clears the query. Mirrors RuleEditor.tsx:375-399.

@@ -530,5 +530,35 @@ describe("RuleEditor", () => {
       );
       expect(activeGutterRow()?.textContent).toBe("5");
     });
+
+    it("re-scrolls on a repeated jump to the same line via jumpNonce (F6)", () => {
+      const { rerender } = render(
+        <RuleEditor
+          rules={fiveRules}
+          onChange={vi.fn()}
+          readOnly
+          focusLine={2}
+          jumpNonce={1}
+        />,
+      );
+      const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+      expect(textarea.scrollTop).toBe(1 * 20.8);
+
+      // 用户手动滚走
+      textarea.scrollTop = 0;
+
+      // 同一行、新的 nonce —— 必须重新滚回目标行
+      rerender(
+        <RuleEditor
+          rules={fiveRules}
+          onChange={vi.fn()}
+          readOnly
+          focusLine={2}
+          jumpNonce={2}
+        />,
+      );
+      expect(textarea.scrollTop).toBe(1 * 20.8);
+      expect(activeGutterRow()?.textContent).toBe("2");
+    });
   });
 });

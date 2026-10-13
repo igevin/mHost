@@ -44,9 +44,13 @@ export default function HostsProfileView() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   // issue #124: 命令面板的跳转目标行（location.state.focusLine）。
+  // review F6: jumpId nonce 让同一行的重复跳转也触发重滚。
   const location = useLocation();
   const focusLine =
-    (location.state as { focusLine?: number } | null)?.focusLine ?? null;
+    (location.state as { focusLine?: number; jumpId?: number } | null)
+      ?.focusLine ?? null;
+  const jumpNonce =
+    (location.state as { jumpId?: number } | null)?.jumpId ?? 0;
 
   const profiles = useAtomValue(profilesAtom);
   const isLoading = useAtomValue(isLoadingAtom);
@@ -74,6 +78,7 @@ export default function HostsProfileView() {
   const [isDeleting, setIsDeleting] = useState(false);
   const isDeletingRef = useRef(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const [importDialogOpen, setImportDialogOpen] = useState(false);
   const [showCreateDialog, setShowCreateDialog] = useState(false);
   // Phase 2: 头部 ⋯ 菜单的锚点 rect（PopupMenu 按 fixed 定位）。
@@ -236,19 +241,22 @@ export default function HostsProfileView() {
 
   const handleDeleteConfirm = useCallback(async () => {
     if (!id || isDeletingRef.current) return;
-    setShowDeleteConfirm(false);
+    // review F5: RollbackButton 模式 —— 删除完成前不关确认框
+    // （isLoading 锁 Esc/取消），失败时错误显示在框内。
+    setDeleteError(null);
     isDeletingRef.current = true;
     setIsDeleting(true);
     try {
       await deleteProfileAction(id);
+      setShowDeleteConfirm(false);
       navigate("/profiles");
     } catch (err: unknown) {
-      setError(extractErrorMessage(err));
+      setDeleteError(extractErrorMessage(err));
     } finally {
       isDeletingRef.current = false;
       setIsDeleting(false);
     }
-  }, [id, deleteProfileAction, navigate, setError]);
+  }, [id, deleteProfileAction, navigate]);
 
   const handleExport = useCallback(async () => {
     if (!profile || !id) return;
@@ -605,12 +613,18 @@ export default function HostsProfileView() {
             isEditing ? styles.rulesContentEditing : styles.rulesContentReadOnly
           }`}
         >
+          {/* review F2: key={profile.id} —— 跨 profile 跳转时强制重挂载，
+              text state 由新 rules 初始化，focusLine effect 读到的不会是
+              上一个 profile 的残留 text（与本组件 effect 里 draft 按
+              profile?.id 重置的时机一致）。 */}
           <RuleEditor
+            key={profile.id}
             rules={isEditing ? draftRules : profile.rules}
             onChange={handleRulesChange}
             onErrorChange={handleRulesErrorChange}
             readOnly={!isEditing}
             focusLine={focusLine}
+            jumpNonce={jumpNonce}
           />
         </div>
       </div>
@@ -638,8 +652,14 @@ export default function HostsProfileView() {
         isLoading={isDeleting}
         loadingLabel="Deleting..."
         onConfirm={handleDeleteConfirm}
-        onCancel={() => setShowDeleteConfirm(false)}
-      />
+        onCancel={() => {
+          if (isDeleting) return;
+          setShowDeleteConfirm(false);
+          setDeleteError(null);
+        }}
+      >
+        {deleteError && <div className="alert alert-error">{deleteError}</div>}
+      </ConfirmDialog>
 
       {headerMenuAnchor && (
         <PopupMenu

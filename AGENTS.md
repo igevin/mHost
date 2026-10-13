@@ -53,10 +53,10 @@ mHost/
 │   ├── components/            Layout, Sidebar (the profile management surface — search, ⋯ menu,
 │   │                          toggles; ManagementDrawer/DrawerProfileCard were removed in the Phase 2
 │   │                          UI overhaul), SidebarProfileItem, PopupMenu, ConfirmDialog, RuleEditor,
-│   │                          ApplyConfirmDialog, SnapshotPanel, StatusBar
-│   ├── pages/                 ProfileList, ProfileView, ProfileEdit
+│   │                          ApplyConfirmDialog, SnapshotPanel, StatusBar, CommandPalette (issue #124)
+│   ├── pages/                 AdBlock, ProfileView, Settings, Snapshot, SystemHosts
 │   ├── stores/                Jotai atoms (profiles, dns, snapshots)
-│   ├── hooks/                 shared hooks
+│   ├── hooks/                 shared hooks (useWebKitPointerDown, useGlobalKeybindings)
 │   ├── lib/                   Tauri IPC bindings (invoke wrappers)
 │   └── types/                 shared TS types
 ├── src-tauri/                 Rust backend (Tauri 2)

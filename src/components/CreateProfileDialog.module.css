@@ -4,7 +4,7 @@
   position: fixed;
   inset: 0;
   background: rgba(0, 0, 0, 0.3);
-  z-index: 200; /* Z_INDEX.CREATE_OVERLAY */
+  z-index: 200; /* layer registry: see global.css */
   display: flex;
   align-items: center;
   justify-content: center;
@@ -17,7 +17,7 @@
   padding: 16px 20px;
   width: 360px;
   box-shadow: var(--shadow-md);
-  z-index: 210; /* Z_INDEX.CREATE_CONTENT */
+  z-index: 210; /* layer registry: see global.css */
 }
 
 .title {

@@ -179,8 +179,11 @@ export const paletteQueryAtom = atom("");
  *  stale response discarded / query empty). */
 export const paletteResultsAtom = atom<QueryDomainResult | null>(null);
 
-/** Last 5 executed lookup queries, persisted (issue #124 history). */
+/** Last 5 executed lookup queries, persisted (issue #124 history).
+ *  Shape-guarded (review F9): a hand-edited/corrupt localStorage value
+ *  that isn't a string array falls back to []. */
 export const paletteHistoryAtom = atomWithLocalStorage<string[]>(
   "mhost.paletteHistory",
   [],
+  (v) => Array.isArray(v) && v.every((s) => typeof s === "string"),
 );

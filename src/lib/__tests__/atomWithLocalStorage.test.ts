@@ -93,4 +93,29 @@ describe("atomWithLocalStorage (issue #123)", () => {
       globalThis.localStorage = original;
     }
   });
+
+  it("falls back to initial when the stored value fails the shape guard (review F9)", () => {
+    // 手改 localStorage：解析成功但形状不对（对象而不是数组）。
+    mockStorage["mhost.paletteHistory"] = JSON.stringify({ "0": "api.local" });
+    const guarded = atomWithLocalStorage<string[]>(
+      "mhost.paletteHistory",
+      [],
+      (v) => Array.isArray(v) && v.every((s) => typeof s === "string"),
+    );
+    expect(store.get(guarded)).toEqual([]);
+
+    // 形状合法 → 正常读入
+    mockStorage["mhost.paletteHistory"] = JSON.stringify(["api.local"]);
+    const guarded2 = atomWithLocalStorage<string[]>(
+      "mhost.paletteHistory",
+      [],
+      (v) => Array.isArray(v) && v.every((s) => typeof s === "string"),
+    );
+    expect(store.get(guarded2)).toEqual(["api.local"]);
+
+    // 不传 guard → 行为与之前完全一致（解析到什么是什么）
+    mockStorage["mhost.flag"] = JSON.stringify(true);
+    const unguarded = atomWithLocalStorage<boolean>("mhost.flag", false);
+    expect(store.get(unguarded)).toBe(true);
+  });
 });

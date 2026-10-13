@@ -90,6 +90,7 @@ function Sidebar({ toolNavItems }: SidebarProps) {
   // Delete 确认目标（ConfirmDialog，Phase 1）+ 删除中状态。
   const [deleteTarget, setDeleteTarget] = useState<Profile | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const [duplicatingId, setDuplicatingId] = useState<string | null>(null);
 
   // 排序 + 过滤都在 memoized selector 里做，绝不 mutate profilesAtom：
@@ -201,26 +202,33 @@ function Sidebar({ toolNavItems }: SidebarProps) {
   );
 
   const handleDeleteRequest = useCallback((profile: Profile) => {
+    setDeleteError(null);
     setDeleteTarget(profile);
   }, []);
 
+  // review F5: RollbackButton 模式 —— 对话框在整个异步删除期间保持打开
+  // （isLoading 锁住 Esc/overlay/Cancel），成功才关闭，失败把错误显示在
+  // 框内。之前先关框再 await，isLoading/Esc 锁全是死代码。
   const handleDeleteConfirm = useCallback(async () => {
     const target = deleteTarget;
-    setDeleteTarget(null);
-    if (!target) return;
+    if (!target || deletingId !== null) return;
+    setDeleteError(null);
     setDeletingId(target.id);
     try {
       await deleteProfile(target.id);
+      setDeleteTarget(null);
     } catch (err: unknown) {
-      setError(extractErrorMessage(err));
+      setDeleteError(extractErrorMessage(err));
     } finally {
       setDeletingId(null);
     }
-  }, [deleteTarget, deleteProfile, setError]);
+  }, [deleteTarget, deletingId, deleteProfile]);
 
   const handleDeleteCancel = useCallback(() => {
+    if (deletingId !== null) return;
     setDeleteTarget(null);
-  }, []);
+    setDeleteError(null);
+  }, [deletingId]);
 
   const menuProfile = menuState
     ? (profiles.find((p) => p.id === menuState.id) ?? null)
@@ -379,7 +387,9 @@ function Sidebar({ toolNavItems }: SidebarProps) {
         loadingLabel="Deleting..."
         onConfirm={handleDeleteConfirm}
         onCancel={handleDeleteCancel}
-      />
+      >
+        {deleteError && <div className="alert alert-error">{deleteError}</div>}
+      </ConfirmDialog>
     </aside>
   );
 }

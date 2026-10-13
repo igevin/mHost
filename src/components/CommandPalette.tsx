@@ -132,6 +132,29 @@ function CommandPalette() {
     setActionError(null);
   }, [setOpen]);
 
+  // PR #244 review (F1): 行在 pointerdown 就执行（WebKit 吞点击 quirk
+  // 的兜底），同步 unmount 会让同一手势的 trailing click 穿透到面板下
+  // 方的页面元素（侧栏 toggle / Enable 按钮）——正是 PopupMenu 注释里
+  // 记录的那类坑。执行后把关闭推迟 50ms，让 trailing click 落在还挂着
+  // 的 overlay 上被吞掉。Esc / overlay 点击不是 pointerdown 执行路径，
+  // 仍然同步关闭。
+  // 计时器挂 ref 并在 unmount 时清掉 —— 否则面板卸载后迟到的 close()
+  // 会写到共享的 paletteOpenAtom，把下一次打开又关掉。
+  const closeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const closeDeferred = useCallback(() => {
+    if (closeTimerRef.current) clearTimeout(closeTimerRef.current);
+    closeTimerRef.current = setTimeout(() => {
+      closeTimerRef.current = null;
+      close();
+    }, 50);
+  }, [close]);
+
+  useEffect(() => {
+    return () => {
+      if (closeTimerRef.current) clearTimeout(closeTimerRef.current);
+    };
+  }, []);
+
   // 打开时清空上次查询、聚焦输入框。
   useEffect(() => {
     if (open) {
@@ -141,6 +164,23 @@ function CommandPalette() {
       inputRef.current?.focus();
     }
   }, [open, setQuery]);
+
+  // PR #244 review (F3): Esc 用 document 的 **capture** 阶段监听 +
+  // stopPropagation。面板 z-index 1300 是最顶层 —— 一次 Esc 只关它，
+  // 不能透传给下层 ConfirmDialog / PopupMenu 的 document 级（bubble）
+  // 监听，否则一次 Esc 把两层一起关掉。
+  useEffect(() => {
+    if (!open) return;
+    const handleEsc = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        close();
+      }
+    };
+    document.addEventListener("keydown", handleEsc, { capture: true });
+    return () => document.removeEventListener("keydown", handleEsc, { capture: true });
+  }, [open, close]);
 
   // 100ms debounce 的域名查询 IPC（issue #124 验收：结果 ≤200ms）。
   useEffect(() => {
@@ -262,50 +302,49 @@ function CommandPalette() {
   const jumpToMatch = useCallback(
     (match: RuleMatch) => {
       pushHistory(query);
-      close();
+      closeDeferred();
+      // jumpId nonce（review F6）：同一个 profile 同一行的重复跳转也要
+      // 重新滚动 —— focusLine 是 primitive，effect dep 不变就不重跑。
+      const state = { focusLine: match.source.line, jumpId: Date.now() };
       switch (match.source.type) {
         case "profile":
-          navigate(`/profiles/${match.source.id}`, {
-            state: { focusLine: match.source.line },
-          });
+          navigate(`/profiles/${match.source.id}`, { state });
           break;
         case "dns_rule":
-          navigate(`/dns-profiles/${match.source.id}`, {
-            state: { focusLine: match.source.line },
-          });
+          navigate(`/dns-profiles/${match.source.id}`, { state });
           break;
         case "system_hosts":
-          navigate("/hosts", { state: { focusLine: match.source.line } });
+          navigate("/hosts", { state });
           break;
       }
     },
-    [pushHistory, query, close, navigate],
+    [pushHistory, query, closeDeferred, navigate],
   );
 
   const runCommand = useCallback(
     (id: string) => {
       if (id === "create-profile") {
-        close();
+        closeDeferred();
         setShowCreate(true);
         return;
       }
       if (id === "import-profile") {
-        close();
+        closeDeferred();
         setShowImport(true);
         return;
       }
       if (id === "open-settings") {
-        close();
+        closeDeferred();
         navigate("/settings");
         return;
       }
       if (id === "toggle-dns-mode") {
-        close();
+        closeDeferred();
         toggleDnsMode(!dnsEnabled);
         return;
       }
       if (id === "apply-current") {
-        close();
+        closeDeferred();
         if (enabledProfile) {
           previewApply({ id: enabledProfile.id, enabled: true });
         }
@@ -313,7 +352,7 @@ function CommandPalette() {
       }
       const cmd = profileCommands.find((c) => c.id === id);
       if (cmd) {
-        close();
+        closeDeferred();
         if (cmd.dns) {
           toggleDnsProfile({ id: cmd.profile.id, enabled: !cmd.profile.enabled });
         } else {
@@ -322,7 +361,7 @@ function CommandPalette() {
       }
     },
     [
-      close,
+      closeDeferred,
       navigate,
       toggleDnsMode,
       dnsEnabled,
@@ -351,10 +390,8 @@ function CommandPalette() {
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.preventDefault();
-        close();
-      } else if (e.key === "ArrowDown") {
+      // Esc 由 document capture 监听处理（F3）—— 这里只管 ↑↓/Enter。
+      if (e.key === "ArrowDown") {
         e.preventDefault();
         setActiveIndex((i) => (items.length === 0 ? 0 : (i + 1) % items.length));
       } else if (e.key === "ArrowUp") {
@@ -368,7 +405,7 @@ function CommandPalette() {
         if (item) execute(item);
       }
     },
-    [close, items, activeIndex, execute],
+    [items, activeIndex, execute],
   );
 
   const handleCreate = useCallback(
@@ -463,6 +500,11 @@ function CommandPalette() {
                           </span>
                           {item.match.is_winner && (
                             <span className={styles.winBadge}>WIN</span>
+                          )}
+                          {/* R1: resolver 后缀命中（fix #79 镜像）——
+                              规则域名是查询的父域，标注出来避免误读 */}
+                          {item.match.via_suffix && (
+                            <span className={styles.suffixBadge}>suffix match</span>
                           )}
                           <span className={styles.sourceLabel}>
                             {sourceLabel(item.match)}

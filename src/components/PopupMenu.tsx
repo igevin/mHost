@@ -16,9 +16,13 @@ interface PopupMenuProps {
   onClose: () => void;
 }
 
+// Width/height estimates for the flip/clamp math. MENU_WIDTH matches the
+// CSS min-width (longer labels render wider — a few px of clamp drift is
+// harmless since the menu is never wider than the viewport gutter).
+// MENU_PADDING must equal the CSS .menu padding (4px).
 const MENU_WIDTH = 160;
 const MENU_ITEM_HEIGHT = 30;
-const MENU_PADDING = 8;
+const MENU_PADDING = 4;
 
 /**
  * Self-drawn ⋯ popover menu — shared by the Sidebar profile rows and the

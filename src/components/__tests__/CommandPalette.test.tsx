@@ -34,6 +34,7 @@ const MATCH_FIXTURE: RuleMatch[] = [
     source: { type: "profile", id: "p1", name: "dev", line: 3, enabled: true },
     effective: true,
     is_winner: true,
+    via_suffix: false,
   },
   {
     domain: "api.local",
@@ -41,6 +42,7 @@ const MATCH_FIXTURE: RuleMatch[] = [
     source: { type: "system_hosts", line: 7 },
     effective: true,
     is_winner: false,
+    via_suffix: false,
   },
   {
     domain: "api.local",
@@ -48,6 +50,7 @@ const MATCH_FIXTURE: RuleMatch[] = [
     source: { type: "profile", id: "p2", name: "old", line: 1, enabled: false },
     effective: false,
     is_winner: false,
+    via_suffix: false,
   },
 ];
 
@@ -70,6 +73,7 @@ vi.mock("../../lib/tauri", async (importOriginal) => {
 });
 
 import CommandPalette from "../CommandPalette";
+import ConfirmDialog from "../ConfirmDialog";
 
 function makeProfile(overrides: Partial<Profile> = {}): Profile {
   return {
@@ -221,11 +225,14 @@ describe("CommandPalette (issue #124)", () => {
     fireEvent.keyDown(input, { key: "ArrowDown" });
     fireEvent.keyDown(input, { key: "Enter" });
 
+    // F6: 跳转 state 带 jumpId nonce
     expect(screen.getByTestId("location")).toHaveTextContent(
-      '/profiles/p1 {"focusLine":3}',
+      /\/profiles\/p1 \{"focusLine":3,"jumpId":\d+\}/,
     );
-    // 面板执行后关闭
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    // F1: 执行后关闭是 deferred（trailing-click 防护）—— 等它落地
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument(),
+    );
   });
 
   it("clicking a system-hosts match jumps to /hosts with the file line", async () => {
@@ -237,7 +244,7 @@ describe("CommandPalette (issue #124)", () => {
     fireEvent.click(screen.getByText("System hosts · :7"));
 
     expect(screen.getByTestId("location")).toHaveTextContent(
-      '/hosts {"focusLine":7}',
+      /\/hosts \{"focusLine":7,"jumpId":\d+\}/,
     );
   });
 
@@ -385,5 +392,88 @@ describe("CommandPalette (issue #124)", () => {
       resolveSlow!({ query: "api.local", matches: MATCH_FIXTURE });
     });
     expect(screen.queryByText("dev · :3")).not.toBeInTheDocument();
+  });
+
+  it("shows a 'suffix match' badge for resolver suffix hits (R1)", async () => {
+    mockQueryDomain.mockImplementation((q: string) =>
+      Promise.resolve({
+        query: q,
+        matches: [
+          {
+            domain: "example.com",
+            ip: "0.0.0.0",
+            source: { type: "dns_rule", id: "d1", name: "ads", line: 2 },
+            effective: true,
+            is_winner: true,
+            via_suffix: true,
+          } as RuleMatch,
+        ],
+      }),
+    );
+
+    renderPalette();
+    openPalette();
+    await typeQuery("ad.example.com");
+
+    expect(screen.getByText("suffix match")).toBeInTheDocument();
+    expect(screen.getByText("WIN")).toBeInTheDocument();
+    expect(screen.getByText("DNS · ads · :2")).toBeInTheDocument();
+  });
+
+  // F1 回归：pointerdown 执行后面板必须保持挂载到 trailing click 之后，
+  // 否则同一手势的 click 会穿透到面板下方的页面元素。
+  it("defers close past the trailing click so it can't hit the page beneath (F1)", async () => {
+    renderPalette();
+    openPalette();
+    await typeQuery("api.local");
+    await waitFor(() => screen.getAllByText("api.local"));
+
+    // pointerdown 执行跳转 —— 面板此时必须**还开着**（deferred close）。
+    // 修复前这里同步 unmount，同一手势的 trailing click 会被 hit-test
+    // 到面板下方的页面元素上（侧栏 toggle / Enable 按钮）。
+    const row = screen.getAllByRole("option")[0];
+    fireEvent.pointerDown(row, { button: 0 });
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    // 执行（跳转）已经发生 —— 只有关闭被推迟
+    expect(screen.getByTestId("location")).toHaveTextContent("/profiles/p1");
+
+    // trailing click 落在仍挂载的 overlay 上 → 被 overlay 吞掉
+    // （它的唯一副作用是关闭面板，不会触发任何页面 handler）。
+    fireEvent.click(screen.getByTestId("palette-overlay"));
+
+    // 50ms defer 窗口后关闭
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument(),
+    );
+  });
+
+  // F3 回归：面板（z 1300）叠在 ConfirmDialog（z 1200）上时，一次 Esc
+  // 只能关最顶层 —— ConfirmDialog 必须保持打开。
+  it("Esc closes only the palette, not a ConfirmDialog beneath it (F3)", async () => {
+    const onCancel = vi.fn();
+    render(
+      <JotaiProvider store={getDefaultStore()}>
+        <MemoryRouter initialEntries={["/"]}>
+          <CommandPalette />
+          <ConfirmDialog
+            open={true}
+            title="Delete Profile"
+            message="Delete this profile?"
+            onConfirm={vi.fn()}
+            onCancel={onCancel}
+          />
+        </MemoryRouter>
+      </JotaiProvider>,
+    );
+    openPalette();
+
+    fireEvent.keyDown(screen.getByLabelText("Command palette input"), {
+      key: "Escape",
+    });
+
+    expect(screen.queryByRole("dialog", { name: "Command palette" })).not.toBeInTheDocument();
+    // 下层的确认框没被这次 Esc 一起关掉
+    expect(onCancel).not.toHaveBeenCalled();
+    expect(screen.getByRole("dialog", { name: "Delete Profile" })).toBeInTheDocument();
   });
 });

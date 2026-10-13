@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, act } from "@testing-library/react";
-import { MemoryRouter, Routes, Route } from "react-router-dom";
+import { MemoryRouter, Routes, Route, useNavigate } from "react-router-dom";
 import { getDefaultStore, Provider as JotaiProvider } from "jotai";
 import type { Profile, HostRule } from "../../types";
 import { profilesAtom, selectedProfileIdAtom, dnsProfilesAtom } from "../../stores/profiles";
@@ -529,5 +529,60 @@ describe("ProfileView", () => {
     const active = document.querySelector("[class*='lineNumberActive']");
     expect(active).not.toBeNull();
     expect(active!.textContent).toBe("2");
+  });
+
+  // review F2 回归：跨 profile 跳转（A → B，B 行数更少）。RuleEditor
+  // 按 profile.id key 住后重挂载，text 由 B 的 rules 初始化 ——
+  // 修复前 effect 会拿 A 的残留 text 去 clamp/定位。
+  it("clamps a cross-profile jump against the NEW profile's text, not the previous one (F2)", () => {
+    function NavButton() {
+      const navigate = useNavigate();
+      return (
+        <button
+          data-testid="go-p2"
+          onClick={() =>
+            navigate("/profiles/p2", { state: { focusLine: 5, jumpId: 2 } })
+          }
+        >
+          go
+        </button>
+      );
+    }
+    const threeRules = [
+      makeRule({ id: "r1", ip: "10.0.0.1", domains: ["a.local"] }),
+      makeRule({ id: "r2", ip: "10.0.0.2", domains: ["b.local"] }),
+      makeRule({ id: "r3", ip: "10.0.0.3", domains: ["c.local"] }),
+    ];
+    const oneRule = [makeRule({ id: "r9", ip: "10.0.0.9", domains: ["z.local"] })];
+    const store = getDefaultStore();
+    store.set(profilesAtom, [
+      makeProfile({ id: "p1", name: "big", rules: threeRules }),
+      makeProfile({ id: "p2", name: "small", rules: oneRule }),
+    ]);
+
+    render(
+      <JotaiProvider store={getDefaultStore()}>
+        <MemoryRouter
+          initialEntries={[{ pathname: "/profiles/p1", state: { focusLine: 3, jumpId: 1 } }]}
+        >
+          <Routes>
+            <Route path="/profiles/:id" element={<ProfileView />} />
+          </Routes>
+          <NavButton />
+        </MemoryRouter>
+      </JotaiProvider>,
+    );
+
+    // 起点：p1 第 3 行高亮
+    expect(
+      document.querySelector("[class*='lineNumberActive']")!.textContent,
+    ).toBe("3");
+
+    // 跳到 p2 的「第 5 行」—— p2 只有 1 行，clamp 必须落在 1 而不是
+    // 用 p1 的 3 行 text 去算。
+    fireEvent.click(screen.getByTestId("go-p2"));
+    expect(
+      document.querySelector("[class*='lineNumberActive']")!.textContent,
+    ).toBe("1");
   });
 });

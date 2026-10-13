@@ -6,6 +6,11 @@
  * hits (after `.` / `-` / `_` or at text start) and penalizes a late first
  * match. The Rust side (`commands/query.rs::fuzzy_score`) mirrors this for
  * domain matching; keep the scoring philosophy aligned.
+ *
+ * Divergence note: this matcher walks UTF-16 code units while the Rust
+ * port walks `char`s (Unicode scalar values) — scores/positions may differ
+ * for non-BMP input (emoji domains). Harmless today: hosts/DNS domains are
+ * ASCII (punycode for IDN), and no assertion crosses the two sides.
  */
 export interface FuzzyMatch {
   score: number;

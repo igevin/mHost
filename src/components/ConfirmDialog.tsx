@@ -96,6 +96,9 @@ function ConfirmDialog({
               handleCancel();
             }}
             disabled={isLoading}
+            // review F9: danger 对话框的默认焦点放在 Cancel 上 —— 破坏性
+            // 操作不该是回车即达的按钮。
+            autoFocus={danger}
           >
             {cancelLabel}
           </button>
@@ -107,7 +110,7 @@ function ConfirmDialog({
               handleConfirm();
             }}
             disabled={isLoading}
-            autoFocus
+            autoFocus={!danger}
           >
             {isLoading && loadingLabel ? loadingLabel : confirmLabel}
           </button>

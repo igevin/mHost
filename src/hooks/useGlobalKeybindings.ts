@@ -5,18 +5,26 @@ import { paletteOpenAtom } from "../stores/profiles";
 interface Keybinding {
   /** e.g. "k" — compared against `KeyboardEvent.key` lowercased. */
   key: string;
-  /** Cmd on macOS / Ctrl elsewhere. */
+  /** Platform primary modifier: Cmd on macOS / Ctrl elsewhere (issue #124). */
   mod: boolean;
   run: () => void;
 }
 
 /**
  * Global keyboard shortcuts, registered once at the Layout level
- * (issue #124). Currently: Cmd+K / Ctrl+K toggles the command palette.
+ * (issue #124). Currently: Cmd+K (macOS) / Ctrl+K (elsewhere) toggles the
+ * command palette.
  *
  * Structure note: bindings live in a table so future shortcuts are one
  * row each. The palette's own Esc / ↑↓ / Enter handling lives inside
  * CommandPalette — this hook only owns the global toggle.
+ *
+ * review F7 gating rules:
+ * - macOS requires metaKey AND !ctrlKey — 否则 Ctrl+K 会劫持 Cocoa 文本
+ *   编辑的 kill-line（delete-to-end-of-line）快捷键；
+ * - other platforms require ctrlKey AND !metaKey;
+ * - Shift held → never fire (Cmd+Shift+K / Ctrl+Shift+K 是常见的
+ *   「保留给 app 自己」的键位).
  */
 export function useGlobalKeybindings() {
   const setPaletteOpen = useSetAtom(paletteOpenAtom);
@@ -34,9 +42,18 @@ export function useGlobalKeybindings() {
     ];
 
     const handleKeyDown = (e: KeyboardEvent) => {
+      // 事件时读取（而非模块级缓存），让测试可以 stub navigator.platform。
+      const isMac = /mac/i.test(navigator.platform ?? "");
+      const primaryMod = isMac ? e.metaKey : e.ctrlKey;
+      const otherMod = isMac ? e.ctrlKey : e.metaKey;
       for (const b of bindings) {
-        const modPressed = e.metaKey || e.ctrlKey;
-        if (b.mod === modPressed && e.key.toLowerCase() === b.key) {
+        if (
+          b.mod &&
+          primaryMod &&
+          !otherMod &&
+          !e.shiftKey &&
+          e.key.toLowerCase() === b.key
+        ) {
           e.preventDefault();
           b.run();
           return;

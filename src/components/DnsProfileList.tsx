@@ -58,6 +58,7 @@ function DnsProfileList() {
   const [deletingId, setDeletingId] = useState<string | null>(null);
   // Delete confirmation target (replaces the native plugin-dialog confirm()).
   const [deleteTargetId, setDeleteTargetId] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   // issue #67：单击 label 会触发 pointerdown + click 两个事件，两个事件
   // 都直接调 handleToggle 会让 setProfileEnabled 跑两次（true → false），
@@ -140,23 +141,28 @@ function DnsProfileList() {
     [deletingId],
   );
 
+  // review F5: RollbackButton 模式 —— 删除完成前不关确认框
+  // （isLoading 锁 Esc/取消），失败时错误显示在框内。
   const handleDeleteConfirm = useCallback(async () => {
     const id = deleteTargetId;
-    setDeleteTargetId(null);
-    if (!id) return;
+    if (!id || deletingId !== null) return;
+    setDeleteError(null);
     setDeletingId(id);
     try {
       await deleteProfile(id);
+      setDeleteTargetId(null);
     } catch (err: unknown) {
-      setError(extractErrorMessage(err));
+      setDeleteError(extractErrorMessage(err));
     } finally {
       setDeletingId(null);
     }
-  }, [deleteTargetId, deleteProfile, setError]);
+  }, [deleteTargetId, deletingId, deleteProfile]);
 
   const handleDeleteCancel = useCallback(() => {
+    if (deletingId !== null) return;
     setDeleteTargetId(null);
-  }, []);
+    setDeleteError(null);
+  }, [deletingId]);
 
   return (
     <div className={viewStyles.viewPage}>
@@ -284,7 +290,9 @@ function DnsProfileList() {
         loadingLabel="Deleting..."
         onConfirm={handleDeleteConfirm}
         onCancel={handleDeleteCancel}
-      />
+      >
+        {deleteError && <div className="alert alert-error">{deleteError}</div>}
+      </ConfirmDialog>
     </div>
   );
 }

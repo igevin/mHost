@@ -10,6 +10,7 @@ import {
   closeApplyConfirmAtom,
   rollbackHostsActionAtom,
   profilesAtom,
+  errorAtom,
 } from "../stores/profiles";
 import ApplyConfirmDialog from "./ApplyConfirmDialog";
 import QuickApplyToast from "./QuickApplyToast";
@@ -165,6 +166,11 @@ function Layout() {
   const rollbackHostsAction = useSetAtom(rollbackHostsActionAtom);
   const setApplyError = useSetAtom(applyErrorAtom);
 
+  // review F4: errorAtom 此前只在 HostsProfileView 渲染 —— 侧栏的
+  // 删除/复制/导出失败在其它路由上是静默的。挪到 Layout 全局渲染。
+  const appError = useAtomValue(errorAtom);
+  const setAppError = useSetAtom(errorAtom);
+
   // Refs #127: profiles needed by QuickApplyToast to resolve disabled IDs to display names.
   const profiles = useAtomValue(profilesAtom);
 
@@ -179,6 +185,18 @@ function Layout() {
       <Sidebar toolNavItems={toolNavItems} />
 
       <main className={styles.mhostMain}>
+        {appError && (
+          <div className="alert alert-error">
+            {appError}
+            <button
+              className="btn btn-ghost btn-sm"
+              onClick={() => setAppError(null)}
+              style={{ marginLeft: 8 }}
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
         {applyError && !applyConfirmOpen && (
           <div className="alert alert-error">
             {applyError}

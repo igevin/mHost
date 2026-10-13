@@ -544,6 +544,48 @@ describe("Sidebar management surface (Phase 2)", () => {
     expect(invoke).toHaveBeenCalledWith("delete_profile", { id: "p1" });
   });
 
+  // review F5: 确认框在异步删除完成前保持打开（isLoading），成功才关闭。
+  it("delete ConfirmDialog stays open (isLoading) until the delete finishes (F5)", async () => {
+    const store = getDefaultStore();
+    store.set(profilesAtom, [makeProfile({ id: "p1", name: "dev" })]);
+    let resolveDelete: () => void;
+    const invoke = await setupInvoke();
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "delete_profile") {
+        return new Promise<void>((r) => {
+          resolveDelete = r;
+        });
+      }
+      return null;
+    });
+
+    renderLayout();
+
+    fireEvent.click(menuButtonFor("dev"));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Delete" }));
+    await act(async () => {
+      fireEvent.click(
+        within(screen.getByRole("dialog")).getByRole("button", {
+          name: "Delete",
+        }),
+      );
+    });
+
+    // 删除进行中：对话框还在，按钮呈 loading 态且被锁
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    expect(
+      within(screen.getByRole("dialog")).getByRole("button", {
+        name: "Deleting...",
+      }),
+    ).toBeDisabled();
+
+    // 完成后才关闭
+    await act(async () => {
+      resolveDelete!();
+    });
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
   it("Delete menu item is disabled for protected profiles", () => {
     const store = getDefaultStore();
     store.set(profilesAtom, [makeProfile({ id: "p1", name: "dev", protected: true })]);

@@ -92,38 +92,6 @@
   color: var(--warning);
 }
 
-.statusPending {
-  margin-top: 6px;
-  font-size: var(--font-size-sm);
-  color: var(--warning);
-  font-weight: 500;
-}
-
-.statusApplyBtn {
-  margin-top: 8px;
-  width: 100%;
-  padding: 6px 10px;
-  border-radius: var(--radius-sm);
-  border: 1px solid var(--accent);
-  background: var(--accent);
-  /* matches .btn-primary: dark mode needs the dark contrast color,
-   * not #fff on the lighter accent (issue #125 review note in global.css). */
-  color: var(--accent-contrast);
-  font-size: var(--font-size-sm);
-  font-weight: 500;
-  cursor: pointer;
-  transition: background 0.15s;
-}
-
-.statusApplyBtn:hover:not(:disabled) {
-  background: var(--accent-hover);
-}
-
-.statusApplyBtn:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
 /* ---- DNS mode mini switch (Phase 2) ----
  * Compact 32x18 variant, mirrors the sidebar profile toggle in
  * Layout.module.css. Cancel 按钮与 switch 是兄弟节点（issue #149：

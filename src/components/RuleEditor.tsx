@@ -16,6 +16,9 @@ interface RuleEditorProps {
   /** issue #124: 命令面板跳转目标行（1-based）。设置后滚动到该行并高亮
    *  gutter —— 只读模式同样生效（跳转不做任何编辑）。 */
   focusLine?: number | null;
+  /** review F6: 同一行的重复跳转也要重滚 —— focusLine 是 primitive，
+   *  dep 不变 effect 不重跑；调用方每次跳转带一个 nonce（jumpId）。 */
+  jumpNonce?: number;
 }
 
 /** Convert HostRule[] to hosts file text format */
@@ -147,7 +150,7 @@ function useDebouncedCallback<T extends (...args: Parameters<T>) => void>(
   return debounced;
 }
 
-function RuleEditor({ rules, onChange, onErrorChange, readOnly = false, focusLine = null }: RuleEditorProps) {
+function RuleEditor({ rules, onChange, onErrorChange, readOnly = false, focusLine = null, jumpNonce = 0 }: RuleEditorProps) {
   const [text, setText] = useState(() => rulesToText(rules));
   const [validateResult, setValidateResult] = useState<ValidateResult | null>(null);
   const errors = validateResult?.errors ?? [];
@@ -346,6 +349,13 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false, focusLin
   // 下一次 onSelect 的 delta walk 会从错误的起点数换行、算错绝对行号
   // （handleActiveLineUpdate 的增量缓存契约，见上方注释）。这里的 O(N)
   // 行首偏移计算每次跳转只跑一次，不在击键热路径上。
+  //
+  // review F2/F6：
+  // - 跨 profile 跳转而 rules 已变时，调用方用 `key={profile.id}` 让本
+  //   组件重挂载（与 HostsProfileView 的 draft-reset 时机一致），mount
+  //   时 text 已由新 rules 初始化 —— ta.value 不会是旧 profile 的内容。
+  // - deps 刻意不含 text：跳转后用户继续打字不应触发重滚。同一行的重复
+  //   跳转靠 jumpNonce 触发。
   useEffect(() => {
     if (focusLine == null) return;
     const ta = textareaRef.current;
@@ -359,7 +369,8 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false, focusLin
     lastLineRef.current = lineIdx;
     setActiveLineNumber(lineIdx);
     scrollToMatch(lineIdx);
-  }, [focusLine, scrollToMatch]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusLine, jumpNonce, scrollToMatch]);
 
   // Navigation handlers
   const handlePrev = useCallback(() => {
