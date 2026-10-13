@@ -1,0 +1,54 @@
+/* ---- PopupMenu — self-drawn ⋯ popover ---- */
+
+.overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1140;
+}
+
+.menu {
+  position: fixed;
+  z-index: 1150; /* below ConfirmDialog (1200) */
+  min-width: 160px;
+  padding: 4px;
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-lg);
+  display: flex;
+  flex-direction: column;
+}
+
+.menuItem {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  padding: 5px 10px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: var(--font-size-md);
+  text-align: left;
+  cursor: pointer;
+  white-space: nowrap;
+  height: 30px;
+}
+
+.menuItem:hover:not(:disabled) {
+  background: var(--sidebar-hover);
+}
+
+.menuItem:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.menuItemDanger {
+  color: var(--danger);
+}
+
+.menuItemDanger:hover:not(:disabled) {
+  background: var(--danger-soft);
+}

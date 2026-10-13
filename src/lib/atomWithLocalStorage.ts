@@ -20,13 +20,23 @@ import { atom } from "jotai";
  * - No cross-tab `storage` event subscription. mHost is a single
  *   user-facing desktop window; the one-tab assumption is intentional.
  */
-export function atomWithLocalStorage<T>(key: string, initial: T) {
+export function atomWithLocalStorage<T>(
+  key: string,
+  initial: T,
+  /** review F9: optional shape guard — a localStorage value that parses
+   *  but has the wrong shape (e.g. a hand-edited `"mhost.paletteHistory":
+   *  {"0": "x"}` object instead of an array) must fall back to `initial`
+   *  instead of poisoning the atom. */
+  isValid?: (value: unknown) => boolean,
+) {
   const readInitial = (): T => {
     if (typeof localStorage === "undefined") return initial;
     try {
       const raw = localStorage.getItem(key);
       if (raw === null) return initial;
-      return JSON.parse(raw) as T;
+      const parsed = JSON.parse(raw) as unknown;
+      if (isValid && !isValid(parsed)) return initial;
+      return parsed as T;
     } catch {
       // Corrupted value — fall back to the default rather than crashing.
       return initial;

@@ -11,17 +11,17 @@
 
 .sidebar {
   width: var(--sidebar-width);
-  background: var(--color-sidebar);
+  background: var(--sidebar-bg);
   border-right: 1px solid var(--rule-soft);
   display: flex;
   flex-direction: column;
   flex-shrink: 0;
   overflow: hidden;
-  color: var(--color-text-secondary);
+  color: var(--ink-soft);
 }
 
 .sidebarHeader {
-  padding: 18px 16px 12px;
+  padding: 16px 16px 12px;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -43,7 +43,7 @@
   justify-content: center;
   color: var(--accent-contrast);
   font-weight: 600;
-  font-size: 14px;
+  font-size: var(--font-size-lg);
   font-family: var(--font-mono);
 }
 
@@ -71,21 +71,21 @@
 }
 
 .dnsStatusIndicator:hover {
-  background: var(--color-sidebar-hover);
+  background: var(--sidebar-hover);
 }
 
 .dnsStatusDot {
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: var(--color-success);
+  background: var(--success);
   flex-shrink: 0;
 }
 
 .dnsStatusLabel {
-  font-size: 11px;
+  font-size: var(--font-size-xs);
   font-weight: 600;
-  color: var(--color-success);
+  color: var(--success);
 }
 
 /* ---- Sidebar Section ---- */
@@ -95,12 +95,12 @@
 }
 
 .sidebarSectionTitle {
-  font-size: 10px;
+  font-size: var(--font-size-xs);
   font-weight: 500;
   color: var(--ink-muted);
   text-transform: uppercase;
   letter-spacing: 0.08em;
-  padding: 4px 8px 6px;
+  padding: 4px 8px 4px;
   font-family: var(--font-mono);
 }
 
@@ -111,22 +111,28 @@
   padding-right: 4px;
 }
 
-.manageLink {
-  font-size: 11px;
-  font-weight: 500;
-  color: var(--color-primary);
-  background: none;
-  border: none;
-  cursor: pointer;
-  padding: 2px 8px 2px 4px;
-  text-transform: none;
-  letter-spacing: 0;
-  opacity: 0.7;
-  transition: opacity var(--transition-fast);
+/* ---- Profile search/filter (Phase 2: sidebar is the management surface) ---- */
+
+.profileSearchInput {
+  width: 100%;
+  margin: 4px 0 8px;
+  padding: 5px 8px;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-sm);
+  background: var(--input-bg);
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  outline: none;
+  transition: border-color var(--transition-fast);
 }
 
-.manageLink:hover {
-  opacity: 1;
+.profileSearchInput:focus {
+  border-color: var(--accent);
+}
+
+.profileSearchInput::placeholder {
+  color: var(--ink-muted);
 }
 
 /* ---- Profile List ----
@@ -158,8 +164,8 @@
 
 .profileEmpty {
   padding: 12px 10px;
-  font-size: 12px;
-  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
+  color: var(--ink-muted);
   text-align: center;
 }
 
@@ -177,11 +183,11 @@
 }
 
 .profileItem:hover {
-  background: var(--color-sidebar-hover);
+  background: var(--sidebar-hover);
 }
 
 .profileItemActive {
-  background: var(--color-sidebar-active);
+  background: var(--sidebar-active);
 }
 
 .profileItemActive::before {
@@ -192,7 +198,7 @@
   transform: translateY(-50%);
   width: 3px;
   height: 18px;
-  background: var(--color-primary);
+  background: var(--accent);
   border-radius: 0 3px 3px 0;
 }
 
@@ -212,11 +218,11 @@
 }
 
 .profileStatusDotOn {
-  background: var(--color-success);
+  background: var(--success);
 }
 
 .profileStatusDotOff {
-  background: var(--color-text-muted);
+  background: var(--ink-muted);
 }
 
 .profileItemInfo {
@@ -227,7 +233,7 @@
 }
 
 .profileItemName {
-  font-size: 12.5px;
+  font-size: var(--font-size-md);
   font-weight: 500;
   color: var(--ink);
   font-family: var(--font-mono);
@@ -239,8 +245,8 @@
 }
 
 .profileItemDesc {
-  font-size: 11px;
-  color: var(--color-text-muted);
+  font-size: var(--font-size-xs);
+  color: var(--ink-muted);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -248,7 +254,39 @@
 }
 
 .profileItemActive .profileItemName {
-  color: var(--color-primary);
+  color: var(--accent);
+}
+
+/* ---- Profile row ⋯ menu button (hover-revealed) ---- */
+
+.profileMenuBtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--ink-muted);
+  font-size: var(--font-size-md);
+  line-height: 1;
+  cursor: pointer;
+  flex-shrink: 0;
+  opacity: 0;
+  transition:
+    opacity var(--transition-fast),
+    background var(--transition-fast);
+}
+
+.profileItem:hover .profileMenuBtn,
+.profileMenuBtn:focus-visible {
+  opacity: 1;
+}
+
+.profileMenuBtn:hover {
+  background: var(--sidebar-hover);
+  color: var(--ink);
 }
 
 /* ---- New Profile Button ---- */
@@ -261,10 +299,10 @@
   padding: 6px 12px;
   margin-top: 4px;
   border-radius: var(--radius-sm);
-  border: 1px dashed var(--color-border);
+  border: 1px dashed var(--rule);
   background: transparent;
-  color: var(--color-text-muted);
-  font-size: 12px;
+  color: var(--ink-muted);
+  font-size: var(--font-size-sm);
   font-weight: 500;
   cursor: pointer;
   transition: all var(--transition-fast);
@@ -272,9 +310,9 @@
 }
 
 .newProfileBtn:hover {
-  border-color: var(--color-primary);
-  color: var(--color-primary);
-  background: var(--accent-lighter);
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-soft);
 }
 
 /* ---- Toggle Switch (compact for sidebar) ---- */
@@ -336,9 +374,9 @@
   gap: 10px;
   padding: 8px 12px;
   border-radius: var(--radius-sm);
-  color: var(--color-text-secondary);
+  color: var(--ink-soft);
   text-decoration: none;
-  font-size: 13px;
+  font-size: var(--font-size-md);
   font-weight: 500;
   position: relative;
   user-select: none;
@@ -347,13 +385,13 @@
 }
 
 .navLink:hover {
-  background: var(--color-sidebar-hover);
-  color: var(--color-text);
+  background: var(--sidebar-hover);
+  color: var(--ink);
 }
 
 .navLinkActive {
-  background: var(--color-sidebar-active);
-  color: var(--color-primary);
+  background: var(--sidebar-active);
+  color: var(--accent);
 }
 
 .navLinkActive::before {
@@ -364,7 +402,7 @@
   transform: translateY(-50%);
   width: 3px;
   height: 18px;
-  background: var(--color-primary);
+  background: var(--accent);
   border-radius: 0 3px 3px 0;
 }
 
@@ -393,10 +431,10 @@
 
 .navBadge {
   margin-left: auto;
-  font-size: 11px;
+  font-size: var(--font-size-xs);
   font-weight: 600;
-  background: var(--color-border-secondary);
-  color: var(--color-text-muted);
+  background: var(--rule-soft);
+  color: var(--ink-muted);
   padding: 1px 7px;
   border-radius: 10px;
   min-width: 20px;
@@ -404,8 +442,8 @@
 }
 
 .navLinkActive .navBadge {
-  background: var(--accent-light);
-  color: var(--color-primary);
+  background: var(--accent-soft);
+  color: var(--accent);
 }
 
 .comingSoonBadge {
@@ -414,10 +452,10 @@
   gap: 4px;
   padding: 1px 7px;
   border-radius: 10px;
-  font-size: 10px;
+  font-size: var(--font-size-xs);
   font-weight: 600;
-  background: var(--color-border-secondary);
-  color: var(--color-text-muted);
+  background: var(--rule-soft);
+  color: var(--ink-muted);
   margin-left: 4px;
 }
 

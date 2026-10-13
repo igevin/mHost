@@ -1,7 +1,7 @@
 import { useEffect, useState, useCallback, useMemo, useRef } from "react";
-import { useParams, useNavigate, Navigate } from "react-router-dom";
+import { useParams, useNavigate, Navigate, useLocation } from "react-router-dom";
 import { useAtomValue, useSetAtom } from "jotai";
-import { save, confirm } from "@tauri-apps/plugin-dialog";
+import { save } from "@tauri-apps/plugin-dialog";
 import {
   profilesAtom,
   selectedProfileIdAtom,
@@ -23,6 +23,8 @@ import type { HostRule } from "../types";
 import RuleEditor from "./RuleEditor";
 import ImportDialog from "./ImportDialog";
 import CreateProfileDialog from "./CreateProfileDialog";
+import ConfirmDialog from "./ConfirmDialog";
+import PopupMenu, { type PopupMenuItem } from "./PopupMenu";
 import styles from "../pages/ProfileView.module.css";
 
 /**
@@ -41,10 +43,17 @@ import styles from "../pages/ProfileView.module.css";
 export default function HostsProfileView() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
+  // issue #124: 命令面板的跳转目标行（location.state.focusLine）。
+  // review F6: jumpId nonce 让同一行的重复跳转也触发重滚。
+  const location = useLocation();
+  const focusLine =
+    (location.state as { focusLine?: number; jumpId?: number } | null)
+      ?.focusLine ?? null;
+  const jumpNonce =
+    (location.state as { jumpId?: number } | null)?.jumpId ?? 0;
 
   const profiles = useAtomValue(profilesAtom);
   const isLoading = useAtomValue(isLoadingAtom);
-  const error = useAtomValue(errorAtom);
 
   const isApplying = useAtomValue(isApplyingAtom);
   const setSelectedId = useSetAtom(selectedProfileIdAtom);
@@ -67,8 +76,13 @@ export default function HostsProfileView() {
   const [isSavingInfo, setIsSavingInfo] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
   const isDeletingRef = useRef(false);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const [importDialogOpen, setImportDialogOpen] = useState(false);
   const [showCreateDialog, setShowCreateDialog] = useState(false);
+  // Phase 2: 头部 ⋯ 菜单的锚点 rect（PopupMenu 按 fixed 定位）。
+  // Import / Export / Delete / Edit info 都收进这个菜单。
+  const [headerMenuAnchor, setHeaderMenuAnchor] = useState<DOMRect | null>(null);
 
   // Draft state for editing rules
   const [draftRules, setDraftRules] = useState<HostRule[]>([]);
@@ -219,22 +233,29 @@ export default function HostsProfileView() {
     }
   }, [profile, draftRules, ruleErrors, isSaving, updateProfile, setError]);
 
-  const handleDeleteProfile = useCallback(async () => {
+  const handleDeleteProfile = useCallback(() => {
     if (!profile || !id || profile.protected || isDeletingRef.current) return;
-    const confirmed = await confirm(`Delete profile "${profile.name}"?`);
-    if (!confirmed) return;
+    setShowDeleteConfirm(true);
+  }, [profile, id]);
+
+  const handleDeleteConfirm = useCallback(async () => {
+    if (!id || isDeletingRef.current) return;
+    // review F5: RollbackButton 模式 —— 删除完成前不关确认框
+    // （isLoading 锁 Esc/取消），失败时错误显示在框内。
+    setDeleteError(null);
     isDeletingRef.current = true;
     setIsDeleting(true);
     try {
       await deleteProfileAction(id);
+      setShowDeleteConfirm(false);
       navigate("/profiles");
     } catch (err: unknown) {
-      setError(extractErrorMessage(err));
+      setDeleteError(extractErrorMessage(err));
     } finally {
       isDeletingRef.current = false;
       setIsDeleting(false);
     }
-  }, [profile, id, deleteProfileAction, navigate, setError]);
+  }, [id, deleteProfileAction, navigate]);
 
   const handleExport = useCallback(async () => {
     if (!profile || !id) return;
@@ -291,6 +312,33 @@ export default function HostsProfileView() {
     previewApplyAction({ id, enabled: !profile.enabled });
   }, [id, profile, setApplyError, previewApplyAction]);
 
+  // Phase 2 头部 ⋯ 菜单项。顺序与已删除的 ManagementDrawer 卡片一致：
+  // 编辑信息 → 导入/导出 → 删除（danger 收尾）。Edit info 展开与信息栏
+  // 里同一个 inline 表单（handleEditInfo 会同时展开 info bar）。
+  const headerMenuItems: PopupMenuItem[] = profile
+    ? [
+        {
+          label: "Edit info",
+          onSelect: handleEditInfo,
+        },
+        {
+          label: "Import",
+          onSelect: () => setImportDialogOpen(true),
+        },
+        {
+          label: "Export",
+          disabled: isLoading,
+          onSelect: handleExport,
+        },
+        {
+          label: "Delete",
+          danger: true,
+          disabled: profile.protected || isLoading || isDeleting,
+          onSelect: handleDeleteProfile,
+        },
+      ]
+    : [];
+
   if (!id) {
     if (profiles.length > 0) {
       return <Navigate to={`/profiles/${profiles[0].id}`} replace />;
@@ -334,8 +382,6 @@ export default function HostsProfileView() {
 
   return (
     <div className={styles.viewPage}>
-      {error && <div className="alert alert-error">{error}</div>}
-
       {/* Info Bar */}
       <div className={styles.infoBar}>
         {!isInfoBarExpanded ? (
@@ -360,15 +406,6 @@ export default function HostsProfileView() {
                 </div>
               )}
             </div>
-            <button
-              className={styles.infoBarEditLink}
-              onClick={(e) => {
-                e.stopPropagation();
-                handleEditInfo();
-              }}
-            >
-              Edit info -&gt;
-            </button>
           </div>
         ) : (
           <div className={styles.infoBarExpanded}>
@@ -510,21 +547,6 @@ export default function HostsProfileView() {
           {!isEditing ? (
             <>
               <button
-                className="btn btn-ghost btn-sm"
-                onClick={() => setImportDialogOpen(true)}
-                onPointerDown={onPointerDown(() => setImportDialogOpen(true))}
-              >
-                Import
-              </button>
-              <button
-                className="btn btn-ghost btn-sm"
-                onClick={handleExport}
-                onPointerDown={onPointerDown(handleExport)}
-                disabled={isLoading}
-              >
-                Export
-              </button>
-              <button
                 className="btn btn-primary btn-sm"
                 onClick={handleEditRules}
                 onPointerDown={onPointerDown(handleEditRules)}
@@ -532,11 +554,17 @@ export default function HostsProfileView() {
                 Edit Rules
               </button>
               <button
-                className="btn btn-danger btn-sm"
-                onClick={handleDeleteProfile}
-                disabled={profile.protected || isLoading || isDeleting}
+                className="btn btn-ghost btn-sm"
+                aria-label="More profile actions"
+                title="More actions"
+                onClick={(e) =>
+                  setHeaderMenuAnchor(e.currentTarget.getBoundingClientRect())
+                }
+                onPointerDown={onPointerDown((e) =>
+                  setHeaderMenuAnchor(e.currentTarget.getBoundingClientRect()),
+                )}
               >
-                Delete
+                ⋯
               </button>
             </>
           ) : (
@@ -582,11 +610,18 @@ export default function HostsProfileView() {
             isEditing ? styles.rulesContentEditing : styles.rulesContentReadOnly
           }`}
         >
+          {/* review F2: key={profile.id} —— 跨 profile 跳转时强制重挂载，
+              text state 由新 rules 初始化，focusLine effect 读到的不会是
+              上一个 profile 的残留 text（与本组件 effect 里 draft 按
+              profile?.id 重置的时机一致）。 */}
           <RuleEditor
+            key={profile.id}
             rules={isEditing ? draftRules : profile.rules}
             onChange={handleRulesChange}
             onErrorChange={handleRulesErrorChange}
             readOnly={!isEditing}
+            focusLine={focusLine}
+            jumpNonce={jumpNonce}
           />
         </div>
       </div>
@@ -604,6 +639,32 @@ export default function HostsProfileView() {
         onCreate={handleCreateProfile}
         isLoading={isLoading}
       />
+
+      <ConfirmDialog
+        open={showDeleteConfirm}
+        title="Delete Profile"
+        message={`Delete profile "${profile.name}"?`}
+        confirmLabel="Delete"
+        danger
+        isLoading={isDeleting}
+        loadingLabel="Deleting..."
+        onConfirm={handleDeleteConfirm}
+        onCancel={() => {
+          if (isDeleting) return;
+          setShowDeleteConfirm(false);
+          setDeleteError(null);
+        }}
+      >
+        {deleteError && <div className="alert alert-error">{deleteError}</div>}
+      </ConfirmDialog>
+
+      {headerMenuAnchor && (
+        <PopupMenu
+          anchorRect={headerMenuAnchor}
+          items={headerMenuItems}
+          onClose={() => setHeaderMenuAnchor(null)}
+        />
+      )}
     </div>
   );
 }

@@ -14,8 +14,10 @@
       {
         "label": "main",
         "title": "mHost",
-        "width": 900,
-        "height": 700
+        "width": 1100,
+        "height": 740,
+        "minWidth": 960,
+        "minHeight": 640
       }
     ],
     "security": {

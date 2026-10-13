@@ -8,11 +8,13 @@
 }
 
 .diffPreview {
-  font-family: var(--font-mono, ui-monospace, "SF Mono", Menlo, monospace);
-  font-size: 12px;
-  background: var(--color-surface-muted);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-sm, 4px);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  /* was var(--color-surface-muted) — never defined, so this rendered
+   * transparent; map to the muted surface token. */
+  background: var(--sidebar-bg);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-sm);
   padding: 8px;
   max-height: 300px;
   overflow-y: auto;
@@ -25,17 +27,17 @@
 }
 
 .diffAdded {
-  color: var(--color-success, #28a745);
-  background: rgba(40, 167, 69, 0.08);
+  color: var(--success);
+  background: var(--success-soft);
 }
 
 .diffRemoved {
-  color: var(--color-danger, #dc3545);
-  background: rgba(220, 53, 69, 0.08);
+  color: var(--danger);
+  background: var(--danger-soft);
 }
 
 .diffUnchanged {
-  color: var(--color-text-muted, #888);
+  color: var(--ink-muted);
 }
 
 .diffUnchangedCollapsed {
@@ -44,17 +46,17 @@
   margin-top: 4px;
   padding: 4px;
   background: transparent;
-  border: 1px dashed var(--color-border);
-  border-radius: var(--radius-sm, 4px);
-  color: var(--color-text-muted, #888);
-  font-family: var(--font-mono, ui-monospace, "SF Mono", Menlo, monospace);
-  font-size: 12px;
+  border: 1px dashed var(--rule);
+  border-radius: var(--radius-sm);
+  color: var(--ink-muted);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
   cursor: pointer;
 }
 
 .diffUnchangedCollapsed:hover {
-  background: var(--color-surface);
-  color: var(--color-text);
+  background: var(--surface);
+  color: var(--ink);
 }
 
 /* Non-interactive sibling of .diffUnchangedCollapsed — the "…N more"
@@ -67,41 +69,41 @@
 
 .diffUnchangedNote:hover {
   background: transparent;
-  color: var(--color-text-muted, #888);
+  color: var(--ink-muted);
 }
 
 .diffEmpty {
-  font-family: var(--font-mono, ui-monospace, "SF Mono", Menlo, monospace);
-  font-size: 12px;
-  color: var(--color-text-muted, #888);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  color: var(--ink-muted);
   padding: 12px;
   text-align: center;
-  background: var(--color-surface-muted);
-  border: 1px dashed var(--color-border);
-  border-radius: var(--radius-sm, 4px);
+  background: var(--sidebar-bg);
+  border: 1px dashed var(--rule);
+  border-radius: var(--radius-sm);
 }
 
 .conflictSection {
   margin-top: 12px;
   padding: 8px 12px;
-  background: rgba(220, 53, 69, 0.08);
-  border: 1px solid var(--color-danger, #dc3545);
-  border-radius: var(--radius-sm, 4px);
+  background: var(--danger-soft);
+  border: 1px solid var(--danger);
+  border-radius: var(--radius-sm);
 }
 
 .conflictWarning {
   font-weight: 600;
-  color: var(--color-danger, #dc3545);
+  color: var(--danger);
   margin-bottom: 6px;
-  font-size: 13px;
+  font-size: var(--font-size-md);
 }
 
 .conflictList {
   display: flex;
   flex-direction: column;
   gap: 4px;
-  font-size: 12px;
-  color: var(--color-text);
+  font-size: var(--font-size-sm);
+  color: var(--ink);
 }
 
 .conflictItem {
@@ -110,6 +112,6 @@
 }
 
 .conflictDomain {
-  font-family: var(--font-mono, ui-monospace, "SF Mono", Menlo, monospace);
+  font-family: var(--font-mono);
   font-weight: 500;
 }

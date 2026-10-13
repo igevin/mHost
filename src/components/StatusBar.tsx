@@ -1,4 +1,5 @@
-import { useAtomValue } from "jotai";
+import { useCallback } from "react";
+import { useAtomValue, useSetAtom } from "jotai";
 import { useNavigate } from "react-router-dom";
 import {
   enabledProfileAtom,
@@ -7,9 +8,13 @@ import {
   enabledDnsProfilesAtom,
   dnsRuleCountAtom,
   dnsProfilesAtom,
+  isDnsLoadingAtom,
+  toggleDnsModeAtom,
+  cancelActiveDnsToggle,
   // issue #232
   dnsDiscrepancyAtom,
 } from "../stores/profiles";
+import { useWebKitPointerDown } from "../hooks/useWebKitPointerDown";
 import styles from "./StatusBar.module.css";
 
 /**
@@ -17,9 +22,17 @@ import styles from "./StatusBar.module.css";
  *  - 左栏：Hosts 模式 active profile（v0.3 既有行为）
  *  - 右栏：DNS 模式摘要（N 个 profile · M 个启用 · K 条规则）
  *
- * 右栏点击行为：
- *  - DNS on：导航到 /dns-profiles（列表落地页），可管理多个启用的 profile
- *  - DNS off：导航到 /settings（开关 DNS 模式的入口）
+ * 右栏行为（Phase 2 起）：
+ *  - 卡内嵌一个 mini switch，直接走 `toggleDnsModeAtom` 开关 DNS 模式；
+ *    toggle 进行中（isDnsLoadingAtom）时 switch 禁用并露出 Cancel
+ *    （`cancelActiveDnsToggle`，issue #149 的 AbortController 取消路径，
+ *    与 Settings 页同一约定：Cancel 是**兄弟节点**，不做同位 swap，
+ *    否则 trailing click 会落到新挂载的 Cancel 上）。
+ *  - 点卡片本体：DNS on → /dns-profiles；DNS off → /settings。
+ *  - `stuck_at_loopback`（issue #232）：不显示 switch（修复必须走
+ *    Settings 的 Restore 路径），点卡片导航到 /settings 并带
+ *    `location.state.highlightDnsDiscrepancy`，Settings 会滚动并高亮
+ *    分歧横幅。
  *
  * Issue #232：`stuck_at_loopback` 的**常驻**警示入口。Settings 页的横幅
  * （`Settings.tsx` 的 `dns-discrepancy-banner`）只在用户主动去 Settings 时
@@ -44,6 +57,10 @@ function StatusBar() {
   const dnsProfiles = useAtomValue(dnsProfilesAtom);
   const enabledDnsProfiles = useAtomValue(enabledDnsProfilesAtom);
   const dnsRuleCount = useAtomValue(dnsRuleCountAtom);
+  // Phase 2: 卡内 switch 直接开关 DNS 模式。isDnsLoadingAtom 的写入只在
+  // toggle 起止两次发生，订阅它不会引入 #90 点名的那类高频重渲染。
+  const isDnsLoading = useAtomValue(isDnsLoadingAtom);
+  const toggleDnsMode = useSetAtom(toggleDnsModeAtom);
   // issue #232: 与 `dnsEnabledAtom` 的分歧。**新增的订阅是纯派生的读**，
   // 不发任何 IPC；它只在 `dnsEnabledAtom` 或 `systemDnsAtom` 变化时才可能
   // 触发本组件重渲染 —— 后者只在启动 / 窗口 focus / DNS toggle 时写。
@@ -53,6 +70,12 @@ function StatusBar() {
   const dnsDiscrepancy = useAtomValue(dnsDiscrepancyAtom);
 
   const navigate = useNavigate();
+  // WebKit pointerdown/click 去重 —— 与 Settings 的 handleToggleDns 同一
+  // pattern B（见 useWebKitPointerDown 文档）。没有这道 guard，一次点击
+  // 会调两次 toggleDnsMode：第二次覆盖进行中的 AbortController slot，
+  // 且同步重渲染会让 trailing click 落到新挂载的 Cancel 上，把 Rust 侧
+  // 的 set_dns_mode 在 TCC 弹窗前就取消掉（issue #149 的症状）。
+  const { fire, releaseSoon } = useWebKitPointerDown();
 
   const totalDns = dnsProfiles.length;
   const enabledDns = enabledDnsProfiles.length;
@@ -61,15 +84,35 @@ function StatusBar() {
   // issue #232: stuck ⟹ `dnsEnabled === false`（见 `dnsDiscrepancyAtom`
   // 的真值表），所以既有的 `handleDnsClick` 已经会落到 `/settings`，
   // 不需要为警示加一条分支。这里点警示 = 点整张卡 = 去 Settings 修复。
+  // Phase 2: 带 location.state 让 Settings 滚动并高亮分歧横幅。
   const handleDnsClick = () => {
-    navigate(dnsEnabled ? "/dns-profiles" : "/settings");
+    if (dnsStuck) {
+      navigate("/settings", { state: { highlightDnsDiscrepancy: true } });
+    } else {
+      navigate(dnsEnabled ? "/dns-profiles" : "/settings");
+    }
   };
+
+  const handleToggleDns = useCallback(
+    (enabled: boolean) => {
+      if (!fire()) return;
+      releaseSoon();
+      toggleDnsMode(enabled);
+    },
+    [fire, releaseSoon, toggleDnsMode],
+  );
+
+  // issue #149: 取消进行中的 DNS toggle（AbortController + cancel_dns_mode
+  // IPC）。无在途 toggle 时是 no-op。
+  const handleCancelDns = useCallback(() => {
+    cancelActiveDnsToggle();
+  }, []);
 
   const dnsTitle = dnsStuck
     ? "System DNS still points at 127.0.0.1 — domain resolution is likely broken. Click to open Settings and restore it."
     : dnsEnabled
       ? `${enabledDns}/${totalDns} DNS profiles enabled · ${dnsRuleCount} active rules`
-      : "DNS mode off — click to open Settings";
+      : "DNS mode off — flip the switch or click to open Settings";
 
   return (
     <div className={styles.sidebarFooter}>
@@ -128,9 +171,8 @@ function StatusBar() {
           {/* issue #232: 警示态下文案必须**自解释** —— 一个 8px 红点
               在 11px 的 muted 底栏里太容易被划过去，而 "DNS broken"
               配合 danger 颜色即使被扫到也读得懂。
-              刻意用英文：同栏的 "Off" / "Applying..." / "2/3 enabled"
-              以及 Settings 页那段横幅全是英文，前端只有
-              RuleEditor / ImportDialog 的冲突诊断是中文 —— 状态标签
+              UI 文案统一英文：同栏的 "Off" / "Applying..." / "2/3 enabled"
+              以及 Settings 页那段横幅全是英文 —— 状态标签
               不该是那个唯一的例外。
 
               `aria-live="polite"`：Settings 横幅有 `role="alert"`，侧栏
@@ -155,6 +197,53 @@ function StatusBar() {
                   }`
                 : "Off"}
           </div>
+          {/* Phase 2: 卡内 mini switch 直接开关 DNS 模式。stuck 态刻意
+              不渲染 switch —— 修复必须走 Settings 的 Restore 路径
+              （后端 disable 分支会真的执行系统 DNS 还原）。Cancel 与
+              switch 是兄弟节点，不做同位 swap（issue #149）。 */}
+          {!dnsStuck && (
+            <div className={styles.dnsToggleRow}>
+              <label
+                className={styles.toggle}
+                title={dnsEnabled ? "Disable DNS mode" : "Enable DNS mode"}
+                aria-label="Toggle DNS mode"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  e.preventDefault();
+                  if (isDnsLoading) return;
+                  handleToggleDns(!dnsEnabled);
+                }}
+                onPointerDown={(e) => {
+                  if (e.button !== 0) return;
+                  e.stopPropagation();
+                  if (isDnsLoading) return;
+                  handleToggleDns(!dnsEnabled);
+                }}
+              >
+                <input
+                  type="checkbox"
+                  role="switch"
+                  checked={dnsEnabled}
+                  readOnly
+                  disabled={isDnsLoading}
+                  data-testid="dns-mode-switch"
+                />
+                <span className={styles.toggleSlider} />
+              </label>
+              {isDnsLoading && (
+                <button
+                  className={styles.dnsCancelBtn}
+                  data-testid="dns-cancel-button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    handleCancelDns();
+                  }}
+                >
+                  Cancel
+                </button>
+              )}
+            </div>
+          )}
         </div>
       </div>
     </div>

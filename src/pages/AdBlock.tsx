@@ -1,6 +1,5 @@
 import { useCallback, useState, useEffect, useRef, useMemo, memo } from "react";
 import { useAtomValue, useSetAtom } from "jotai";
-import { confirm as confirmDialog } from "@tauri-apps/plugin-dialog";
 import {
   adBlockStateAtom,
   isAdBlockLoadingAtom,
@@ -33,6 +32,7 @@ import {
 import { useNavigate } from "react-router-dom";
 import { useWebKitPointerDown } from "../hooks/useWebKitPointerDown";
 import { getAdBlockOverlapDetails } from "../lib/tauri";
+import ConfirmDialog from "../components/ConfirmDialog";
 import type {
   AdBlockLimits,
   AdBlockResponse,
@@ -93,6 +93,10 @@ const SourceCard = memo(function SourceCard({
   const reorderSource = useSetAtom(reorderAdBlockSourceAtom);
   const removeSource = useSetAtom(removeAdBlockSourceAtom);
   const { onPointerDown } = useWebKitPointerDown();
+  // Remove-source confirmation (replaces the native plugin-dialog
+  // confirm()). Local to each memo'd card — no new props, so the
+  // issue #230 memo contract is untouched.
+  const [showRemoveConfirm, setShowRemoveConfirm] = useState(false);
 
   return (
     <div className={`${styles.sourceCard} ${!src.enabled ? styles.dimmed : ""}`}>
@@ -279,16 +283,7 @@ const SourceCard = memo(function SourceCard({
           </button>
           <button
             className="btn btn-sm btn-danger"
-            onClick={() => {
-              confirmDialog(`Remove source "${src.name}"?`, {
-                title: "Remove Source",
-                kind: "warning",
-              })
-                .then((ok) => {
-                  if (ok) removeSource(src.source_id).catch(() => {});
-                })
-                .catch(() => {});
-            }}
+            onClick={() => setShowRemoveConfirm(true)}
             disabled={isLoading}
             onPointerDown={onPointerDown(() => {})}
           >
@@ -296,6 +291,19 @@ const SourceCard = memo(function SourceCard({
           </button>
         </div>
       </div>
+
+      <ConfirmDialog
+        open={showRemoveConfirm}
+        title="Remove Source"
+        message={`Remove source "${src.name}"?`}
+        confirmLabel="Delete"
+        danger
+        onConfirm={() => {
+          setShowRemoveConfirm(false);
+          removeSource(src.source_id).catch(() => {});
+        }}
+        onCancel={() => setShowRemoveConfirm(false)}
+      />
     </div>
   );
 });

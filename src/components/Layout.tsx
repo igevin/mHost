@@ -1,4 +1,3 @@
-import { useCallback, useState } from "react";
 import { Outlet } from "react-router-dom";
 import { useAtomValue, useSetAtom } from "jotai";
 import {
@@ -11,11 +10,13 @@ import {
   closeApplyConfirmAtom,
   rollbackHostsActionAtom,
   profilesAtom,
+  errorAtom,
 } from "../stores/profiles";
-import ManagementDrawer from "./ManagementDrawer";
 import ApplyConfirmDialog from "./ApplyConfirmDialog";
 import QuickApplyToast from "./QuickApplyToast";
+import CommandPalette from "./CommandPalette";
 import Sidebar, { type NavItem } from "./Sidebar";
+import { useGlobalKeybindings } from "../hooks/useGlobalKeybindings";
 import styles from "./Layout.module.css";
 
 /* ---- SVG Icons ---- */
@@ -155,8 +156,6 @@ const toolNavItems: NavItem[] = [
 ];
 
 function Layout() {
-  const [showManagement, setShowManagement] = useState(false);
-
   const applyConfirmOpen = useAtomValue(applyConfirmOpenAtom);
   const applyPlan = useAtomValue(applyPlanAtom);
   const applyResult = useAtomValue(applyResultAtom);
@@ -167,32 +166,37 @@ function Layout() {
   const rollbackHostsAction = useSetAtom(rollbackHostsActionAtom);
   const setApplyError = useSetAtom(applyErrorAtom);
 
+  // review F4: errorAtom 此前只在 HostsProfileView 渲染 —— 侧栏的
+  // 删除/复制/导出失败在其它路由上是静默的。挪到 Layout 全局渲染。
+  const appError = useAtomValue(errorAtom);
+  const setAppError = useSetAtom(errorAtom);
+
   // Refs #127: profiles needed by QuickApplyToast to resolve disabled IDs to display names.
   const profiles = useAtomValue(profilesAtom);
 
-  // **fix (P-F1, issue #90)**: useCallback 保持 onOpenManagement 引用稳定，
-  // 否则 inline arrow 会让 Sidebar 的 React.memo 失效（每次 Layout 渲染
-  // 都看到新 props）。
-  const handleOpenManagement = useCallback(() => {
-    setShowManagement(true);
-  }, []);
-
-  // Issue #230 item 5: keep the onClose prop stable. It feeds the
-  // drawer's Escape-key effect (`[open, onClose]` deps) — an inline arrow
-  // here re-created it on every Layout render, tearing down and re-adding
-  // the document listener each time while the drawer was open.
-  const handleCloseManagement = useCallback(() => {
-    setShowManagement(false);
-  }, []);
+  // issue #124: Cmd+K 命令面板全局可用（任意路由）。keybinding 注册与
+  // 面板都挂在最外层 Layout，路由切换不影响。
+  useGlobalKeybindings();
 
   return (
     <div className={styles.mhostLayout}>
-      <Sidebar
-        toolNavItems={toolNavItems}
-        onOpenManagement={handleOpenManagement}
-      />
+      {/* 侧栏即管理面（Phase 2）：ManagementDrawer 已删除，
+          profile 的 toggle / 编辑 / 删除全部收进 Sidebar。 */}
+      <Sidebar toolNavItems={toolNavItems} />
 
       <main className={styles.mhostMain}>
+        {appError && (
+          <div className="alert alert-error">
+            {appError}
+            <button
+              className="btn btn-ghost btn-sm"
+              onClick={() => setAppError(null)}
+              style={{ marginLeft: 8 }}
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
         {applyError && !applyConfirmOpen && (
           <div className="alert alert-error">
             {applyError}
@@ -208,11 +212,8 @@ function Layout() {
         <Outlet />
       </main>
 
-      <ManagementDrawer
-        open={showManagement}
-        onClose={handleCloseManagement}
-      />
-
+      {/* ApplyConfirmDialog 全局只挂载这一份 —— 之前 ManagementDrawer
+          里还有第二个挂载点，两个 dialog 会同时响应 apply 状态。 */}
       <ApplyConfirmDialog
         open={applyConfirmOpen}
         plan={applyPlan}
@@ -225,6 +226,9 @@ function Layout() {
       />
 
       <QuickApplyToast profiles={profiles} />
+
+      {/* issue #124: Cmd+K 命令面板（portal 到 body，open=false 时渲染 null） */}
+      <CommandPalette />
     </div>
   );
 }

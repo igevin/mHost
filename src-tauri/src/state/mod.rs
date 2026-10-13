@@ -102,7 +102,11 @@ pub struct AppState {
     /// Uses `std::sync::RwLock` (not tokio) because tray callbacks are
     /// sync and don't need to hold across await; lock acquisition is
     /// non-blocking as long as no panics while holding write guard.
-    pub cached_profiles: RwLock<Option<Vec<Profile>>>,
+    ///
+    /// **PR #244 review (R4)**: wrapped in `Arc` so IPC handlers can move
+    /// the handle into `spawn_blocking` — a cache *miss* synchronously walks
+    /// and parses the profiles dir, which must not happen on a Tokio worker.
+    pub cached_profiles: Arc<RwLock<Option<Vec<Profile>>>>,
     // DNS 相关
     pub dns_server: Arc<Mutex<Option<mhost_dns::DnsServer>>>,
     pub dns_enabled: AtomicBool,
@@ -260,7 +264,7 @@ impl AppState {
             apply_lock: ApplyLock(tokio::sync::Mutex::new(())),
             snapshot_lock: Arc::new(ApplyLock(tokio::sync::Mutex::new(()))),
             last_profile_ids: Mutex::new(Vec::new()),
-            cached_profiles: RwLock::new(None), // lazy load on first cached_profiles() call
+            cached_profiles: Arc::new(RwLock::new(None)), // lazy load on first cached_profiles() call
             dns_server,
             dns_enabled: AtomicBool::new(dns_enabled),
             original_dns: tokio::sync::RwLock::new(original_dns),
@@ -505,17 +509,7 @@ impl AppState {
     /// miss 才走 write 路径 load + store。Tray 每次 build 都读，
     /// 二次读零 I/O 是主要收益。
     pub fn cached_profiles(&self) -> Result<Vec<Profile>, mhost_core::StorageError> {
-        // Fast path: cache hit.
-        {
-            let guard = lock_or_recover_rwlock(&self.cached_profiles);
-            if let Some(c) = guard.as_ref() {
-                return Ok(c.clone());
-            }
-        }
-        // Slow path: load from storage, store to cache, return clone.
-        let profiles = self.storage.list_profiles()?;
-        *lock_or_recover_rwlock_write(&self.cached_profiles) = Some(profiles.clone());
-        Ok(profiles)
+        cached_profiles_read(&self.cached_profiles, &self.storage)
     }
 
     /// 失效缓存：mutation 后调用，下一次 [`cached_profiles`] 会重新从 storage 拉。
@@ -524,6 +518,26 @@ impl AppState {
     pub fn invalidate_profile_cache(&self) {
         *lock_or_recover_rwlock_write(&self.cached_profiles) = None;
     }
+}
+
+/// The shared body of [`AppState::cached_profiles`], callable with cloned
+/// `Arc` handles from inside `spawn_blocking` (PR #244 review R4: a cache
+/// miss does a sync dir walk + JSON parse — never on a Tokio worker).
+pub(crate) fn cached_profiles_read(
+    cache: &RwLock<Option<Vec<Profile>>>,
+    storage: &Arc<dyn Storage + Send + Sync>,
+) -> Result<Vec<Profile>, mhost_core::StorageError> {
+    // Fast path: cache hit.
+    {
+        let guard = lock_or_recover_rwlock(cache);
+        if let Some(c) = guard.as_ref() {
+            return Ok(c.clone());
+        }
+    }
+    // Slow path: load from storage, store to cache, return clone.
+    let profiles = storage.list_profiles()?;
+    *lock_or_recover_rwlock_write(cache) = Some(profiles.clone());
+    Ok(profiles)
 }
 
 #[cfg(test)]
@@ -652,7 +666,7 @@ mod tests {
             apply_lock: ApplyLock::new(),
             snapshot_lock: Arc::new(ApplyLock::new()),
             last_profile_ids: std::sync::Mutex::new(Vec::new()),
-            cached_profiles: std::sync::RwLock::new(None),
+            cached_profiles: std::sync::Arc::new(std::sync::RwLock::new(None)),
             dns_server: std::sync::Arc::new(std::sync::Mutex::new(None)),
             dns_enabled: std::sync::atomic::AtomicBool::new(false),
             original_dns: tokio::sync::RwLock::new(OriginalDns::DhcpEmpty),

@@ -22,33 +22,22 @@
 
 .statCard {
   padding: 12px 14px;
-  background: var(--color-surface, var(--paper));
-  border: 1px solid var(--rule, #e5e5e5);
-  border-radius: var(--radius-md, 6px);
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-md);
 }
 
-.statValue {
-  font-size: 20px;
-  font-weight: 700;
-  color: var(--color-text, var(--ink));
-  font-variant-numeric: tabular-nums;
-}
-
-.statLabel {
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  color: var(--color-muted, var(--ink-muted));
-  margin-top: 4px;
-}
+/* NOTE: .statValue / .statLabel were defined twice (here and in the
+ * issue #199 stats-panel block below); merged into the single definitions
+ * further down — keep all stat typography in one place. */
 
 /* ---- Source card ---- */
 
 .sourceCard {
-  border: 1px solid var(--rule, #e5e5e5);
-  border-radius: var(--radius-md, 6px);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-md);
   padding: 14px 16px;
-  background: var(--color-surface, var(--paper));
+  background: var(--surface);
   display: flex;
   flex-direction: column;
   gap: 10px;
@@ -70,13 +59,13 @@
   align-items: center;
   gap: 8px;
   font-weight: 600;
-  color: var(--color-text, var(--ink));
-  font-size: 14px;
+  color: var(--ink);
+  font-size: var(--font-size-lg);
 }
 
 .sourceMeta {
-  font-size: 11px;
-  color: var(--color-muted, var(--ink-muted));
+  font-size: var(--font-size-xs);
+  color: var(--ink-muted);
   word-break: break-all;
 }
 
@@ -88,9 +77,9 @@
 }
 
 .errorBadge {
-  font-size: 11px;
-  color: var(--color-danger, var(--danger));
-  background: var(--color-danger-soft, #fdecec);
+  font-size: var(--font-size-xs);
+  color: var(--danger);
+  background: var(--danger-soft);
   padding: 2px 8px;
   border-radius: 10px;
   display: inline-block;
@@ -125,32 +114,32 @@
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  background: var(--color-surface, var(--paper));
-  border: 1px solid var(--rule, #e5e5e5);
+  background: var(--surface);
+  border: 1px solid var(--rule);
   border-radius: 12px;
   padding: 3px 4px 3px 10px;
-  font-size: 12px;
-  font-family: var(--font-mono, monospace);
+  font-size: var(--font-size-sm);
+  font-family: var(--font-mono);
 }
 
 .removeBtn {
   border: none;
   background: transparent;
   cursor: pointer;
-  font-size: 14px;
+  font-size: var(--font-size-lg);
   line-height: 1;
   padding: 0 6px;
-  color: var(--color-muted, var(--ink-muted));
+  color: var(--ink-muted);
 }
 
 .removeBtn:hover {
-  color: var(--color-danger, var(--danger));
+  color: var(--danger);
 }
 
 .empty {
-  color: var(--color-muted, var(--ink-muted));
+  color: var(--ink-muted);
   font-style: italic;
-  font-size: 13px;
+  font-size: var(--font-size-md);
   padding: 12px 0;
 }
 
@@ -160,12 +149,12 @@
   display: flex;
   align-items: center;
   gap: 10px;
-  background: var(--color-warning-soft, #fff5e0);
-  border: 1px solid var(--color-warning, var(--warning));
-  color: var(--color-text, var(--ink));
+  background: var(--warning-soft);
+  border: 1px solid var(--warning);
+  color: var(--ink);
   padding: 10px 14px;
-  border-radius: var(--radius-md, 6px);
-  font-size: 13px;
+  border-radius: var(--radius-md);
+  font-size: var(--font-size-md);
 }
 
 .banner button {
@@ -185,8 +174,8 @@
 }
 
 .muted {
-  color: var(--color-muted, var(--ink-muted));
-  font-size: 12px;
+  color: var(--ink-muted);
+  font-size: var(--font-size-sm);
 }
 
 /* ---- Layout helpers (PR #154 review P2: was inline styles) ---- */
@@ -200,7 +189,7 @@
 
 .bannerTitle {
   font-weight: 600;
-  color: var(--color-text, var(--ink));
+  color: var(--ink);
 }
 
 .sectionGap {
@@ -220,12 +209,12 @@
 }
 
 .dangerText {
-  color: var(--color-danger, var(--danger));
+  color: var(--danger);
 }
 
 .dangerTextGap {
   margin-top: 10px;
-  color: var(--color-danger, var(--danger));
+  color: var(--danger);
 }
 
 .mutedGap {
@@ -241,7 +230,7 @@
 }
 
 .badgeSm {
-  font-size: 12px;
+  font-size: var(--font-size-sm);
   padding: 2px 6px;
 }
 
@@ -255,7 +244,7 @@
 }
 
 .limitResetBtn {
-  font-size: 12px;
+  font-size: var(--font-size-sm);
   padding: 0 4px;
 }
 
@@ -283,22 +272,22 @@
   width: 100%;
   min-height: 72px;
   resize: vertical;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 13px;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-md);
   line-height: 1.4;
 }
 
 .bulkAdd {
   margin-top: 12px;
-  border: 1px dashed rgba(127, 127, 127, 0.4);
-  border-radius: 6px;
+  border: 1px dashed var(--rule);
+  border-radius: var(--radius-md);
   padding: 8px 12px;
 }
 
 .bulkAddSummary {
   cursor: pointer;
-  font-size: 13px;
-  color: var(--color-text-muted, #888);
+  font-size: var(--font-size-md);
+  color: var(--ink-muted);
   user-select: none;
   /* Native <summary> has default disclosure-triangle styling; keep it. */
 }
@@ -308,8 +297,8 @@
   width: 100%;
   min-height: 60px;
   resize: vertical;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 13px;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-md);
   line-height: 1.4;
 }
 
@@ -325,20 +314,24 @@
   display: flex;
   flex-direction: column;
   padding: 12px;
-  border: 1px solid var(--border-color, rgba(127, 127, 127, 0.25));
-  border-radius: 6px;
-  background: var(--stat-counter-bg, rgba(127, 127, 127, 0.05));
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-md);
+  background: var(--surface);
 }
 
 .statValue {
   font-size: 24px;
   font-weight: 600;
+  color: var(--ink);
   font-variant-numeric: tabular-nums;
   line-height: 1.2;
 }
 
 .statLabel {
-  font-size: 12px;
+  font-size: var(--font-size-sm);
+  color: var(--ink-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
   opacity: 0.7;
   margin-top: 4px;
 }
@@ -346,20 +339,20 @@
 .statTable {
   width: 100%;
   border-collapse: collapse;
-  font-size: 13px;
+  font-size: var(--font-size-md);
 }
 
 .statTable th,
 .statTable td {
   text-align: left;
   padding: 6px 8px;
-  border-bottom: 1px solid var(--border-color, rgba(127, 127, 127, 0.15));
+  border-bottom: 1px solid var(--rule);
 }
 
 .statTable th {
   font-weight: 600;
   opacity: 0.7;
-  font-size: 12px;
+  font-size: var(--font-size-sm);
   text-transform: uppercase;
   letter-spacing: 0.05em;
 }
@@ -371,15 +364,15 @@
   gap: 6px;
   margin-top: 6px;
   padding: 2px 8px;
-  font-size: 12px;
-  background: var(--color-bg-alt, rgba(255, 255, 255, 0.05));
-  border: 1px solid var(--color-border, rgba(255, 255, 255, 0.12));
+  font-size: var(--font-size-sm);
+  background: var(--accent-soft);
+  border: 1px solid var(--rule);
   border-radius: 999px;
   cursor: pointer;
-  color: var(--color-text, var(--ink));
+  color: var(--ink);
 }
 .overlapChip:hover {
-  background: var(--color-bg-hover, rgba(255, 255, 255, 0.1));
+  background: var(--sidebar-hover);
 }
 
 .overlapOverlay {
@@ -396,10 +389,10 @@
   width: min(560px, 92vw);
   max-height: 80vh;
   overflow-y: auto;
-  background: var(--color-bg, #1f2024);
-  color: var(--color-text, var(--ink));
-  border: 1px solid var(--color-border, var(--ink-muted));
-  border-radius: 8px;
+  background: var(--paper);
+  color: var(--ink);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-lg);
   padding: 18px 20px;
   z-index: 51;
   box-shadow: 0 16px 48px rgba(0, 0, 0, 0.45);
@@ -416,26 +409,26 @@
   font-size: 16px;
 }
 .overlapEntry {
-  border-top: 1px solid var(--color-border, rgba(255, 255, 255, 0.08));
+  border-top: 1px solid var(--rule);
   padding: 10px 0;
 }
 .overlapEntry:first-child {
   border-top: 0;
 }
 .overlapEntryDomain {
-  font-family: var(--font-mono, ui-monospace, monospace);
-  font-size: 13px;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-md);
 }
 .overlapEntryMeta {
-  font-size: 12px;
-  color: var(--color-muted, var(--ink-muted));
+  font-size: var(--font-size-sm);
+  color: var(--ink-muted);
   margin-top: 4px;
 }
 .overlapEffectiveBadge {
   display: inline-block;
-  font-size: 11px;
+  font-size: var(--font-size-xs);
   padding: 1px 6px;
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   margin-left: 6px;
-  background: var(--color-bg-alt, rgba(255, 255, 255, 0.08));
+  background: var(--accent-soft);
 }

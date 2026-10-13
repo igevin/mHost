@@ -1,7 +1,6 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import { createPortal } from "react-dom";
 import { useAtomValue, useSetAtom } from "jotai";
-import { confirm } from "@tauri-apps/plugin-dialog";
 import {
   snapshotsAtom,
   isLoadingSnapshotsAtom,
@@ -11,6 +10,7 @@ import {
   deleteSnapshotAtom,
 } from "../stores/profiles";
 import { useWebKitPointerDown } from "../hooks/useWebKitPointerDown";
+import ConfirmDialog from "./ConfirmDialog";
 import type { SnapshotMeta } from "../types";
 import styles from "./SnapshotPanel.module.css";
 
@@ -35,6 +35,14 @@ function SnapshotPanel({
   const [isSaving, setIsSaving] = useState(false);
   const [isRollingBackId, setIsRollingBackId] = useState<string | null>(null);
   const [isDeletingId, setIsDeletingId] = useState<string | null>(null);
+
+  // Pending destructive confirmation (replaces the native plugin-dialog
+  // confirm() calls). The matching guard stays latched from the click until
+  // the dialog resolves.
+  const [pendingConfirm, setPendingConfirm] = useState<{
+    kind: "rollback" | "delete";
+    snapshot: SnapshotMeta;
+  } | null>(null);
 
   const [createName, setCreateName] = useState("");
   const [createDescription, setCreateDescription] = useState("");
@@ -80,15 +88,34 @@ function SnapshotPanel({
   }, [createName, createDescription, onCreateSnapshot, onCloseCreateDialog, saveGuard]);
 
   const handleRollback = useCallback(
-    async (snapshot: SnapshotMeta) => {
+    (snapshot: SnapshotMeta) => {
       if (!rollbackGuard.fire()) return;
-      const confirmed = await confirm(
-        `Rollback to snapshot "${snapshot.name}"? Current configuration will be overwritten.`,
-      );
-      if (!confirmed) {
-        rollbackGuard.release();
-        return;
-      }
+      setPendingConfirm({ kind: "rollback", snapshot });
+    },
+    [rollbackGuard],
+  );
+
+  const handleDelete = useCallback(
+    (snapshot: SnapshotMeta) => {
+      if (!deleteGuard.fire()) return;
+      setPendingConfirm({ kind: "delete", snapshot });
+    },
+    [deleteGuard],
+  );
+
+  const handleConfirmCancel = useCallback(() => {
+    setPendingConfirm(null);
+    // Whichever guard latched on the opening click is released here;
+    // release() is an idempotent reset, so clearing both is safe.
+    rollbackGuard.release();
+    deleteGuard.release();
+  }, [rollbackGuard, deleteGuard]);
+
+  const handleConfirmAction = useCallback(async () => {
+    if (!pendingConfirm) return;
+    const { kind, snapshot } = pendingConfirm;
+    setPendingConfirm(null);
+    if (kind === "rollback") {
       setIsRollingBackId(snapshot.id);
       try {
         await loadSnapshot(snapshot.id);
@@ -98,18 +125,7 @@ function SnapshotPanel({
         setIsRollingBackId(null);
         rollbackGuard.release();
       }
-    },
-    [loadSnapshot, rollbackGuard],
-  );
-
-  const handleDelete = useCallback(
-    async (snapshot: SnapshotMeta) => {
-      if (!deleteGuard.fire()) return;
-      const confirmed = await confirm(`Delete snapshot "${snapshot.name}"?`);
-      if (!confirmed) {
-        deleteGuard.release();
-        return;
-      }
+    } else {
       setIsDeletingId(snapshot.id);
       try {
         await deleteSnapshot(snapshot.id);
@@ -119,9 +135,8 @@ function SnapshotPanel({
         setIsDeletingId(null);
         deleteGuard.release();
       }
-    },
-    [deleteSnapshot, deleteGuard],
-  );
+    }
+  }, [pendingConfirm, loadSnapshot, deleteSnapshot, rollbackGuard, deleteGuard]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -173,12 +188,17 @@ function SnapshotPanel({
                 <span>{formatDate(snapshot.created_at)}</span>
               </div>
               <div className={styles.snapshotActions}>
+                {/* These handlers own their guards (saveGuard / rollbackGuard /
+                 * deleteGuard), so per the useWebKitPointerDown contract they
+                 * are NOT wrapped in `onPointerDown(...)` — both events feed
+                 * the handler directly with an inline `button !== 0` filter. */}
                 <button
                   className="btn btn-primary btn-sm"
                   onClick={() => handleRollback(snapshot)}
-                  onPointerDown={onPointerDown(() =>
-                    handleRollback(snapshot),
-                  )}
+                  onPointerDown={(e) => {
+                    if (e.button !== 0) return;
+                    handleRollback(snapshot);
+                  }}
                   disabled={isRollingBackId === snapshot.id}
                 >
                   {isRollingBackId === snapshot.id
@@ -188,9 +208,10 @@ function SnapshotPanel({
                 <button
                   className="btn btn-danger btn-sm"
                   onClick={() => handleDelete(snapshot)}
-                  onPointerDown={onPointerDown(() =>
-                    handleDelete(snapshot),
-                  )}
+                  onPointerDown={(e) => {
+                    if (e.button !== 0) return;
+                    handleDelete(snapshot);
+                  }}
                   disabled={isDeletingId === snapshot.id}
                 >
                   {isDeletingId === snapshot.id ? "Deleting..." : "Delete"}
@@ -239,7 +260,10 @@ function SnapshotPanel({
                 <button
                   className="btn btn-primary"
                   onClick={handleSave}
-                  onPointerDown={onPointerDown(handleSave)}
+                  onPointerDown={(e) => {
+                    if (e.button !== 0) return;
+                    handleSave();
+                  }}
                   disabled={!createName.trim() || isSaving}
                 >
                   {isSaving ? "Saving..." : "Save"}
@@ -257,6 +281,26 @@ function SnapshotPanel({
           </div>,
           document.body,
         )}
+
+      <ConfirmDialog
+        open={pendingConfirm !== null}
+        title={
+          pendingConfirm?.kind === "rollback"
+            ? "Rollback to Snapshot"
+            : "Delete Snapshot"
+        }
+        message={
+          pendingConfirm?.kind === "rollback"
+            ? `Rollback to snapshot "${pendingConfirm.snapshot.name}"? Current configuration will be overwritten.`
+            : `Delete snapshot "${pendingConfirm?.snapshot.name}"?`
+        }
+        confirmLabel={
+          pendingConfirm?.kind === "rollback" ? "Rollback" : "Delete"
+        }
+        danger
+        onConfirm={handleConfirmAction}
+        onCancel={handleConfirmCancel}
+      />
     </div>
   );
 }

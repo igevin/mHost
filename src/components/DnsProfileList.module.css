@@ -11,8 +11,8 @@
 }
 
 .statCard {
-  background: var(--color-surface);
-  border: 1px solid var(--color-border);
+  background: var(--surface);
+  border: 1px solid var(--rule);
   border-radius: var(--radius-md);
   padding: 14px 16px;
   transition: all var(--transition-normal);
@@ -23,9 +23,9 @@
 }
 
 .statLabel {
-  font-size: 11px;
+  font-size: var(--font-size-xs);
   font-weight: 500;
-  color: var(--color-text-muted);
+  color: var(--ink-muted);
   margin-bottom: 4px;
   text-transform: uppercase;
   letter-spacing: 0.3px;
@@ -34,7 +34,7 @@
 .statValue {
   font-size: 24px;
   font-weight: 700;
-  color: var(--color-text);
+  color: var(--ink);
   line-height: 1.2;
   display: flex;
   align-items: baseline;
@@ -42,9 +42,9 @@
 }
 
 .statTotal {
-  font-size: 14px;
+  font-size: var(--font-size-lg);
   font-weight: 500;
-  color: var(--color-text-muted);
+  color: var(--ink-muted);
 }
 
 /* ---- Mode-off hint banner ---- */
@@ -55,11 +55,11 @@
   gap: 10px;
   padding: 10px 14px;
   margin-bottom: 16px;
-  background: var(--yellow-light, #fff7e0);
-  border: 1px solid var(--yellow, #d4a72c);
+  background: var(--warning-soft);
+  border: 1px solid var(--warning);
   border-radius: var(--radius-md);
-  font-size: 12px;
-  color: var(--color-text);
+  font-size: var(--font-size-sm);
+  color: var(--ink);
   flex-shrink: 0;
 }
 
@@ -70,16 +70,16 @@
   width: 18px;
   height: 18px;
   border-radius: 50%;
-  background: var(--yellow, #d4a72c);
+  background: var(--warning);
   color: white;
-  font-size: 11px;
+  font-size: var(--font-size-xs);
   font-weight: 700;
   flex-shrink: 0;
   font-style: italic;
 }
 
 .modeBannerLink {
-  color: var(--color-primary);
+  color: var(--accent);
   cursor: pointer;
   font-weight: 500;
   text-decoration: underline;
@@ -104,8 +104,8 @@
 /* ---- Profile Card ---- */
 
 .profileCard {
-  background: var(--color-surface);
-  border: 1px solid var(--color-border);
+  background: var(--surface);
+  border: 1px solid var(--rule);
   border-radius: var(--radius-md);
   padding: 14px 16px;
   transition: all var(--transition-normal);
@@ -119,16 +119,16 @@
 }
 
 .profileCardEnabled {
-  border-left: 3px solid var(--color-success);
+  border-left: 3px solid var(--success);
 }
 
 .profileCardDisabled {
-  border-left: 3px solid var(--color-text-muted);
+  border-left: 3px solid var(--ink-muted);
   opacity: 0.85;
 }
 
 .profileCardProtected {
-  border-left: 3px solid var(--color-warning);
+  border-left: 3px solid var(--warning);
 }
 
 .profileCardMain {
@@ -153,9 +153,9 @@
 }
 
 .profileName {
-  font-size: 14px;
+  font-size: var(--font-size-lg);
   font-weight: 600;
-  color: var(--color-text);
+  color: var(--ink);
   margin: 0;
 }
 
@@ -170,29 +170,29 @@
   align-items: center;
   padding: 1px 8px;
   border-radius: 10px;
-  font-size: 10px;
+  font-size: var(--font-size-xs);
   font-weight: 600;
 }
 
 .badgeEnabled {
-  background: var(--color-success);
+  background: var(--success);
   color: white;
 }
 
 .badgeDisabled {
-  background: var(--color-border-secondary);
-  color: var(--color-text-muted);
+  background: var(--rule-soft);
+  color: var(--ink-muted);
 }
 
 .badgeProtected {
-  background: var(--color-warning);
+  background: var(--warning);
   color: white;
 }
 
 .profileDesc {
   margin: 6px 0 0;
-  font-size: 12px;
-  color: var(--color-text-secondary);
+  font-size: var(--font-size-sm);
+  color: var(--ink-soft);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -201,15 +201,15 @@
 
 .profileMeta {
   margin-top: 6px;
-  font-size: 11px;
-  color: var(--color-text-muted);
+  font-size: var(--font-size-xs);
+  color: var(--ink-muted);
   display: flex;
   align-items: center;
   gap: 6px;
 }
 
 .metaSep {
-  color: var(--color-border);
+  color: var(--rule);
 }
 
 .profileTags {
@@ -223,7 +223,7 @@
   display: flex;
   gap: 6px;
   padding-top: 10px;
-  border-top: 1px solid var(--color-border-secondary);
+  border-top: 1px solid var(--rule-soft);
 }
 
 /* ---- Toggle (inline enable switch) ---- */
@@ -247,10 +247,10 @@
 .toggleSlider {
   position: absolute;
   inset: 0;
-  background: var(--color-border);
+  background: var(--rule);
   border-radius: 10px;
   transition: all 0.2s;
-  border: 2px solid var(--color-border);
+  border: 2px solid var(--rule);
 }
 
 .toggleSlider::before {
@@ -267,8 +267,8 @@
 }
 
 .toggle input:checked + .toggleSlider {
-  background: var(--color-success);
-  border-color: var(--color-success);
+  background: var(--success);
+  border-color: var(--success);
 }
 
 .toggle input:checked + .toggleSlider::before {
@@ -284,15 +284,15 @@
   justify-content: center;
   gap: 12px;
   padding: 48px 20px;
-  background: var(--color-surface);
-  border: 1px dashed var(--color-border);
+  background: var(--surface);
+  border: 1px dashed var(--rule);
   border-radius: var(--radius-md);
-  color: var(--color-text-secondary);
+  color: var(--ink-soft);
   text-align: center;
 }
 
 .emptyHint {
-  font-size: 12px;
-  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
+  color: var(--ink-muted);
   margin: 0;
 }

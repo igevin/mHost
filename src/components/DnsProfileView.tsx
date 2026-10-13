@@ -1,5 +1,5 @@
 import { useState, useCallback, useMemo, useRef } from "react";
-import { useParams, useNavigate } from "react-router-dom";
+import { useParams, useNavigate, useLocation } from "react-router-dom";
 import { useAtomValue, useSetAtom } from "jotai";
 import { save } from "@tauri-apps/plugin-dialog";
 import {
@@ -18,6 +18,7 @@ import { useWebKitPointerDown } from "../hooks/useWebKitPointerDown";
 import type { HostRule } from "../types";
 import RuleEditor from "./RuleEditor";
 import CreateProfileDialog from "./CreateProfileDialog";
+import ConfirmDialog from "./ConfirmDialog";
 import styles from "../pages/ProfileView.module.css";
 
 /**
@@ -37,6 +38,14 @@ import styles from "../pages/ProfileView.module.css";
 export default function DnsProfileView() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
+  // issue #124: 命令面板的跳转目标行（location.state.focusLine）。
+  // review F6: jumpId nonce 让同一行的重复跳转也触发重滚。
+  const location = useLocation();
+  const focusLine =
+    (location.state as { focusLine?: number; jumpId?: number } | null)
+      ?.focusLine ?? null;
+  const jumpNonce =
+    (location.state as { jumpId?: number } | null)?.jumpId ?? 0;
 
   const profiles = useAtomValue(dnsProfilesAtom);
   const isLoading = useAtomValue(isDnsLoadingAtom);
@@ -46,6 +55,9 @@ export default function DnsProfileView() {
   const createProfileAction = useSetAtom(createDnsProfileAtom);
   const deleteProfileAction = useSetAtom(deleteDnsProfileAtom);
   const toggleEnabled = useSetAtom(toggleDnsProfileEnabledAtom);
+  // review F9: 从声明点后移到这里 —— 与所有 useSetAtom 邻居放一起，
+  // 不再悬在组件中段（handleDeleteConfirm 等早于它的引用靠闭包才合法）。
+  const setError = useSetAtom(dnsErrorAtom);
   const { onPointerDown } = useWebKitPointerDown();
 
   const profile = profiles.find((p) => p.id === id);
@@ -56,6 +68,8 @@ export default function DnsProfileView() {
   const [showCreateDialog, setShowCreateDialog] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
   const isDeletingRef = useRef(false);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   // Rules editing state（镜像 HostsProfileView）
   const [isEditing, setIsEditing] = useState(false);
@@ -146,22 +160,29 @@ export default function DnsProfileView() {
     }
   }, [profile, id]);
 
-  const handleDeleteProfile = useCallback(async () => {
+  const handleDeleteProfile = useCallback(() => {
     if (!profile || !id || profile.protected || isDeletingRef.current) return;
-    const confirmed = window.confirm(`Delete profile "${profile.name}"?`);
-    if (!confirmed) return;
+    setShowDeleteConfirm(true);
+  }, [profile, id]);
+
+  const handleDeleteConfirm = useCallback(async () => {
+    if (!id || isDeletingRef.current) return;
+    // review F5: RollbackButton 模式 —— 删除完成前不关确认框
+    // （isLoading 锁 Esc/取消），失败时错误显示在框内。
+    setDeleteError(null);
     isDeletingRef.current = true;
     setIsDeleting(true);
     try {
       await deleteProfileAction(id);
+      setShowDeleteConfirm(false);
       navigate("/dns-profiles");
     } catch (err: unknown) {
-      setError(extractErrorMessage(err));
+      setDeleteError(extractErrorMessage(err));
     } finally {
       isDeletingRef.current = false;
       setIsDeleting(false);
     }
-  }, [profile, id, deleteProfileAction, navigate]);
+  }, [id, deleteProfileAction, navigate]);
 
   const handleCreateProfile = useCallback(
     async (name: string) => {
@@ -224,9 +245,6 @@ export default function DnsProfileView() {
       setIsSaving(false);
     }
   }, [profile, draftRules, hasChanges, isSaving, ruleErrors, updateProfile]);
-
-  // 帮助函数：error atom setter 不直接暴露，从 useSetAtom 取
-  const setError = useSetAtom(dnsErrorAtom);
 
   // issue #67：无 :id 时路由已被 `ProfileView` 切到 `<DnsProfileList />`，
   // 这里只处理 :id 存在但找不到 profile 的回退（详情页用）。
@@ -502,10 +520,13 @@ export default function DnsProfileView() {
           }`}
         >
           <RuleEditor
+            key={profile.id}
             rules={isEditing ? draftRules : profile.rules}
             onChange={handleRulesChange}
             onErrorChange={handleRulesErrorChange}
             readOnly={!isEditing}
+            focusLine={focusLine}
+            jumpNonce={jumpNonce}
           />
         </div>
       </div>
@@ -516,6 +537,24 @@ export default function DnsProfileView() {
         onCreate={handleCreateProfile}
         isLoading={isLoading}
       />
+
+      <ConfirmDialog
+        open={showDeleteConfirm}
+        title="Delete Profile"
+        message={`Delete profile "${profile.name}"?`}
+        confirmLabel="Delete"
+        danger
+        isLoading={isDeleting}
+        loadingLabel="Deleting..."
+        onConfirm={handleDeleteConfirm}
+        onCancel={() => {
+          if (isDeleting) return;
+          setShowDeleteConfirm(false);
+          setDeleteError(null);
+        }}
+      >
+        {deleteError && <div className="alert alert-error">{deleteError}</div>}
+      </ConfirmDialog>
     </div>
   );
 }

@@ -18,21 +18,41 @@ export const POINTER_DOWN_DEBOUNCE_MS = 50;
  * read modifiers (`metaKey`, `altKey`) — e.g. issue #123's Quick Apply
  * override that holds Cmd/Option to force the Preview dialog.
  *
- * Usage:
- *   const { fire, release, onPointerDown } = useWebKitPointerDown();
+ * Two supported call-site patterns — pick exactly one per button:
  *
- *   <button onPointerDown={onPointerDown((e) => handleCancel(e.metaKey))} />
+ * **A. Wrapper (handler does NOT own a guard).** For plain buttons whose
+ * handler has no `fire()` call of its own:
  *
- *   // Sync toggles guarded from double-fire (issue #123). Both `onClick`
- *   // and `onPointerDown` feed `handleToggle()`, which calls `fire()` +
- *   // `releaseSoon()` itself. The wrapper is **not** used here — that
- *   // would double-consume `firedRef` (the wrapper calls `fire()` before
- *   // dispatching the handler) and drop every gesture on the floor.
+ *   const { onPointerDown } = useWebKitPointerDown();
+ *   <button onClick={handleSave} onPointerDown={onPointerDown(handleSave)} />
+ *
+ *   Precondition: the handler must tolerate double invocation — the
+ *   pointerdown path and the trailing `click` both reach it (issue #100:
+ *   a double-bound Delete once fired two confirms and a
+ *   `ProfileNotFound`). Acceptable when the handler is idempotent, or the
+ *   button disables/unmounts synchronously on the first call (e.g. a
+ *   dialog opens over it). Anything else belongs to pattern B.
+ *
+ * **B. Handler-owned guard (both events feed one handler).** For toggles
+ * and async actions that must dedupe the pointerdown+click pair across a
+ * longer window (issue #123/#149 legacy): the handler calls `fire()` +
+ * `releaseSoon()` itself, and `onPointerDown` is bound with only an inline
+ * `e.button !== 0` filter — NEVER through the wrapper, which would
+ * double-consume `firedRef` and drop every gesture on the floor:
+ *
+ *   const { fire, releaseSoon } = useWebKitPointerDown();
  *   const handleToggle = () => {
  *     if (!fire()) return;
  *     releaseSoon();
  *     doWork();
  *   };
+ *   <button
+ *     onClick={handleToggle}
+ *     onPointerDown={(e) => { if (e.button !== 0) return; handleToggle(); }}
+ *   />
+ *
+ * Use a separate hook instance per independent action (e.g. SnapshotPanel's
+ * save/rollback/delete guards) so one action's latch can't block another's.
  */
 export function useWebKitPointerDown() {
   const firedRef = useRef(false);
@@ -76,8 +96,11 @@ export function useWebKitPointerDown() {
       if (e.button !== 0) return;
       if (!fire()) return;
       handler(e);
-      // Pointerdown-only handler — onClick is NOT bound, so we don't need
-      // the trailing-click protection `releaseSoon` provides.
+      // Pattern A 里 onClick 也绑了同一个 handler —— releaseSoon 把
+      // wrapper 自己的 guard 留到 trailing click 之后再复位，免得同一
+      // 手势的下一次 pointerdown 被误判成连点。注意这只复位 wrapper
+      // 实例；onClick 路径不经过这里，handler 自己要能容忍双触发
+      // （见上方 pattern A 的前提条件）。
       releaseSoon();
     },
     [fire, releaseSoon],

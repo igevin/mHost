@@ -62,8 +62,8 @@ bash scripts/dev.sh                                                            #
 mHost/
 ├── src/                       React/TS frontend
 │   ├── App.tsx, main.tsx      entry + router
-│   ├── components/            Layout, ProfileCard, ManagementDrawer, RuleEditor, ApplyConfirmDialog, SnapshotPanel, ApplyStatus
-│   ├── pages/                 ProfileList, ProfileView, ProfileEdit
+│   ├── components/            Layout, Sidebar (management surface), SidebarProfileItem, PopupMenu, ConfirmDialog, RuleEditor, ApplyConfirmDialog, SnapshotPanel, StatusBar, CommandPalette
+│   ├── pages/                 AdBlock, ProfileView, Settings, Snapshot, SystemHosts
 │   ├── stores/                Jotai atoms (profiles, dns, snapshots)
 │   ├── hooks/                 shared hooks
 │   ├── lib/                   Tauri IPC bindings (invoke wrappers)

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, act } from "@testing-library/react";
+import { render, screen, fireEvent, act, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { getDefaultStore, Provider as JotaiProvider } from "jotai";
 import type { Profile, HostRule } from "../../types";
@@ -347,8 +347,8 @@ describe("DnsProfileList", () => {
 
   // ---- Delete ----
 
-  it("clicking Delete triggers confirm dialog", async () => {
-    const { confirm } = await import("@tauri-apps/plugin-dialog");
+  it("clicking Delete opens the ConfirmDialog and confirms deletion", async () => {
+    const { invoke } = await import("@tauri-apps/api/core");
     const store = getDefaultStore();
     store.set(dnsProfilesAtom, [makeProfile({ id: "d1", protected: false })]);
 
@@ -359,7 +359,17 @@ describe("DnsProfileList", () => {
       fireEvent.click(deleteButton);
     });
 
-    expect(confirm).toHaveBeenCalledWith("Delete this DNS profile?");
+    // The shared ConfirmDialog (not the native plugin-dialog confirm) opens
+    const dialog = screen.getByRole("dialog");
+    expect(
+      within(dialog).getByText("Delete this DNS profile?"),
+    ).toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole("button", { name: "Delete" }));
+    });
+
+    expect(invoke).toHaveBeenCalledWith("delete_profile", { id: "d1" });
   });
 
   it("disables Delete button for protected profile", () => {

@@ -17,6 +17,7 @@ import type {
   AdBlockStats,
   AdBlockOverlapReport,
   AdBlockOverlapDetails,
+  QueryDomainResult,
 } from "../types";
 
 // ---- Profile commands ----
@@ -99,6 +100,12 @@ export async function readSystemHosts(): Promise<string> {
 
 export async function validateHostsText(text: string): Promise<ValidateResult> {
   return invoke("validate_hosts_text", { text });
+}
+
+// ---- Command palette domain lookup (issue #124) ----
+
+export async function queryDomain(query: string): Promise<QueryDomainResult> {
+  return invoke("query_domain", { query });
 }
 
 // ---- Import / Export / Duplicate commands ----

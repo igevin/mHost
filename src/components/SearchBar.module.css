@@ -3,8 +3,8 @@
   flex-direction: column;
   gap: 4px;
   padding: 6px 8px;
-  background: var(--color-surface-elevated, var(--color-surface));
-  border-bottom: 1px solid var(--color-border);
+  background: var(--surface-elevated);
+  border-bottom: 1px solid var(--rule);
 }
 
 .searchRow,
@@ -19,23 +19,23 @@
   flex: 1;
   min-width: 0;
   padding: 4px 8px;
-  font-size: 13px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-sm, 4px);
-  background: var(--color-input-bg, var(--color-surface));
-  color: var(--color-text);
+  font-size: var(--font-size-md);
+  font-family: var(--font-mono);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-sm);
+  background: var(--input-bg);
+  color: var(--ink);
   outline: none;
 }
 
 .searchInput:focus,
 .replaceInput:focus {
-  border-color: var(--color-primary);
+  border-color: var(--accent);
 }
 
 .matchCount {
-  font-size: 12px;
-  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
+  color: var(--ink-muted);
   font-variant-numeric: tabular-nums;
   min-width: 36px;
   text-align: center;
@@ -49,11 +49,11 @@
   align-items: center;
   justify-content: center;
   padding: 4px 8px;
-  font-size: 12px;
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-sm, 4px);
-  background: var(--color-button-bg, var(--color-surface));
-  color: var(--color-text);
+  font-size: var(--font-size-sm);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--ink);
   cursor: pointer;
   flex-shrink: 0;
   line-height: 1;
@@ -62,13 +62,13 @@
 .navButton:hover,
 .actionButton:hover,
 .closeButton:hover {
-  background: var(--color-button-hover-bg, var(--color-border));
+  background: var(--rule);
 }
 
 .navButton:active,
 .actionButton:active,
 .closeButton:active {
-  background: var(--color-button-active-bg, var(--color-border));
+  background: var(--rule);
 }
 
 .navButton:disabled,
@@ -78,13 +78,13 @@
 }
 
 .actionButtonActive {
-  background: var(--color-primary);
-  color: var(--color-primary-contrast, #fff);
-  border-color: var(--color-primary);
+  background: var(--accent);
+  color: var(--accent-contrast);
+  border-color: var(--accent);
 }
 
 .closeButton {
   padding: 4px 6px;
-  font-size: 14px;
+  font-size: var(--font-size-lg);
   font-weight: 600;
 }

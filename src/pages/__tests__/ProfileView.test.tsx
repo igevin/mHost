@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, act } from "@testing-library/react";
-import { MemoryRouter, Routes, Route } from "react-router-dom";
+import { MemoryRouter, Routes, Route, useNavigate } from "react-router-dom";
 import { getDefaultStore, Provider as JotaiProvider } from "jotai";
 import type { Profile, HostRule } from "../../types";
 import { profilesAtom, selectedProfileIdAtom, dnsProfilesAtom } from "../../stores/profiles";
@@ -86,6 +86,22 @@ function renderWithRouter(initialEntry: string) {
   return render(
     <JotaiProvider store={getDefaultStore()}>
       <MemoryRouter initialEntries={[initialEntry]}>
+        <Routes>
+          <Route path="/profiles" element={<ProfileView />} />
+          <Route path="/profiles/:id" element={<ProfileView />} />
+          <Route path="/dns-profiles" element={<ProfileView mode="dns" />} />
+          <Route path="/dns-profiles/:id" element={<ProfileView mode="dns" />} />
+        </Routes>
+      </MemoryRouter>
+    </JotaiProvider>,
+  );
+}
+
+/** Variant that carries location.state (issue #124 palette jump). */
+function renderWithRouterState(pathname: string, state: Record<string, unknown>) {
+  return render(
+    <JotaiProvider store={getDefaultStore()}>
+      <MemoryRouter initialEntries={[{ pathname, state }]}>
         <Routes>
           <Route path="/profiles" element={<ProfileView />} />
           <Route path="/profiles/:id" element={<ProfileView />} />
@@ -267,35 +283,39 @@ describe("ProfileView", () => {
     expect(screen.getByText("Save")).toBeDisabled();
   });
 
-  it("shows Delete confirmation when Delete button is clicked", async () => {
-    const { confirm } = await import("@tauri-apps/plugin-dialog");
+  it("shows Delete confirmation when Delete menu item is clicked", async () => {
     const profile = makeProfile({ id: "p1", protected: false });
     const store = getDefaultStore();
     store.set(profilesAtom, [profile]);
 
     renderWithRouter("/profiles/p1");
 
-    // Click delete button
-    const deleteButton = screen.getByText("Delete");
-    expect(deleteButton).not.toBeDisabled();
+    // Delete lives in the header ⋯ menu (Phase 2)
+    fireEvent.click(
+      screen.getByRole("button", { name: /more profile actions/i }),
+    );
+    const deleteItem = screen.getByRole("menuitem", { name: "Delete" });
+    expect(deleteItem).not.toBeDisabled();
 
     await act(async () => {
-      fireEvent.click(deleteButton);
+      fireEvent.click(deleteItem);
     });
 
-    // The confirm dialog should have been called
-    expect(confirm).toHaveBeenCalled();
+    // The shared ConfirmDialog (not the native plugin-dialog confirm) opens
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    expect(
+      screen.getByText('Delete profile "dev-profile"?'),
+    ).toBeInTheDocument();
   });
 
   // Regression test for issue #100: Delete was double-bound to both
   // `onClick` and `onPointerDown`, so one physical click fired the handler
   // twice — producing two confirmation dialogs and a `ProfileNotFound` error
-  // on the second IPC call. After the fix, a `pointerDown` followed by a
-  // `click` must result in exactly one `confirm` call.
-  it("Delete fires confirm only once when both pointerDown and click are dispatched", async () => {
-    const { confirm } = await import("@tauri-apps/plugin-dialog");
-    vi.mocked(confirm).mockClear();
-    vi.mocked(confirm).mockResolvedValue(true);
+  // on the second IPC call. The entry now lives in the ⋯ menu (items are
+  // click-only, see PopupMenu docs); a `pointerDown` followed by a `click`
+  // must still open exactly one ConfirmDialog and never delete directly.
+  it("Delete menu item opens only one ConfirmDialog when both pointerDown and click are dispatched", async () => {
+    const { invoke } = await import("@tauri-apps/api/core");
 
     const profile = makeProfile({ id: "p1", protected: false });
     const store = getDefaultStore();
@@ -303,17 +323,23 @@ describe("ProfileView", () => {
 
     renderWithRouter("/profiles/p1");
 
-    const deleteButton = screen.getByText("Delete");
+    fireEvent.click(
+      screen.getByRole("button", { name: /more profile actions/i }),
+    );
+    const deleteItem = screen.getByRole("menuitem", { name: "Delete" });
 
     await act(async () => {
-      fireEvent.pointerDown(deleteButton, { button: 0 });
-      fireEvent.click(deleteButton);
-      // Flush microtasks so the first handler's `await confirm(...)` resolves
-      // before any second-invocation effects propagate.
+      fireEvent.pointerDown(deleteItem, { button: 0 });
+      fireEvent.click(deleteItem);
+      // Flush microtasks so any async handler effects propagate.
       await Promise.resolve();
     });
 
-    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(screen.getAllByRole("dialog")).toHaveLength(1);
+    expect(invoke).not.toHaveBeenCalledWith(
+      "delete_profile",
+      expect.anything(),
+    );
   });
 
   // ---- DNS mode tests ----
@@ -476,5 +502,87 @@ describe("ProfileView", () => {
     expect(screen.queryByText("Editing")).not.toBeInTheDocument();
     expect(screen.getByText("Edit")).toBeInTheDocument();
     expect(screen.getByText("Edit Info")).toBeInTheDocument();
+  });
+
+  // issue #124: 命令面板 dns_rule 跳转 —— DnsProfileView 必须读取
+  // location.state.focusLine 并透传给 RuleEditor（gutter 高亮目标行）。
+  it("forwards location.state.focusLine to the DNS profile's RuleEditor gutter", () => {
+    const profile = makeProfile({ id: "d1", mode: "dns" });
+    const store = getDefaultStore();
+    store.set(dnsProfilesAtom, [profile]);
+
+    renderWithRouterState("/dns-profiles/d1", { focusLine: 2 });
+
+    const active = document.querySelector("[class*='lineNumberActive']");
+    expect(active).not.toBeNull();
+    expect(active!.textContent).toBe("2");
+  });
+
+  // issue #124: hosts 侧同款接线（palette profile 跳转）。
+  it("forwards location.state.focusLine to the hosts profile's RuleEditor gutter", () => {
+    const profile = makeProfile({ id: "p1" });
+    const store = getDefaultStore();
+    store.set(profilesAtom, [profile]);
+
+    renderWithRouterState("/profiles/p1", { focusLine: 2 });
+
+    const active = document.querySelector("[class*='lineNumberActive']");
+    expect(active).not.toBeNull();
+    expect(active!.textContent).toBe("2");
+  });
+
+  // review F2 回归：跨 profile 跳转（A → B，B 行数更少）。RuleEditor
+  // 按 profile.id key 住后重挂载，text 由 B 的 rules 初始化 ——
+  // 修复前 effect 会拿 A 的残留 text 去 clamp/定位。
+  it("clamps a cross-profile jump against the NEW profile's text, not the previous one (F2)", () => {
+    function NavButton() {
+      const navigate = useNavigate();
+      return (
+        <button
+          data-testid="go-p2"
+          onClick={() =>
+            navigate("/profiles/p2", { state: { focusLine: 5, jumpId: 2 } })
+          }
+        >
+          go
+        </button>
+      );
+    }
+    const threeRules = [
+      makeRule({ id: "r1", ip: "10.0.0.1", domains: ["a.local"] }),
+      makeRule({ id: "r2", ip: "10.0.0.2", domains: ["b.local"] }),
+      makeRule({ id: "r3", ip: "10.0.0.3", domains: ["c.local"] }),
+    ];
+    const oneRule = [makeRule({ id: "r9", ip: "10.0.0.9", domains: ["z.local"] })];
+    const store = getDefaultStore();
+    store.set(profilesAtom, [
+      makeProfile({ id: "p1", name: "big", rules: threeRules }),
+      makeProfile({ id: "p2", name: "small", rules: oneRule }),
+    ]);
+
+    render(
+      <JotaiProvider store={getDefaultStore()}>
+        <MemoryRouter
+          initialEntries={[{ pathname: "/profiles/p1", state: { focusLine: 3, jumpId: 1 } }]}
+        >
+          <Routes>
+            <Route path="/profiles/:id" element={<ProfileView />} />
+          </Routes>
+          <NavButton />
+        </MemoryRouter>
+      </JotaiProvider>,
+    );
+
+    // 起点：p1 第 3 行高亮
+    expect(
+      document.querySelector("[class*='lineNumberActive']")!.textContent,
+    ).toBe("3");
+
+    // 跳到 p2 的「第 5 行」—— p2 只有 1 行，clamp 必须落在 1 而不是
+    // 用 p1 的 3 行 text 去算。
+    fireEvent.click(screen.getByTestId("go-p2"));
+    expect(
+      document.querySelector("[class*='lineNumberActive']")!.textContent,
+    ).toBe("1");
   });
 });

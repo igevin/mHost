@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, act } from "@testing-library/react";
 import { BrowserRouter } from "react-router-dom";
 import { getDefaultStore, Provider as JotaiProvider } from "jotai";
 import type { Profile } from "../../types";
@@ -9,6 +9,8 @@ import {
   isApplyingAtom,
   dnsEnabledAtom,
   dnsStatusAtom,
+  errorAtom,
+  paletteOpenAtom,
 } from "../../stores/profiles";
 
 // Mock tauri invoke
@@ -55,6 +57,15 @@ describe("Layout", () => {
     store.set(isApplyingAtom, false);
     store.set(dnsEnabledAtom, false);
     store.set(dnsStatusAtom, null);
+    store.set(errorAtom, null);
+    // 共享 atom：上个用例可能把面板开着 —— 每个用例前复位。
+    store.set(paletteOpenAtom, false);
+    // F7 用例会 stub navigator.platform —— 每个用例前复位为空字符串
+    // （非 mac，与 jsdom 默认一致）。
+    Object.defineProperty(window.navigator, "platform", {
+      value: "",
+      configurable: true,
+    });
   });
 
   it("renders the mHost logo", () => {
@@ -137,8 +148,11 @@ describe("Layout", () => {
 
     renderWithProviders(<Layout />);
 
-    // Toggle switches should be rendered as role="switch"
-    const toggles = screen.getAllByRole("switch");
+    // Toggle switches should be rendered as role="switch". Scope to the
+    // profile list — StatusBar's DNS card has its own switch (Phase 2).
+    const toggles = screen
+      .getAllByRole("switch")
+      .filter((el) => el.closest("[class*='profileList']") !== null);
     expect(toggles).toHaveLength(2);
   });
 
@@ -241,5 +255,63 @@ describe("Layout", () => {
     // (StatusBar DNS column is a separate UI element and stays visible.)
     const indicator = document.querySelector("[class*='dnsStatusIndicator']");
     expect(indicator).toBeFalsy();
+  });
+
+  /** review F7: platform gating — mac 用 metaKey && !ctrlKey；其它平台
+   *  ctrlKey && !metaKey；Shift 一律不触发。逐用例 stub platform。 */
+  function stubPlatform(value: string) {
+    Object.defineProperty(window.navigator, "platform", {
+      value,
+      configurable: true,
+    });
+  }
+
+  it("Cmd+K toggles the command palette on macOS (issue #124)", () => {
+    stubPlatform("MacIntel");
+    renderWithProviders(<Layout />);
+    expect(screen.queryByRole("dialog", { name: "Command palette" })).not.toBeInTheDocument();
+
+    fireEvent.keyDown(document, { key: "k", metaKey: true });
+    expect(screen.getByRole("dialog", { name: "Command palette" })).toBeInTheDocument();
+
+    // 再按一次关闭（toggle，不劫持面板内部按键）
+    fireEvent.keyDown(document, { key: "k", metaKey: true });
+    expect(screen.queryByRole("dialog", { name: "Command palette" })).not.toBeInTheDocument();
+  });
+
+  it("Ctrl+K opens the palette on non-macOS platforms", () => {
+    stubPlatform("Win32");
+    renderWithProviders(<Layout />);
+    fireEvent.keyDown(document, { key: "k", ctrlKey: true });
+    expect(screen.getByRole("dialog", { name: "Command palette" })).toBeInTheDocument();
+  });
+
+  it("does NOT fire on the other platform's modifier (F7)", () => {
+    stubPlatform("MacIntel");
+    renderWithProviders(<Layout />);
+    // macOS 上 Ctrl+K 是 Cocoa kill-line，不能劫持
+    fireEvent.keyDown(document, { key: "k", ctrlKey: true });
+    expect(screen.queryByRole("dialog", { name: "Command palette" })).not.toBeInTheDocument();
+  });
+
+  it("does NOT fire with Shift held (F7)", () => {
+    stubPlatform("MacIntel");
+    renderWithProviders(<Layout />);
+    fireEvent.keyDown(document, { key: "k", metaKey: true, shiftKey: true });
+    expect(screen.queryByRole("dialog", { name: "Command palette" })).not.toBeInTheDocument();
+  });
+
+  it("renders the global errorAtom banner and dismisses it (review F4)", () => {
+    const store = getDefaultStore();
+    renderWithProviders(<Layout />);
+
+    // errorAtom 现在由 Layout 全局渲染 —— 任何路由都看得到。
+    act(() => {
+      store.set(errorAtom, "delete failed: ProfileNotFound");
+    });
+    expect(screen.getByText("delete failed: ProfileNotFound")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+    expect(store.get(errorAtom)).toBeNull();
   });
 });

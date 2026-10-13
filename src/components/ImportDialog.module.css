@@ -8,7 +8,7 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  z-index: 100; /* Z_INDEX.DIALOG_OVERLAY */
+  z-index: 100; /* layer registry: see global.css */
   animation: fadeIn 0.15s ease;
 }
 
@@ -24,8 +24,8 @@
 /* ---- Dialog ---- */
 
 .dialog {
-  background: var(--color-surface);
-  border: 1px solid var(--color-border);
+  background: var(--surface);
+  border: 1px solid var(--rule);
   border-radius: var(--radius-lg);
   padding: 24px;
   width: 90%;
@@ -34,7 +34,7 @@
   overflow-y: auto;
   box-shadow: var(--shadow-md);
   animation: slideUp 0.2s ease;
-  z-index: 110; /* Z_INDEX.DIALOG_CONTENT */
+  z-index: 110; /* layer registry: see global.css */
 }
 
 @keyframes slideUp {
@@ -49,7 +49,7 @@
 }
 
 .title {
-  font-size: 17px;
+  font-size: 16px;
   font-weight: 600;
   margin: 0 0 16px;
 }
@@ -61,26 +61,26 @@
 }
 
 .hasErrors {
-  border-color: var(--color-danger);
+  border-color: var(--danger);
 }
 
 .hasErrors:focus {
-  border-color: var(--color-danger);
+  border-color: var(--danger);
 }
 
 /* ---- Status / Preview ---- */
 
 .status {
-  font-size: 12px;
-  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
+  color: var(--ink-muted);
   margin-bottom: 8px;
 }
 
 .preview {
-  font-size: 13px;
-  color: var(--color-success);
-  background: var(--color-success-bg);
-  border: 1px solid var(--color-success-border);
+  font-size: var(--font-size-md);
+  color: var(--success);
+  background: var(--success-soft);
+  border: 1px solid var(--success-soft);
   border-radius: var(--radius-sm);
   padding: 6px 10px;
   margin-bottom: 8px;
@@ -96,19 +96,19 @@
 }
 
 .errorItem {
-  font-size: 12px;
-  color: var(--color-danger);
-  background: var(--color-error-bg);
-  border: 1px solid var(--color-error-border);
+  font-size: var(--font-size-sm);
+  color: var(--danger);
+  background: var(--danger-soft);
+  border: 1px solid var(--danger-soft);
   border-radius: var(--radius-sm);
   padding: 4px 8px;
 }
 
 .warningItem {
-  font-size: 12px;
-  color: var(--color-warning);
-  background: var(--color-warning-bg);
-  border: 1px solid var(--color-warning-border);
+  font-size: var(--font-size-sm);
+  color: var(--warning);
+  background: var(--warning-soft);
+  border: 1px solid var(--warning-soft);
   border-radius: var(--radius-sm);
   padding: 4px 8px;
 }
@@ -138,8 +138,8 @@
 }
 
 .filePath {
-  font-size: 13px;
-  color: var(--color-text-secondary);
+  font-size: var(--font-size-md);
+  color: var(--ink-soft);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;

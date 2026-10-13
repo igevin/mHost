@@ -2,9 +2,9 @@
 
 .sidebarFooter {
   padding: 12px 16px;
-  border-top: 1px solid var(--color-border-secondary);
-  font-size: 11px;
-  color: var(--color-text-muted);
+  border-top: 1px solid var(--rule-soft);
+  font-size: var(--font-size-xs);
+  color: var(--ink-muted);
 }
 
 /* issue #67：双栏（Hosts / DNS）。两列等宽 + gap。 */
@@ -15,7 +15,7 @@
 }
 
 .statusCard {
-  background: var(--color-border-secondary);
+  background: var(--rule-soft);
   border-radius: var(--radius-md);
   padding: 10px;
   cursor: pointer;
@@ -24,11 +24,11 @@
 }
 
 .statusCard:hover {
-  background: var(--color-sidebar-hover, rgba(255, 255, 255, 0.06));
+  background: var(--sidebar-hover);
 }
 
 .statusCard:focus-visible {
-  outline: 2px solid var(--color-primary);
+  outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
 
@@ -40,8 +40,8 @@
 }
 
 .statusLabel {
-  font-size: 12px;
-  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
+  color: var(--ink-muted);
   text-transform: uppercase;
   letter-spacing: 0.4px;
 }
@@ -50,15 +50,15 @@
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: var(--color-text-muted);
+  background: var(--ink-muted);
 }
 
 .statusDotOn {
-  background: var(--color-success);
+  background: var(--success);
 }
 
 .statusDotOff {
-  background: var(--color-text-muted);
+  background: var(--ink-muted);
 }
 
 /* issue #232: `stuck_at_loopback` 警示色。
@@ -66,12 +66,12 @@
    单类选择器、优先级相同，靠**源码顺序**覆盖 .statusDot 的 background。
    所以这个变体必须声明在 .statusDot 之后 —— 挪到前面会静默失效。 */
 .statusDotDanger {
-  background: var(--color-danger);
+  background: var(--danger);
 }
 
 .statusProfile {
-  font-size: 12px;
-  color: var(--color-text);
+  font-size: var(--font-size-sm);
+  color: var(--ink);
   font-weight: 500;
   white-space: nowrap;
   overflow: hidden;
@@ -82,42 +82,88 @@
    靠源码顺序取胜）。使用处两个 class 都挂：
    `${styles.statusProfile} ${styles.statusProfileDanger}`。 */
 .statusProfileDanger {
-  color: var(--color-danger);
+  color: var(--danger);
   font-weight: 600;
 }
 
 .statusApplying {
   margin-top: 6px;
-  font-size: 12px;
-  color: var(--color-warning);
+  font-size: var(--font-size-sm);
+  color: var(--warning);
 }
 
-.statusPending {
-  margin-top: 6px;
-  font-size: 12px;
-  color: var(--color-warning);
-  font-weight: 500;
-}
+/* ---- DNS mode mini switch (Phase 2) ----
+ * Compact 32x18 variant, mirrors the sidebar profile toggle in
+ * Layout.module.css. Cancel 按钮与 switch 是兄弟节点（issue #149：
+ * 同位 swap 会让 trailing click 落到新挂载的 Cancel 上）。 */
 
-.statusApplyBtn {
+.dnsToggleRow {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   margin-top: 8px;
-  width: 100%;
-  padding: 6px 10px;
-  border-radius: var(--radius-sm);
-  border: 1px solid var(--color-primary);
-  background: var(--color-primary);
-  color: #fff;
-  font-size: 12px;
-  font-weight: 500;
+}
+
+.toggle {
+  position: relative;
+  display: inline-block;
+  width: 32px;
+  height: 18px;
   cursor: pointer;
-  transition: background 0.15s;
+  flex-shrink: 0;
 }
 
-.statusApplyBtn:hover:not(:disabled) {
-  background: var(--color-primary-hover);
+.toggle input {
+  opacity: 0;
+  width: 0;
+  height: 0;
 }
 
-.statusApplyBtn:disabled {
+.toggleSlider {
+  position: absolute;
+  inset: 0;
+  background: var(--rule-soft);
+  border-radius: 9px;
+  transition: background var(--transition-fast);
+}
+
+.toggleSlider::before {
+  content: "";
+  position: absolute;
+  height: 12px;
+  width: 12px;
+  left: 3px;
+  top: 3px;
+  background: var(--accent-contrast);
+  border-radius: 50%;
+  transition: transform var(--transition-fast);
+}
+
+.toggle input:checked + .toggleSlider {
+  background: var(--accent);
+}
+
+.toggle input:checked + .toggleSlider::before {
+  transform: translateX(14px);
+}
+
+.toggle input:disabled + .toggleSlider {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+.dnsCancelBtn {
+  border: none;
+  background: transparent;
+  color: var(--danger);
+  font-size: var(--font-size-xs);
+  font-weight: 500;
+  font-family: var(--font-mono);
+  cursor: pointer;
+  padding: 1px 4px;
+  border-radius: var(--radius-sm);
+}
+
+.dnsCancelBtn:hover {
+  background: var(--danger-soft);
 }

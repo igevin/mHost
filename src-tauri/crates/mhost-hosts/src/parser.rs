@@ -7,8 +7,11 @@ use std::net::IpAddr;
 use std::str::FromStr;
 
 /// Managed block markers
-const MANAGED_START: &str = "# ---- mHost start ----";
-const MANAGED_END: &str = "# ---- mHost end ----";
+///
+/// **PR #244 review (R3)**: `pub` so `commands::query` can run its lenient
+/// managed-block masking fallback without duplicating the literals.
+pub const MANAGED_START: &str = "# ---- mHost start ----";
+pub const MANAGED_END: &str = "# ---- mHost end ----";
 
 /// Result of parsing a hosts file
 #[derive(Debug, PartialEq)]

@@ -216,7 +216,7 @@ describe("RuleEditor", () => {
       await vi.runAllTimersAsync();
     });
 
-    const warningEl = screen.getByText(/冗余.*example.com/);
+    const warningEl = screen.getByText(/Duplicate.*example\.com/);
     expect(warningEl).toBeInTheDocument();
     expect(warningEl.className).toMatch(/warningItem/);
     expect(onErrorChange).toHaveBeenCalledWith(false);
@@ -246,7 +246,7 @@ describe("RuleEditor", () => {
       await vi.runAllTimersAsync();
     });
 
-    const errorEl = screen.getByText(/冲突.*example.com/);
+    const errorEl = screen.getByText(/Conflict.*example\.com/);
     expect(errorEl).toBeInTheDocument();
     expect(errorEl.className).toMatch(/errorItem/);
     expect(onErrorChange).toHaveBeenCalledWith(true);
@@ -274,7 +274,7 @@ describe("RuleEditor", () => {
       await vi.runAllTimersAsync();
     });
 
-    expect(screen.queryByText(/冗余|冲突/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Duplicate|Conflict/)).not.toBeInTheDocument();
   });
 
   describe("Search & Replace", () => {
@@ -478,6 +478,87 @@ describe("RuleEditor", () => {
       // Highlights should be cleared (no searchMatch in highlight layer)
       highlightLayer = document.querySelector("[aria-hidden='true']");
       expect(highlightLayer!.innerHTML).not.toMatch(/searchMatch/);
+    });
+  });
+
+  describe("focusLine jump target (issue #124)", () => {
+    const fiveRules: HostRule[] = [1, 2, 3, 4, 5].map((i) =>
+      makeRule({ id: `r${i}`, ip: "10.0.0.1", domains: [`d${i}.local`] }),
+    );
+
+    function activeGutterRow(): Element | null {
+      const active = document.querySelectorAll("[class*='lineNumberActive']");
+      expect(active.length).toBeLessThanOrEqual(1);
+      return active[0] ?? null;
+    }
+
+    it("scrolls to the focus line and highlights its gutter row in read-only mode", () => {
+      render(
+        <RuleEditor rules={fiveRules} onChange={vi.fn()} readOnly focusLine={3} />,
+      );
+
+      expect(activeGutterRow()?.textContent).toBe("3");
+      const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+      // lineHeight 20.8 = 13px × 1.6（scrollToMatch 的既有契约）
+      expect(textarea.scrollTop).toBe(2 * 20.8);
+    });
+
+    it("highlights no gutter row in read-only mode without focusLine", () => {
+      render(<RuleEditor rules={fiveRules} onChange={vi.fn()} readOnly />);
+      expect(activeGutterRow()).toBeNull();
+    });
+
+    it("keeps the caret-line cache consistent after a jump", () => {
+      render(<RuleEditor rules={fiveRules} onChange={vi.fn()} focusLine={3} />);
+
+      // 跳转后用户把 caret 挪到第 5 行行首 —— delta walk 必须从
+      // 「目标行行首」的自洽基准出发，算出绝对行号 5 而不是错位值。
+      const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+      const lines = textarea.value.split("\n");
+      const line5Start = lines
+        .slice(0, 4)
+        .reduce((n, l) => n + l.length + 1, 0);
+      textarea.setSelectionRange(line5Start, line5Start);
+      fireEvent.select(textarea);
+
+      expect(activeGutterRow()?.textContent).toBe("5");
+    });
+
+    it("clamps an out-of-range focusLine to the last line", () => {
+      render(
+        <RuleEditor rules={fiveRules} onChange={vi.fn()} readOnly focusLine={99} />,
+      );
+      expect(activeGutterRow()?.textContent).toBe("5");
+    });
+
+    it("re-scrolls on a repeated jump to the same line via jumpNonce (F6)", () => {
+      const { rerender } = render(
+        <RuleEditor
+          rules={fiveRules}
+          onChange={vi.fn()}
+          readOnly
+          focusLine={2}
+          jumpNonce={1}
+        />,
+      );
+      const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+      expect(textarea.scrollTop).toBe(1 * 20.8);
+
+      // 用户手动滚走
+      textarea.scrollTop = 0;
+
+      // 同一行、新的 nonce —— 必须重新滚回目标行
+      rerender(
+        <RuleEditor
+          rules={fiveRules}
+          onChange={vi.fn()}
+          readOnly
+          focusLine={2}
+          jumpNonce={2}
+        />,
+      );
+      expect(textarea.scrollTop).toBe(1 * 20.8);
+      expect(activeGutterRow()?.textContent).toBe("2");
     });
   });
 });
