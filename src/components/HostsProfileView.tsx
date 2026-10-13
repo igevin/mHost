@@ -54,7 +54,6 @@ export default function HostsProfileView() {
 
   const profiles = useAtomValue(profilesAtom);
   const isLoading = useAtomValue(isLoadingAtom);
-  const error = useAtomValue(errorAtom);
 
   const isApplying = useAtomValue(isApplyingAtom);
   const setSelectedId = useSetAtom(selectedProfileIdAtom);
@@ -383,8 +382,6 @@ export default function HostsProfileView() {
 
   return (
     <div className={styles.viewPage}>
-      {error && <div className="alert alert-error">{error}</div>}
-
       {/* Info Bar */}
       <div className={styles.infoBar}>
         {!isInfoBarExpanded ? (
