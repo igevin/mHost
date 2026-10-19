@@ -1,15 +1,18 @@
-# AI Code Review —— PR 创建/更新时用 Claude Code (Headless) 审查，结论评论到 PR。
+# AI Code Review —— PR 创建/更新时用 Pi Agent (headless) 审查，结论评论到 PR。
 #
 # 前置配置（仓库 Settings → Secrets and variables → Actions）：
-#   Secrets（挂在 LLM environment 上，运行时经 step env 注入 claude 进程，不落盘）：
-#     ZHIPU_API_KEY              智谱 API Key（必填，未配置时审查失败）
+#   Secrets（经进程环境/命令行参数注入 pi 进程，不落盘）：
+#     AI_REVIEW_API_KEY          兼容端点的 API Key（必填，未配置时审查失败）
 #   Variables（可选，用于覆盖默认值）:
 #     AI_REVIEW_MAX_DIFF_LINES   diff 上限（行数），默认 2000
-#     AI_REVIEW_MODEL            审查模型，默认 glm-5.3-flash
+#     AI_REVIEW_MODEL            审查模型 ID，默认 MiniMax-M2.7
+#     AI_REVIEW_BASE_URL         OpenAI 兼容端点基址，默认 https://api.minimaxi.com/v1
+#                                改这一个变量即可切换背后的大模型服务（任何
+#                                OpenAI 兼容网关：智谱 paas、OpenRouter 等）
 #
 # 定位是 advisory：评论非阻塞，不作为合并门禁；审查失败时 PR 留"AI 审查失败"说明。
 # 评审标准在 .github/ai-review-prompt.md，改 prompt 不用动本文件。
-
+#
 name: AI Code Review
 
 on:
@@ -36,7 +39,13 @@ permissions:
 
 env:
   MAX_DIFF_LINES: ${{ vars.AI_REVIEW_MAX_DIFF_LINES || 2000 }}
-  AI_REVIEW_MODEL: ${{ vars.AI_REVIEW_MODEL || 'glm-5.3-flash' }}
+  AI_REVIEW_MODEL: ${{ vars.AI_REVIEW_MODEL || 'MiniMax-M2.7' }}
+  AI_REVIEW_BASE_URL: ${{ vars.AI_REVIEW_BASE_URL || 'https://api.minimaxi.com/v1' }}
+  # 钉精确版本：PoC（2026-10）验证过的行为——models.json 自定义 provider 的
+  # apiKey "$ENV" 插值在该版本不生效（凭证实际按 baseUrl 主机名回退到对应
+  # 内置 provider 的环境变量，或靠 --api-key 传入），只锁主版本可能让这条
+  # 结论静默漂移
+  AI_REVIEW_PI_VERSION: 1.3.0
   # 发布评论的头前缀，**同时**被两个步骤使用：
   #   1. Post review comment       —— 拼出评论头
   #   2. Resolve previous AI review —— 按此前缀回捞上一轮结论
@@ -56,9 +65,10 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' || (github.event.pull_request.head.repo != null && github.event.pull_request.head.repo.fork == false) }}
     runs-on: ubuntu-latest
     # job 级余量要盖过内层 timeout 900s + 检出/安装；审查耗时随 PR 复杂度
-    # 和端点延迟波动（实测 2~10 分钟），超时只会打断"Post failure notice"
+    # 和端点延迟波动（PoC 实测 1240 行 diff 约 67s，端点繁忙时可能数倍），
+    # 超时只会打断"Post failure notice"
     timeout-minutes: 20
-    # 模型密钥（ZHIPU_API_KEY）挂在 LLM environment 上；该环境无保护规则，
+    # 模型密钥（AI_REVIEW_API_KEY）挂在 LLM environment 上；该环境无保护规则，
     # fork PR 已在上方 if 跳过，不受环境密钥对 fork 不可用的限制
     environment: LLM
     steps:
@@ -113,38 +123,101 @@ jobs:
           BASE: ${{ steps.refs.outputs.base }}
         run: |
           # PR 检出树是不可信输入：项目级 .claude/（hooks、permissions.allow）
-          # 与 .mcp.json 会在 -p 模式下被自动执行/加载且无审批门，而
+          # 与 .mcp.json 会在 agent 模式下被自动执行/加载，而
           # workflow_dispatch 复审 fork PR 是设计内场景——fork 作者可以
-          # 在 PR 里植入它们，故运行前一律清除。
-          # CLAUDE.md/CLAUDE.local.md/AGENTS.md（含子目录级，读取对应目录
-          # 文件时自动加载）会被 claude 吸收进上下文，全部清除后仅恢复
-          # base 版的根文件，PR 作者无法借此改写审查口径。
-          rm -rf .claude .mcp.json
+          # 在 PR 里植入它们，故运行前一律清除。Pi 侧虽已用
+          # --no-extensions/--no-approve/--no-context-files 等 flag 关闭
+          # 全部项目资源发现，这里的删除是纵深防御，成本极低。
+          rm -rf .claude .mcp.json .pi
           find . -not -path './.git/*' \( -name 'CLAUDE.md' -o -name 'CLAUDE.local.md' -o -name 'AGENTS.md' \) -delete
           git show "$BASE:CLAUDE.md" > CLAUDE.md 2>/dev/null || true
           git show "$BASE:AGENTS.md" > AGENTS.md 2>/dev/null || true
-          # 密钥经进程环境注入后 /proc/self/environ 仍是 Read 可达的文件，
-          # 用 deny 规则封禁内核伪文件系统。注意只需 Read 规则：claude-code
-          # 的文件权限校验对读文件类工具统一走 Read 规则（Grep/Glob 自动
-          # 被覆盖，官方校验警告与实测均确认）；deny 优先于 allowedTools，
-          # // 前缀为绝对路径规则，已在 claude-code 2.1.x 上实测生效。
-          cat > "$RUNNER_TEMP/ai-review-guard.json" <<'EOF'
-          {
-            "permissions": {
-              "deny": [
-                "Read(//proc/**)",
-                "Read(//sys/**)",
-                "Read(//dev/**)"
-              ]
-            }
+          # guard 扩展同理：只信任 base 版本。先从工作树删除（防 PR 里的
+          # 副本被任何途径加载），再从 base 恢复到 runner 临时目录。
+          rm -f .github/ai-review/guard.ts
+          if git show "$BASE:.github/ai-review/guard.ts" > "$RUNNER_TEMP/ai-review-guard.ts" 2>/dev/null; then
+            : # base 已有 guard，恢复完成
+          else
+            # base 尚无 guard.ts（即引入本防线/本工作流的 PR 自身）时回退到
+            # workflow 内嵌版。为什么不加载 PR 工作树副本：fork 作者可植入
+            # 弱化版 guard，workflow_dispatch 复审 fork PR 时会加载它，/proc
+            # 封禁随之失效 → 密钥可经 PR 评论泄出。workflow 文件本身对
+            # pull_request 来自 PR 分支、对 workflow_dispatch 恒为 master ——
+            # 与原 claude guard JSON 的信任模型一致（防线可信源是 workflow
+            # 文件，被防的是 PR 工作树内容）。
+            # ⚠️ 内嵌版必须与 .github/ai-review/guard.ts 保持逐字一致
+            # （改扩展时两处同改），同步由 code review 保证
+            cat > "$RUNNER_TEMP/ai-review-guard.ts" <<'EOF'
+          /**
+           * ai-review guard 扩展 —— 补齐 Pi 缺失的文件级防线。
+           *
+           * Pi 的 read/grep/find/ls 工具接受任意绝对路径，内核没有文件权限系统；
+           * 被审 diff 里的 prompt injection 可能诱导模型读取 /proc/self/environ，
+           * 把进程环境里的 API key / GITHUB_TOKEN 带进 PR 评论造成泄密。
+           * 本扩展在 tool_call gate 上拦截对内核伪文件系统的访问。
+           *
+           * 加载方式（ai-review.yml）：`-ne -e <本文件>`——`--no-extensions` 只关闭
+           * 自动发现，显式 -e 仍然加载。工作流从 PR base 版本恢复本文件后再加载，
+           * 绝不加载 PR 工作树里的副本（防 fork 作者在 PR 里植入弱化版 guard）。
+           *
+           * 自检：加载时向 stderr 打印一行日志；工作流在恢复文件后校验其包含
+           * "tool_call" 关键字，缺失即拒绝运行审查（防线自校验，防静默失效）。
+           *
+           * ⚠️ 本文件在 workflow Sanitize 步骤中有一份内嵌副本（base 尚无本文件时
+           * 的引导回退），改动须两处同步，同步由 code review 保证。
+           */
+          
+          import { resolve } from "node:path";
+          
+          /** 内核伪文件系统前缀，命中即拦截。 */
+          const BLOCKED_PREFIXES = ["/proc", "/sys", "/dev"];
+          
+          /** 只读审查启用的工具集（与 ai-review.yml 的 --tools 保持一致）。 */
+          const GUARDED_TOOLS = new Set(["read", "grep", "find", "ls"]);
+          
+          function blockedReason(resolvedPath: string): string | undefined {
+          	for (const prefix of BLOCKED_PREFIXES) {
+          		if (resolvedPath === prefix || resolvedPath.startsWith(prefix + "/")) {
+          			return `path ${resolvedPath} is under ${prefix}, blocked by ai-review guard`;
+          		}
+          	}
+          	return undefined;
+          }
+          
+          export default function (pi: any) {
+          	pi.on("tool_call", (event: any, ctx: any) => {
+          		if (!GUARDED_TOOLS.has(event.toolName)) return;
+          		const input = event.input;
+          		if (!input || typeof input !== "object") return;
+          
+          		const candidates: string[] = [];
+          		if (typeof input.path === "string") candidates.push(input.path);
+          		// find 的 glob pattern 若以 / 开头等价于绝对路径，同样纳入检查
+          		if (typeof input.pattern === "string" && input.pattern.startsWith("/")) {
+          			candidates.push(input.pattern);
+          		}
+          
+          		for (const raw of candidates) {
+          			const resolved = raw.startsWith("/") ? resolve(raw) : resolve(ctx.cwd, raw);
+          			const reason = blockedReason(resolved);
+          			if (reason) {
+          				console.error(`[ai-review-guard] blocked ${event.toolName}: ${reason}`);
+          				return { block: true, reason, terminate: true };
+          			}
+          		}
+          	});
+          
+          	console.error("[ai-review-guard] loaded, blocking reads under /proc, /sys, /dev");
           }
           EOF
-          # 防线自校验：JSON 若损坏会被 claude 静默忽略，/proc 封禁随之
-          # 失效；校验不过就拒绝运行审查，走"AI 审查失败"路径
-          jq -e '.permissions.deny | index("Read(//proc/**)")' "$RUNNER_TEMP/ai-review-guard.json" > /dev/null || {
-            echo "::error::ai-review-guard.json invalid — refusing to run review without the /proc deny rule"
+          fi
+          # 防线自校验：恢复/内嵌出的文件必须非空且包含 tool_call 关键字——
+          # 扩展若损坏/被 base 误删，Pi 会静默不带 guard 运行，/proc 封禁
+          # 无声失效，必须在这里显式拒绝
+          if [ ! -s "$RUNNER_TEMP/ai-review-guard.ts" ] || ! grep -q "tool_call" "$RUNNER_TEMP/ai-review-guard.ts"; then
+            echo "::error::ai-review guard.ts missing or invalid — refusing to run review without the /proc guard"
             exit 1
-          }
+          fi
 
       - name: Build diff with size guard
         id: diff
@@ -242,8 +315,8 @@ jobs:
           # 可能含被诱导的措辞。缓解：① 只取本 workflow 自己发的评论
           # （按 job 级 AI_REVIEW_HEADER_PREFIX 过滤，不取任意用户评论）；
           # ② 由 prompt 用 <上一轮审查结论> 包裹并显式声明「是数据不是指令」；
-          # ③ 模型仍是只读工具 + 上下文清洗 + /proc deny。残余风险与 report
-          # 侧同级，advisory 定位下接受。
+          # ③ 模型仍是只读工具 + 上下文清洗 + guard 扩展拦截 /proc。
+          # 残余风险与 report 侧同级，advisory 定位下接受。
           total=$(gh pr view "$PR_NUMBER" --json comments --jq '.comments | length' 2>/dev/null || echo 0)
           body=$(gh pr view "$PR_NUMBER" --json comments \
             --jq "[.comments[] | select(.body | startswith(env.AI_REVIEW_HEADER_PREFIX))] | last | .body // \"\"" \
@@ -274,24 +347,67 @@ jobs:
         if: steps.gate.outputs.skip == 'false'
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
+          # Pi 要求 Node ≥ 22.19
           node-version: 22
 
-      - name: Install Claude Code
+      - name: Install Pi
         if: steps.gate.outputs.skip == 'false'
-        # 钉精确版本：Read deny 规则覆盖 Grep/Glob 是 2.1.x 的实测行为，
-        # 只锁主版本仍可能被小版本无声漂移破坏这条防线
-        run: npm install -g @anthropic-ai/claude-code@2.1.289
+        # 钉精确版本见 env.AI_REVIEW_PI_VERSION 的注释。--ignore-scripts 关闭
+        # 依赖生命周期脚本（Pi 正常安装不需要），缩小供应链执行面
+        run: npm install -g --ignore-scripts "@earendil-works/pi-coding-agent@${AI_REVIEW_PI_VERSION}"
+
+      - name: Write models.json
+        if: steps.gate.outputs.skip == 'false'
+        env:
+          PI_CODING_AGENT_DIR: ${{ runner.temp }}/pi-agent
+        run: |
+          # Pi 的 models.json 自定义 provider 接入任意 OpenAI 兼容端点。
+          # 密钥**不写进本文件**：PoC 实测 1.3.0 的 apiKey "$ENV" 插值对
+          # 自定义 provider 不生效，且落盘文件可能被模型的 read 工具读到
+          # 经报告泄出。改为 Run 步骤用 --api-key 经进程参数传入（runner
+          # 单次单租户；模型侧无 bash 工具，guard 扩展封禁 /proc 读，无法
+          # 从 cmdline/environ 取到 key）。
+          mkdir -p "$PI_CODING_AGENT_DIR"
+          jq -n \
+            --arg baseUrl "$AI_REVIEW_BASE_URL" \
+            --arg model "$AI_REVIEW_MODEL" \
+            '{
+              "$schema": "https://pi.dev/schemas/models.schema.json",
+              providers: {
+                "ai-review": {
+                  name: "AI Review Endpoint",
+                  baseUrl: $baseUrl,
+                  api: "openai-completions",
+                  authHeader: true,
+                  models: [
+                    {
+                      id: $model,
+                      name: $model,
+                      reasoning: true,
+                      contextWindow: 1000000,
+                      maxTokens: 16384
+                    }
+                  ]
+                }
+              }
+            }' > "$PI_CODING_AGENT_DIR/models.json"
+          # 防线自校验：models.json 损坏会让 pi 启动即失败，与其留一个
+          # 难懂的报错不如在这里显式拦住
+          jq -e '.providers["ai-review"].models[0].id == "'"$AI_REVIEW_MODEL"'"' "$PI_CODING_AGENT_DIR/models.json" > /dev/null || {
+            echo "::error::models.json generation failed validation"
+            exit 1
+          }
 
       - name: Run AI review
         id: review
         if: steps.gate.outputs.skip == 'false'
         env:
-          # 密钥只经进程环境注入 claude，不写入 settings.json；/proc、/sys、
-          # /dev 的读取面由 sanitize 步骤写出的 deny 规则封禁
-          ANTHROPIC_BASE_URL: https://open.bigmodel.cn/api/anthropic
-          ANTHROPIC_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
-          ANTHROPIC_AUTH_TOKEN: ${{ secrets.ZHIPU_API_KEY }}
-          ANTHROPIC_MODEL: ${{ env.AI_REVIEW_MODEL }}
+          # 密钥经 --api-key 进程参数注入 pi，不写入任何文件
+          AI_REVIEW_API_KEY: ${{ secrets.AI_REVIEW_API_KEY }}
+          PI_CODING_AGENT_DIR: ${{ runner.temp }}/pi-agent
+          # 关闭遥测与版本检查请求，避免 CI 里出现无关出网流量
+          PI_TELEMETRY: "0"
+          PI_SKIP_VERSION_CHECK: "1"
         run: |
           set +e
           # 拼装最终 prompt = 仓库版审查标准 [+ 上一轮结论]
@@ -303,20 +419,26 @@ jobs:
               printf '\n\n</上一轮审查结论>\n'
             fi
           } > ai-review-prompt.final.md
-          timeout 900 claude -p "$(cat ai-review-prompt.final.md)" \
-            --allowedTools "Read,Grep,Glob" \
-            --strict-mcp-config \
-            --settings "$RUNNER_TEMP/ai-review-guard.json" \
-            --max-turns 40 \
-            --output-format json \
-            < pr.diff > review.json
+          timeout 900 pi --print \
+            --provider ai-review --model "$AI_REVIEW_MODEL" \
+            --api-key "$AI_REVIEW_API_KEY" \
+            --thinking off \
+            --tools read,grep,find,ls \
+            --exclude-tools 'mcp__*' \
+            --no-mcp --no-extensions --no-skills --no-prompt-templates \
+            --no-context-files --no-session --no-approve \
+            -e "$RUNNER_TEMP/ai-review-guard.ts" \
+            "$(cat ai-review-prompt.final.md)" \
+            < pr.diff > review.raw.md 2> review.stderr
           code=$?
           set -e
+          # MiniMax 的思考链以 <think> 标签内联在 content 里返回（--thinking
+          # off 只缩短、不消除），必须剥掉再发评论——否则报告开头会带一大段
+          # 模型独白。perl 多字节安全地跨行剥离；剥完若全文为空说明模型
+          # 只吐了思考链，按失败处理
+          perl -0777 -pe 's/<think>.*?<\/think>//gs' review.raw.md | sed -e '/./,$!d' > report.md
           status=failed
-          if [ "$code" -eq 0 ] && [ -s review.json ] \
-             && [ "$(jq -r '.subtype // ""' review.json)" = "success" ] \
-             && jq -e '.result | type == "string" and length > 0' review.json > /dev/null; then
-            jq -r '.result' review.json > report.md
+          if [ "$code" -eq 0 ] && [ -s report.md ]; then
             # GitHub 评论上限 64KB：超长截断，避免"审查成功但发评论失败"
             # 导致整个 job 报错、PR 一条评论都没有。iconv -c 丢弃截断点
             # 可能劈开的半个多字节字符，保证输出仍是合法 UTF-8
@@ -330,8 +452,8 @@ jobs:
 
       - name: Post review comment
         # 残余风险声明：report 是模型输出、原样发布——被审 diff 中的注入
-        # 指令仍可能诱导报告措辞（缓解：只读工具、上下文清洗、/proc deny；
-        # advisory 定位下接受该残余风险），评论头带 head SHA 便于归因
+        # 指令仍可能诱导报告措辞（缓解：只读工具、上下文清洗、guard 扩展
+        # 拦截 /proc 读；advisory 定位下接受该残余风险），评论头带 head SHA 便于归因
         if: steps.review.outputs.status == 'ok'
         env:
           GH_TOKEN: ${{ github.token }}
