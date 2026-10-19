@@ -12,6 +12,9 @@
  *
  * 自检：加载时向 stderr 打印一行日志；工作流在恢复文件后校验其包含
  * "tool_call" 关键字，缺失即拒绝运行审查（防线自校验，防静默失效）。
+ *
+ * ⚠️ 本文件在 workflow Sanitize 步骤中有一份内嵌副本（base 尚无本文件时
+ * 的引导回退），改动须两处同步，同步由 code review 保证。
  */
 
 import { resolve } from "node:path";

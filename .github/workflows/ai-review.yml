@@ -139,13 +139,88 @@ jobs:
           git show "$BASE:AGENTS.md" > AGENTS.md 2>/dev/null || true
           # guard 扩展同理：只信任 base 版本。先从工作树删除（防 PR 里的
           # 副本被任何途径加载），再从 base 恢复到 runner 临时目录。
-          # 防线自校验：恢复出的文件必须非空且包含 tool_call 关键字——
+          rm -f .github/ai-review/guard.ts
+          if git show "$BASE:.github/ai-review/guard.ts" > "$RUNNER_TEMP/ai-review-guard.ts" 2>/dev/null; then
+            : # base 已有 guard，恢复完成
+          else
+            # base 尚无 guard.ts（即引入本防线/本工作流的 PR 自身）时回退到
+            # workflow 内嵌版。为什么不加载 PR 工作树副本：fork 作者可植入
+            # 弱化版 guard，workflow_dispatch 复审 fork PR 时会加载它，/proc
+            # 封禁随之失效 → 密钥可经 PR 评论泄出。workflow 文件本身对
+            # pull_request 来自 PR 分支、对 workflow_dispatch 恒为 master ——
+            # 与原 claude guard JSON 的信任模型一致（防线可信源是 workflow
+            # 文件，被防的是 PR 工作树内容）。
+            # ⚠️ 内嵌版必须与 .github/ai-review/guard.ts 保持逐字一致
+            # （改扩展时两处同改），同步由 code review 保证
+            cat > "$RUNNER_TEMP/ai-review-guard.ts" <<'EOF'
+          /**
+           * ai-review guard 扩展 —— 补齐 Pi 缺失的文件级防线。
+           *
+           * Pi 的 read/grep/find/ls 工具接受任意绝对路径，内核没有文件权限系统；
+           * 被审 diff 里的 prompt injection 可能诱导模型读取 /proc/self/environ，
+           * 把进程环境里的 API key / GITHUB_TOKEN 带进 PR 评论造成泄密。
+           * 本扩展在 tool_call gate 上拦截对内核伪文件系统的访问。
+           *
+           * 加载方式（ai-review.yml）：`-ne -e <本文件>`——`--no-extensions` 只关闭
+           * 自动发现，显式 -e 仍然加载。工作流从 PR base 版本恢复本文件后再加载，
+           * 绝不加载 PR 工作树里的副本（防 fork 作者在 PR 里植入弱化版 guard）。
+           *
+           * 自检：加载时向 stderr 打印一行日志；工作流在恢复文件后校验其包含
+           * "tool_call" 关键字，缺失即拒绝运行审查（防线自校验，防静默失效）。
+           *
+           * ⚠️ 本文件在 workflow Sanitize 步骤中有一份内嵌副本（base 尚无本文件时
+           * 的引导回退），改动须两处同步，同步由 code review 保证。
+           */
+          
+          import { resolve } from "node:path";
+          
+          /** 内核伪文件系统前缀，命中即拦截。 */
+          const BLOCKED_PREFIXES = ["/proc", "/sys", "/dev"];
+          
+          /** 只读审查启用的工具集（与 ai-review.yml 的 --tools 保持一致）。 */
+          const GUARDED_TOOLS = new Set(["read", "grep", "find", "ls"]);
+          
+          function blockedReason(resolvedPath: string): string | undefined {
+          	for (const prefix of BLOCKED_PREFIXES) {
+          		if (resolvedPath === prefix || resolvedPath.startsWith(prefix + "/")) {
+          			return `path ${resolvedPath} is under ${prefix}, blocked by ai-review guard`;
+          		}
+          	}
+          	return undefined;
+          }
+          
+          export default function (pi: any) {
+          	pi.on("tool_call", (event: any, ctx: any) => {
+          		if (!GUARDED_TOOLS.has(event.toolName)) return;
+          		const input = event.input;
+          		if (!input || typeof input !== "object") return;
+          
+          		const candidates: string[] = [];
+          		if (typeof input.path === "string") candidates.push(input.path);
+          		// find 的 glob pattern 若以 / 开头等价于绝对路径，同样纳入检查
+          		if (typeof input.pattern === "string" && input.pattern.startsWith("/")) {
+          			candidates.push(input.pattern);
+          		}
+          
+          		for (const raw of candidates) {
+          			const resolved = raw.startsWith("/") ? resolve(raw) : resolve(ctx.cwd, raw);
+          			const reason = blockedReason(resolved);
+          			if (reason) {
+          				console.error(`[ai-review-guard] blocked ${event.toolName}: ${reason}`);
+          				return { block: true, reason, terminate: true };
+          			}
+          		}
+          	});
+          
+          	console.error("[ai-review-guard] loaded, blocking reads under /proc, /sys, /dev");
+          }
+          EOF
+          fi
+          # 防线自校验：恢复/内嵌出的文件必须非空且包含 tool_call 关键字——
           # 扩展若损坏/被 base 误删，Pi 会静默不带 guard 运行，/proc 封禁
           # 无声失效，必须在这里显式拒绝
-          rm -f .github/ai-review/guard.ts
-          git show "$BASE:.github/ai-review/guard.ts" > "$RUNNER_TEMP/ai-review-guard.ts"
           if [ ! -s "$RUNNER_TEMP/ai-review-guard.ts" ] || ! grep -q "tool_call" "$RUNNER_TEMP/ai-review-guard.ts"; then
-            echo "::error::ai-review guard.ts missing or invalid in base revision — refusing to run review without the /proc guard"
+            echo "::error::ai-review guard.ts missing or invalid — refusing to run review without the /proc guard"
             exit 1
           fi
 
