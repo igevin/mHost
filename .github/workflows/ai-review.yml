@@ -13,11 +13,6 @@
 # 定位是 advisory：评论非阻塞，不作为合并门禁；审查失败时 PR 留"AI 审查失败"说明。
 # 评审标准在 .github/ai-review-prompt.md，改 prompt 不用动本文件。
 #
-# GRAY-RELEASE：合入前试跑阶段——pull_request 触发已临时恢复（PR 分支上的
-# pull_request 事件用 PR 分支的 workflow 文件版本，合入前即可真实试跑）。
-# 试跑验证通过后、合入 master 前，必须重新注释掉下面三行，让 master 进入
-# 仅 workflow_dispatch 的灰度状态；观察 1~2 个真实 PR 后再恢复自动触发。
-
 name: AI Code Review
 
 on:
