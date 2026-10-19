@@ -473,9 +473,15 @@ impl AppState {
         //
         // fix：与 commands/dns.rs set_dns_mode_enable 第 6 步同理，
         // enable_dns_mode 内部走 osascript 同步阻塞，挪到 spawn_blocking。
+        //
+        // fix（issue #160）：sidecar 路径由 Tauri 层解析注入
+        //（`resolve_proxy_sidecar_path`），与 IPC 层同一套解析；
+        // 本路径在 AppState::new 内运行、早于 Tauri app 创建，拿不到
+        // AppHandle，因此不能用插件式 API，必须与 dns.rs 共用本 helper。
+        let proxy_path = crate::resolve_proxy_sidecar_path()?;
         let enable_result = tokio::task::spawn_blocking({
             let original = original.clone();
-            move || mhost_dns::platform::enable_dns_mode(dns_port, &original)
+            move || mhost_dns::platform::enable_dns_mode(&proxy_path, dns_port, &original)
         })
         .await;
         let enable_outcome = match enable_result {

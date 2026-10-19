@@ -69,28 +69,19 @@ pnpm install
 
 ### 开发模式（推荐日常使用）
 
-> **⚠️ DNS mode 用户必读（issue #155）**：`pnpm tauri dev` **不会**自动
-> 构建 `mhost-dns-proxy` 这个独立 sidecar binary（它在 workspace member
-> `crates/mhost-dns/` 里，是一个 `[[bin]]`）。第一次启用 DNS mode 时，
-> 如果 `src-tauri/target/debug/mhost-dns-proxy` 不存在，DNS 查询会
-> 全部卡死（系统 DNS 被改成 127.0.0.1:53 但 53 端口没人监听）。
-
-**推荐工作流**（一键构建 proxy + 启动 dev）：
+> **✅ issue #160 已修复**：`pnpm tauri dev` 现在通过 `beforeDevCommand`
+> 自动构建 `mhost-dns-proxy` sidecar（`scripts/build-proxy-sidecar.sh --dev`，
+> debug 构建当前 host triple）。裸 `pnpm tauri dev` 即可工作，不再需要
+> `scripts/dev.sh`（已删除）。原 `pnpm dev:full` 等价于 `pnpm tauri dev`。
 
 ```bash
-pnpm dev:full
+pnpm tauri dev
 ```
 
-或直接调脚本：
+等价于手动执行：
 
 ```bash
-bash scripts/dev.sh
-```
-
-等价于：
-
-```bash
-cd src-tauri && cargo build -p mhost-dns --bin mhost-dns-proxy
+bash scripts/build-proxy-sidecar.sh --dev   # cargo build -p mhost-dns --bin mhost-dns-proxy（debug）
 pnpm tauri dev
 ```
 
@@ -98,16 +89,14 @@ pnpm tauri dev
 > `cargo build --bin mhost-dns-proxy` 会 fail 报
 > "no bin target named 'mhost-dns-proxy' in default-run packages"
 > （mhost-dns 是 workspace member 而不是 default-run package）。
+> `--dev` 脚本内部已处理这个细节。
 
-临时用普通 dev 模式时，单独构建一次 proxy 也行：
-
-```bash
-(cd src-tauri && cargo build -p mhost-dns --bin mhost-dns-proxy) && pnpm tauri dev
-```
-
-构建完成后 `src-tauri/target/debug/mhost-dns-proxy` 就在 `current_exe()`
-同目录下，被 `enable_dns_mode` 通过 `current_exe().parent().join(...)`
-定位到。
+构建完成后 `src-tauri/target/debug/mhost-dns-proxy` 与 dev 主二进制
+同目录；运行时由 Tauri 层的 `resolve_proxy_sidecar_path`
+（`src-tauri/src/lib.rs`）按 `<current_exe 目录>/mhost-dns-proxy` 解析
+并注入 `platform::enable_dns_mode`（issue #160，语义同
+tauri-plugin-shell 的 sidecar 解析；未引入该插件，见
+`src/lib.rs::resolve_proxy_sidecar_path` 注释）。
 
 ```bash
 pnpm tauri dev
