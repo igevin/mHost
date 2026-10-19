@@ -246,6 +246,11 @@ async fn set_dns_mode_enable(
     //    fix（proxy self-cleanup）：把 &OriginalDns 传给 proxy，让它在
     //    退出时能自己恢复系统 DNS（DhcpEmpty → 写 Empty；Manual → 写回 list）。
     //
+    //    fix（issue #160）：sidecar 路径由 Tauri 层解析
+    //    （`resolve_proxy_sidecar_path`，语义同 tauri-plugin-shell sidecar），
+    //    注入 `platform::enable_dns_mode`；`mhost-dns` crate 不再自己探测。
+    //    解析失败在这里返回明确 Err，不走提权脚本、不弹 sudo。
+    //
     //    fix（regression from #155）+ **fix（issue #142）**：enable_dns_mode 内部走
     //    osascript 弹 sudo 密码框，`Command::output()` 同步阻塞。
     //
@@ -268,8 +273,9 @@ async fn set_dns_mode_enable(
     //   disable_dns_mode 把系统 DNS 恢复)。这里 `cancel=None` 因为 rollback
     //   是「已经决定要清理」,不应该被 cancel 再次打断。
     let original_for_enable = original.clone();
+    let proxy_path = crate::resolve_proxy_sidecar_path()?;
     match tokio::task::spawn_blocking(move || {
-        mhost_dns::platform::enable_dns_mode(dns_port, &original_for_enable)
+        mhost_dns::platform::enable_dns_mode(&proxy_path, dns_port, &original_for_enable)
     })
     .await
     {

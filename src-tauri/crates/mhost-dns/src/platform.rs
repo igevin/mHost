@@ -782,8 +782,21 @@ fn get_active_network_device() -> Option<String> {
 ///   - 所有 path 走单引号包裹（POSIX shell-quoting idiom），保证
 ///     `~/Library/Application Support/...` 这种带空格路径不会截断
 ///   - `trap ... EXIT` 在 networksetup 成功前清掉 disowned proxy + PID 文件
-pub fn enable_dns_mode(dns_port: u16, original: &OriginalDns) -> Result<(), PlatformError> {
-    tracing::info!("enable_dns_mode: entered (dns_port={})", dns_port);
+///
+/// **fix（issue #160）**：`proxy_path` 由调用方（Tauri 层
+/// `resolve_proxy_sidecar_path`）解析注入，本函数不再自己探测
+/// `current_exe()`；crate 保持无 Tauri 依赖，Windows / Linux（#67）
+/// 由各自平台层注入等价路径。
+pub fn enable_dns_mode(
+    proxy_path: &Path,
+    dns_port: u16,
+    original: &OriginalDns,
+) -> Result<(), PlatformError> {
+    tracing::info!(
+        "enable_dns_mode: entered (proxy_path={}, dns_port={})",
+        proxy_path.display(),
+        dns_port
+    );
     let interface = get_active_network_interface()?;
     tracing::info!(
         "enable_dns_mode: get_active_network_interface returned: {}",
@@ -793,11 +806,9 @@ pub fn enable_dns_mode(dns_port: u16, original: &OriginalDns) -> Result<(), Plat
 
     // 0.5 **fix（issue #155）**：先验证 `mhost-dns-proxy` sidecar binary
     //     存在并且可执行，再做任何文件写入 / 网络副作用。
-    let proxy_path = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|dir| dir.join("mhost-dns-proxy")))
-        .unwrap_or_else(|| PathBuf::from("mhost-dns-proxy"));
-    validate_proxy_binary(&proxy_path)?;
+    //     路径来自调用方注入；缺失/不可执行在这里响亮失败（issue #155
+    //     的 silent-failure 修复在 #160 后依然成立）。
+    validate_proxy_binary(proxy_path)?;
 
     // 1. 确保 runtime dir 存在（mode 0o700）
     ensure_runtime_dir()
@@ -844,7 +855,7 @@ pub fn enable_dns_mode(dns_port: u16, original: &OriginalDns) -> Result<(), Plat
         .join("mhost-dns-proxy.log");
     let ready_file = proxy_ready_file();
     let inputs = EnableScriptInputs {
-        proxy_path: &proxy_path,
+        proxy_path,
         dns_port,
         pid_file: &pid_file,
         log_path: &log_path,
@@ -885,9 +896,8 @@ pub(crate) fn validate_proxy_binary(proxy_path: &Path) -> Result<(), PlatformErr
         Err(e) => {
             return Err(PlatformError::SetDns(format!(
                 "mhost-dns-proxy binary not found at {display} ({e}). \
-                 This usually means `pnpm tauri dev` was run without first building the proxy. \
-                 Fix: `{PROXY_BUILD_INSTR}`, \
-                 or use `bash scripts/dev.sh` which builds it for you. \
+                 `pnpm tauri dev` builds the sidecar automatically via beforeDevCommand; \
+                 to rebuild manually: `{PROXY_BUILD_INSTR}`. \
                  See doc/dev-guide.md for details.",
             )));
         }
@@ -903,6 +913,10 @@ pub(crate) fn validate_proxy_binary(proxy_path: &Path) -> Result<(), PlatformErr
 /// "no bin target named 'mhost-dns-proxy' in default-run packages"，
 /// 把用户从「silent failure」摆渡到「更难修的 explicit failure」。
 /// 把命令集中在这里，所有错误消息 + 文档都引用它。
+///
+/// **fix（issue #160）**：dev 下的常规路径是 `pnpm tauri dev`
+/// （beforeDevCommand 自动构建 sidecar），本命令只作为手动重建的
+/// 精确指令保留。
 pub(crate) const PROXY_BUILD_INSTR: &str =
     "cd src-tauri && cargo build -p mhost-dns --bin mhost-dns-proxy";
 
@@ -3312,9 +3326,13 @@ networksetup -setdnsservers Wi-Fi 127.0.0.1
         // 象（issue #155 引入；PR #156 review 加权限检查），比 orphan 的裸
         // `is_file()` 更严格（还会查 mode & 0o111）。这里改测源码含
         // `validate_proxy_binary(` 调用 + `binary not found` 报错文案。
+        //
+        // **fix (issue #160)**：`proxy_path` 改为调用方注入的函数参数，
+        // 调用形式从 `validate_proxy_binary(&proxy_path)` 变为
+        // `validate_proxy_binary(proxy_path)`，断言同步更新。
         let platform_src = include_str!("platform.rs");
         assert!(
-            platform_src.contains("validate_proxy_binary(&proxy_path)?"),
+            platform_src.contains("validate_proxy_binary(proxy_path)?"),
             "enable_dns_mode 必须调 validate_proxy_binary 做前置检查（issue #140/#155）"
         );
         assert!(

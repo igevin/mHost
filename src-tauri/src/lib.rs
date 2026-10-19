@@ -14,6 +14,36 @@ use commands::{
 use state::AppState;
 use tauri::{Manager, RunEvent};
 
+/// 解析 `mhost-dns-proxy` sidecar 二进制的运行时路径（issue #160）。
+///
+/// 路径发现从 `mhost-dns` crate 上移到 Tauri 层：`crates/` 保持无
+/// Tauri 依赖，`platform::enable_dns_mode` 改为接收注入的 `proxy_path`，
+/// Windows / Linux 端口（#67）由各自的 IPC 层注入自己的解析结果。
+///
+/// 解析语义与 `tauri-plugin-shell` 的 sidecar 解析保持一致
+/// （`process/mod.rs::relative_command_path`，v2.0–2.2.1 未变更）：
+/// `<current_exe 所在目录>/mhost-dns-proxy`。
+/// - dev：`target/debug/mhost-dns-proxy`（`beforeDevCommand` 负责构建）
+/// - release：`mHost.app/Contents/MacOS/mhost-dns-proxy`（`bundle.externalBin` 落位）
+///
+/// 未引入 tauri-plugin-shell：其 sidecar 解析实现与本函数等价
+/// （`current_exe().parent().join(name)`），且冷启动恢复
+/// （`AppState::new` → `try_recover_dns`）早于 Tauri app 创建、拿不到
+/// `AppHandle`，用插件反而会造成两套解析并存。
+pub(crate) fn resolve_proxy_sidecar_path() -> Result<std::path::PathBuf, mhost_core::MhostError> {
+    let exe = std::env::current_exe().map_err(|e| {
+        mhost_core::MhostError::InvalidInput(format!(
+            "cannot resolve sidecar path: current_exe failed: {e}"
+        ))
+    })?;
+    let dir = exe.parent().ok_or_else(|| {
+        mhost_core::MhostError::InvalidInput(
+            "cannot resolve sidecar path: current exe has no parent directory".to_string(),
+        )
+    })?;
+    Ok(dir.join("mhost-dns-proxy"))
+}
+
 /// **fix issue #67 bug 3**: 防止 RunEvent::ExitRequested 递归触发 cleanup。
 ///
 /// `handle.exit(0)` 会再次触发 ExitRequested → cleanup → handle.exit(0)
