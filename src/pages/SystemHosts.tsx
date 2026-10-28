@@ -8,6 +8,15 @@ import { highlightHostsLine } from "../lib/highlightHosts";
 import SearchBar from "../components/SearchBar";
 import styles from "./SystemHosts.module.css";
 
+/** 只读 hosts 预览的行高（px）—— 必须与 CSS 的
+ *  `--editor-line-height-compact` 一致（定义在 src/styles/global.css，
+ *  由 SystemHosts.module.css 的 .editorWrapper 应用给 gutter 与预览）。
+ *
+ *  issue #248: 不能再用 `12px * 1.6 = 19.2px`。WebKit 会把分数行盒向下
+ *  取整成 19px，而 gutter 的行槽位（min-height）不取整 —— 两者逐行错开，
+ *  行号会随行数漂移。显式的 19px 让「声明值 == 渲染值」。 */
+export const HOSTS_PREVIEW_LINE_HEIGHT_PX = 19;
+
 /**
  * Per-line hosts-syntax highlighting + search-match wrapping (issue #126).
  * Mirrors RuleEditor's `highlightText` exactly so a user inspecting
@@ -200,11 +209,13 @@ function SystemHosts() {
   }, []);
 
   // issue #124: 命令面板跳转 —— focusLine 变化且内容加载完成后，把
-  // pre 滚到目标行（12px × 1.6 = 19.2px 行高，与 gutter 的
-  // min-height 一致），gutter 同步滚动。jumpId 是重复跳转的 nonce（F6）。
+  // pre 滚到目标行，gutter 同步滚动。jumpId 是重复跳转的 nonce（F6）。
+  //
+  // issue #248: 行高用真实渲染值（19px），不是 `12px × 1.6 = 19.2px` ——
+  // 与 CSS 的 --editor-line-height-compact 保持一致，避免 gutter 与预览逐行漂移。
   useEffect(() => {
     if (focusLine == null || hostsContent === null) return;
-    const top = (focusLine - 1) * 19.2;
+    const top = (focusLine - 1) * HOSTS_PREVIEW_LINE_HEIGHT_PX;
     if (previewRef.current) previewRef.current.scrollTop = top;
     if (gutterRef.current) gutterRef.current.scrollTop = top;
   }, [focusLine, jumpId, hostsContent]);
