@@ -1,6 +1,9 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, act, fireEvent } from "@testing-library/react";
-import RuleEditor from "../RuleEditor";
+import RuleEditor, { EDITOR_LINE_HEIGHT_PX } from "../RuleEditor";
+import globalCss from "../../styles/global.css?raw";
+import ruleEditorCss from "../RuleEditor.module.css?raw";
+import hostsHighlightCss from "../../styles/hostsHighlight.css?raw";
 import type { HostRule } from "../../types";
 
 // Mock validateHostsText
@@ -499,8 +502,8 @@ describe("RuleEditor", () => {
 
       expect(activeGutterRow()?.textContent).toBe("3");
       const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
-      // lineHeight 20.8 = 13px × 1.6（scrollToMatch 的既有契约）
-      expect(textarea.scrollTop).toBe(2 * 20.8);
+      // issue #248: 行高用真实渲染值（20px），不再是 13px × 1.6 = 20.8px
+      expect(textarea.scrollTop).toBe(2 * EDITOR_LINE_HEIGHT_PX);
     });
 
     it("highlights no gutter row in read-only mode without focusLine", () => {
@@ -542,7 +545,7 @@ describe("RuleEditor", () => {
         />,
       );
       const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
-      expect(textarea.scrollTop).toBe(1 * 20.8);
+      expect(textarea.scrollTop).toBe(1 * EDITOR_LINE_HEIGHT_PX);
 
       // 用户手动滚走
       textarea.scrollTop = 0;
@@ -557,8 +560,58 @@ describe("RuleEditor", () => {
           jumpNonce={2}
         />,
       );
-      expect(textarea.scrollTop).toBe(1 * 20.8);
+      expect(textarea.scrollTop).toBe(1 * EDITOR_LINE_HEIGHT_PX);
       expect(activeGutterRow()?.textContent).toBe("2");
     });
+  });
+});
+
+/**
+ * issue #248 回归护栏。
+ *
+ * 这个 bug 只在真实渲染层可见：gutter 的行槽位与正文行盒差 0.8px/行，
+ * 高亮层的合成粗体把字形步进撑宽 4.6% —— jsdom 不排版，DOM 断言抓不到
+ * 度量类回归，所以这里直接对样式源码立规矩（vitest.config.ts 开了
+ * `css: true`，`?raw` 才会返回样式原文）：
+ *   1. 行高只有一个来源（global.css 的 token），且与 JS 的滚动换算一致；
+ *   2. 编辑器各层不得自行声明行高 —— 只能继承 .editorWrapper 的那一份；
+ *   3. hosts token 样式必须「度量中性」：字重不能触发合成粗体。
+ */
+describe("editor metrics invariants (issue #248)", () => {
+  /** 去掉注释后再断言 —— 注释里会引用旧值做对比说明。 */
+  function declarations(css: string): string {
+    return css.replace(/\/\*[\s\S]*?\*\//g, "");
+  }
+
+  function block(css: string, selector: string): string {
+    const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const m = css.match(new RegExp(`${escaped}\\s*\\{([^}]*)\\}`));
+    expect(m, `找不到 ${selector} 的样式块`).not.toBeNull();
+    return m![1];
+  }
+
+  it("keeps the CSS line-height token in sync with the JS scroll math", () => {
+    const token = globalCss.match(/--editor-line-height:\s*([\d.]+)px/);
+    expect(token).not.toBeNull();
+    expect(Number(token![1])).toBe(EDITOR_LINE_HEIGHT_PX);
+  });
+
+  it("declares the line height once on the wrapper and inherits it everywhere else", () => {
+    const css = declarations(ruleEditorCss);
+    expect(block(css, ".editorWrapper")).toMatch(/line-height:\s*var\(--editor-line-height\)/);
+    // gutter 与两层正文都继承同一个值 —— 各自再声明行高就会与继承值分叉
+    for (const selector of [".lineNumbers", ".lineNumber", ".highlightLayer", ".textarea"]) {
+      expect(block(css, selector), selector).not.toMatch(/line-height:/);
+    }
+    // 分数行高（1.6）在 WebKit 会被向下取整，与 min-height 的行槽位错开
+    expect(css).not.toMatch(/line-height:\s*1\.\d/);
+  });
+
+  it("keeps the hosts token styles metric-neutral (no synthetic bold)", () => {
+    const ip = block(declarations(hostsHighlightCss), ".hosts-token-ip");
+    const weight = Number(ip.match(/font-weight:\s*(\d+)/)?.[1]);
+    expect(weight).toBeGreaterThan(0);
+    // JetBrains Mono 只打包 400/500；>=600 会命中合成粗体，撑宽字形步进
+    expect(weight).toBeLessThanOrEqual(500);
   });
 });

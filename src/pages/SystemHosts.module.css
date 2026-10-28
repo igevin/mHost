@@ -10,6 +10,14 @@
  * Mirrors RuleEditor.module.css — duplicated here so the read-only viewer
  * doesn't reach into RuleEditor's CSS module scope (rule of three). */
 
+/* issue #248: 行高**只在这里声明一次**，gutter（.lineNumbers）与预览
+ * （.hostsPreview）全部继承同一个值 —— 结构上就不可能出现漂移。
+ * 值来自 global.css 的 `--editor-line-height-compact`（19px，整数）。
+ *
+ * 为什么不写 `font-size: 12px; line-height: 1.6`（= 19.2px）：
+ * WebKit（macOS WKWebView，实测）把分数行盒向下取整到整数 CSS px，
+ * 预览实际渲染成 19px；而 gutter 的行槽位是 `min-height`（不取整），
+ * 19.2px 会与 19px 的行盒逐行错开。显式 19px 让「声明值 == 渲染值」。 */
 .editorWrapper {
   flex: 1;
   min-height: 0;
@@ -18,6 +26,8 @@
   border: 1px solid var(--rule);
   border-radius: var(--radius-sm);
   background: var(--sidebar-bg);
+  /* 唯一一处行高声明：gutter 与预览都继承它（issue #248） */
+  line-height: var(--editor-line-height-compact);
 }
 
 .lineNumbers {
@@ -31,7 +41,7 @@
   border-right: 1px solid var(--rule);
   font-family: var(--font-mono);
   font-size: var(--font-size-sm);
-  line-height: 1.6;
+  /* 行高继承自 .editorWrapper（issue #248） */
   color: var(--ink-muted);
   text-align: right;
   /* The content (line-number divs) overflows vertically; we sync scrollTop
@@ -46,10 +56,9 @@
 }
 
 .lineNumber {
-  /* Match hostsPreview's font-size × line-height (12px × 1.6 = 19.2px,
-   * rounded for sub-pixel). Each line number reserves one row of vertical
-   * space so the gutter aligns with the rendered content. */
-  min-height: 19.2px;
+  /* issue #248: 行槽位高度 = 预览行盒高度（继承自 .editorWrapper）。
+   * 每个行号占一行垂直空间，gutter 才能与渲染内容逐行对齐。 */
+  min-height: var(--editor-line-height-compact);
 }
 
 .lineNumberActive {
@@ -73,7 +82,7 @@
   border-radius: 0;
   background: transparent;
   font-size: var(--font-size-sm);
-  line-height: 1.6;
+  /* 行高继承自 .editorWrapper（issue #248） */
   overflow: auto;
   white-space: pre-wrap;
   word-break: break-word;

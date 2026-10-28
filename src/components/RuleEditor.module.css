@@ -10,8 +10,19 @@
 
 /* ---- Editor Wrapper: textarea + highlight layer ----
  * Edge-to-edge: no border, no radius — title bar lives in ProfileView.
- * The top edge fades to a 1px rule only when there are blocking errors. */
-
+ * The top edge fades to a 1px rule only when there are blocking errors.
+ *
+ * issue #248: 行高**只在这里声明一次**，gutter（.lineNumbers）与正文
+ * （.highlightLayer / .textarea）全部继承同一个值 —— 结构上就不可能
+ * 出现「行号与正文行高不等」的漂移。值来自 global.css 的
+ * `--editor-line-height`（20px，整数）。
+ *
+ * 为什么不写 `font-size: 13px; line-height: 1.6`（= 20.8px）：
+ * WebKit（macOS WKWebView，实测）会把分数行盒向下取整到整数 CSS px，
+ * 13px × 1.6 实际渲染为 20px；而 gutter 的行槽位是 `min-height`
+ * （不取整），两者每行差 0.8px，到第 12 行累计 9px ≈ 半行 —— 行号与
+ * 正文错位，蓝色「当前行」标记指错行（issue #248 报的现象）。
+ * 显式的整数行高让「声明值 == 渲染值」，不依赖引擎的取整行为。 */
 .editorWrapper {
   flex: 1;
   position: relative;
@@ -19,6 +30,8 @@
   overflow: hidden;
   border-top: 1px solid var(--rule-soft);
   background: var(--surface);
+  /* 唯一一处行高声明：gutter 与正文都继承它 */
+  line-height: var(--editor-line-height);
 }
 
 /* ---- Gutter (line numbers) ---- */
@@ -34,7 +47,7 @@
   border-right: 1px solid var(--rule-soft);
   font-family: var(--font-mono);
   font-size: 12px;
-  line-height: 1.6;
+  /* 行高继承自 .editorWrapper（issue #248） */
   color: var(--ink-muted);
   text-align: right;
   overflow: hidden;
@@ -44,7 +57,8 @@
 }
 
 .lineNumber {
-  min-height: 19.2px;
+  /* issue #248: 行槽位高度 = 正文行盒高度（继承自 .editorWrapper） */
+  min-height: var(--editor-line-height);
   padding-right: 2px;
 }
 
@@ -64,7 +78,7 @@
   padding: 12px 14px;
   font-family: var(--font-mono);
   font-size: 13px;
-  line-height: 1.6;
+  /* 行高继承自 .editorWrapper（issue #248） */
   color: var(--ink);
   background: transparent;
   white-space: pre-wrap;
@@ -94,7 +108,8 @@
   caret-color: var(--ink);
   font-family: var(--font-mono);
   font-size: 13px;
-  line-height: 1.6;
+  /* 行高继承自 .editorWrapper（issue #248）—— 两层必须逐像素对齐，
+   * 否则 textarea 的光标会落在高亮文字的错位上 */
   white-space: pre-wrap;
   word-wrap: break-word;
   tab-size: 4;

@@ -69,6 +69,17 @@
   --font-size-md: 13px;
   --font-size-lg: 14px;
 
+  /* ---- Editor metrics (issue #248) ----
+   * 行高的唯一来源：gutter 的行槽位与正文行盒必须同高，否则行号会随
+   * 行数线性漂移（蓝色「当前行」标记指错行）。
+   * 整数 px 是刻意的：WebKit（macOS WKWebView，实测）会把分数行高
+   * —— 例如 13px × 1.6 = 20.8px —— 向下取整到整数 CSS px，而
+   * `min-height` 的行槽位不取整，两者每行就会错开 0.8px。
+   *   --editor-line-height         13px 可编辑 hosts（RuleEditor）
+   *   --editor-line-height-compact 12px 只读预览（System Hosts） */
+  --editor-line-height: 20px;
+  --editor-line-height-compact: 19px;
+
   /* ---- Surfaces (paper) ---- */
   --paper: #FAF7EE;
   --surface: #FCF9F2;

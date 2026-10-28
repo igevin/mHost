@@ -43,6 +43,25 @@ function rulesToText(rules: HostRule[]): string {
 // RuleEditor and SystemHosts render identical token colors.
 const highlightLine = highlightHostsLine;
 
+/** 编辑器行高（px）—— 必须与 CSS 的 `--editor-line-height` 一致
+ *  （定义在 src/styles/global.css，由 RuleEditor.module.css 的
+ *  .editorWrapper 应用给 gutter 与正文两层）。
+ *
+ *  issue #248: 不能再用 `13px * 1.6 = 20.8px` 换算滚动位置。WebKit 会把
+ *  分数行盒向下取整到整数 CSS px（实测 13px × 1.6 的行盒渲染为 20px），
+ *  用 20.8 换算会越滚越偏（第 500 行偏 400px）。 */
+export const EDITOR_LINE_HEIGHT_PX = 20;
+
+/** 取真实行高：优先问 DOM（声明值可能 != 渲染值），读不到时回落到常量。
+ *  只认 px 计算值 —— 浏览器里 getComputedStyle 返回的一定是 px；jsdom 对
+ *  无单位的 `line-height: 1.6` 会原样返回 "1.6"，那是开发环境的假象，
+ *  拿它换算滚动位置会得到完全错误的值。 */
+function resolveEditorLineHeight(el: HTMLElement): number {
+  const raw = getComputedStyle(el).lineHeight;
+  const parsed = raw.endsWith("px") ? parseFloat(raw) : NaN;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : EDITOR_LINE_HEIGHT_PX;
+}
+
 /** Parse text into HTML with syntax highlighting and search marks */
 function highlightText(
   text: string,
@@ -336,11 +355,13 @@ function RuleEditor({ rules, onChange, onErrorChange, readOnly = false, focusLin
   }, []);
 
   // Scroll to a specific line in the textarea
+  //
+  // issue #248: 用真实渲染行高换算，不要用 CSS 声明值（WebKit 取整后
+  // 声明的 20.8px 实际渲染成 20px）。搜索跳转与命令面板跳转共用这里。
   const scrollToMatch = useCallback((lineIndex: number) => {
-    if (textareaRef.current) {
-      const lineHeight = 20.8; // 13px * 1.6
-      textareaRef.current.scrollTop = lineIndex * lineHeight;
-    }
+    const ta = textareaRef.current;
+    if (!ta) return;
+    ta.scrollTop = lineIndex * resolveEditorLineHeight(ta);
   }, []);
 
   // issue #124: 命令面板跳转。focusLine 变化时滚动到该行并高亮 gutter。

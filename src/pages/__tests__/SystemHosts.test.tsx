@@ -12,7 +12,9 @@ vi.mock("../../lib/tauri", async (importOriginal) => {
   };
 });
 
-import SystemHosts from "../SystemHosts";
+import SystemHosts, { HOSTS_PREVIEW_LINE_HEIGHT_PX } from "../SystemHosts";
+import globalCss from "../../styles/global.css?raw";
+import systemHostsCss from "../SystemHosts.module.css?raw";
 
 const SAMPLE_HOSTS = [
   "127.0.0.1 localhost",
@@ -401,5 +403,32 @@ describe("SystemHosts", () => {
     } finally {
       Element.prototype.scrollIntoView = original;
     }
+  });
+});
+
+/**
+ * issue #248 回归护栏：只读预览的行高也必须单一来源 —— gutter 的行槽位
+ * 与预览的行盒同高，否则行号随行数漂移。详见 RuleEditor 的同名护栏。
+ */
+describe("system hosts metrics invariants (issue #248)", () => {
+  it("keeps the CSS line-height token in sync with the JS scroll math", () => {
+    const token = globalCss.match(/--editor-line-height-compact:\s*([\d.]+)px/);
+    expect(token).not.toBeNull();
+    expect(Number(token![1])).toBe(HOSTS_PREVIEW_LINE_HEIGHT_PX);
+  });
+
+  it("declares the line height once on the wrapper and inherits it everywhere else", () => {
+    const css = systemHostsCss.replace(/\/\*[\s\S]*?\*\//g, "");
+    const block = (selector: string): string => {
+      const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const m = css.match(new RegExp(`${escaped}\\s*\\{([^}]*)\\}`));
+      expect(m, `找不到 ${selector} 的样式块`).not.toBeNull();
+      return m![1];
+    };
+    expect(block(".editorWrapper")).toMatch(/line-height:\s*var\(--editor-line-height-compact\)/);
+    for (const selector of [".lineNumbers", ".lineNumber", ".hostsPreview"]) {
+      expect(block(selector), selector).not.toMatch(/line-height:/);
+    }
+    expect(css).not.toMatch(/line-height:\s*1\.\d/);
   });
 });

@@ -1,11 +1,22 @@
 /* Hosts syntax highlight tokens (issue #126). Shared by RuleEditor and
    SystemHosts. `highlightHostsLine()` in src/lib/highlightHosts.ts emits
    spans with these class names. Colors come from the design tokens in
-   src/styles/global.css (Terminal Native palette). */
+   src/styles/global.css (Terminal Native palette).
+ *
+ * issue #248 — 度量中性约束：这层文字叠在透明 textarea 下面（只有光标
+ * 可见），两层必须共用同一套字形度量，否则光标与可见字符错位。
+ * 实测（WKWebView / macOS，13px JetBrains Mono + size-adjust 105%）：
+ *   weight 400 / 500 / italic → 步进 8.19px（一致，安全）
+ *   weight >= 600              → 步进 8.57px（+4.6%，错位） */
 
 .hosts-token-ip {
   color: var(--accent);
-  font-weight: 600;
+  /* 不能用 600+：仓库只打包了 JetBrains Mono 的 400/500，600 会命中
+   * 「合成粗体」（synthetic bold），描边把每个字符的步进从 8.19px 撑到
+   * 8.57px（+4.6%）。高亮层比 textarea 宽，光标就落在可见字符内部。
+   * 500 命中已打包的 Medium face，步进与 Regular 完全一致。
+   * 需要更粗的 IP 时应打包真实的 Bold face（等宽字各字重步进相同）。 */
+  font-weight: 500;
 }
 
 .hosts-token-domain {
@@ -15,5 +26,6 @@
 
 .hosts-token-comment {
   color: var(--ink-muted);
+  /* synthetic oblique 是斜切，不改变步进（实测与 normal 同为 8.19px） */
   font-style: italic;
 }
